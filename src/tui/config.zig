@@ -21,7 +21,7 @@ const Diagnostic = struct {
 pub const Configuration = struct {
     pub const default_highlight_max_file_bytes: usize = 2 * 1024 * 1024;
     pub const default_inactive_file_cache_max_bytes: usize = 256 * 1024 * 1024;
-    pub const default_comments_collapsed_rows: usize = 6;
+    pub const default_comments_collapsed_rows: usize = 9;
     pub const default_external_edit_max_bytes: usize = 1024 * 1024;
 
     theme: ThemeId,
@@ -748,10 +748,10 @@ test "File content cache defaults on at 256 MiB and zero means unlimited" {
     try testing.expectEqual(@as(usize, 2), renamed_key.invalid[0].line);
 }
 
-test "Comment disclosure defaults to six rendered rows and zero disables collapse" {
+test "Comment disclosure defaults to nine rendered rows and zero disables collapse" {
     var default_result = try parse(testing.allocator, "");
     defer default_result.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 6), default_result.ok.comments_collapsed_rows);
+    try testing.expectEqual(@as(usize, 9), default_result.ok.comments_collapsed_rows);
 
     var configured = try parse(testing.allocator,
         \\[comments]

@@ -371,6 +371,25 @@ const StoredFile = struct {
     }
 };
 
+/// The File indices `first` to `end`, `end` exclusive. The cache never
+/// evicts a File in the focused range.
+pub const FileRange = struct {
+    first: usize = 0,
+    end: usize = 0,
+
+    pub fn single(file_idx: usize) FileRange {
+        return .{ .first = file_idx, .end = file_idx + 1 };
+    }
+
+    pub fn contains(self: FileRange, file_idx: usize) bool {
+        return file_idx >= self.first and file_idx < self.end;
+    }
+
+    pub fn isEmpty(self: FileRange) bool {
+        return self.first >= self.end;
+    }
+};
+
 pub const CachePolicy = struct {
     enabled: bool = true,
     max_retained_bytes: usize = std.math.maxInt(usize),
@@ -414,7 +433,7 @@ const AtomicCacheEntry = struct {
 
 /// Project a completed result and the cache victims into private Frame inputs.
 /// The caller keeps the result and all source content alive until publication.
-pub fn previewAdmission(file_idx: usize, result: *const Result, policy: CachePolicy, focused: ?usize, entries: []CacheEntry, projection: Projection) void {
+pub fn previewAdmission(file_idx: usize, result: *const Result, policy: CachePolicy, focused: FileRange, entries: []CacheEntry, projection: Projection) void {
     projectView(file_idx, result.view(), projection);
     entries[file_idx].retained_bytes = result.retainedBytes();
     entries[file_idx].failed_old = result.old == .fetch_failed;
@@ -422,13 +441,13 @@ pub fn previewAdmission(file_idx: usize, result: *const Result, policy: CachePol
     previewCacheEnforcement(policy, focused, entries, projection);
 }
 
-pub fn previewCacheEnforcement(policy: CachePolicy, focused: ?usize, entries: []CacheEntry, projection: Projection) void {
+pub fn previewCacheEnforcement(policy: CachePolicy, focused: FileRange, entries: []CacheEntry, projection: Projection) void {
     const budget = if (!policy.enabled) 0 else if (policy.max_retained_bytes == 0) std.math.maxInt(usize) else policy.max_retained_bytes;
     while (true) {
         var total: usize = 0;
         var victim: ?usize = null;
         for (entries, 0..) |entry, index| {
-            if (focused != null and focused.? == index or entry.leases > 0) continue;
+            if (focused.contains(index) or entry.leases > 0) continue;
             total +|= entry.retained_bytes;
             if (entry.retained_bytes > 0 and (victim == null or entry.last_used < entries[victim.?].last_used)) victim = index;
         }
@@ -488,7 +507,7 @@ pub const Storage = struct {
     errors: []SideErrors,
     cache_entries: []AtomicCacheEntry,
     cache: CachePolicy = .{},
-    focused_file: ?usize = null,
+    focused: FileRange = .{},
     recency: u64 = 0,
     retired: std.ArrayList(RetiredFile) = .empty,
     revision: u64 = 0,
@@ -593,36 +612,38 @@ pub const Storage = struct {
         self.commitCacheUpdate();
     }
 
-    pub fn focus(self: *Storage, file_idx: usize) void {
-        _ = self.stageFocus(file_idx);
+    pub fn focus(self: *Storage, range: FileRange) void {
+        _ = self.stageFocus(range);
         self.commitCacheUpdate();
     }
 
-    pub fn stageFocus(self: *Storage, file_idx: usize) bool {
+    pub fn stageFocus(self: *Storage, range: FileRange) bool {
         std.debug.assert(self.retired.items.len == 0);
-        std.debug.assert(file_idx < self.files.len);
-        self.recency +|= 1;
-        self.files[file_idx].last_used = self.recency;
-        self.cache_entries[file_idx].store(self.files[file_idx]);
-        self.focused_file = file_idx;
-        self.revision +%= 1;
+        self.markFocused(range);
         return self.stageCacheEnforcement();
     }
 
-    pub fn rollbackFocus(self: *Storage, previous: ?usize) void {
+    pub fn rollbackFocus(self: *Storage, previous: FileRange) void {
         self.rollbackCacheUpdate();
-        self.focused_file = previous;
+        self.focused = previous;
     }
 
-    /// The destination Frame already uses this File. Releasing search holds
+    /// The destination Frame already uses these Files. Releasing search holds
     /// enforces the inactive cache budget after focus moves.
-    pub fn focusAdmitted(self: *Storage, file_idx: usize) void {
+    pub fn focusAdmitted(self: *Storage, range: FileRange) void {
         std.debug.assert(self.retired.items.len == 0);
-        if (self.focused_file == file_idx) return;
+        if (std.meta.eql(self.focused, range)) return;
+        self.markFocused(range);
+    }
+
+    fn markFocused(self: *Storage, range: FileRange) void {
+        std.debug.assert(range.isEmpty() or range.end <= self.files.len);
         self.recency +|= 1;
-        self.files[file_idx].last_used = self.recency;
-        self.cache_entries[file_idx].store(self.files[file_idx]);
-        self.focused_file = file_idx;
+        for (range.first..@max(range.first, range.end)) |file_idx| {
+            self.files[file_idx].last_used = self.recency;
+            self.cache_entries[file_idx].store(self.files[file_idx]);
+        }
+        self.focused = range;
         self.revision +%= 1;
     }
 
@@ -688,11 +709,11 @@ pub const Storage = struct {
         self.revision +%= 1;
     }
 
-    pub fn requiresCacheEnforcement(self: *const Storage, focused: ?usize) bool {
+    pub fn requiresCacheEnforcement(self: *const Storage, focused: FileRange) bool {
         const budget = if (!self.cache.enabled) 0 else if (self.cache.max_retained_bytes == 0) std.math.maxInt(usize) else self.cache.max_retained_bytes;
         var total: usize = 0;
         for (self.files, 0..) |*stored, index| {
-            if (focused == index or stored.leases > 0) continue;
+            if (focused.contains(index) or stored.leases > 0) continue;
             total +|= stored.retainedBytes();
         }
         return total > budget;
@@ -816,7 +837,7 @@ pub const Storage = struct {
     /// The worker chose these victims against the checked cache revision.
     pub fn stageCacheVictims(self: *Storage, victims: []const usize) void {
         for (victims) |victim| {
-            std.debug.assert(self.files[victim].leases == 0 and self.focused_file != victim);
+            std.debug.assert(self.files[victim].leases == 0 and !self.focused.contains(victim));
             self.retired.appendAssumeCapacity(.{ .index = victim, .file = self.files[victim] });
             self.files[victim] = .{
                 .old = retainedTerminalSide(self.files[victim].old),
@@ -833,7 +854,7 @@ pub const Storage = struct {
     fn inactiveRetainedBytes(self: *const Storage) usize {
         var total: usize = 0;
         for (self.files, 0..) |*stored_file, file_idx| {
-            if (self.focused_file != null and self.focused_file.? == file_idx) continue;
+            if (self.focused.contains(file_idx)) continue;
             if (stored_file.leases > 0) continue;
             total +|= stored_file.retainedBytes();
         }
@@ -843,7 +864,7 @@ pub const Storage = struct {
     fn leastRecentlyUsedInactive(self: *const Storage) ?usize {
         var victim: ?usize = null;
         for (self.files, 0..) |*stored_file, file_idx| {
-            if (self.focused_file != null and self.focused_file.? == file_idx) continue;
+            if (self.focused.contains(file_idx)) continue;
             if (stored_file.leases > 0) continue;
             if (stored_file.retainedBytes() == 0) continue;
             if (victim == null or stored_file.last_used < self.files[victim.?].last_used) victim = file_idx;
@@ -947,7 +968,7 @@ test "File read lease release restores inactive cache budget while focused File 
     const files = test_files;
     var storage = try Storage.init(testing.allocator, &files);
     defer storage.deinit();
-    storage.focus(1);
+    storage.focus(.single(1));
     var first = try ownedAddedResult(testing.allocator, "first");
     defer first.deinit();
     try storage.admit(0, &first);
@@ -1690,22 +1711,22 @@ test "File content cache evicts the least-recently-focused whole File and refetc
     defer storage.deinit();
     storage.configureCache(.{ .enabled = true, .max_retained_bytes = 10 });
 
-    storage.focus(0);
+    storage.focus(.single(0));
     var first = try ownedAddedResult(testing.allocator, "aaaaaa");
     defer first.deinit();
     try storage.admit(0, &first);
 
-    storage.focus(1);
+    storage.focus(.single(1));
     var second = try ownedAddedResult(testing.allocator, "bbbbbb");
     defer second.deinit();
     try storage.admit(1, &second);
 
-    storage.focus(2);
+    storage.focus(.single(2));
     try testing.expect(storage.file(0).new == .pending);
     try testing.expect(storage.needsEnrichment(0));
     try testing.expectEqualStrings("bbbbbb", storage.file(1).new.content.blob);
 
-    storage.focus(0);
+    storage.focus(.single(0));
     var revisited = try ownedAddedResult(testing.allocator, "AAAAAA");
     defer revisited.deinit();
     try storage.admit(0, &revisited);
@@ -1720,7 +1741,7 @@ test "File Enrichment preview matches an evicted result with a failed side" {
     var storage = try Storage.init(testing.allocator, &files);
     defer storage.deinit();
     storage.configureCache(.{ .enabled = false });
-    storage.focus(1);
+    storage.focus(.single(1));
     var result = try ownedAddedResult(testing.allocator, "content");
     defer result.deinit();
     result.old = .{ .fetch_failed = error.NotFound };
@@ -1734,7 +1755,7 @@ test "File Enrichment preview matches an evicted result with a failed side" {
     defer testing.allocator.free(statuses);
     const entries = try storage.cacheEntries(testing.allocator);
     defer testing.allocator.free(entries);
-    previewAdmission(0, &result, storage.cache, storage.focused_file, entries, .{
+    previewAdmission(0, &result, storage.cache, storage.focused, entries, .{
         .blobs = blobs,
         .highlights = highlights,
         .content_statuses = statuses,
@@ -1764,11 +1785,11 @@ test "File content cache budget includes Highlight Spans" {
     var storage = try Storage.init(testing.allocator, test_files[0..2]);
     defer storage.deinit();
     storage.configureCache(.{ .enabled = true, .max_retained_bytes = "const".len });
-    storage.focus(0);
+    storage.focus(.single(0));
     try storage.admit(0, &result);
     try testing.expectEqual(bbr.highlight.CaptureRole.keyword, storage.file(0).new.content.highlighting.ready.spans[0].capture.role);
 
-    storage.focus(1);
+    storage.focus(.single(1));
     try testing.expect(storage.file(0).new == .pending);
 }
 
@@ -1777,18 +1798,40 @@ test "zero File cache budget retains unlimited inactive content and excludes the
     defer storage.deinit();
     storage.configureCache(.{ .enabled = true, .max_retained_bytes = 0 });
 
-    storage.focus(0);
+    storage.focus(.single(0));
     var first = try ownedAddedResult(testing.allocator, "aaaaaa");
     defer first.deinit();
     try storage.admit(0, &first);
 
-    storage.focus(1);
+    storage.focus(.single(1));
     var second = try ownedAddedResult(testing.allocator, "bbbbbb");
     defer second.deinit();
     try storage.admit(1, &second);
 
-    storage.focus(2);
+    storage.focus(.single(2));
     try testing.expectEqualStrings("aaaaaa", storage.file(0).new.content.blob);
+    try testing.expectEqualStrings("bbbbbb", storage.file(1).new.content.blob);
+}
+
+test "a disabled File cache keeps every File in the focused range and evicts each File that leaves it" {
+    var storage = try Storage.init(testing.allocator, test_files[0..3]);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = false });
+    storage.focus(.{ .first = 0, .end = 2 });
+
+    var first = try ownedAddedResult(testing.allocator, "aaaaaa");
+    defer first.deinit();
+    try storage.admit(0, &first);
+    var second = try ownedAddedResult(testing.allocator, "bbbbbb");
+    defer second.deinit();
+    try storage.admit(1, &second);
+    try testing.expectEqualStrings("aaaaaa", storage.file(0).new.content.blob);
+    try testing.expectEqualStrings("bbbbbb", storage.file(1).new.content.blob);
+    try testing.expect(!storage.requiresCacheEnforcement(storage.focused));
+
+    try testing.expect(storage.requiresCacheEnforcement(.{ .first = 1, .end = 3 }));
+    storage.focus(.{ .first = 1, .end = 3 });
+    try testing.expect(storage.file(0).new == .pending);
     try testing.expectEqualStrings("bbbbbb", storage.file(1).new.content.blob);
 }
 
@@ -1796,7 +1839,7 @@ test "equal-recency inactive Files evict in stable File order" {
     var storage = try Storage.init(testing.allocator, test_files[0..3]);
     defer storage.deinit();
     storage.configureCache(.{ .enabled = true, .max_retained_bytes = 6 });
-    storage.focus(2);
+    storage.focus(.single(2));
 
     var first = try ownedAddedResult(testing.allocator, "aaaaaa");
     defer first.deinit();

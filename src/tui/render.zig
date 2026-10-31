@@ -32,6 +32,8 @@ const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 const layouts = @import("layouts.zig");
 const view_paint = @import("view_paint.zig");
+const view_mod = @import("view.zig");
+const help_mod = @import("help.zig");
 
 pub const sidebar_width: u16 = 28;
 
@@ -103,13 +105,14 @@ pub fn drawReview(
         "Diff";
     drawDiffPaneTitle(scratch, win, frame, path, review.preferences.scope, theme);
     const sidebar = childRect(win, panes.get(.sidebar).content);
-    const diff_pane = childRect(win, panes.get(.diff).content);
+    const diff_pane = childRect(win, panes.get(.diff_body).content);
     var diff_theme = theme;
     diff_theme.section_rule = if (frame.focus == .diff) theme.pane_border_focused else theme.pane_border;
     drawFileTree(sidebar, review.frame.file_tree, theme);
     drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, diff_theme, review.frame.navigation);
     drawCodeHighlights(diff_pane, review.frame, theme);
     drawSearchRanges(diff_pane, review.frame, theme);
+    drawVersionMarkerColumn(childRect(win, panes.get(.version_marker).content), diff_pane, review.frame.buffer, review.frame.visual_rows, review.frame.navigation, diff_theme);
     joinSectionRules(win, panes.get(.diff).border, panes.get(.diff).content, review.frame.visual_rows, review.frame.navigation);
 }
 
@@ -565,7 +568,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
         },
         .hunk_header => |hunk| {
             fillRow(win, r, theme.hunk_header);
-            _ = win.printSegment(.{ .text = hunk.header, .style = theme.hunk_header }, .{ .row_offset = r, .wrap = .none });
+            _ = win.printSegment(.{ .text = hunk.header, .style = theme.hunk_header }, .{ .row_offset = r, .col_offset = if (layout == .side_by_side) anchor_cols else 0, .wrap = .none });
         },
         .status_placeholder => |value| drawStatusPlaceholder(scratch, win, r, layout, value, theme),
         .line => |lr| {
@@ -601,16 +604,47 @@ fn drawSideFileHeader(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, h
     }
     const old = std.fmt.allocPrint(scratch, "OLD {s}", .{header.file.old_path}) catch "OLD";
     const new = std.fmt.allocPrint(scratch, "NEW {s}", .{header.file.new_path}) catch "NEW";
-    if (half > 0) _ = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 }).printSegment(.{ .text = old, .style = theme.resolveStyle(old_style) }, .{ .wrap = .none });
+    if (half > 0) _ = win.child(.{ .x_off = anchor_cols, .y_off = row, .width = half - anchor_cols, .height = 1 }).printSegment(.{ .text = old, .style = theme.resolveStyle(old_style) }, .{ .wrap = .none });
     if (right_x < win.width) _ = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 }).printSegment(.{ .text = new, .style = theme.resolveStyle(new_style) }, .{ .wrap = .none });
 }
 
+/// The new version marker on the divider. The old version marker sits in the
+/// Selected Version marker column, which `drawVersionMarkerColumn` paints.
 fn drawSelectedColumnEdge(win: vaxis.Window, row: u16, selected: ?buffer_mod.SelectedColumn, theme: Theme) void {
     const column = selected orelse return;
-    const divider = win.width / 2;
-    if (divider >= win.width) return;
-    const current = win.readCell(divider, row) orelse return;
-    win.writeCell(divider, row, .{
+    if (column.version == .old) return;
+    drawSelectedVersionMarker(win, win.width / 2, row, column, theme);
+}
+
+/// The Selected Version marker column between the DiffPane border and the
+/// body. It continues the rule of a rule row and the background of every
+/// other row. With the old version selected in SideBySide, it holds the old
+/// version marker on each row outside a ReviewCard.
+fn drawVersionMarkerColumn(marker: vaxis.Window, body: vaxis.Window, buf: Buffer, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav, theme: Theme) void {
+    if (marker.width == 0) return;
+    const old_column: ?buffer_mod.SelectedColumn = blk: {
+        const column = buf.selected_column orelse break :blk null;
+        break :blk if (buf.layout == .side_by_side and column.version == .old) column else null;
+    };
+    var screen_row: u16 = 0;
+    while (screen_row < marker.height) : (screen_row += 1) {
+        const index = nav.scroll + screen_row;
+        if (index >= visual_rows.len) break;
+        const beside = body.readCell(0, screen_row) orelse continue;
+        const visual_row = visual_rows[index];
+        switch (visual_row.kind) {
+            .file_header, .section => marker.writeCell(0, screen_row, beside),
+            else => marker.writeCell(0, screen_row, .{ .style = .{ .bg = beside.style.bg } }),
+        }
+        const row = buf.rows[visual_row.buffer_index];
+        if (row == .comment or row == .draft) continue;
+        if (old_column) |column| drawSelectedVersionMarker(marker, 0, screen_row, column, theme);
+    }
+}
+
+fn drawSelectedVersionMarker(win: vaxis.Window, edge: u16, row: u16, column: buffer_mod.SelectedColumn, theme: Theme) void {
+    const current = win.readCell(edge, row) orelse return;
+    win.writeCell(edge, row, .{
         .char = .{ .grapheme = if (column.inner_gutter_edge == .right) "▐" else "▌", .width = 1 },
         .style = theme.resolveStyle(.{ .fg = theme.accent, .bg = current.style.bg, .bold = true }),
     });
@@ -639,10 +673,10 @@ fn drawStatusPlaceholder(
     const half = win.width / 2;
     if (half == 0) return;
     if (value.old) |status| {
-        const left = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 });
+        const left = win.child(.{ .x_off = anchor_cols, .y_off = row, .width = half - anchor_cols, .height = 1 });
         _ = left.printSegment(.{ .text = statusPlaceholderText(scratch, .old, status), .style = theme.section }, .{ .wrap = .none });
     } else if (value.file.status == .added) {
-        const left = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 });
+        const left = win.child(.{ .x_off = anchor_cols, .y_off = row, .width = half - anchor_cols, .height = 1 });
         _ = left.printSegment(.{ .text = "Old content absent", .style = theme.section }, .{ .wrap = .none });
     }
     const right_x = half + 1;
@@ -2180,88 +2214,29 @@ fn drawSubmissionDetail(
         const footer: []const u8 = if (tree.completion == null)
             " In progress; A abandons recovered ambiguity only"
         else if (item.retry_eligible)
-            " e edit | a re-anchor | D delete | X retry selected subtree | Esc dismiss"
+            " ⏎ jump | e edit | a re-anchor | D delete | X retry subtree | Esc dismiss"
         else if (item.repair_eligible)
-            " e edit | a re-anchor | D delete | R reload | repair before retry | Esc dismiss"
+            " ⏎ jump | e edit | a re-anchor | D delete | R reload | repair first"
         else if (item.state == .outcome_unknown)
-            " L link author-owned Comment | U confirm not published | A decide later"
+            " ⏎ jump | L link Comment | U confirm not published | A decide later"
         else if (item.state == .posted)
-            " Posted items are inspectable, never retryable | Esc dismiss"
+            " ⏎ jump | Posted items are never retryable | Esc dismiss"
         else if (item.state == .skipped)
-            " Select its blocking ancestor to repair or retry | Esc dismiss"
+            " ⏎ jump | Repair or retry its blocking ancestor | Esc dismiss"
         else
-            " j/k select | Esc dismiss";
+            " j/k select | ⏎ jump | Esc dismiss";
         _ = detail.printSegment(.{ .text = footer, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
     }
 }
 
-/// A short display label for a key codepoint: named for the special keys,
-/// otherwise the codepoint's own utf8. `scratch` outlives render.
-fn keyName(scratch: std.mem.Allocator, cp: u21) []const u8 {
-    return switch (cp) {
-        vaxis.Key.enter => "⏎",
-        vaxis.Key.escape => "esc",
-        vaxis.Key.up => "↑",
-        vaxis.Key.down => "↓",
-        vaxis.Key.left => "←",
-        vaxis.Key.right => "→",
-        vaxis.Key.home => "home",
-        vaxis.Key.end => "end",
-        vaxis.Key.page_up => "pgup",
-        vaxis.Key.page_down => "pgdn",
-        else => blk: {
-            var b: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(cp, &b) catch break :blk "?";
-            break :blk scratch.dupe(u8, b[0..n]) catch "?";
-        },
-    };
-}
-
-/// Format a Chord for the help overlay, including configured multi-chord Actions.
-fn chordLabel(scratch: std.mem.Allocator, c: keymap.Chord) []const u8 {
-    var out: []const u8 = "";
-    for (0..c.len()) |i| {
-        const stroke = c.at(i);
-        var label = keyName(scratch, stroke.cp);
-        if (stroke.mods.shift) label = std.fmt.allocPrint(scratch, "shift-{s}", .{label}) catch label;
-        if (stroke.mods.alt) label = std.fmt.allocPrint(scratch, "alt-{s}", .{label}) catch label;
-        if (stroke.mods.ctrl) label = std.fmt.allocPrint(scratch, "ctrl-{s}", .{label}) catch label;
-        if (stroke.mods.super) label = std.fmt.allocPrint(scratch, "super-{s}", .{label}) catch label;
-        if (stroke.mods.hyper) label = std.fmt.allocPrint(scratch, "hyper-{s}", .{label}) catch label;
-        if (stroke.mods.meta) label = std.fmt.allocPrint(scratch, "meta-{s}", .{label}) catch label;
-        out = std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ out, if (i == 0) "" else " ", label }) catch label;
+fn helpEntry(scratch: std.mem.Allocator, entry: help_mod.Entry, availability: presentation.ActionAvailability) struct { text: []const u8, available: bool } {
+    var result: struct { text: []const u8, available: bool } = .{ .text = entry.description, .available = true };
+    if (entry.action) |action| {
+        result.available = availability.available(action);
+        if (sourceRefusalLabel(availability, action)) |label|
+            result.text = std.fmt.allocPrint(scratch, "{s} ({s})", .{ entry.description, label }) catch entry.description;
     }
-    return out;
-}
-
-/// Coalesce the Keymap into two help columns — Motions and commands — one line
-/// per Action ("keys  label"), merging the (adjacent) alternate bindings of an
-/// Action into one "j ↓"-style key list.
-const HelpRow = struct { text: []const u8, available: bool };
-const HelpRows = struct { motions: []HelpRow, commands: []HelpRow };
-fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: presentation.ActionAvailability) HelpRows {
-    var motions: std.ArrayList(HelpRow) = .empty;
-    var commands: std.ArrayList(HelpRow) = .empty;
-    var i: usize = 0;
-    while (i < km.bindings.len) {
-        const act = km.bindings[i].action;
-        const help = km.bindings[i].help;
-        var keys: std.ArrayList(u8) = .empty;
-        while (i < km.bindings.len and km.bindings[i].action == act) : (i += 1) {
-            if (keys.items.len > 0) keys.append(scratch, ' ') catch {};
-            keys.appendSlice(scratch, chordLabel(scratch, km.bindings[i].chord)) catch {};
-        }
-        const reason = sourceRefusalLabel(availability, act);
-        const line = if (reason) |label|
-            std.fmt.allocPrint(scratch, "{s:<8}{s} ({s})", .{ keys.items, help, label }) catch help
-        else
-            std.fmt.allocPrint(scratch, "{s:<8}{s}", .{ keys.items, help }) catch help;
-        (if (keymap.isMotion(act)) &motions else &commands).append(scratch, .{
-            .text = line,
-            .available = availability.available(act),
-        }) catch {};
-    }
-    return .{ .motions = motions.items, .commands = commands.items };
+    return .{ .text = result.text, .available = result.available };
 }
 
 fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: keymap.Action) ?[]const u8 {
@@ -2291,35 +2266,78 @@ fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: key
     };
 }
 
-/// Draw the keybinding-help Overlay: a centered modal with Motions in the left
-/// column and commands in the right, read straight from the Keymap so it can
-/// never drift from the live bindings. Dismissed by any key. `scratch` outlives
-/// render for the synthesized rows.
-pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km: keymap.Keymap, availability: presentation.ActionAvailability) void {
-    const rows = buildHelpRows(scratch, km, availability);
-    const n = @max(rows.motions.len, rows.commands.len);
-    const rects = view_paint.paint(layouts.HelpSlot, layouts.help, n, win, theme);
+/// The cells between the key column and the description column.
+const help_key_gap: u16 = 3;
+/// The widest key column. A longer key list pushes only its own description.
+const help_key_column_max: u16 = help_mod.key_column_max;
+
+/// A key label that fits `width` cells. Help continues a long chord list on
+/// more lines, so only one chord wider than the column ends in `…`. Its
+/// description keeps the shared column.
+fn fitHelpKeys(scratch: std.mem.Allocator, keys: []const u8, width: u16) []const u8 {
+    if (vaxis.gwidth.gwidth(keys, .unicode) <= width) return keys;
+    var end: usize = 0;
+    var cells: usize = 0;
+    while (end < keys.len) {
+        const next = terminal_cell_metrics.next(keys[end..]);
+        if (next.byte_len == 0 or cells + next.cell_width + 1 > width) break;
+        cells += next.cell_width;
+        end += next.byte_len;
+    }
+    return std.fmt.allocPrint(scratch, "{s}…", .{keys[0..end]}) catch keys[0..end];
+}
+
+pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, help: help_mod.View, availability: presentation.ActionAvailability) void {
+    const rows = help.lines;
+    var params = help.layout();
+    const body_rows = view_mod.solve(layouts.HelpSlot, layouts.help, params, .{ .width = win.width, .height = win.height }).get(.body).content.height;
+    const offset = @min(help.scroll, rows.len -| body_rows);
+    params.scroll.offset = offset;
+    const rects = view_paint.paint(layouts.HelpSlot, layouts.help, params, win, theme);
     if (rects.get(.surface).border.isEmpty()) return;
-    _ = childRect(win, rects.get(.title).content).printSegment(.{ .text = " Keybindings", .style = theme.picker_query }, .{ .wrap = .none });
 
-    const motions = childRect(win, rects.get(.motions).content);
-    const commands = childRect(win, rects.get(.commands).content);
-    for (rows.motions, 0..) |row, i| {
-        if (i >= motions.height) break;
-        _ = motions.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = @intCast(i), .wrap = .none });
-    }
-    for (rows.commands, 0..) |row, i| {
-        if (i >= commands.height) break;
-        _ = commands.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = @intCast(i), .wrap = .none });
+    switch (help.query) {
+        .none => {},
+        .input, .kept => |text| {
+            const query_win = childRect(win, rects.get(.query).content);
+            const query = std.fmt.allocPrint(scratch, "/{s}{s}", .{ text, if (help.query == .input) "▏" else "" }) catch text;
+            var start: usize = 0;
+            while (start < query.len and query_win.gwidth(query[start..]) > query_win.width) start += terminal_cell_metrics.next(query[start..]).byte_len;
+            _ = query_win.printSegment(.{ .text = query[start..], .style = theme.picker_query }, .{ .wrap = .none });
+        },
     }
 
-    const mouse = childRect(win, rects.get(.mouse).content);
-    if (mouse.height == 3) {
-        _ = mouse.printSegment(.{ .text = " Mouse", .style = theme.picker_query }, .{ .wrap = .none });
-        _ = mouse.printSegment(.{ .text = " click focus/select/toggle · wheel scroll", .style = theme.picker }, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
-        _ = mouse.printSegment(.{ .text = " Shift/Option: native selection · [input.mouse] enabled=false", .style = theme.gutter }, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
+    var key_column: u16 = 0;
+    for (rows) |line| if (line == .entry) {
+        key_column = @max(key_column, @as(u16, @intCast(@min(vaxis.gwidth.gwidth(line.entry.keys, .unicode), help_key_column_max))));
+    };
+    const indent: u16 = 1;
+    const body = childRect(win, rects.get(.body).content);
+    for (rows[offset..], 0..) |line, index| {
+        if (index >= body.height) break;
+        const line_row: u16 = @intCast(index);
+        switch (line) {
+            .blank => {},
+            .no_matches => _ = body.printSegment(.{ .text = "No matches", .style = theme.gutter }, .{ .row_offset = line_row, .wrap = .none }),
+            .heading => |title| _ = body.printSegment(.{ .text = title, .style = theme.picker_query }, .{ .row_offset = line_row, .wrap = .none }),
+            .entry => |entry| {
+                const row = helpEntry(scratch, entry, availability);
+                var key_style = if (row.available) theme.helpKeyStyle() else theme.gutter;
+                key_style.bold = true;
+                const keys = fitHelpKeys(scratch, entry.keys, key_column);
+                _ = body.printSegment(.{ .text = keys, .style = key_style }, .{ .row_offset = line_row, .col_offset = indent, .wrap = .none });
+                if (entry.continued) continue;
+                const description_column = indent + key_column + help_key_gap;
+                _ = body.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = line_row, .col_offset = description_column, .wrap = .none });
+            },
+        }
     }
-    _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .wrap = .none });
+    const hint = switch (help.query) {
+        .input => " Enter keeps filter · Esc restores · ⌫ ctrl-w ctrl-u erase",
+        .kept => " / search · Esc clears filter · j k scroll · g G top / bottom",
+        .none => " / search · j k scroll · ctrl-d ctrl-u half page · other key closes",
+    };
+    _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = hint, .style = theme.picker_query }, .{ .wrap = .none });
 }
 
 /// The boot/switch frame shown until a Session arrives: a centered floating
@@ -3275,14 +3293,16 @@ test "SideBySide Status Placeholders render each side independently" {
         .old = .{ .binary = 3 },
         .new = .{ .unavailable = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } } },
     } }};
-    const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side };
+    const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side, .selected_version = .old, .selected_column = .{ .version = .old, .inner_gutter_edge = .right } };
     var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
     drawPane(a, win, buf, theme_dark, Nav.init(1, 1));
 
-    try expectScreenText(win, 0, "Old content binary, 3 bytes");
+    try testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
+    const left = win.child(.{ .x_off = 1, .width = win.width / 2 - 1, .height = 1 });
+    try expectScreenText(left, 0, "Old content binary, 3 bytes");
     const right = win.child(.{ .x_off = win.width / 2 + 1, .width = win.width - (win.width / 2 + 1), .height = 1 });
     try expectScreenText(right, 0, "New content unavailable: acquisition failed");
 }
@@ -3304,10 +3324,11 @@ test "binary Status Placeholder renders an unknown size" {
 
     drawPane(a, win, buf, theme_dark, Nav.init(2, 2));
 
-    try expectScreenText(win, 0, "Old content absent");
+    const left = win.child(.{ .x_off = 1, .width = win.width / 2 - 1, .height = 2 });
+    try expectScreenText(left, 0, "Old content absent");
     const right = win.child(.{ .x_off = win.width / 2 + 1, .width = win.width - (win.width / 2 + 1), .height = 2 });
     try expectScreenText(right, 0, "New content binary, size unavailable");
-    try expectScreenText(win, 1, "Old content binary, 7 bytes");
+    try expectScreenText(left, 1, "Old content binary, 7 bytes");
     try expectScreenText(right, 1, "New content absent");
 }
 
@@ -3822,7 +3843,7 @@ test "every Overlay surface has a rounded border" {
         for ([_]layouts.Dialog{ layouts.composer, layouts.submit_progress, layouts.submit_result }) |dialog|
             try Check.corners(win, view_paint.paint(layouts.DialogSlot, layouts.dialog, dialog, win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.LoadingSlot, layouts.loading, {}, win, theme_dark).get(.surface).border);
-        try Check.corners(win, view_paint.paint(layouts.HelpSlot, layouts.help, @as(usize, 20), win, theme_dark).get(.surface).border);
+        try Check.corners(win, view_paint.paint(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = 20 }, win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.SubmissionSlot, layouts.submission, {}, win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.SearchSlot, layouts.reviewSearch, layouts.ReviewSearch{}, win, theme_dark).get(.surface).border);
     }
@@ -3881,7 +3902,7 @@ test "every Overlay paints the Theme base background" {
     defer arena.deinit();
     const a = arena.allocator();
     const frame = @import("frame.zig");
-    const view = @import("view.zig");
+    const view = view_mod;
     const geometry: frame.Geometry = .{ .cols = 120, .rows = 40 };
     const area: view.Rect = .{ .width = geometry.cols, .height = geometry.rows };
     const backdrop: vaxis.Cell.Color = .{ .rgb = .{ 1, 2, 3 } };
@@ -3940,9 +3961,10 @@ test "every Overlay paints the Theme base background" {
         try Check.surface(win, view.solve(layouts.DialogSlot, layouts.dialog, layouts.submit_result, area).get(.surface).border, base, .{});
 
         win.fill(.{ .style = .{ .bg = backdrop } });
-        drawHelp(a, win, theme, keymap.Keymap.default, .{ .remote = true });
-        const help_rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
-        try Check.surface(win, view.solve(layouts.HelpSlot, layouts.help, @max(help_rows.motions.len, help_rows.commands.len), area).get(.surface).border, base, .{});
+        var help = try help_mod.State.init(a, .default);
+        defer help.deinit();
+        drawHelp(a, win, theme, help.view(), .{ .remote = true });
+        try Check.surface(win, view.solve(layouts.HelpSlot, layouts.help, help.view().layout(), area).get(.surface).border, base, .{});
 
         win.fill(.{ .style = .{ .bg = backdrop } });
         drawLoading(a, win, 42, theme, null);
@@ -4138,7 +4160,7 @@ test "M23 ancestry renders shared offsets and visible capped depth with search c
             .id = index + 1,
             .parent_id = if (index == 0) null else index,
             .author = "author with a name longer than the available header width at the indentation cap",
-            .body = "bodyabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+            .body = "bodyabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz" ** 3,
         };
         const threads = try bbr.review.buildThreads(a, comments[0 .. case.depth + 1]);
         const diff: bbr.diff.Diff = .{ .files = &.{} };
@@ -4150,6 +4172,7 @@ test "M23 ancestry renders shared offsets and visible capped depth with search c
             draw(a, win, diff, buf, builtin.value, Nav.init(buf.rows.len, 120), 0, threads, &.{});
             for (buf.rows, 0..) |row, index| if (row == .comment and row.comment.owner.comment == case.depth + 1) {
                 const card = row.comment;
+                if (card.hidden_indicator) continue;
                 const left = 29 + case.indent;
                 const start = left + 2;
                 if (card.part == .header and (case.indent == 1 or case.depth == 20)) {
@@ -4712,7 +4735,96 @@ test "DiffPane title reserves and renders published Selected Version targets" {
     }) |cell| try testing.expectEqualStrings(cell.text, win.readCell(cell.x, 0).?.char.grapheme);
 }
 
-test "SideBySide WholeFile accents only the selected header and inner gutter edge" {
+test "Selected Version markers stay left of their SideBySide column and off Unified rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-old source that wraps over several rows
+        \\+new source that wraps over several rows
+    );
+    const blobs = [_]bbr.diff.FileBlob{.{ .old = "old source that wraps over several rows\n", .new = "new source that wraps over several rows\n" }};
+    for ([_]u16{ 40, 41 }) |width| for ([_]bool{ false, true }) |whole_file| for ([_]buffer_mod.Layout{ .side_by_side, .unified }) |layout| for ([_]buffer_mod.SelectedVersion{ .old, .new }) |version| {
+        const buf = try buffer_mod.buildWithComments(a, diff, layout, &.{}, .{ .whole_file = whole_file, .selected_version = version, .blobs = &blobs });
+        const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = layout, .width = width });
+        var screen = try vaxis.Screen.init(a, .{ .rows = 16, .cols = width + 1, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const pane = drawMarkedDiffPane(a, headlessWindow(&screen), buf, visual_rows, theme_dark);
+        for (0..visual_rows.len) |row| {
+            const y: u16 = @intCast(row);
+            if (layout == .side_by_side) {
+                const marker = if (version == .old) pane.marker.readCell(0, y).? else pane.body.readCell(width / 2, y).?;
+                try testing.expectEqualStrings(if (version == .old) "▐" else "▌", marker.char.grapheme);
+                try testing.expectEqual(theme_dark.accent, marker.style.fg);
+            } else {
+                try testing.expect(!isVersionMarker(pane.marker.readCell(0, y).?.char.grapheme));
+            }
+            for (0..width) |col| {
+                const expected_marker = layout == .side_by_side and version == .new and col == width / 2;
+                try testing.expectEqual(expected_marker, isVersionMarker(pane.body.readCell(@intCast(col), y).?.char.grapheme));
+            }
+        }
+        if (layout == .side_by_side) {
+            const left = pane.body.child(.{ .x_off = 1, .width = width / 2 - 1, .height = pane.body.height });
+            const right = pane.body.child(.{ .x_off = width / 2 + 1, .width = width - (width / 2 + 1), .height = pane.body.height });
+            try expectScreenText(left, 0, "OLD a.txt");
+            try expectScreenText(right, 0, "NEW a.txt");
+            if (!whole_file) try expectScreenText(left, 1, "@@ -1 +1 @@");
+        }
+    };
+}
+
+test "the old version marker and the Anchor Indicator keep separate columns" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a, card_test_diff);
+    const comments = [_]bbr.review.Comment{.{ .id = 1, .author = "Ada", .body = "root", .scope = .{ .@"inline" = .{ .path = "a.zig", .start_to = 2, .to = 4 } } }};
+    const threads = try bbr.review.buildThreads(a, &comments);
+    const width: u16 = 80;
+    const buf = try buffer_mod.buildWithComments(a, diff, .side_by_side, threads, .{ .card_width = width, .selected_version = .old });
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = .side_by_side, .width = width });
+    var screen = try vaxis.Screen.init(a, .{ .rows = @intCast(visual_rows.len), .cols = width + 1, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    var nav = Nav.init(visual_rows.len, visual_rows.len);
+    const probe: CardTestPane = .{ .win = headlessWindow(&screen), .buf = buf, .visual_rows = visual_rows };
+    nav.jumpTo(probe.cardRow(.{ .comment = 1 }, .body));
+    const pane = drawMarkedDiffPaneAt(a, headlessWindow(&screen), buf, visual_rows, theme_dark, nav);
+
+    const top = probe.lineRow(2);
+    const corner = probe.cardRow(.{ .comment = 1 }, .header);
+    try testing.expectEqualStrings("╭", pane.body.readCell(0, @intCast(top)).?.char.grapheme);
+    try testing.expectEqualStrings("╰", pane.body.readCell(0, @intCast(corner)).?.char.grapheme);
+    for (top..corner) |row| try testing.expectEqualStrings("▐", pane.marker.readCell(0, @intCast(row)).?.char.grapheme);
+}
+
+const MarkedDiffPane = struct { marker: vaxis.Window, body: vaxis.Window };
+
+/// The Selected Version marker column and the DiffPane body, side by side
+/// as `layouts.panes` places them, painted as `drawReview` paints them.
+fn drawMarkedDiffPane(a: std.mem.Allocator, win: vaxis.Window, buf: Buffer, visual_rows: []const @import("frame.zig").VisualRow, theme: Theme) MarkedDiffPane {
+    return drawMarkedDiffPaneAt(a, win, buf, visual_rows, theme, Nav.init(visual_rows.len, win.height));
+}
+
+fn drawMarkedDiffPaneAt(a: std.mem.Allocator, win: vaxis.Window, buf: Buffer, visual_rows: []const @import("frame.zig").VisualRow, theme: Theme, nav: Nav) MarkedDiffPane {
+    const pane: MarkedDiffPane = .{
+        .marker = win.child(.{ .width = 1, .height = win.height }),
+        .body = win.child(.{ .x_off = 1, .width = win.width - 1, .height = win.height }),
+    };
+    drawVisualPane(a, pane.body, buf, visual_rows, theme, nav);
+    drawVersionMarkerColumn(pane.marker, pane.body, buf, visual_rows, nav, theme);
+    return pane;
+}
+
+fn isVersionMarker(glyph: []const u8) bool {
+    return std.mem.eql(u8, glyph, "▐") or std.mem.eql(u8, glyph, "▌");
+}
+
+test "SideBySide WholeFile accents only the selected header and left gutter edge" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -4729,17 +4841,19 @@ test "SideBySide WholeFile accents only the selected header and inner gutter edg
     );
     const blobs = [_]bbr.diff.FileBlob{.{ .old = "let value = 1\n", .new = "let value = 2\n" }};
     const buf = try buffer_mod.buildWithComments(a, diff, .side_by_side, &.{}, .{ .whole_file = true, .selected_version = .old, .blobs = &blobs });
-    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = .side_by_side, .width = 40 });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 41, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
-    const win = headlessWindow(&screen);
-
-    drawPane(a, win, buf, theme_dark, Nav.init(buf.rows.len, 6));
+    const pane = drawMarkedDiffPane(a, headlessWindow(&screen), buf, visual_rows, theme_dark);
+    const win = pane.body;
 
     const half = win.width / 2;
-    try testing.expectEqual(theme_dark.accent, win.readCell(0, 0).?.style.fg);
+    try testing.expectEqual(theme_dark.accent, pane.marker.readCell(0, 0).?.style.fg);
+    try testing.expectEqual(theme_dark.accent, win.readCell(anchor_cols, 0).?.style.fg);
     try testing.expect(!std.meta.eql(win.readCell(half + 1, 0).?.style.fg, theme_dark.accent));
-    try testing.expectEqualStrings("▐", win.readCell(half, 1).?.char.grapheme);
-    try testing.expectEqual(theme_dark.accent, win.readCell(half, 1).?.style.fg);
+    try testing.expectEqualStrings("▐", pane.marker.readCell(0, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.accent, pane.marker.readCell(0, 1).?.style.fg);
+    try testing.expectEqualStrings(" ", win.readCell(half, 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.removed.bg, win.readCell(side_gutter, 1).?.style.bg);
     try testing.expectEqual(theme_dark.added.bg, win.readCell(half + 1 + side_gutter, 1).?.style.bg);
 }
@@ -5372,40 +5486,102 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true });
+    var help = try help_mod.State.init(a, .default);
+    defer help.deinit();
+    drawHelp(a, win, theme_dark, help.view(), .{ .remote = true });
 
-    const rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
-    const rects = @import("view.zig").solve(layouts.HelpSlot, layouts.help, @max(rows.motions.len, rows.commands.len), .{ .width = 80, .height = 24 });
+    const rows = help.view().lines;
+    const rects = view_mod.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len }, .{ .width = 80, .height = 24 });
     const modal = rects.get(.surface).border;
     try testing.expectEqualStrings("╭", win.readCell(modal.x, modal.y).?.char.grapheme);
     try testing.expectEqualStrings("╯", win.readCell(modal.x + modal.width - 1, modal.y + modal.height - 1).?.char.grapheme);
-    // Title " Keybindings" begins one cell into the title row.
-    const title = rects.get(.title).content;
-    try testing.expectEqualStrings("K", win.readCell(title.x + 1, title.y).?.char.grapheme);
-    // The first motion binding is `j`/`↓` → down.
-    const motions = rects.get(.motions).content;
-    try testing.expectEqualStrings("j", win.readCell(motions.x, motions.y).?.char.grapheme);
-    const mouse = rects.get(.mouse).content;
-    try testing.expectEqualStrings("M", win.readCell(mouse.x + 1, mouse.y).?.char.grapheme);
+    var top: std.ArrayList(u8) = .empty;
+    for (modal.x..modal.x + modal.width) |col| try top.appendSlice(a, win.readCell(@intCast(col), modal.y).?.char.grapheme);
+    try testing.expect(std.mem.indexOf(u8, top.items, " Keybindings ") != null);
+
+    // The Motions heading, then `j ↓` in the bold accent, then at least three
+    // blank cells before the description.
+    const body = rects.get(.body).content;
+    try testing.expectEqualStrings("M", win.readCell(body.x, body.y).?.char.grapheme);
+    const key = win.readCell(body.x + 1, body.y + 1).?;
+    try testing.expectEqualStrings("j", key.char.grapheme);
+    try testing.expectEqual(theme_dark.accent, key.style.fg);
+    try testing.expect(key.style.bold);
+    const keys_end = body.x + 1 + 3;
+    for (keys_end..keys_end + 3) |col| try testing.expectEqualStrings(" ", win.readCell(@intCast(col), body.y + 1).?.char.grapheme);
+    try testing.expect(rows.len > body.height);
+}
+
+test "a wide help chord ends in an ellipsis, and a continued line has no description" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var lines = [_]help_mod.Line{
+        .{ .heading = "Motions" },
+        .{ .entry = .{ .keys = "ctrl-a ctrl-b ctrl-c ctrl-d ctrl-e ctrl-f", .description = "long keys", .action = .down } },
+        .{ .entry = .{ .keys = "k", .description = "short keys", .action = .up } },
+        .{ .entry = .{ .keys = "K", .description = "", .action = .up, .continued = true } },
+    };
+    const help_view: help_mod.View = .{ .lines = &lines, .query = .none, .scroll = 0 };
+    drawHelp(a, win, theme_dark, help_view, .{ .remote = true });
+    const body = view_mod.solve(layouts.HelpSlot, layouts.help, help_view.layout(), .{ .width = 80, .height = 24 }).get(.body).content;
+    const column = body.x + 1 + help_key_column_max + help_key_gap;
+    try testing.expectEqualStrings("…", win.readCell(body.x + help_key_column_max, body.y + 1).?.char.grapheme);
+    try testing.expectEqualStrings("l", win.readCell(column, body.y + 1).?.char.grapheme);
+    try testing.expectEqualStrings("s", win.readCell(column, body.y + 2).?.char.grapheme);
+    try testing.expectEqualStrings("K", win.readCell(body.x + 1, body.y + 3).?.char.grapheme);
+    try testing.expectEqualStrings(" ", win.readCell(column, body.y + 3).?.char.grapheme);
+}
+
+test "the help overlay scrolls its lines and clamps the scroll at the end" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var help = try help_mod.State.init(a, .default);
+    defer help.deinit();
+    const rows = help.view().lines;
+    const body = view_mod.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len }, .{ .width = 80, .height = 24 }).get(.body).content;
+
+    // Scrolled one line, the body starts with the first `j ↓` entry.
+    var help_view = help.view();
+    help_view.scroll = 1;
+    drawHelp(a, win, theme_dark, help_view, .{ .remote = true });
+    try testing.expectEqualStrings("j", win.readCell(body.x + 1, body.y).?.char.grapheme);
+
+    // A scroll past the end shows the last line on the last body row.
+    win.clear();
+    help_view.scroll = std.math.maxInt(usize);
+    drawHelp(a, win, theme_dark, help_view, .{ .remote = true });
+    const last = rows[rows.len - 1].entry.keys;
+    try testing.expectEqualStrings(last[0..1], win.readCell(body.x + 1, body.y + body.height - 1).?.char.grapheme);
 }
 
 test "Selected Version help names horizontal keys and the absent File version" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const rows = buildHelpRows(arena.allocator(), .default, .{ .remote = true, .old_version = false });
+    var help = try help_mod.State.init(arena.allocator(), .default);
+    defer help.deinit();
     var old_found = false;
     var new_found = false;
-    for (rows.commands) |row| {
+    for (help.view().lines) |line| {
+        if (line != .entry) continue;
+        const row = helpEntry(arena.allocator(), line.entry, .{ .remote = true, .old_version = false });
         if (std.mem.indexOf(u8, row.text, "select old File version") != null) {
             old_found = true;
             try testing.expect(!row.available);
-            try testing.expect(std.mem.indexOf(u8, row.text, "h ←") != null);
+            try testing.expectEqualStrings("h ←", line.entry.keys);
             try testing.expect(std.mem.indexOf(u8, row.text, "old File version absent") != null);
         }
         if (std.mem.indexOf(u8, row.text, "select new File version") != null) {
             new_found = true;
             try testing.expect(row.available);
-            try testing.expect(std.mem.indexOf(u8, row.text, "l →") != null);
+            try testing.expectEqualStrings("l →", line.entry.keys);
         }
     }
     try testing.expect(old_found and new_found);
@@ -5414,59 +5590,138 @@ test "Selected Version help names horizontal keys and the absent File version" {
 test "local help projection marks remote-only commands unavailable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const rows = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = false });
+    var help = try help_mod.State.init(arena.allocator(), .default);
+    defer help.deinit();
     var unavailable: usize = 0;
-    for (rows.commands) |row| {
+    for (help.view().lines) |line| {
+        if (line != .entry) continue;
+        const row = helpEntry(arena.allocator(), line.entry, .{ .remote = false });
         if (!row.available) unavailable += 1;
+        if (line.entry.action) |action| if (keymap.isMotion(action)) try testing.expect(row.available);
     }
     // Remote-only commands, plus edit, re-anchor, and delete, stay visible.
     try testing.expectEqual(@as(usize, 11), unavailable);
-    for (rows.motions) |row| try testing.expect(row.available);
 }
 
 test "help keeps refused source Actions visible with typed reasons" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const rows = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{
+    const availability: presentation.ActionAvailability = .{
         .remote = true,
         .selected_version = .old,
         .yank_refusal = .selected_content_unavailable,
         .inline_comment_refusal = .not_hunk_line,
         .suggestion_refusal = .old_version,
-    });
-    try testing.expect(!helpRowAvailable(rows.commands, "yank text (old content unavailable)").?);
-    try testing.expect(!helpRowAvailable(rows.commands, "inline comment (not a Hunk Line)").?);
-    try testing.expect(!helpRowAvailable(rows.commands, "suggestion (requires new File version)").?);
+    };
+    try testing.expect(!try helpRowAvailable(arena.allocator(), availability, "yank text (old content unavailable)"));
+    try testing.expect(!try helpRowAvailable(arena.allocator(), availability, "inline comment (not a Hunk Line)"));
+    try testing.expect(!try helpRowAvailable(arena.allocator(), availability, "suggestion (requires new File version)"));
 }
 
 test "delete stays discoverable in the help Overlay when it is refused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = .descendant_locked });
-    const deletable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = null });
-    try testing.expect(!helpRowAvailable(refused.commands, "delete Comment or Draft").?);
-    try testing.expect(helpRowAvailable(deletable.commands, "delete Comment or Draft").?);
+    try testing.expect(!try helpRowAvailable(arena.allocator(), .{ .remote = true, .delete_refusal = .descendant_locked }, "delete Comment or Draft"));
+    try testing.expect(try helpRowAvailable(arena.allocator(), .{ .remote = true, .delete_refusal = null }, "delete Comment or Draft"));
 }
 
 test "re-anchor stays discoverable in the help Overlay when it is refused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .reanchor_refusal = .reply_inherits_scope });
-    const anchorable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .reanchor_refusal = null });
-    try testing.expect(!helpRowAvailable(refused.commands, "re-anchor local root Draft").?);
-    try testing.expect(helpRowAvailable(anchorable.commands, "re-anchor local root Draft").?);
+    try testing.expect(!try helpRowAvailable(arena.allocator(), .{ .remote = true, .reanchor_refusal = .reply_inherits_scope }, "re-anchor local root Draft"));
+    try testing.expect(try helpRowAvailable(arena.allocator(), .{ .remote = true, .reanchor_refusal = null }, "re-anchor local root Draft"));
 }
 
 test "edit stays discoverable in the help Overlay when it is refused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .edit_refusal = .submission_owns_draft });
-    const editable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .edit_refusal = null });
-    try testing.expect(!helpRowAvailable(refused.commands, "edit local Draft").?);
-    try testing.expect(helpRowAvailable(editable.commands, "edit local Draft").?);
+    try testing.expect(!try helpRowAvailable(arena.allocator(), .{ .remote = true, .edit_refusal = .submission_owns_draft }, "edit local Draft"));
+    try testing.expect(try helpRowAvailable(arena.allocator(), .{ .remote = true, .edit_refusal = null }, "edit local Draft"));
 }
 
-fn helpRowAvailable(rows: []const HelpRow, help: []const u8) ?bool {
-    for (rows) |row| if (std.mem.indexOf(u8, row.text, help) != null) return row.available;
-    return null;
+fn helpRowAvailable(allocator: std.mem.Allocator, availability: presentation.ActionAvailability, description: []const u8) !bool {
+    var help = try help_mod.State.init(allocator, .default);
+    defer help.deinit();
+    for (help.view().lines) |line| if (line == .entry) {
+        const row = helpEntry(allocator, line.entry, availability);
+        if (std.mem.indexOf(u8, row.text, description) != null) return row.available;
+    };
+    return error.MissingHelpEntry;
+}
+
+test "help search paints rounded input boxes query and no matches from the same lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var help = try help_mod.State.init(testing.allocator, .default);
+    defer help.deinit();
+    _ = try help.applyKey(.default, .{ .codepoint = '/' }, 3);
+    _ = try help.applyKey(.default, .{ .codepoint = 0, .text = "no-such-help-entry" }, 3);
+    for ([_]u16{ 24, 40, 80 }) |width| {
+        var screen = try vaxis.Screen.init(a, .{ .rows = 16, .cols = width, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        const projected = help.view();
+        const rects = view_mod.solve(layouts.HelpSlot, layouts.help, projected.layout(), .{ .width = width, .height = 16 });
+        drawHelp(a, win, theme_dark, projected, .{ .remote = true });
+        try testing.expectEqual(@as(usize, 1), projected.lines.len);
+        const query = rects.get(.query);
+        const body = rects.get(.body).content;
+        try testing.expectEqualStrings("╭", win.readCell(query.border.x, query.border.y).?.char.grapheme);
+        try testing.expectEqualStrings("╭", win.readCell(query.border.x, body.y - 1).?.char.grapheme);
+        try testing.expectEqualStrings("/", win.readCell(query.content.x, query.content.y).?.char.grapheme);
+        var text: std.ArrayList(u8) = .empty;
+        for (body.x..body.x + body.width) |col| try text.appendSlice(a, win.readCell(@intCast(col), body.y).?.char.grapheme);
+        try testing.expect(std.mem.startsWith(u8, text.items, "No matches"));
+    }
+    _ = try help.applyKey(.default, .{ .codepoint = keymap.special.enter }, 3);
+    try testing.expect(help.view().layout().query);
+}
+
+test "help clips long queries on grapheme boundaries and keeps the input tail visible" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var help = try help_mod.State.init(testing.allocator, .default);
+    defer help.deinit();
+    _ = try help.applyKey(.default, .{ .codepoint = '/' }, 3);
+    _ = try help.applyKey(.default, .{ .codepoint = 0, .text = "👩‍💻" ** 20 ++ "needle" }, 3);
+    const rect = view_mod.solve(layouts.HelpSlot, layouts.help, help.view().layout(), .{ .width = 24, .height = 12 }).get(.query).content;
+    drawHelp(a, win, theme_dark, help.view(), .{ .remote = true });
+    var text: std.ArrayList(u8) = .empty;
+    for (rect.x..rect.x + rect.width) |col| {
+        const grapheme = win.readCell(@intCast(col), rect.y).?.char.grapheme;
+        try testing.expect(std.unicode.utf8ValidateSlice(grapheme));
+        try text.appendSlice(a, grapheme);
+    }
+    try testing.expect(std.mem.indexOf(u8, text.items, "needle▏") != null);
+}
+
+test "help filtering keeps unavailable entries and paints their refusal after matching" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 16, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var help = try help_mod.State.init(testing.allocator, .default);
+    defer help.deinit();
+    _ = try help.applyKey(.default, .{ .codepoint = '/' }, 3);
+    _ = try help.applyKey(.default, .{ .codepoint = 0, .text = "select old File version" }, 3);
+    try testing.expectEqual(@as(usize, 2), help.view().lines.len);
+    const projected = help.view();
+    const body = view_mod.solve(layouts.HelpSlot, layouts.help, projected.layout(), .{ .width = 100, .height = 16 }).get(.body).content;
+    drawHelp(a, win, theme_dark, projected, .{ .remote = true, .old_version = false });
+    const key = win.readCell(body.x + 1, body.y + 1).?;
+    try testing.expectEqualStrings("h", key.char.grapheme);
+    try testing.expectEqual(theme_dark.gutter.fg, key.style.fg);
+    var text: std.ArrayList(u8) = .empty;
+    for (body.x..body.x + body.width) |col| try text.appendSlice(a, win.readCell(@intCast(col), body.y + 1).?.char.grapheme);
+    try testing.expect(std.mem.indexOf(u8, text.items, "old File version absent") != null);
+    _ = try help.applyKey(.default, .{ .codepoint = 'u', .mods = .{ .ctrl = true } }, 3);
+    _ = try help.applyKey(.default, .{ .codepoint = 0, .text = "absent" }, 3);
+    try testing.expect(help.view().lines[0] == .no_matches);
 }

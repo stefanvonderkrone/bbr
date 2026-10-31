@@ -11,6 +11,7 @@ const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
 const file_enrichment = @import("file_enrichment.zig");
 const keymap_mod = @import("keymap.zig");
+const help_mod = @import("help.zig");
 const list_overlay_mod = @import("list_overlay.zig");
 const ListOverlay = list_overlay_mod.ListOverlay;
 const ThemeId = @import("theme_id.zig").ThemeId;
@@ -400,10 +401,8 @@ test "M23 highlighting retains successful results through layouts and disclosure
         const spans = state.projection().review.?.frame.code_highlights[0].spans.ptr;
         for ([_]Action{ .toggle_layout, .toggle_review_card }) |action| {
             try visitCodeCard(&state, 1);
-            if (action == .toggle_review_card) {
-                try state.dispatch(.{ .action = .down });
-                try state.dispatch(.{ .action = .down });
-            }
+            // Header, one body row, and the hidden-row indicator precede the footer.
+            if (action == .toggle_review_card) for (0..3) |_| try state.dispatch(.{ .action = .down });
             try state.dispatch(.{ .action = action });
             const build = state.takeCommand().?.build_buffer_disclosure;
             build.build();
@@ -411,6 +410,77 @@ test "M23 highlighting retains successful results through layouts and disclosure
             try testing.expectEqual(spans, state.projection().review.?.frame.code_highlights[0].spans.ptr);
             try testing.expect(state.takeCommand() == null);
         }
+    }
+}
+
+test "Enter on the hidden-row indicator expands its ReviewCard" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .target = .bitbucket, .scope = .review, .body = "x\n\ny\n\nz" });
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 40,
+    });
+    defer state.deinit();
+    try visitCodeCard(&state, 1);
+    for (0..2) |_| try state.dispatch(.{ .action = .down });
+    const indicator = state.published.?.cursorRow().?.draft;
+    try testing.expect(indicator.hidden_indicator);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const build = state.takeCommand().?.build_buffer_disclosure;
+    build.build();
+    try state.dispatch(.{ .buffer_disclosure_built = build });
+    const published = state.published.?;
+    const cursor = published.cursorRow().?.draft;
+    try testing.expectEqual(indicator.source_range.start, cursor.source_range.start);
+    try testing.expect(!cursor.hidden_indicator);
+    for (published.buffer.rows) |row| if (row == .draft) {
+        try testing.expect(!row.draft.hidden_indicator);
+        if (row.draft.part == .disclosure_footer) try testing.expectEqual(@as(usize, 0), row.draft.hidden_rows);
+    };
+}
+
+fn jumpToBufferRow(published: *Published, buffer_index: usize) !void {
+    for (published.visual_rows, 0..) |visual, index| if (visual.buffer_index == buffer_index) {
+        published.navigation.jumpTo(index);
+        return;
+    };
+    return error.MissingRow;
+}
+
+test "Enter on the hidden-row indicator of a resolved Thread root expands only the ReviewCard" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .viewport_rows = 60,
+    });
+    defer state.deinit();
+    const thread_key: buffer_mod.DisclosureKey = .{ .resolved_thread = 1 };
+    try jumpToBufferRow(state.published.?, findDisclosureRow(state.published.?.buffer.rows, thread_key).?);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeNextDisclosureBuild(&state);
+
+    var indicator: ?usize = null;
+    for (state.published.?.buffer.rows, 0..) |row, index| {
+        if (row == .comment and row.comment.owner.comment == 1 and row.comment.hidden_indicator) indicator = index;
+    }
+    try jumpToBufferRow(state.published.?, indicator.?);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeNextDisclosureBuild(&state);
+
+    const published = state.published.?;
+    var thread_expanded = false;
+    var card_expanded = false;
+    for (published.expanded_disclosures.items) |key| {
+        thread_expanded = thread_expanded or std.meta.eql(key, thread_key);
+        card_expanded = card_expanded or std.meta.eql(key, buffer_mod.DisclosureKey{ .review_card = .{ .comment = 1 } });
+    }
+    try testing.expect(thread_expanded);
+    try testing.expect(card_expanded);
+    for (published.buffer.rows) |row| {
+        if (row == .comment and row.comment.owner.comment == 1) try testing.expect(!row.comment.hidden_indicator);
     }
 }
 
@@ -860,7 +930,7 @@ pub const Dependencies = struct {
     highlight_max_file_bytes: usize = 0,
     file_cache_enabled: bool = true,
     inactive_file_cache_max_bytes: usize = 256 * 1024 * 1024,
-    comments_collapsed_rows: usize = 6,
+    comments_collapsed_rows: usize = 9,
     mouse_enabled: bool = true,
     mouse_vertical_scroll_rows: usize = 3,
     external_edit_max_bytes: usize = 1024 * 1024,
@@ -2052,7 +2122,8 @@ const SearchProjection = struct {
             owners[0] = root.id;
             for (thread.replies, owners[1..]) |reply, *id| id.* = reply.id;
             for (owners) |id| {
-                try comment_chains.put(a, id, chain);
+                // A Draft Reply hides with a collapsed resolved Thread too.
+                try comment_chains.put(a, id, required);
                 var keys = required;
                 keys.append(.{ .review_card = .{ .comment = id } });
                 try self.body_disclosures.put(a, .{ .comment = id }, keys);
@@ -2498,7 +2569,7 @@ const DraftMutation = struct {
 const DraftMutationError = error{ OutOfMemory, DraftLocked, DraftEditConflict, DraftNotAnchorable, InvalidAnchor, PersistenceFailed };
 
 pub const DisclosureBuild = struct {
-    const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, cache_update, draft_save, draft_mutation, review_destination };
+    const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, cache_update, draft_save, draft_mutation, review_destination, draft_destination };
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
     arena: std.heap.ArenaAllocator,
     session: *Session,
@@ -2529,7 +2600,7 @@ pub const DisclosureBuild = struct {
     cache_entries: []file_enrichment.CacheEntry = &.{},
     cache_victims: []const usize = &.{},
     cache_policy: file_enrichment.CachePolicy = .{},
-    cache_focused: ?usize = null,
+    cache_focused: file_enrichment.FileRange = .{},
     cache_request_id: u64 = 0,
     hold_enrichment: bool = false,
     tree: file_tree.Projection = .{},
@@ -2564,6 +2635,12 @@ pub const DisclosureBuild = struct {
     review_request_id: u64 = 0,
     review_destination_id: u64 = 0,
     destination_row: ?usize = null,
+    /// The Draft whose ReviewCard header a `draft_destination` build finds.
+    destination_draft: ?bbr.review.TempId = null,
+    destination_id: u64 = 0,
+    /// 0 for the first build, 1 for the build with the disclosures that the
+    /// first build found.
+    destination_attempt: u1 = 0,
     buffer: buffer_mod.Buffer = undefined,
     visual_rows: []const frame_mod.VisualRow = &.{},
     projection: ?*SearchProjection = null,
@@ -2603,7 +2680,7 @@ pub const DisclosureBuild = struct {
             .active = active,
             .cache_revision = published.session.enrichment.revision,
             .cache_policy = published.session.enrichment.cache,
-            .cache_focused = published.session.enrichment.focused_file,
+            .cache_focused = published.session.enrichment.focused,
         };
         job.inputs.retain();
         _ = job.target.base.retain();
@@ -2783,7 +2860,7 @@ pub const DisclosureBuild = struct {
                 }
             }
         }
-        if (self.kind == .view or self.kind == .enrichment or self.kind == .cache_update or self.kind == .draft_save or self.kind == .draft_mutation or self.kind == .review_destination) {
+        if (self.kind == .view or self.kind == .enrichment or self.kind == .cache_update or self.kind == .draft_save or self.kind == .draft_mutation or self.kind == .review_destination or self.kind == .draft_destination) {
             const candidates = try buffer_mod.buildSearchCandidates(a, self.session.diff, self.preferences.layout, self.session.threads, .{
                 .fold_context = self.preferences.scope == .changes,
                 .whole_file = self.preferences.scope == .whole,
@@ -2842,6 +2919,9 @@ pub const DisclosureBuild = struct {
         });
         if (self.kind == .review_destination) {
             self.destination_row = occurrenceVisualRowFor(self.buffer, self.visual_rows, self.review_snapshot.?.occurrences[self.review_selected.?]);
+        }
+        if (self.kind == .draft_destination) {
+            self.destination_row = self.projection.?.navigation.owners.get(.{ .draft = .{ .id = self.destination_draft.?, .source_offset = 0, .part = .header } });
         }
         if (self.batch orelse self.rebuilt_batch orelse self.accepted_snapshot) |batch| {
             const result = try self.projection.?.project(std.heap.page_allocator, batch);
@@ -3231,7 +3311,7 @@ pub const Projection = struct {
     /// The Theme to paint this frame.
     theme: ThemeId,
     configured_theme: ThemeId,
-    help_visible: bool,
+    help: ?help_mod.View,
     action_availability: ActionAvailability,
     loading_pull_request_id: ?u64,
     composer: ?ComposerProjection,
@@ -3967,13 +4047,16 @@ const Published = struct {
     pending_draft_save: ?bbr.review.TempId = null,
     draft_mutation_generation: u64 = 0,
     pending_draft_mutation: ?u64 = null,
+    draft_destination_generation: u64 = 0,
+    /// The jump to a Draft's ReviewCard that waits for its Buffer build.
+    pending_draft_destination: ?u64 = null,
     buffer_search: BufferSearchState,
     search_generation: u64 = 0,
     view_generation: u64 = 0,
     pending_view: ?struct { request_id: u64, preferences: Preferences, isolated_file: ?usize, geometry: frame_mod.Geometry, navigation_policy: DisclosureBuild.NavigationPolicy, navigation_file: ?usize } = null,
     cache_update_generation: u64 = 0,
     pending_cache_update: ?u64 = null,
-    pending_cache_focus: ?usize = null,
+    pending_cache_focus: file_enrichment.FileRange = .{},
     search_corpus: ?*BufferSearchCorpus = null,
     review_search: ReviewSearchState,
     active_search: enum { none, buffer, review } = .none,
@@ -4079,7 +4162,7 @@ const Published = struct {
         published.pending_view = null;
         published.cache_update_generation = 0;
         published.pending_cache_update = null;
-        published.pending_cache_focus = null;
+        published.pending_cache_focus = .{};
         published.search_corpus = null;
         published.review_search = .{};
         published.active_search = .none;
@@ -4090,7 +4173,7 @@ const Published = struct {
         published.cell_metrics = cell_metrics;
         published.comments_collapsed_rows = comments_collapsed_rows;
         session.enrichment.configureCache(cache_policy);
-        if (session.enrichment.len() > 0) session.enrichment.focus(0);
+        if (session.enrichment.len() > 0) session.enrichment.focus(.single(0));
         return published;
     }
 
@@ -5062,16 +5145,17 @@ const VersionRestoration = struct {
 
 const VersionDestination = struct { row: ?usize = null, found: bool = false };
 
-const PrefetchArm = struct {
-    session_epoch: SessionEpoch,
-    file_index: usize,
+/// The Files above and the Files below the visible Files that File
+/// Enrichment also keeps.
+const enrichment_overscan_files: usize = 1;
+
+const EnrichmentRange = struct {
+    visible: file_enrichment.FileRange,
+    focused: file_enrichment.FileRange,
 };
 
-const SpeculativeEnrichment = struct {
-    work_id: WorkId,
-    session_epoch: SessionEpoch,
-    file_index: usize,
-};
+/// The speculative File Enrichments that may be queued or in flight at once.
+const max_speculative_enrichments: usize = 4;
 
 const SubmissionPhase = enum {
     post_queued,
@@ -5536,6 +5620,8 @@ const SubmissionTree = struct {
     selected: usize = 0,
     completion: ?bbr.review.SubmissionCompletion = null,
     stale_repair: ?StaleRepairProjection = null,
+    /// A jump to a Draft hides a terminal tree. Submit shows it again.
+    hidden: bool = false,
 
     fn create(allocator: Allocator, durable: *const DurableSubmission, order: []const bbr.review.TempId) !*SubmissionTree {
         const tree = try allocator.create(SubmissionTree);
@@ -5881,12 +5967,10 @@ pub const Presentation = struct {
     outstanding_loads: usize = 0,
     outstanding_picker_loads: usize = 0,
     issued_enrichments: std.ArrayList(IssuedEnrichment) = .empty,
-    prefetch_arm: ?PrefetchArm = null,
-    speculative_enrichment: ?SpeculativeEnrichment = null,
     resolver: keymap_mod.Resolver = .{},
     list_overlay: ?ListOverlay = null,
     configured_theme: ThemeId,
-    help_visible: bool = false,
+    help: ?help_mod.State = null,
     durable_submission: ?*DurableSubmission = null,
     submission_tree: ?*SubmissionTree = null,
     durable_comment_edit: ?*DurableCommentEdit = null,
@@ -5969,6 +6053,7 @@ pub const Presentation = struct {
     }
 
     pub fn deinit(self: *Presentation) void {
+        self.closeHelp();
         for (self.commands.items) |*command| command.deinit();
         if (self.durable_submission) |durable| durable.destroy();
         if (self.submission_tree) |tree| tree.destroy();
@@ -6058,6 +6143,7 @@ pub const Presentation = struct {
             .dismiss_submission_result => self.dismissSubmissionTree(),
             .request_shutdown => self.requestShutdown(),
         }
+        if (self.published == null or self.published.?.composer == null) self.composer_footer.clearRetainingCapacity();
         if (self.code_work != null or (self.published != null and self.published.?.code_highlighting.bodies.items.len > 0)) self.refreshCodeVisibility();
     }
 
@@ -6163,7 +6249,7 @@ pub const Presentation = struct {
             } else null,
             .submission_result = self.submission_result,
             .submission_tree = if (self.submission_tree) |tree| blk: {
-                if (self.submissionRepairInteractionActive()) break :blk null;
+                if (tree.hidden or self.submissionRepairInteractionActive()) break :blk null;
                 break :blk tree.projection();
             } else null,
             .comment_edit_result = self.comment_edit_result,
@@ -6185,7 +6271,7 @@ pub const Presentation = struct {
             .picker_tick_scope = if (self.shutdown_requested) null else if (self.list_overlay) |*overlay| overlay.tickScope() else null,
             .theme = self.activeTheme(),
             .configured_theme = self.configured_theme,
-            .help_visible = self.help_visible,
+            .help = if (self.help) |*help| help.view() else null,
             .action_availability = self.actionAvailability(),
             .loading_pull_request_id = if (self.replacement) |replacement|
                 if (replacement.key.isRemote()) replacement.key.pull_request_id else null
@@ -6259,7 +6345,7 @@ pub const Presentation = struct {
     }
 
     fn overlayTarget(self: *const Presentation) ?frame_mod.OverlayTarget {
-        if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
+        if (self.help != null or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
             return frame_mod.screenOverlayTarget(self.geometry);
         if (self.list_overlay) |*overlay| {
             var target = frame_mod.listOverlayTarget(self.geometry, overlay.box()) orelse return null;
@@ -6278,12 +6364,12 @@ pub const Presentation = struct {
     fn visibleSubmissionOverlay(self: *const Presentation) bool {
         const published = self.published orelse return false;
         if (self.submissionRepairInteractionActive()) return false;
-        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) return true;
+        if (self.submission_tree) |tree| if (!tree.hidden and OwnedReviewIdentity.eql(tree.key, published.key)) return true;
         return false;
     }
 
     fn submissionRepairInteractionActive(self: *const Presentation) bool {
-        if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.reanchor != null) return true;
+        if (self.help != null or self.unknown_resolution != null or self.delete_confirmation != null or self.reanchor != null) return true;
         if (self.list_overlay != null) return true;
         if (self.published) |published| return published.composer != null;
         return false;
@@ -6345,7 +6431,6 @@ pub const Presentation = struct {
 
     fn activateMouseTarget(self: *Presentation, target: frame_mod.HitTarget, time_ns: ?i96) void {
         if (target != .select_old_version and target != .select_new_version) {
-            self.prefetch_arm = null;
             self.version_restoration = null;
         }
         switch (target) {
@@ -6653,7 +6738,7 @@ pub const Presentation = struct {
         self.shutdown_requested = true;
         if (self.published) |published| if (published.review_search.open) self.closeReviewSearch();
         self.closeListOverlay();
-        self.help_visible = false;
+        self.closeHelp();
         self.unknown_resolution = null;
         var write: usize = 0;
         for (self.commands.items) |command_value| {
@@ -6676,7 +6761,7 @@ pub const Presentation = struct {
     }
 
     fn interactionContext(self: *const Presentation) keymap_mod.InteractionContext {
-        if (self.help_visible) return .help;
+        if (self.help != null) return .help;
         if (self.unknown_resolution != null) return .unknown_resolution;
         if (self.delete_confirmation != null) return .delete_confirmation;
         if (self.list_overlay) |*overlay| return overlay.interactionContext();
@@ -6701,7 +6786,7 @@ pub const Presentation = struct {
     }
 
     fn actionAvailability(self: *const Presentation) ActionAvailability {
-        const pane_under_overlay = self.help_visible or if (self.list_overlay) |*overlay| overlay.availabilityContext() == .pane else false;
+        const pane_under_overlay = self.help != null or if (self.list_overlay) |*overlay| overlay.availabilityContext() == .pane else false;
         const context = if (pane_under_overlay) self.paneContext() else self.interactionContext();
         const published = self.published orelse return .{
             .remote = self.dependencies.remote_enabled,
@@ -7090,8 +7175,8 @@ pub const Presentation = struct {
             self.applySubmissionTreeKey(key);
             return;
         }
-        if (self.help_visible) {
-            self.help_visible = false;
+        if (self.help != null) {
+            self.applyHelpKey(key);
             return;
         }
         if (self.unknown_resolution != null) {
@@ -7204,6 +7289,10 @@ pub const Presentation = struct {
         if (self.replacement != null) return;
         const published = self.published orelse return;
         if (!OwnedReviewIdentity.eql(published.key, tree.key)) return;
+        if (key.matches(keymap_mod.special.enter, .{})) {
+            self.jumpToSubmissionDraft(published, tree, item.temp_id);
+            return;
+        }
         if (item.state == .outcome_unknown) {
             if (key.matches('U', .{})) self.resolveUnknownAsUnpublished(published, item.temp_id) else if (key.matches('L', .{})) self.openUnknownResolutionEditorFor(published, item.temp_id) else if (key.matches('A', .{})) self.dismissSubmissionTree();
             return;
@@ -7242,6 +7331,96 @@ pub const Presentation = struct {
             if (!item.retry_eligible) return;
             self.startSubmissionSelection(published, item.temp_id);
         }
+    }
+
+    fn applyHelpKey(self: *Presentation, key: keymap_mod.KeyStroke) void {
+        const state = if (self.help) |*state| state else return;
+        const page = frame_mod.helpBodyRows(self.geometry, state.view().layout());
+        const result = state.applyKey(self.dependencies.keymap, key, page) catch |err| {
+            self.action_error = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                error.TooLong => .buffer_search_query_too_long,
+                else => .buffer_search_invalid_query,
+            };
+            return;
+        };
+        self.action_error = null;
+        if (result == .close) self.closeHelp();
+    }
+
+    fn closeHelp(self: *Presentation) void {
+        if (self.help) |*state| state.deinit();
+        self.help = null;
+    }
+
+    /// Hide the terminal Submission Overlay and put the DiffPane cursor on the
+    /// header of `temp_id`'s ReviewCard. A card that a disclosure or File
+    /// isolation hides comes into view through a Buffer build first.
+    fn jumpToSubmissionDraft(self: *Presentation, published: *Published, tree: *SubmissionTree, temp_id: bbr.review.TempId) void {
+        if (published.review.getConst(temp_id) == null) {
+            self.action_error = .no_review_item;
+            return;
+        }
+        tree.hidden = true;
+        self.action_error = null;
+        if (published.search_projection.navigation.owners.get(.{ .draft = .{ .id = temp_id, .source_offset = 0, .part = .header } })) |row| {
+            self.landOnDraftCard(published, row);
+            return;
+        }
+        const required = published.search_projection.body_disclosures.get(.{ .draft = temp_id }) orelse SearchDisclosureSet{};
+        const isolated = if (published.isolated_file) |index|
+            if (draftFileIndex(published, temp_id) == index) index else null
+        else
+            null;
+        self.queueDraftDestination(published, temp_id, required, isolated, 0) catch
+            self.failDraftDestination(published, .out_of_memory);
+    }
+
+    /// A failed Draft jump reports its error and shows the Submission Overlay
+    /// that the jump hid.
+    fn failDraftDestination(self: *Presentation, published: *Published, err: ActionError) void {
+        published.pending_draft_destination = null;
+        self.action_error = err;
+        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) {
+            tree.hidden = false;
+        };
+    }
+
+    fn queueDraftDestination(self: *Presentation, published: *Published, temp_id: bbr.review.TempId, required: SearchDisclosureSet, isolated: ?usize, attempt: u1) !void {
+        try self.commands.ensureUnusedCapacity(self.allocator, 1);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys, .add = required }, published.search_generation, published.buffer_search.active);
+        job.kind = .draft_destination;
+        job.destination_draft = temp_id;
+        job.destination_attempt = attempt;
+        job.isolated_file = isolated;
+        published.draft_destination_generation +%= 1;
+        job.destination_id = published.draft_destination_generation;
+        published.pending_draft_destination = job.destination_id;
+        var index: usize = 0;
+        while (index < self.commands.items.len) {
+            const command = self.commands.items[index];
+            if (command == .build_buffer_disclosure and command.build_buffer_disclosure.kind == .draft_destination) {
+                var discarded = self.commands.orderedRemove(index);
+                discarded.deinit();
+            } else index += 1;
+        }
+        self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
+    }
+
+    fn landOnDraftCard(self: *Presentation, published: *Published, row: usize) void {
+        // The cursor leaves the Buffer Search match. A restore of the saved
+        // disclosures could hide the Draft again, so the current ones stay.
+        if (published.buffer_search.active != null) {
+            published.buffer_search.active = null;
+            if (published.buffer_search.saved_disclosures) |baseline| baseline.release();
+            published.buffer_search.saved_disclosures = null;
+        }
+        published.navigation.clearMark();
+        published.navigation.jumpTo(row);
+        published.focus = .diff;
+        published.frame_revision += 1;
+        self.revealActiveFile(published);
+        self.action_error = null;
     }
 
     fn setMutationActionError(self: *Presentation, refusal: MutationRefusal) void {
@@ -7357,11 +7536,6 @@ pub const Presentation = struct {
             action == .focus_next_pane or action == .isolate or action == .cycle_scope or action == .open_file_finder or
             action == .scroll_row_up or action == .scroll_row_down)
             self.version_restoration = null;
-        if (keymap_mod.isMotion(action) or action == .next_file or action == .prev_file or
-            action == .open_file_finder or action == .focus_next_pane)
-        {
-            self.prefetch_arm = null;
-        }
         if (action == .quit) {
             self.requestShutdown();
             return;
@@ -7408,7 +7582,12 @@ pub const Presentation = struct {
             return;
         }
         if (action == .help) {
-            self.help_visible = true;
+            const next = help_mod.State.init(self.allocator, self.dependencies.keymap) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            self.closeHelp();
+            self.help = next;
             return;
         }
         if (action == .open_pull_request_picker) {
@@ -7545,13 +7724,7 @@ pub const Presentation = struct {
             };
         }
         if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
-        const active_after = published.activeFile();
         self.selectFocusedFileVersion(published);
-        if (active_before != active_after and action == .next_file and active_before != null and
-            active_after == active_before.? + 1 and published.key.isRemote() and self.dependencies.file_cache_enabled)
-        {
-            self.prefetch_arm = .{ .session_epoch = published.epoch, .file_index = active_after.? };
-        }
     }
 
     fn openReviewSearch(self: *Presentation) void {
@@ -7607,8 +7780,7 @@ pub const Presentation = struct {
         }
         if (state.query != null) holdReviewSearchFiles(published);
         state.open = true;
-        self.prefetch_arm = null;
-        self.pauseQueuedPrefetch(published);
+        self.pauseQueuedSpeculativeEnrichment(published);
         self.pumpReviewSearchAcquisition(published);
         self.maybeQueueReviewSourceScan(published);
         published.active_search = .review;
@@ -7678,8 +7850,8 @@ pub const Presentation = struct {
         const state = &((self.published orelse return).review_search);
         const text = if (state.query) |query| query.text else return;
         const end = switch (edit) {
-            .backspace => lastScalarStart(text),
-            .delete_word => searchWordStart(text),
+            .backspace => search.lastScalarStart(text),
+            .delete_word => search.wordStart(text),
             .delete_all => 0,
         };
         self.replaceReviewSearchQuery(text[0..end]);
@@ -7795,16 +7967,13 @@ pub const Presentation = struct {
         }
     }
 
-    fn pauseQueuedPrefetch(self: *Presentation, published: *Published) void {
+    fn pauseQueuedSpeculativeEnrichment(self: *Presentation, published: *Published) void {
         var index: usize = 0;
         while (index < self.commands.items.len) {
             const queued = self.commands.items[index];
             if (queued == .enrich_file and queued.enrich_file.speculative and queued.enrich_file.session_epoch == published.epoch) {
                 _ = self.commands.orderedRemove(index);
                 published.session.enrichment.resetLoading(queued.enrich_file.file_index);
-                if (self.speculative_enrichment) |speculative| {
-                    if (speculative.work_id == queued.enrich_file.work_id) self.speculative_enrichment = null;
-                }
             } else index += 1;
         }
     }
@@ -7893,7 +8062,7 @@ pub const Presentation = struct {
 
     fn stageReleasedSearchLeases(self: *Presentation, published: *Published) void {
         if (self.shutdown_requested) return;
-        const focused = if (published.pending_cache_update != null) published.pending_cache_focus else published.session.enrichment.focused_file;
+        const focused = if (published.pending_cache_update != null) published.pending_cache_focus else published.session.enrichment.focused;
         if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
         self.queueCacheBuild(published, focused) catch {
             self.action_error = .out_of_memory;
@@ -8437,8 +8606,8 @@ pub const Presentation = struct {
         const input = &(published.buffer_search.input orelse return);
         const text = if (input.query) |query| query.text else return;
         const end = switch (edit) {
-            .backspace => lastScalarStart(text),
-            .delete_word => searchWordStart(text),
+            .backspace => search.lastScalarStart(text),
+            .delete_word => search.wordStart(text),
             .delete_all => 0,
         };
         try self.replaceBufferSearchQuery(text[0..end]);
@@ -8706,7 +8875,7 @@ pub const Presentation = struct {
         if (!self.consumeCommand(job.command_id, .build_buffer_disclosure)) return;
         const published = self.published orelse return;
         if (self.shutdown_requested or published.epoch != job.epoch) return;
-        if (job.kind == .view or job.kind == .enrichment or job.kind == .cache_update or job.kind == .draft_save or job.kind == .draft_mutation or job.kind == .review_destination) {
+        if (job.kind == .view or job.kind == .enrichment or job.kind == .cache_update or job.kind == .draft_save or job.kind == .draft_mutation or job.kind == .review_destination or job.kind == .draft_destination) {
             self.acceptViewBuild(published, job, &owned);
             return;
         }
@@ -8840,7 +9009,8 @@ pub const Presentation = struct {
         }
         if (job.kind == .draft_save and (published.composer == null or published.pending_draft_save != job.new_draft.?.local_id)) return;
         if (job.kind == .draft_mutation and published.pending_draft_mutation != job.mutation_id) return;
-        if ((job.kind == .draft_save or job.kind == .draft_mutation) and !std.meta.eql(job.geometry, published.geometry)) {
+        if (job.kind == .draft_destination and published.pending_draft_destination != job.destination_id) return;
+        if ((job.kind == .draft_save or job.kind == .draft_mutation or job.kind == .draft_destination) and !std.meta.eql(job.geometry, published.geometry)) {
             self.retryContentBuild(published, job);
             return;
         }
@@ -8900,6 +9070,7 @@ pub const Presentation = struct {
             if (job.kind == .view) published.pending_view = null;
             if (job.kind == .draft_save) published.pending_draft_save = null;
             if (job.kind == .draft_mutation) published.pending_draft_mutation = null;
+            if (job.kind == .draft_destination) return self.failDraftDestination(published, .buffer_build_failed);
             if (!job.enrichment_speculative) self.action_error = .buffer_build_failed;
             if (job.enrichment_file) |index| published.session.enrichment.resetLoading(index);
             return;
@@ -8924,6 +9095,22 @@ pub const Presentation = struct {
             {
                 review_saved = published.disclosure_keys.retain();
             }
+        }
+        if (job.kind == .draft_destination) {
+            if (job.destination_row == null) {
+                published.pending_draft_destination = null;
+                if (job.destination_attempt == 0) {
+                    // The first build can uncover a disclosure that hid the
+                    // card, such as the outdated section of a File that
+                    // isolation left out. Build once more with it.
+                    const required = job.projection.?.body_disclosures.get(.{ .draft = job.destination_draft.? }) orelse SearchDisclosureSet{};
+                    self.queueDraftDestination(published, job.destination_draft.?, required, null, 1) catch
+                        self.failDraftDestination(published, .out_of_memory);
+                } else self.failDraftDestination(published, .no_review_item);
+                return;
+            }
+            disclosures.appendSlice(self.allocator, job.disclosures) catch
+                return self.failDraftDestination(published, .out_of_memory);
         }
         if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
             published.pending_draft_save = null;
@@ -8961,7 +9148,7 @@ pub const Presentation = struct {
             };
         }
         if (job.kind == .cache_update) {
-            if (job.cache_focused) |index| published.session.enrichment.focusAdmitted(index);
+            if (!job.cache_focused.isEmpty()) published.session.enrichment.focusAdmitted(job.cache_focused);
             published.session.enrichment.stageCacheVictims(job.cache_victims);
         }
         if (job.completed_inputs) |inputs| {
@@ -9067,8 +9254,8 @@ pub const Presentation = struct {
             }
             const occurrence = job.review_snapshot.?.occurrences[job.review_selected.?];
             if (occurrence.location == .source) {
-                published.session.enrichment.focusAdmitted(occurrence.location.source.file_index);
-                published.pending_cache_focus = occurrence.location.source.file_index;
+                published.session.enrichment.focusAdmitted(.single(occurrence.location.source.file_index));
+                published.pending_cache_focus = .single(occurrence.location.source.file_index);
             }
             published.navigation.jumpTo(job.destination_row.?);
             published.focus = .diff;
@@ -9080,6 +9267,16 @@ pub const Presentation = struct {
             self.discardQueuedSearchEnrichments(published);
             self.releaseReviewSearchHolds(published);
             self.action_error = null;
+            return;
+        }
+        if (job.kind == .draft_destination) {
+            published.expanded_disclosures.deinit(self.allocator);
+            published.expanded_disclosures = disclosures;
+            disclosures = .empty;
+            published.disclosure_keys.release();
+            published.disclosure_keys = job.disclosure_keys.?.retain();
+            published.pending_draft_destination = null;
+            self.landOnDraftCard(published, job.destination_row.?);
             return;
         }
         if (job.kind == .draft_save) {
@@ -9126,10 +9323,6 @@ pub const Presentation = struct {
             if (published.review_search.acquired) |acquired| acquired[index] = true;
             self.pumpReviewSearchAcquisition(published);
             self.maybeQueueReviewSourceScan(published);
-            if (job.source_active_file != null and job.source_active_file.? == index)
-                self.maybeQueuePrefetch(published, index) catch {
-                    self.prefetch_arm = null;
-                };
             if (self.version_restoration) |target| if (job.preferences.scope == .whole and target.selected_version == job.preferences.selected_version and
                 target.session_epoch == published.epoch and target.file_index == index and
                 job.version_restoration != null and std.meta.eql(target, job.version_restoration.?) and
@@ -9162,6 +9355,8 @@ pub const Presentation = struct {
                 published.pending_draft_mutation = null;
                 self.action_error = .out_of_memory;
             },
+            .draft_destination => self.queueDraftDestination(published, job.destination_draft.?, job.target.add, job.isolated_file, job.destination_attempt) catch
+                self.failDraftDestination(published, .out_of_memory),
             else => self.retryViewBuild(published, job),
         }
     }
@@ -9175,7 +9370,7 @@ pub const Presentation = struct {
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
 
-    fn queueCacheBuild(self: *Presentation, published: *Published, focused: ?usize) !void {
+    fn queueCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
         const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active);
         job.kind = .cache_update;
@@ -9677,7 +9872,6 @@ pub const Presentation = struct {
     }
 
     fn focusFile(self: *Presentation, published: *Published, file_index: usize) void {
-        self.prefetch_arm = null;
         if (file_index >= published.session.diff.files.len) return;
         var candidate = if (published.pending_view) |desired| desired.preferences else self.preferences;
         candidate.selected_version = fileVersion(published.session.diff.files[file_index], candidate.selected_version);
@@ -9861,6 +10055,11 @@ pub const Presentation = struct {
     }
 
     fn startSubmission(self: *Presentation, published: *Published) void {
+        if (self.submission_tree) |tree| if (tree.hidden and OwnedReviewIdentity.eql(tree.key, published.key)) {
+            tree.hidden = false;
+            self.action_error = null;
+            return;
+        };
         self.startSubmissionSelection(published, null);
     }
 
@@ -10864,7 +11063,6 @@ pub const Presentation = struct {
                 composer.deinit();
                 published.composer = null;
                 self.action_error = null;
-                self.composer_footer.clearRetainingCapacity();
             },
             .save => self.saveComposer(published),
             .external_edit => {
@@ -11117,32 +11315,88 @@ pub const Presentation = struct {
         }
     }
 
+    /// Keep File Enrichment for the Enrichment Range. The active File is
+    /// demand work. Once it is terminal, the other Files in the range follow
+    /// as speculative work, up to `max_speculative_enrichments` at once: the
+    /// visible Files from top to bottom, then the overscan Files above, then
+    /// the overscan Files below.
     fn ensureFocusedEnrichment(self: *Presentation) !void {
         if (self.shutdown_requested) return;
         const published = self.published orelse return;
-        const file_index = published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex()) orelse return;
-        if (file_index >= published.session.diff.files.len or file_index >= published.session.enrichment.len()) return;
+        const files = @min(published.session.diff.files.len, published.session.enrichment.len());
+        const active = if (published.activeFile()) |index| if (index < files) index else null else null;
+        const range = enrichmentRange(published, active, files);
+        if (range.focused.isEmpty()) return;
+        // A promoted read reports its failure even when a cache update defers
+        // the rest of this check.
+        if (active) |file_index| self.promoteSpeculativeEnrichment(published.epoch, file_index);
         if (published.pending_cache_update != null) {
-            if (published.pending_cache_focus != file_index) try self.queueCacheBuild(published, file_index);
+            if (!std.meta.eql(published.pending_cache_focus, range.focused)) try self.queueCacheBuild(published, range.focused);
             return;
         }
-        if (published.session.enrichment.requiresCacheEnforcement(file_index)) {
-            try self.queueCacheBuild(published, file_index);
+        if (published.session.enrichment.requiresCacheEnforcement(range.focused)) {
+            try self.queueCacheBuild(published, range.focused);
             return;
         }
-        published.session.enrichment.focusAdmitted(file_index);
+        const enrichment = &published.session.enrichment;
+        enrichment.focusAdmitted(range.focused);
         if (published.review_search.open) return;
-        self.promoteSpeculativeEnrichment(published.epoch, file_index);
-        if (!published.session.enrichment.needsEnrichment(file_index)) {
-            try self.maybeQueuePrefetch(published, file_index);
-            return;
+        if (active) |file_index| {
+            if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, false);
+            if (!enrichment.isTerminal(file_index)) return;
         }
-        try self.queueFileEnrichment(published, file_index, false);
+        // Speculative work fails silently. A File that fails to queue stays
+        // pending, and a later check queues it again.
+        for (range.visible.first..range.visible.end) |file_index| {
+            if (enrichment.needsEnrichment(file_index)) self.queueFileEnrichment(published, file_index, true) catch return;
+        }
+        var above = range.visible.first;
+        while (above > range.focused.first) {
+            above -= 1;
+            if (enrichment.needsEnrichment(above)) self.queueFileEnrichment(published, above, true) catch return;
+        }
+        for (range.visible.end..range.focused.end) |file_index| {
+            if (enrichment.needsEnrichment(file_index)) self.queueFileEnrichment(published, file_index, true) catch return;
+        }
+    }
+
+    /// The Files with a row in the DiffPane viewport, and the focused range:
+    /// those Files plus `enrichment_overscan_files` Files above and below.
+    /// It always holds the active File. An isolated File is the whole range.
+    fn enrichmentRange(published: *const Published, active: ?usize, files: usize) EnrichmentRange {
+        if (published.isolated_file) |isolated| {
+            const range: file_enrichment.FileRange = if (isolated < files) .single(isolated) else .{};
+            return .{ .visible = range, .focused = range };
+        }
+        var visible: file_enrichment.FileRange = if (active) |index| .single(index) else .{};
+        const buffer = published.buffer;
+        const rows = published.visual_rows;
+        const top = @min(published.navigation.scroll, rows.len);
+        const bottom = @min(top +| published.navigation.viewport, rows.len);
+        if (buffer.file_rows.len > 0 and top < bottom) {
+            const top_row = rows[top].buffer_index;
+            const bottom_row = rows[bottom - 1].buffer_index;
+            if (bottom_row >= buffer.file_rows[0].first_row and top_row < buffer.file_rows_end) {
+                const first = buffer.fileIndexForRow(top_row) orelse buffer.file_rows[0].file_index;
+                const last = buffer.fileIndexForRow(bottom_row) orelse buffer.file_rows[buffer.file_rows.len - 1].file_index;
+                visible = if (visible.isEmpty())
+                    .{ .first = first, .end = last + 1 }
+                else
+                    .{ .first = @min(visible.first, first), .end = @max(visible.end, last + 1) };
+            }
+        }
+        visible.end = @min(visible.end, files);
+        visible.first = @min(visible.first, visible.end);
+        if (visible.isEmpty()) return .{ .visible = visible, .focused = visible };
+        return .{ .visible = visible, .focused = .{
+            .first = visible.first -| enrichment_overscan_files,
+            .end = @min(visible.end +| enrichment_overscan_files, files),
+        } };
     }
 
     fn queueFileEnrichment(self: *Presentation, published: *Published, file_index: usize, speculative: bool) !void {
         if (speculative and published.review_search.open) return;
-        if (speculative and self.speculative_enrichment != null) return;
+        if (speculative and self.speculativeEnrichments() >= max_speculative_enrichments) return;
         const previous_action_error = self.action_error;
         defer if (speculative) {
             self.action_error = previous_action_error;
@@ -11203,38 +11457,29 @@ pub const Presentation = struct {
         }
         self.next_work_id = work_id;
         published.session.enrichment.markLoading(file_index);
-        if (speculative) self.speculative_enrichment = .{
-            .work_id = work_id,
-            .session_epoch = published.epoch,
-            .file_index = file_index,
-        };
         self.action_error = null;
     }
 
-    fn maybeQueuePrefetch(self: *Presentation, published: *Published, focused_file: usize) !void {
-        if (published.review_search.open) return;
-        const arm = self.prefetch_arm orelse return;
-        if (arm.session_epoch != published.epoch or arm.file_index != focused_file) return;
-        if (!published.session.enrichment.isTerminal(focused_file)) return;
-        self.prefetch_arm = null;
-        if (!published.key.isRemote() or !self.dependencies.file_cache_enabled) return;
-        const successor = focused_file + 1;
-        if (successor >= published.session.diff.files.len) return;
-        if (!published.session.enrichment.needsEnrichment(successor)) return;
-        try self.queueFileEnrichment(published, successor, true);
+    /// Reads of a replaced Session also count. They run until they finish.
+    fn speculativeEnrichments(self: *const Presentation) usize {
+        var count: usize = 0;
+        for (self.commands.items) |queued| {
+            if (queued == .enrich_file and queued.enrich_file.speculative) count += 1;
+        }
+        for (self.issued_enrichments.items) |issued| {
+            if (issued.speculative) count += 1;
+        }
+        return count;
     }
 
     fn promoteSpeculativeEnrichment(self: *Presentation, epoch: SessionEpoch, file_index: usize) void {
-        const speculative = self.speculative_enrichment orelse return;
-        if (speculative.session_epoch != epoch or speculative.file_index != file_index) return;
         for (self.commands.items) |*queued| {
-            if (queued.* == .enrich_file and queued.enrich_file.work_id == speculative.work_id)
+            if (queued.* == .enrich_file and queued.enrich_file.session_epoch == epoch and queued.enrich_file.file_index == file_index)
                 queued.enrich_file.speculative = false;
         }
         for (self.issued_enrichments.items) |*issued| {
-            if (issued.work_id == speculative.work_id) issued.speculative = false;
+            if (issued.session_epoch == epoch and issued.file_index == file_index) issued.speculative = false;
         }
-        self.speculative_enrichment = null;
     }
 
     fn acceptFileEnrichment(self: *Presentation, completed: FileEnrichmentCompleted) void {
@@ -11263,9 +11508,6 @@ pub const Presentation = struct {
         }
         const issued = self.issued_enrichments.items[issued_index.?];
         _ = self.issued_enrichments.orderedRemove(issued_index.?);
-        if (self.speculative_enrichment) |speculative| {
-            if (speculative.work_id == completed.work_id) self.speculative_enrichment = null;
-        }
         const published = self.published;
         const applies = if (published) |current|
             !self.shutdown_requested and issued.session_epoch == completed.session_epoch and issued.file_index == completed.file_index and
@@ -11526,7 +11768,8 @@ pub const Presentation = struct {
     }
 
     fn toggleDisclosure(self: *Presentation, published: *Published) void {
-        const key = buffer_mod.disclosureKey(published.cursorRow() orelse return) orelse return;
+        const row = published.cursorRow() orelse return;
+        const key = buffer_mod.disclosureKey(row) orelse buffer_mod.hiddenIndicatorKey(row) orelse return;
         var saved: ?[]buffer_mod.DisclosureKey = null;
         if (published.review_search.saved_disclosures) |baseline| {
             var updated: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -11836,9 +12079,8 @@ pub const Presentation = struct {
     }
 
     fn choosePullRequest(self: *Presentation, key: OwnedReviewIdentity) !void {
-        self.prefetch_arm = null;
         self.unknown_resolution = null;
-        self.help_visible = false;
+        self.closeHelp();
         if (self.published) |published| {
             if (OwnedReviewIdentity.eql(published.key, key)) {
                 self.next_intent += 1; // invalidate a candidate already in flight
@@ -11879,7 +12121,6 @@ pub const Presentation = struct {
     }
 
     fn queueReconciliation(self: *Presentation, key: OwnedReviewIdentity) void {
-        self.prefetch_arm = null;
         const intent = self.next_intent + 1;
         self.removeQueuedSessionLoads();
         self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .reconciliation } });
@@ -11889,7 +12130,6 @@ pub const Presentation = struct {
     }
 
     fn queueRefresh(self: *Presentation, key: OwnedReviewIdentity) void {
-        self.prefetch_arm = null;
         const intent = self.next_intent + 1;
         self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1) catch {
             self.action_error = .out_of_memory;
@@ -12094,6 +12334,21 @@ fn recoveryMatches(notice: RecoveryNotice, active: bbr.review.ActiveSubmissionRu
         OwnedReviewIdentity.eql(notice.key, OwnedReviewIdentity.init(active.key.workspace, active.key.repository, active.key.pull_request_id) catch return false) and
         notice.current_temp_id == active.current_temp_id and
         std.mem.eql(u8, notice.source_commit.slice(), active.source_commit);
+}
+
+/// The File of the Draft's root scope, or null for a Review-level root or a
+/// path that no File of the Diff matches.
+fn draftFileIndex(published: *const Published, temp_id: bbr.review.TempId) ?usize {
+    var root = published.review.getConst(temp_id) orelse return null;
+    const scope = while (true) {
+        const parent = root.parent orelse break root.effectiveScope();
+        switch (parent) {
+            .comment => |comment_id| break (threadRootOf(published, comment_id) orelse return null).effectiveScope(),
+            .draft => |id| root = published.review.getConst(id) orelse return null,
+        }
+    };
+    for (published.session.diff.files, 0..) |file, index| if (scopePathMatchesFile(scope, file)) return index;
+    return null;
 }
 
 fn staleSubtreeEligible(published: *const Published, selected: bbr.review.TempId) bool {
@@ -12390,6 +12645,14 @@ fn reviewCardTarget(published: *const Published) ?MutationTarget {
         .draft => |row| .{ .draft = row.owner.draft },
         else => null,
     };
+}
+
+fn threadRootOf(published: *const Published, id: bbr.review.CommentId) ?*const bbr.review.Comment {
+    for (published.session.threads) |thread| {
+        if (thread.root.id == id) return thread.root;
+        for (thread.replies) |reply| if (reply.id == id) return thread.root;
+    }
+    return null;
 }
 
 fn findPublishedComment(published: *const Published, id: bbr.review.CommentId) ?*const bbr.review.Comment {
@@ -12914,33 +13177,6 @@ fn searchLocationEql(a: search.Location, b: search.Location) bool {
                 std.mem.eql(u8, source.old_path, other.old_path) and std.mem.eql(u8, source.new_path, other.new_path);
         },
         .review_body => |body| std.meta.eql(body, b.review_body),
-    };
-}
-
-fn lastScalarStart(text: []const u8) usize {
-    var result: usize = 0;
-    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
-    while (iterator.nextCodepointSlice()) |scalar| result = @intFromPtr(scalar.ptr) - @intFromPtr(text.ptr);
-    return result;
-}
-
-fn searchWordStart(text: []const u8) usize {
-    var word_start: usize = 0;
-    var previous_whitespace = true;
-    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
-    while (iterator.nextCodepointSlice()) |bytes| {
-        const scalar = std.unicode.utf8Decode(bytes) catch unreachable;
-        const whitespace = isSearchWhitespace(scalar);
-        if (!whitespace and previous_whitespace) word_start = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr);
-        previous_whitespace = whitespace;
-    }
-    return word_start;
-}
-
-fn isSearchWhitespace(scalar: u21) bool {
-    return switch (scalar) {
-        0x0009...0x000D, 0x0020, 0x0085, 0x00A0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
-        else => false,
     };
 }
 
@@ -14565,7 +14801,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
     for (0..3) |change| for (0..9) |sample| {
         // Restore cache content and the complete Frame outside the timed stages.
         storage.configureCache(.{ .max_retained_bytes = 0 });
-        storage.focusAdmitted(0);
+        storage.focusAdmitted(.single(0));
         for (published.session.diff.files, 0..) |file, index| {
             if (storage.needsEnrichment(index)) {
                 var result = try file_enrichment.enrich(std.heap.page_allocator, client, plain.highlighter(), .{
@@ -14605,7 +14841,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
             else => unreachable,
         }
         times[change][0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(target)) return error.CachePublishedBeforeWorker;
+        if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(.single(target))) return error.CachePublishedBeforeWorker;
         var job = (presentation.takeCommand() orelse return error.MissingCacheBuild).build_buffer_disclosure;
         start = std.Io.Clock.awake.now(io);
         job.build();
@@ -14618,7 +14854,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
             start = std.Io.Clock.awake.now(io);
             try presentation.dispatch(.{ .buffer_disclosure_built = job });
             input_times[1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-            if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(target)) return error.StaleCachePublished;
+            if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(.single(target))) return error.StaleCachePublished;
             var scan = presentation.takeCommand() orelse return error.MissingScan;
             defer scan.deinit();
             if (scan != .scan_buffer_search) return error.UnexpectedCommand;
@@ -14632,7 +14868,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .buffer_disclosure_built = job });
         times[change][2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (published.worker_frame != job or storage.requiresCacheEnforcement(target)) return error.CacheNotPublished;
+        if (published.worker_frame != job or storage.requiresCacheEnforcement(.single(target))) return error.CacheNotPublished;
         const victim: usize = if (change == 0) 0 else 1;
         if (storage.file(victim).new != .pending or published.disclosure_inputs.blobs[victim].new != null) return error.CacheVictimRetained;
         if (change == 0 and (!std.mem.eql(u8, published.buffer_search.input.?.query.?.text, "needl") or
@@ -14968,7 +15204,7 @@ fn disclosureWorkerFailureCase(allocator: Allocator, kind: DisclosureBuild.Kind,
             .outcome = .{ .completed = result },
         } });
     } else if (kind == .cache_update) {
-        try presentation.queueCacheBuild(presentation.published.?, 0);
+        try presentation.queueCacheBuild(presentation.published.?, .single(0));
     } else if (kind == .draft_save) {
         try presentation.dispatch(.{ .action = .review_comment });
         try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
@@ -15790,7 +16026,7 @@ test "M21 kernel File-header navigation matches row order at boundaries and insi
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
-        .geometry = .{ .cols = 42, .rows = 12 },
+        .geometry = .{ .cols = 43, .rows = 12 },
     });
     defer presentation.deinit();
     const published = presentation.published.?;
@@ -16085,7 +16321,7 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     try presentation.dispatch(.{ .review_source_scanned = other_scan });
     try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
     const before_destination = presentation.projection().review.?.frame;
-    const before_focus = session.enrichment.focused_file;
+    const before_focus = session.enrichment.focused;
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     try testing.expectEqual(before_destination.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
     try testing.expectEqual(@as(?usize, 1), presentation.projection().review.?.isolated_file);
@@ -16101,7 +16337,7 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
     try testing.expectEqual(before_destination.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
-    try testing.expectEqual(before_focus, session.enrichment.focused_file);
+    try testing.expectEqual(before_focus, session.enrichment.focused);
     try testing.expectEqual(@as(?usize, 1), presentation.projection().review.?.isolated_file);
     try testing.expect(presentation.published.?.review_search.saved_disclosures == null);
     try presentation.dispatch(.{ .action = .open_search_occurrence });
@@ -18469,6 +18705,48 @@ test "External Edit snapshots exactly once blocks input and accepts only matchin
     try testing.expectEqualStrings("External Edit accepted", presentation.projection().composer.?.footer.?);
 }
 
+test "External Edit footer ends with its Composer and appears after another accepted edit" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer state.deinit();
+
+    for ([_]enum { save, cancel, replace }{ .save, .cancel, .replace }) |end| {
+        try state.dispatch(.{ .action = .review_comment });
+        try testing.expect(state.projection().composer.?.footer == null);
+        try state.dispatch(.{ .composer = .external_edit });
+        const command = state.takeCommand().?.external_edit;
+        const accepted = try ExternalEditCompleted.create(testing.allocator, command.command_id, command.session_epoch);
+        command.destroy();
+        accepted.outcome = .{ .changed = try accepted.arena.allocator().dupe(u8, "accepted body") };
+        try state.dispatch(.{ .external_edit_completed = accepted });
+        try testing.expectEqualStrings("External Edit accepted", state.projection().composer.?.footer.?);
+        switch (end) {
+            .save => {
+                try state.dispatch(.{ .composer = .save });
+                try completeDisclosureBuild(&state);
+            },
+            .cancel => try state.dispatch(.{ .composer = .cancel }),
+            .replace => {
+                try state.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.initLocal(43, "refs/remotes/origin/main", "refs/heads/other") });
+                const load = state.takeCommand().?.load_session;
+                try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+                    .command_id = load.command_id,
+                    .intent = load.intent,
+                    .outcome = .{ .loaded = try testLocalSession(testing.allocator) },
+                } });
+            },
+        }
+        try testing.expect(state.projection().composer == null);
+    }
+    try state.dispatch(.{ .action = .review_comment });
+    try testing.expect(state.projection().composer.?.footer == null);
+}
+
 test "M23 ancestry retains typed cursor and search ownership across resize and failed projection" {
     for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
@@ -18695,8 +18973,8 @@ fn testManyFileSession(backing: std.mem.Allocator, id: u64, file_count: usize) !
         .source_label = "Bitbucket",
         .pull_request_id = pr.id,
     };
+    // The Diff borrows its text from `raw`, so the Session arena keeps it.
     var raw: std.ArrayList(u8) = .empty;
-    defer raw.deinit(a);
     for (0..file_count) |index| try raw.print(
         a,
         "diff --git a/{d}.zig b/{d}.zig\n--- a/{d}.zig\n+++ b/{d}.zig\n@@ -1 +1 @@\n-old {d}\n+new {d}\n",
@@ -18749,7 +19027,7 @@ const PersistenceTestHighlighter = struct {
             .line = 1,
             .start = 0,
             .end = 8,
-            .capture = bbr.highlight.Capture.init(0, "prefetch-capture-sentinel"),
+            .capture = bbr.highlight.Capture.init(0, "speculative-capture-sentinel"),
         };
         return .{ .spans = spans };
     }
@@ -18762,7 +19040,7 @@ fn expectNoPersistenceSentinels(dir: std.Io.Dir) !void {
         if (entry.kind != .file) continue;
         const bytes = try dir.readFileAlloc(testing.io, entry.path, testing.allocator, .unlimited);
         defer testing.allocator.free(bytes);
-        inline for (.{ "prefetch-old-content-sentinel", "prefetch-new-content-sentinel", "prefetch-capture-sentinel" }) |sentinel|
+        inline for (.{ "speculative-old-content-sentinel", "speculative-new-content-sentinel", "speculative-capture-sentinel" }) |sentinel|
             try testing.expect(std.mem.indexOf(u8, bytes, sentinel) == null);
     }
 }
@@ -19687,7 +19965,7 @@ test "the Command Palette works with no Session" {
     try testing.expect(testListOverlay(&presentation, .command_palette) != null);
     try testType(&presentation, "keybindings");
     try presentation.dispatch(.{ .key = test_enter });
-    try testing.expect(presentation.projection().help_visible);
+    try testing.expect(presentation.projection().help != null);
 }
 
 test "a Session replacement closes the Command Palette" {
@@ -20606,7 +20884,7 @@ test "M23 links search navigates reference uses across resize and disclosure as 
         try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
             .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
-            .geometry = .{ .cols = 39, .rows = 20 },
+            .geometry = .{ .cols = 40, .rows = 20 },
         });
         defer presentation.deinit();
         if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
@@ -20629,7 +20907,7 @@ test "M23 links search navigates reference uses across resize and disclosure as 
         for (review.frame.search_ranges) |range| try testing.expect(range.definition != null);
         try presentation.dispatch(.{ .action = .next_search_occurrence });
         const retained_active = presentation.projection().buffer_search.?.active;
-        for ([_]u16{ 160, 39 }) |cols| {
+        for ([_]u16{ 160, 40 }) |cols| {
             try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
             try testing.expectEqual(@as(usize, 4), presentation.projection().buffer_search.?.total);
             try testing.expectEqual(retained_active, presentation.projection().buffer_search.?.active);
@@ -22960,6 +23238,7 @@ test "M21 kernel search indexes cover Draft chains and release every failed allo
     try store.store().put(key.storeKey(), .{ .local_id = 12, .kind = .comment, .parent = .{ .draft = 11 }, .body = "nested draft" });
     try store.store().put(key.storeKey(), .{ .local_id = 13, .kind = .comment, .parent = .{ .draft = 12 }, .body = "deep draft" });
     try store.store().put(key.storeKey(), .{ .local_id = 14, .kind = .comment, .parent = .{ .comment = 3 }, .body = "outdated reply" });
+    try store.store().put(key.storeKey(), .{ .local_id = 15, .kind = .comment, .parent = .{ .comment = 2 }, .body = "resolved reply" });
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
         .initial = .{ .key = key, .session = try testDisclosureSession(testing.allocator, 1) },
     });
@@ -22973,6 +23252,10 @@ test "M21 kernel search indexes cover Draft chains and release every failed allo
     try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .outdated_file = &published.session.diff.files[0] }, outdated.items[0]);
     const reply = index.body_disclosures.get(.{ .comment = 2 }).?;
     try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .resolved_thread = 1 }, reply.items[0]);
+    const resolved_reply = index.body_disclosures.get(.{ .draft = 15 }).?;
+    try testing.expectEqual(@as(usize, 2), resolved_reply.len);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .resolved_thread = 1 }, resolved_reply.items[0]);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .review_card = .{ .draft = 15 } }, resolved_reply.items[1]);
     try testing.checkAllAllocationFailures(testing.allocator, exerciseSearchIndexAllocationFailure, .{published});
     var preferences = presentation.preferences;
     preferences.scope = .whole;
@@ -23412,7 +23695,7 @@ test "M21 kernel initial Session Frame stays private until worker admission" {
         try testing.expect(presentation.published == previous);
         try testing.expectEqual(epoch, presentation.next_session_epoch);
         try presentation.dispatch(.{ .key = .{ .codepoint = '?', .text = "?" } });
-        try testing.expect(presentation.help_visible);
+        try testing.expect(presentation.help != null);
         job.build();
         try testing.expect(job.ready);
         try testing.expect(presentation.published == previous);
@@ -26445,40 +26728,112 @@ test "focused File Enrichment emits one Session Epoch command while in flight" {
     try testing.expect(presentation.takeCommand() == null);
 }
 
-test "explicit forward File traversal prefetches only after focused enrichment completes" {
+fn takeTestEnrichment(presentation: *Presentation) !EnrichFile {
+    try presentation.dispatch(.ensure_focused_enrichment);
+    var command = presentation.takeCommand() orelse return error.MissingEnrichment;
+    if (command != .enrich_file) {
+        command.deinit();
+        return error.UnexpectedCommand;
+    }
+    return command.enrich_file;
+}
+
+/// Takes every File Enrichment that one focus check queues.
+fn takeTestEnrichments(presentation: *Presentation, buffer: []EnrichFile) ![]EnrichFile {
+    try presentation.dispatch(.ensure_focused_enrichment);
+    var count: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command != .enrich_file or count == buffer.len) {
+            command.deinit();
+            return error.UnexpectedCommand;
+        }
+        buffer[count] = command.enrich_file;
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
+/// Completes the speculative File Enrichments batch by batch. Each batch
+/// starts at once and holds `max_speculative_enrichments` Files or the rest.
+fn expectSpeculativeOrder(presentation: *Presentation, expected: []const usize) !void {
+    var next: usize = 0;
+    while (next < expected.len) {
+        var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+        const batch = try takeTestEnrichments(presentation, &buffer);
+        try testing.expectEqual(@min(max_speculative_enrichments, expected.len - next), batch.len);
+        for (batch) |command| {
+            try testing.expectEqual(expected[next], command.file_index);
+            try testing.expect(command.speculative);
+            next += 1;
+        }
+        for (batch) |command| try completeTestEnrichment(presentation, command);
+    }
+    try expectNoTestEnrichment(presentation);
+}
+
+fn expectNoTestEnrichment(presentation: *Presentation) !void {
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "File Enrichment covers the visible Files and the overscan Files, with the active File first" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 8) },
         .viewport_rows = 8,
     });
     defer presentation.deinit();
+    const published = presentation.published.?;
 
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const initial = presentation.takeCommand().?.enrich_file;
-    try testing.expect(!initial.speculative);
-    try completeTestEnrichment(&presentation, initial);
-    try testing.expect(presentation.takeCommand() == null);
+    const active = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(@as(usize, 0), active.file_index);
+    try testing.expect(!active.speculative);
+    try expectNoTestEnrichment(&presentation);
+    try completeTestEnrichment(&presentation, active);
 
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const focused = presentation.takeCommand().?.enrich_file;
-    try testing.expectEqual(@as(usize, 1), focused.file_index);
-    try testing.expect(!focused.speculative);
-    try testing.expect(presentation.takeCommand() == null);
-
-    try completeTestEnrichment(&presentation, focused);
-    const successor = presentation.takeCommand().?.enrich_file;
-    try testing.expectEqual(@as(usize, 2), successor.file_index);
-    try testing.expect(successor.speculative);
-    try completeTestEnrichment(&presentation, successor);
+    const range = Presentation.enrichmentRange(published, 0, 8);
+    try testing.expectEqual(@as(usize, 0), range.visible.first);
+    try testing.expect(range.visible.end > 1 and range.visible.end < 7);
+    try testing.expectEqual(range.visible.end + enrichment_overscan_files, range.focused.end);
+    var expected: std.ArrayList(usize) = .empty;
+    defer expected.deinit(testing.allocator);
+    for (1..range.focused.end) |file_index| try expected.append(testing.allocator, file_index);
+    try expectSpeculativeOrder(&presentation, expected.items);
+    try testing.expectEqual(range.focused, published.session.enrichment.focused);
     try testing.expectEqual(@as(usize, 0), store.entries.items.len);
 }
 
-test "M21 authored Review Search pauses a queued successor prefetch before it starts" {
+test "File Enrichment takes the visible Files top to bottom, then the overscan File above, then below" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 8) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    for (0..4) |_| try presentation.dispatch(.{ .action = .next_file });
+    const active_file = published.activeFile().?;
+    const range = Presentation.enrichmentRange(published, active_file, 8);
+    try testing.expect(range.visible.first > 1);
+
+    const active = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(active_file, active.file_index);
+    try testing.expect(!active.speculative);
+    try completeTestEnrichment(&presentation, active);
+
+    var expected: std.ArrayList(usize) = .empty;
+    defer expected.deinit(testing.allocator);
+    for (range.visible.first..range.visible.end) |file_index| if (file_index != active_file) try expected.append(testing.allocator, file_index);
+    try expected.append(testing.allocator, range.visible.first - 1);
+    for (range.visible.end..range.focused.end) |file_index| try expected.append(testing.allocator, file_index);
+    try expectSpeculativeOrder(&presentation, expected.items);
+    try testing.expect(published.session.enrichment.needsEnrichment(range.focused.first - 1));
+}
+
+test "an isolated File is the whole Enrichment Range" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -26486,11 +26841,25 @@ test "M21 authored Review Search pauses a queued successor prefetch before it st
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    try completeTestEnrichment(&presentation, presentation.takeCommand().?.enrich_file);
     try presentation.dispatch(.{ .action = .next_file });
+    try dispatchView(&presentation, .{ .action = .isolate });
+    const range = Presentation.enrichmentRange(presentation.published.?, 1, 3);
+    try testing.expectEqual(file_enrichment.FileRange.single(1), range.visible);
+    try testing.expectEqual(file_enrichment.FileRange.single(1), range.focused);
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try expectNoTestEnrichment(&presentation);
+}
+
+test "M21 authored Review Search pauses a queued speculative File Enrichment before it starts" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
     try presentation.dispatch(.ensure_focused_enrichment);
-    try completeTestEnrichment(&presentation, presentation.takeCommand().?.enrich_file);
     try testing.expect(presentation.commands.items.len > 0);
     try testing.expect(presentation.commands.items[0].enrich_file.speculative);
     try presentation.dispatch(.{ .action = .open_review_search });
@@ -26501,161 +26870,51 @@ test "M21 authored Review Search pauses a queued successor prefetch before it st
     try testing.expect(command.enrich_file.search_acquisition);
 }
 
-test "focusing speculative File promotes its WorkId and prefetches its successor" {
+test "speculative Files start together, and focusing one promotes it so its failure reports" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 4),
-        },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 4) },
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, second);
-    const speculative = presentation.takeCommand().?.enrich_file;
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+    const batch = try takeTestEnrichments(&presentation, &buffer);
+    try testing.expect(batch.len > 1);
+    const speculative = batch[0];
+    try testing.expect(speculative.speculative);
 
     try presentation.dispatch(.{ .action = .next_file });
+    try testing.expectEqual(speculative.file_index, presentation.published.?.activeFile().?);
     try presentation.dispatch(.ensure_focused_enrichment);
-    try testing.expect(presentation.takeCommand() == null);
-    try completeTestEnrichment(&presentation, speculative);
-
-    const successor = presentation.takeCommand().?.enrich_file;
-    try testing.expectEqual(@as(usize, 3), successor.file_index);
-    try testing.expect(successor.speculative);
-}
-
-test "disabled cache and LocalReview never prefetch" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var disabled = try Presentation.init(testing.allocator, .{
-        .reviews = store.store(),
-        .file_cache_enabled = false,
-    }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
-        .viewport_rows = 8,
-    });
-    defer disabled.deinit();
-    try disabled.dispatch(.{ .action = .next_file });
-    try disabled.dispatch(.ensure_focused_enrichment);
-    const remote = disabled.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&disabled, remote);
-    try testing.expect(disabled.takeCommand() == null);
-
-    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
-    var local = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = key, .session = try testManyLocalFileSession(testing.allocator, 3) },
-        .viewport_rows = 8,
-    });
-    defer local.deinit();
-    try local.dispatch(.{ .action = .next_file });
-    try local.dispatch(.ensure_focused_enrichment);
-    const local_command = local.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&local, local_command);
-    try testing.expect(local.takeCommand() == null);
-}
-
-test "backward File traversal disarms a pending successor prefetch" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
-        .viewport_rows = 8,
-    });
-    defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-
-    try presentation.dispatch(.{ .action = .prev_file });
-    while (presentation.published.?.activeFile().? < 1) try presentation.dispatch(.{ .action = .down });
-    try completeTestEnrichment(&presentation, second);
-    try testing.expect(presentation.takeCommand() == null);
-}
-
-test "jump within focused File disarms a pending successor prefetch" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
-        .viewport_rows = 8,
-    });
-    defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-
-    try presentation.dispatch(.{ .action = .center });
-    try completeTestEnrichment(&presentation, second);
-    try testing.expect(presentation.takeCommand() == null);
-}
-
-test "non-navigation Action keeps a pending successor prefetch" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
-        .viewport_rows = 8,
-    });
-    defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-
-    try presentation.dispatch(.{ .action = .clear_selection });
-    try dispatchView(&presentation, .{ .action = .select_new_version });
-    try completeTestEnrichment(&presentation, second);
-    try testing.expect(presentation.takeCommand().?.enrich_file.speculative);
+    for (presentation.issued_enrichments.items) |issued| {
+        try testing.expectEqual(issued.file_index != speculative.file_index, issued.speculative);
+    }
+    for (presentation.commands.items) |queued| {
+        if (queued == .enrich_file) try testing.expect(queued.enrich_file.file_index != speculative.file_index);
+    }
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = speculative.command_id,
+        .work_id = speculative.work_id,
+        .session_epoch = speculative.session_epoch,
+        .file_index = speculative.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    } });
+    try testing.expectEqual(ActionError.file_enrichment_launch_failed, presentation.projection().action_error.?);
 }
 
 test "speculative failure stays silent and focus retries it as demand" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, second);
-    const speculative = presentation.takeCommand().?.enrich_file;
-
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    const speculative = try takeTestEnrichment(&presentation);
+    try testing.expect(speculative.speculative);
     try presentation.dispatch(.{ .file_enrichment_completed = .{
         .command_id = speculative.command_id,
         .work_id = speculative.work_id,
@@ -26666,8 +26925,7 @@ test "speculative failure stays silent and focus retries it as demand" {
     try testing.expect(presentation.projection().action_error == null);
 
     try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const retry = presentation.takeCommand().?.enrich_file;
+    const retry = try takeTestEnrichment(&presentation);
     try testing.expectEqual(speculative.file_index, retry.file_index);
     try testing.expect(!retry.speculative);
     try presentation.dispatch(.{ .file_enrichment_completed = .{
@@ -26675,6 +26933,105 @@ test "speculative failure stays silent and focus retries it as demand" {
         .work_id = retry.work_id,
         .session_epoch = retry.session_epoch,
         .file_index = retry.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    } });
+    try testing.expectEqual(ActionError.file_enrichment_launch_failed, presentation.projection().action_error.?);
+}
+
+test "a disabled File cache and a LocalReview keep the whole Enrichment Range" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var disabled = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        .viewport_rows = 8,
+    });
+    defer disabled.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var local = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testManyLocalFileSession(testing.allocator, 3) },
+        .viewport_rows = 8,
+    });
+    defer local.deinit();
+    for ([_]*Presentation{ &disabled, &local }) |presentation| {
+        const command = try takeTestEnrichment(presentation);
+        try testing.expectEqual(@as(usize, 0), command.file_index);
+        try completeTestEnrichment(presentation, command);
+        try expectSpeculativeOrder(presentation, &.{ 1, 2 });
+        for (0..3) |file_index| try testing.expect(presentation.published.?.session.enrichment.file(file_index).new == .content);
+    }
+}
+
+test "a speculative queueing failure stays silent and leaves the File pending" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    // Force the speculative handoff to allocate command storage.
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(presentation.published.?.session.enrichment.needsEnrichment(1));
+    const retry = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(@as(usize, 1), retry.file_index);
+    try testing.expect(retry.speculative);
+}
+
+test "speculative reads of a replaced Session count against the speculative limit" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    const stale_epoch = presentation.published.?.epoch +% 1;
+    for (0..max_speculative_enrichments) |index| try presentation.issued_enrichments.append(testing.allocator, .{
+        .command_id = 0,
+        .work_id = 1000 + index,
+        .session_epoch = stale_epoch,
+        .file_index = index,
+        .speculative = true,
+    });
+    try expectNoTestEnrichment(&presentation);
+}
+
+test "a File that becomes active during a cache update promotes its speculative read" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 4) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+    const speculative = (try takeTestEnrichments(&presentation, &buffer))[0];
+    try testing.expectEqual(@as(usize, 1), speculative.file_index);
+
+    try presentation.dispatch(.{ .action = .next_file });
+    try testing.expectEqual(@as(?usize, 1), published.activeFile());
+    published.pending_cache_update = 1;
+    defer published.pending_cache_update = null;
+    published.pending_cache_focus = Presentation.enrichmentRange(published, 1, 4).focused;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    for (presentation.issued_enrichments.items) |issued| {
+        if (issued.file_index == 1) try testing.expect(!issued.speculative);
+    }
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = speculative.command_id,
+        .work_id = speculative.work_id,
+        .session_epoch = speculative.session_epoch,
+        .file_index = speculative.file_index,
         .outcome = .{ .failed = .launch_failed },
     } });
     try testing.expectEqual(ActionError.file_enrichment_launch_failed, presentation.projection().action_error.?);
@@ -26695,19 +27052,13 @@ test "speculative request metadata failure stays silent" {
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-
-    try completeTestEnrichment(&presentation, second);
-    try testing.expect(presentation.takeCommand() == null);
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try expectNoTestEnrichment(&presentation);
     try testing.expect(presentation.projection().action_error == null);
 }
 
-test "prefetch writes no File content or Highlighting to persistence" {
+test "speculative File Enrichment writes no File content or Highlighting to persistence" {
     const sqlite_store = @import("../persist/sqlite_store.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -26732,18 +27083,16 @@ test "prefetch writes no File content or Highlighting to persistence" {
             .viewport_rows = 8,
         });
         defer presentation.deinit();
-        try presentation.dispatch(.ensure_focused_enrichment);
-        const first = presentation.takeCommand().?.enrich_file;
-        try completeTestEnrichment(&presentation, first);
-        try presentation.dispatch(.{ .action = .next_file });
-        try presentation.dispatch(.ensure_focused_enrichment);
-        const second = presentation.takeCommand().?.enrich_file;
-        try completeTestEnrichment(&presentation, second);
-        const speculative = presentation.takeCommand().?.enrich_file;
+        try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+        var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+        const batch = try takeTestEnrichments(&presentation, &buffer);
+        try testing.expect(batch.len > 0);
+        const speculative = batch[0];
+        try testing.expect(speculative.speculative);
 
         const responses = [_]bbr.http.Canned{
-            .{ .status = 200, .body = "prefetch-old-content-sentinel\n" },
-            .{ .status = 200, .body = "prefetch-new-content-sentinel\n" },
+            .{ .status = 200, .body = "speculative-old-content-sentinel\n" },
+            .{ .status = 200, .body = "speculative-new-content-sentinel\n" },
         };
         var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
         const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
@@ -26757,6 +27106,7 @@ test "prefetch writes no File content or Highlighting to persistence" {
             .outcome = .{ .completed = result },
         } });
         try completeDisclosureBuild(&presentation);
+        for (batch[1..]) |command| try completeTestEnrichment(&presentation, command);
 
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
@@ -26930,7 +27280,7 @@ test "disabled File cache discards an inactive completion and revisiting refetch
     }, .{
         .initial = .{
             .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testTwoFileSession(testing.allocator, 1),
+            .session = try testManyFileSession(testing.allocator, 1, 5),
         },
         .viewport_rows = 8,
     });
@@ -26939,9 +27289,10 @@ test "disabled File cache discards an inactive completion and revisiting refetch
     try presentation.dispatch(.ensure_focused_enrichment);
     const first = presentation.takeCommand().?.enrich_file;
     try testing.expectEqual(@as(usize, 0), first.file_index);
-    try presentation.dispatch(.{ .action = .next_file });
+    for (0..3) |_| try presentation.dispatch(.{ .action = .next_file });
     try presentation.dispatch(.ensure_focused_enrichment);
     _ = presentation.takeCommand().?.enrich_file;
+    try testing.expect(!presentation.published.?.session.enrichment.focused.contains(0));
 
     const responses = [_]bbr.http.Canned{
         .{ .status = 200, .body = "old a\n" },
@@ -26958,8 +27309,9 @@ test "disabled File cache discards an inactive completion and revisiting refetch
         .outcome = .{ .completed = result },
     } });
     try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.published.?.session.enrichment.file(0).new == .pending);
 
-    try presentation.dispatch(.{ .action = .prev_file });
+    for (0..3) |_| try presentation.dispatch(.{ .action = .prev_file });
     try presentation.dispatch(.ensure_focused_enrichment);
     try testing.expectEqual(@as(usize, 0), presentation.takeCommand().?.enrich_file.file_index);
 }
@@ -26977,10 +27329,10 @@ const TestNoopHighlighter = struct {
 };
 
 fn testCacheSession(hold_inactive: bool) !*Session {
-    const session = try testTwoFileSession(testing.allocator, 1);
+    const session = try testManyFileSession(testing.allocator, 1, 3);
     errdefer session.destroy();
-    session.enrichment.focus(0);
-    for (0..if (hold_inactive) @as(usize, 2) else 1) |index| {
+    session.enrichment.focus(.single(0));
+    for (([_]usize{ 0, 2 })[0..if (hold_inactive) 2 else 1]) |index| {
         const responses = [_]bbr.http.Canned{
             .{ .status = 200, .body = "old\ncached old\n" },
             .{ .status = 200, .body = "new\ncached needle\n" },
@@ -26998,7 +27350,7 @@ fn testCacheSession(hold_inactive: bool) !*Session {
             .max_file_bytes = 0,
         });
         defer result.deinit();
-        if (index == 1) session.enrichment.hold(index);
+        if (index == 2) session.enrichment.hold(index);
         try session.enrichment.admit(index, &result);
     }
     return session;
@@ -27014,25 +27366,25 @@ test "M21 kernel cache focus keeps eviction and Frame private until admission" {
     const published = presentation.published.?;
     try dispatchView(&presentation, .{ .action = .cycle_scope });
     try dispatchView(&presentation, .{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .next_file });
+    try presentation.dispatch(.{ .action = .to_bottom });
     const before = presentation.projection().review.?.frame;
     try presentation.dispatch(.ensure_focused_enrichment);
     try presentation.dispatch(.ensure_focused_enrichment);
     const worker = presentation.takeCommand().?.build_buffer_disclosure;
     try testing.expect(presentation.takeCommand() == null);
     try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
-    try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+    try testing.expectEqual(file_enrichment.FileRange.single(0), published.session.enrichment.focused);
     worker.build();
     try testing.expect(!worker.failed);
     try testing.expect(published.session.enrichment.file(0).new == .content);
     try testing.expectEqual(before.buffer.rows.ptr, published.buffer.rows.ptr);
     try presentation.dispatch(.{ .buffer_disclosure_built = worker });
-    try testing.expectEqual(@as(?usize, 1), published.session.enrichment.focused_file);
+    try testing.expect(!published.session.enrichment.focused.contains(0) and published.session.enrichment.focused.contains(2));
     try testing.expect(published.session.enrichment.file(0).new == .pending);
     try testing.expect(before.visual_rows.ptr != published.visual_rows.ptr);
     try testing.expect(published.disclosure_inputs.blobs[0].new == null);
     try presentation.dispatch(.ensure_focused_enrichment);
-    try testing.expectEqual(@as(usize, 1), presentation.takeCommand().?.enrich_file.file_index);
+    try testing.expectEqual(@as(usize, 2), presentation.takeCommand().?.enrich_file.file_index);
 }
 
 test "M21 kernel cache focus failure preserves content and focus before retry" {
@@ -27043,7 +27395,7 @@ test "M21 kernel cache focus failure preserves content and focus before retry" {
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .next_file });
+    try presentation.dispatch(.{ .action = .to_bottom });
     const published = presentation.published.?;
     const before = published.frameProjection();
     // Force the handoff to allocate command storage.
@@ -27053,14 +27405,14 @@ test "M21 kernel cache focus failure preserves content and focus before retry" {
     try testing.expectError(error.OutOfMemory, presentation.dispatch(.ensure_focused_enrichment));
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
-    try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+    try testing.expectEqual(file_enrichment.FileRange.single(0), published.session.enrichment.focused);
     try testing.expect(published.session.enrichment.file(0).new == .content);
     try presentation.dispatch(.ensure_focused_enrichment);
     const failed = presentation.takeCommand().?.build_buffer_disclosure;
     failed.failed = true;
     try presentation.dispatch(.{ .buffer_disclosure_built = failed });
     try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
-    try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+    try testing.expectEqual(file_enrichment.FileRange.single(0), published.session.enrichment.focused);
     try testing.expect(published.session.enrichment.file(0).new == .content);
     try testing.expect(published.pending_cache_update == null);
     try presentation.dispatch(.ensure_focused_enrichment);
@@ -27077,10 +27429,10 @@ test "M21 kernel cache focus supersedes queued and issued focus changes" {
         });
         defer presentation.deinit();
         const published = presentation.published.?;
-        try presentation.dispatch(.{ .action = .next_file });
+        try presentation.dispatch(.{ .action = .to_bottom });
         try presentation.dispatch(.ensure_focused_enrichment);
         const old = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
-        try presentation.dispatch(.{ .action = .prev_file });
+        try presentation.dispatch(.{ .action = .to_top });
         try presentation.dispatch(.ensure_focused_enrichment);
         const before = published.frameProjection();
         if (old) |worker| {
@@ -27089,7 +27441,7 @@ test "M21 kernel cache focus supersedes queued and issued focus changes" {
             try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
         }
         try completeDisclosureBuild(&presentation);
-        try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+        try testing.expectEqual(file_enrichment.FileRange{ .first = 0, .end = 2 }, published.session.enrichment.focused);
         try testing.expect(published.session.enrichment.file(0).new == .content);
         try testing.expect(presentation.takeCommand() == null);
     }
@@ -27101,11 +27453,11 @@ test "M21 kernel cache worker retries changed Query geometry File Tree and lease
         defer store.deinit();
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
             .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
-            .geometry = .{ .cols = 100, .rows = 25 },
+            .geometry = .{ .cols = 100, .rows = 5 },
         });
         defer presentation.deinit();
         const published = presentation.published.?;
-        try presentation.dispatch(.{ .action = .next_file });
+        try presentation.dispatch(.{ .action = .to_bottom });
         try presentation.dispatch(.ensure_focused_enrichment);
         const old = presentation.takeCommand().?.build_buffer_disclosure;
         var owned = true;
@@ -27117,7 +27469,7 @@ test "M21 kernel cache worker retries changed Query geometry File Tree and lease
                 try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
             },
             .geometry => {
-                try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 24 } });
+                try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 4 } });
             },
             .tree => published.tree.scroll += 1,
             .lease => published.session.enrichment.hold(0),
@@ -27133,7 +27485,7 @@ test "M21 kernel cache worker retries changed Query geometry File Tree and lease
             try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
         }
         try completeDisclosureBuild(&presentation);
-        try testing.expectEqual(@as(?usize, 1), published.session.enrichment.focused_file);
+        try testing.expect(!published.session.enrichment.focused.contains(0) and published.session.enrichment.focused.contains(2));
         if (change == .lease) {
             try testing.expect(published.session.enrichment.file(0).new == .content);
             presentation.finishSearchLease(published, 0);
@@ -27163,20 +27515,20 @@ test "M21 kernel search lease release and Review Search hold release stage evict
         try completeBufferSearchScan(&presentation);
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
         const before = published.frameProjection();
-        var lease = published.session.enrichment.snapshot(1);
+        var lease = published.session.enrichment.snapshot(2);
         defer lease.release();
-        if (release == .source) presentation.finishSearchLease(published, 1) else {
-            published.review_search.held = try presentation.allocator.alloc(bool, 2);
+        if (release == .source) presentation.finishSearchLease(published, 2) else {
+            published.review_search.held = try presentation.allocator.alloc(bool, 3);
             @memset(published.review_search.held.?, false);
-            published.review_search.held.?[1] = true;
+            published.review_search.held.?[2] = true;
             published.review_search.open = true;
             if (release == .close) presentation.closeReviewSearch() else presentation.replaceReviewSearchQuery("");
         }
         try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
-        try testing.expect(published.session.enrichment.file(1).new == .content);
+        try testing.expect(published.session.enrichment.file(2).new == .content);
         try testing.expectEqual(@as(usize, 1), presentation.commands.items.len);
         try completeDisclosureBuild(&presentation);
-        try testing.expect(published.session.enrichment.file(1).new == .pending);
+        try testing.expect(published.session.enrichment.file(2).new == .pending);
         try testing.expect(published.session.enrichment.file(0).new == .content);
         try testing.expectEqualStrings("new\ncached needle\n", lease.view.new.content.blob);
         try testing.expectEqual(@as(usize, 1), lease.new.?.references.load(.acquire));
@@ -27194,7 +27546,7 @@ test "M21 kernel cache worker rejects Session replacement and shutdown" {
             .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
         });
         defer presentation.deinit();
-        try presentation.dispatch(.{ .action = .next_file });
+        try presentation.dispatch(.{ .action = .to_bottom });
         if (issued or replacement == .shutdown) try presentation.dispatch(.ensure_focused_enrichment);
         const old = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
         switch (replacement) {
@@ -28120,6 +28472,335 @@ test "Submission Overlay permits Review switching without cancelling the run" {
     try testing.expect(presentation.projection().submission != null);
 }
 
+/// Submit Draft 1 alone, fail its POST definitively, and complete the
+/// reconciliation load with `session`, so the Submission Overlay is terminal.
+fn failSoleDraftSubmission(presentation: *Presentation, key: OwnedReviewIdentity, session: *session_mod.Session) !void {
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const command_id = post.post_draft.command_id;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .command_id = command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .rejected = error.NotFound },
+    } });
+    var loaded = false;
+    while (presentation.takeCommand()) |command| {
+        if (command == .load_session and !loaded) {
+            loaded = true;
+            try dispatchSessionLoadForTest(presentation, .{ .session_loaded = .{
+                .command_id = command.load_session.command_id,
+                .intent = command.load_session.intent,
+                .outcome = .{ .loaded = session },
+            } });
+        } else {
+            var discarded = command;
+            discarded.deinit();
+        }
+    }
+    if (!loaded) session.destroy();
+    try testing.expect(presentation.projection().submission_tree.?.completion.? == .partial);
+}
+
+/// Run the next Buffer build and discard the other queued commands.
+fn completeNextDisclosureBuild(presentation: *Presentation) !void {
+    while (presentation.commands.items.len > 0 and presentation.commands.items[0] != .build_buffer_disclosure) {
+        var other = presentation.takeCommand().?;
+        other.deinit();
+    }
+    try completeDisclosureBuild(presentation);
+}
+
+fn cursorOwner(presentation: *Presentation) frame_mod.RowOwner {
+    const review = presentation.projection().review.?;
+    return review.frame.visual_rows[review.navigation.cursor].owner;
+}
+
+test "Enter in the terminal Submission Overlay jumps to the Draft and X shows the Overlay again" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "failed root" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testSession(testing.allocator, 1, 'a'));
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.published.?.focus);
+
+    // The hidden Overlay no longer captures keys. X shows the same terminal
+    // Overlay again and starts no Submission.
+    while (presentation.takeCommand()) |command| {
+        var discarded = command;
+        discarded.deinit();
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    const shown = presentation.projection().submission_tree.?;
+    try testing.expect(shown.completion.? == .partial);
+    try testing.expectEqual(SubmissionItemState.failed, shown.items[0].state);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "Enter reveals a Draft that File isolation hides before it jumps" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "on b", .scope = .{ .@"inline" = .{ .path = "b.zig", .to = 1, .commit = "source" } } });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testTwoFileSession(testing.allocator, 1));
+
+    try presentation.dispatch(.{ .action = .isolate });
+    try completeNextDisclosureBuild(&presentation);
+    try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    try completeNextDisclosureBuild(&presentation);
+    const review = presentation.projection().review.?;
+    try testing.expect(review.isolated_file == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
+    try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(review.frame.visual_rows[review.navigation.cursor].buffer_index));
+}
+
+test "a Draft jump clears the accepted Buffer Search match" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "failed root" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testSession(testing.allocator, 1, 'a'));
+    // Enter hides the Overlay. X shows it again after the search.
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    while (presentation.takeCommand()) |command| {
+        var discarded = command;
+        discarded.deinit();
+    }
+    const published = presentation.published.?;
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.replaceBufferSearchQuery("root");
+    try completeBufferSearchScan(&presentation);
+    while (presentation.takeCommand()) |command| {
+        if (command == .build_buffer_disclosure) {
+            command.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+        } else {
+            var discarded = command;
+            discarded.deinit();
+        }
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(published.buffer_search.active != null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    try testing.expect(presentation.projection().submission_tree != null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(published.buffer_search.active == null);
+    try testing.expect(published.buffer_search.saved_disclosures == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
+}
+
+test "Enter jumps to a failed Draft Reply under a collapsed resolved Thread" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .parent = .{ .comment = 2 }, .body = "resolved reply" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testDisclosureSession(testing.allocator, 1) } });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testDisclosureSession(testing.allocator, 1));
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeNextDisclosureBuild(&presentation);
+    try testing.expect(presentation.projection().action_error == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
+}
+
+test "a failed Draft jump shows the Submission Overlay again and reports the failure" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "on b", .scope = .{ .@"inline" = .{ .path = "b.zig", .to = 1, .commit = "source" } } });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testTwoFileSession(testing.allocator, 1));
+    try presentation.dispatch(.{ .action = .isolate });
+    try completeNextDisclosureBuild(&presentation);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    while (presentation.commands.items.len > 0 and presentation.commands.items[0] != .build_buffer_disclosure) {
+        var other = presentation.takeCommand().?;
+        other.deinit();
+    }
+    var command = presentation.takeCommand().?;
+    try presentation.dispatch(try command.launchFailed());
+    try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().submission_tree != null);
+    try testing.expect(presentation.published.?.pending_draft_destination == null);
+}
+
+test "help scroll keys move within the help lines and any other key closes the help" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 100, .rows = 20 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .help });
+    const help = presentation.projection().help.?;
+    const last = help.lines.len - frame_mod.helpBodyRows(presentation.geometry, help.layout());
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .text = "k" } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().help.?.scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expectEqual(@as(usize, 1), presentation.projection().help.?.scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'G', .text = "G" } });
+    try testing.expectEqual(last, presentation.projection().help.?.scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expectEqual(last, presentation.projection().help.?.scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try testing.expect(presentation.projection().help.?.scroll < last);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().help.?.scroll);
+    try testing.expect(presentation.projection().help != null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
+    try testing.expect(presentation.projection().help == null);
+}
+
+test "help search leaves the accepted DiffPane Buffer Search unchanged" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "new" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const published = presentation.published.?;
+    const query = published.buffer_search.accepted_query.?.text.ptr;
+    const occurrences = published.buffer_search.accepted_batch.?.occurrences.ptr;
+    const ranges = published.buffer_search.accepted_ranges.?.ptr;
+    const before = presentation.projection().buffer_search.?;
+    const navigation = presentation.projection().review.?.navigation;
+    try presentation.dispatch(.{ .action = .help });
+    try presentation.dispatch(.{ .key = .{ .codepoint = '/', .text = "/" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "Draft" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = '/', .text = "/" } });
+    try testing.expectEqualStrings("", presentation.projection().help.?.query.input);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "absent-query" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expectEqualStrings("Draft", presentation.projection().help.?.query.kept);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().help.?.query == .none);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().help == null);
+    try testing.expectEqualDeep(before, presentation.projection().buffer_search.?);
+    try testing.expectEqualDeep(navigation, presentation.projection().review.?.navigation);
+    try testing.expectEqual(query, published.buffer_search.accepted_query.?.text.ptr);
+    try testing.expectEqual(occurrences, published.buffer_search.accepted_batch.?.occurrences.ptr);
+    try testing.expectEqual(ranges, published.buffer_search.accepted_ranges.?.ptr);
+}
+
+test "help close reopen shutdown and Review choice release input and saved snapshots" {
+    for ([_]enum { close, reopen, shutdown, review_choice }{ .close, .reopen, .shutdown, .review_choice }) |ending| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .help });
+        try presentation.dispatch(.{ .key = .{ .codepoint = '/' } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "old" } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        if (ending != .close) {
+            try presentation.dispatch(.{ .key = .{ .codepoint = '/' } });
+            try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "new" } });
+        }
+        switch (ending) {
+            .close => {
+                try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
+                try testing.expect(presentation.projection().help == null);
+                try presentation.dispatch(.{ .action = .help });
+            },
+            .reopen => try presentation.dispatch(.{ .action = .help }),
+            .shutdown => try presentation.dispatch(.request_shutdown),
+            .review_choice => try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 1) }),
+        }
+        if (ending == .close or ending == .reopen) {
+            const help = presentation.projection().help.?;
+            try testing.expect(help.query == .none);
+            try testing.expectEqual(@as(usize, 0), help.scroll);
+            try testing.expect(help.lines.len > 1);
+        } else try testing.expect(presentation.projection().help == null);
+    }
+}
+
+test "help movement clamps stored filtered scroll after a terminal resize" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .help });
+    try presentation.dispatch(.{ .key = .{ .codepoint = '/' } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "o" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'G' } });
+    try testing.expect(presentation.projection().help.?.scroll > 0);
+    const height: u16 = @intCast(presentation.projection().help.?.lines.len + 30);
+    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = height } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'k' } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().help.?.scroll);
+}
+
 test "stale repair reload evaluates each root scope independently and checks the refreshed source again" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -28295,9 +28976,14 @@ test "portable key input owns help overlay capture" {
     defer presentation.deinit();
 
     try presentation.dispatch(.{ .key = .{ .codepoint = '?', .text = "?" } });
-    try testing.expect(presentation.projection().help_visible);
+    try testing.expect(presentation.projection().help != null);
+    const cursor = presentation.published.?.navigation.cursor;
     try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
-    try testing.expect(!presentation.projection().help_visible);
+    try testing.expect(presentation.projection().help != null);
+    try testing.expectEqual(cursor, presentation.published.?.navigation.cursor);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'q', .text = "q" } });
+    try testing.expect(presentation.projection().help == null);
+    try testing.expect(!presentation.projection().shutting_down);
 }
 
 test "portable Picker input loads summaries and selects a replacement" {

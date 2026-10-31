@@ -17,6 +17,10 @@ _Avoid_: PullRequest header, comparison string, byline.
 The lazily acquired old/new full-file content and Highlighting attached to a File during a Session. Each side becomes available independently; failure on one side does not suppress usable content from the other.
 _Avoid_: blob load, highlight job, hydration.
 
+**Enrichment Range**:
+The Files whose File Enrichment Presentation keeps: every File with a row in the DiffPane viewport, plus a fixed number of overscan Files above and below them. An isolated File is the whole Enrichment Range.
+_Avoid_: prefetch window, focused File (for the whole range).
+
 **Selected Version**:
 The review-wide choice of old or new File content for version-specific inspection, source Actions, and clipboard eligibility.
 It defaults to new when both File versions exist.
@@ -129,7 +133,7 @@ Presentation's width-independent semantic reading of a Comment or Draft's author
 _Avoid_: parsed Comment, rendered Markdown, Markdown document.
 
 **ReviewCard**:
-The bounded DiffPane presentation of one Comment or Draft: a rounded border, ReviewBody rows, and an in-place disclosure footer when the projected body exceeds its row budget. Its Title in the top border names the author or `✎ draft`, and any other state follows in parentheses, as in `✎ draft (posted)` or `Ada (deleted)`. The disclosure footer is the Title in the bottom border. A Reply sits at its ancestry indent directly below the preceding card, with no blank row. Its top-left corner joins the border above with `┬` and becomes `├`. A card with a later sibling keeps its line down to that sibling: its bottom-left corner becomes `├`, and the line passes every row of the card's Replies. A ReviewCard has the Theme base background. Its role shows only in its text color and emphasis. Every row belongs to the same stable Comment or Draft identity.
+The bounded DiffPane presentation of one Comment or Draft: a rounded border, ReviewBody rows, and an in-place disclosure footer when the projected body exceeds its row budget by at least two rows. A collapsed card ends its visible rows with a `[...] (enter to expand)` row, and Enter on that row expands the card. Its Title in the top border names the author or `✎ draft`, and any other state follows in parentheses, as in `✎ draft (posted)` or `Ada (deleted)`. The disclosure footer is the Title in the bottom border. A Reply sits at its ancestry indent directly below the preceding card, with no blank row. Its top-left corner joins the border above with `┬` and becomes `├`. A card with a later sibling keeps its line down to that sibling: its bottom-left corner becomes `├`, and the line passes every row of the card's Replies. A ReviewCard has the Theme base background. Its role shows only in its text color and emphasis. Every row belongs to the same stable Comment or Draft identity.
 _Avoid_: Comment (the Review entity), panel, box.
 
 A resolved Thread's header identifies its root author, resolved state, and reply count.

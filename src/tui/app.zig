@@ -166,6 +166,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
                 vx.screen.width_method = .unicode;
+                painted_revision = null;
             },
             .presentation_done => |done| {
                 reapPresentationWork(&futures, ctx.io, done.work_id);
@@ -185,8 +186,11 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
         }
         try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
-        if (try syncContentGeometry(&state, &frame_arena, vx.window(), &sent_geometry))
+        if (try syncContentGeometry(&state, &frame_arena, vx.window(), &sent_geometry)) {
+            // A taller DiffPane can expose Files outside the old Enrichment Range.
+            if (state.projection().review != null) try state.dispatch(.ensure_focused_enrichment);
             try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
+        }
         // A completed worker may still own a payload queued for Presentation.
         // Keep the loop alive until every completion has been received and
         // reaped so shutdown cannot strand that payload in the event queue.
@@ -224,7 +228,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         if (projection.submission_tree) |tree| if (projection.review) |review_projection|
             if (presentation.OwnedReviewIdentity.eql(tree.key, review_projection.key))
                 render.drawSubmissionTree(frame, content_win, active_theme, tree);
-        if (projection.help_visible) render.drawHelp(frame, content_win, active_theme, ctx.keymap, projection.action_availability);
+        if (projection.help) |help| render.drawHelp(frame, content_win, active_theme, help, projection.action_availability);
         try vx.render(writer);
         painted_revision = projection.revision;
         _ = frame_arena.reset(.{ .retain_with_limit = frame_arena_retained_limit });
@@ -1391,6 +1395,7 @@ test {
     _ = @import("theme.zig");
     _ = @import("nav.zig");
     _ = @import("keymap.zig");
+    _ = @import("help.zig");
     _ = @import("list_overlay.zig");
     _ = @import("theme_id.zig");
     _ = @import("session.zig");

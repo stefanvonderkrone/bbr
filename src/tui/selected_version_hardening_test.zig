@@ -322,7 +322,7 @@ test "M20 hardening renders zero narrow ordinary and wide DiffPane geometry" {
     const line_row = review.frame.panes.diff_content.y + 1;
     var accented_gutter = false;
     var highlighted_source = false;
-    for (review.frame.panes.diff_content.x..80) |col| if (window.readCell(@intCast(col), line_row)) |cell| {
+    for (review.frame.panes.version_marker.x..80) |col| if (window.readCell(@intCast(col), line_row)) |cell| {
         if (std.mem.eql(u8, cell.char.grapheme, "▐")) {
             try testing.expectEqual(theme.accent, cell.style.fg);
             accented_gutter = true;
