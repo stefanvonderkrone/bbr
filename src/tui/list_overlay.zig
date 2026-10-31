@@ -124,25 +124,15 @@ pub const FuzzyList = struct {
     /// Recompute the matches from the current query. A blank query matches
     /// every item in item order. The cursor is clamped into the new set.
     fn refilter(self: *FuzzyList, haystack: anytype) void {
-        const text = std.mem.trim(u8, self.query(), " \t");
         const item_count = haystack.len();
         std.debug.assert(item_count <= self.match_buf.len);
-        if (text.len == 0) {
+        var needles: Query.Needles = undefined;
+        const parsed = Query.parse(self.query(), &needles) orelse {
             for (0..item_count) |index| self.match_buf[index] = index;
             self.match_count = item_count;
             self.clamp();
             return;
-        }
-
-        var needles: [max_needles][]const u8 = undefined;
-        var needle_count: usize = 0;
-        var words = std.mem.tokenizeScalar(u8, text, ' ');
-        while (words.next()) |word| {
-            if (needle_count == needles.len) break;
-            needles[needle_count] = word;
-            needle_count += 1;
-        }
-        const parsed: Query = .{ .text = text, .needles = needles[0..needle_count] };
+        };
 
         var count: usize = 0;
         for (0..item_count) |index| {
@@ -182,6 +172,23 @@ pub const FuzzyList = struct {
 pub const Query = struct {
     text: []const u8,
     needles: []const []const u8,
+
+    pub const Needles = [max_needles][]const u8;
+
+    /// The trimmed query and its words in `needles`, or null for a blank
+    /// query. The result borrows `text` and `needles`.
+    pub fn parse(text: []const u8, needles: *Needles) ?Query {
+        const trimmed = std.mem.trim(u8, text, " \t");
+        if (trimmed.len == 0) return null;
+        var count: usize = 0;
+        var words = std.mem.tokenizeScalar(u8, trimmed, ' ');
+        while (words.next()) |word| {
+            if (count == needles.len) break;
+            needles[count] = word;
+            count += 1;
+        }
+        return .{ .text = trimmed, .needles = needles[0..count] };
+    }
 
     /// Rank `haystack` against every needle.
     pub fn rank(self: Query, haystack: []const u8) ?f64 {
@@ -364,6 +371,11 @@ pub const CommandPalette = struct {
         .{ .action = .show_comment_overview, .title = "Show Comment Overview", .description = "List every Comment, Reply, and Draft in this Review" },
         .{ .action = .show_diff_pane, .title = "Show DiffPane", .description = "Show the diff in the Main Pane" },
         .{ .action = .open_overview_entry, .title = "Open in DiffPane", .description = "Show the selected entry's ReviewCard in the DiffPane" },
+        .{ .action = .edit_overview_query, .title = "Filter Comments", .description = "Type a query over author, body, and path" },
+        .{ .action = .toggle_overview_unresolved, .title = "Unresolved Only", .description = "Show only unresolved Threads" },
+        .{ .action = .toggle_overview_drafts, .title = "Drafts Only", .description = "Show only Drafts" },
+        .{ .action = .toggle_overview_mine, .title = "Mine Only", .description = "Show only your Comments and Drafts" },
+        .{ .action = .toggle_overview_order, .title = "Toggle Comment Order", .description = "Switch between Review order and newest first" },
         .{ .action = .open_theme_overlay, .title = "Theme", .description = "Preview and choose the color Theme" },
         .{ .action = .help, .title = "Keybindings", .description = "Show the keybinding help" },
         .{ .action = .quit, .title = "Quit", .description = "Quit bbr" },
@@ -858,5 +870,29 @@ test "M29 overview the Command Palette lists Open in DiffPane only from the Comm
             listed = true;
         }
         try testing.expectEqual(context == .comment_overview, listed);
+    }
+}
+
+test "M29 overview the Command Palette lists the filter and order entries only from the Comment Overview" {
+    const expected = [_]struct { action: Action, title: []const u8, description: []const u8 }{
+        .{ .action = .edit_overview_query, .title = "Filter Comments", .description = "Type a query over author, body, and path" },
+        .{ .action = .toggle_overview_unresolved, .title = "Unresolved Only", .description = "Show only unresolved Threads" },
+        .{ .action = .toggle_overview_drafts, .title = "Drafts Only", .description = "Show only Drafts" },
+        .{ .action = .toggle_overview_mine, .title = "Mine Only", .description = "Show only your Comments and Drafts" },
+        .{ .action = .toggle_overview_order, .title = "Toggle Comment Order", .description = "Switch between Review order and newest first" },
+    };
+    for ([_]InteractionContext{ .diff, .diff_review_card, .sidebar, .sidebar_file, .comment_overview }) |context| {
+        var palette = try ListOverlay.openCommandPalette(testing.allocator, context);
+        defer palette.deinit();
+        var listed: usize = 0;
+        for (0..palette.command_palette.row_count) |row| {
+            const entry = palette.command_palette.command(row);
+            for (expected) |item| if (item.action == entry.action) {
+                try testing.expectEqualStrings(item.title, entry.title);
+                try testing.expectEqualStrings(item.description, entry.description);
+                listed += 1;
+            };
+        }
+        try testing.expectEqual(@as(usize, if (context == .comment_overview) expected.len else 0), listed);
     }
 }

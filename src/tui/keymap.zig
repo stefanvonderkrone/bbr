@@ -219,6 +219,11 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.two('g', 'o'), .action = .show_comment_overview, .help = "show Comment Overview" },
     .{ .chord = Chord.two('g', 'd'), .action = .show_diff_pane, .help = "show DiffPane" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .open_overview_entry, .help = "open entry in DiffPane" },
+    .{ .chord = Chord.one('/'), .action = .edit_overview_query, .help = "filter Comment Overview" },
+    .{ .chord = Chord.one('u'), .action = .toggle_overview_unresolved, .help = "unresolved only" },
+    .{ .chord = Chord.one('d'), .action = .toggle_overview_drafts, .help = "Drafts only" },
+    .{ .chord = Chord.one('a'), .action = .toggle_overview_mine, .help = "mine only" },
+    .{ .chord = Chord.one('o'), .action = .toggle_overview_order, .help = "toggle Comment order" },
 };
 
 pub const Keymap = struct {
@@ -384,7 +389,7 @@ fn validateBindings(bindings: []const Binding) !void {
 pub fn supportsContext(action: Action, context: InteractionContext) bool {
     return switch (context) {
         .composer => action == .external_edit,
-        .help, .unknown_resolution, .delete_confirmation, .buffer_search_input => false,
+        .help, .unknown_resolution, .delete_confirmation, .buffer_search_input, .comment_overview_query => false,
         .comment_overview => switch (action) {
             .down,
             .up,
@@ -416,6 +421,11 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .show_comment_overview,
             .show_diff_pane,
             .open_overview_entry,
+            .edit_overview_query,
+            .toggle_overview_unresolved,
+            .toggle_overview_drafts,
+            .toggle_overview_mine,
+            .toggle_overview_order,
             => true,
             else => false,
         },
@@ -928,4 +938,36 @@ test "M29 overview Enter opens the selected entry only in the Comment Overview a
     try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain(vaxis.Key.enter)) == .none);
     try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain(' ')) == .none);
     try testing.expectEqual(Action.open_overview_entry, resolver.feed(configured.keymap(), .comment_overview, plain(vaxis.Key.enter)).action);
+}
+
+test "M29 overview /, u, d, a, and o filter and order only in the Comment Overview and remain configurable" {
+    try validateBindings(&default_bindings);
+    const cases = [_]struct { key: u21, action: Action, other: ?Action, help: []const u8, name: []const u8 }{
+        .{ .key = '/', .action = .edit_overview_query, .other = .open_buffer_search, .help = "filter Comment Overview", .name = "edit_overview_query" },
+        .{ .key = 'u', .action = .toggle_overview_unresolved, .other = null, .help = "unresolved only", .name = "toggle_overview_unresolved" },
+        .{ .key = 'd', .action = .toggle_overview_drafts, .other = null, .help = "Drafts only", .name = "toggle_overview_drafts" },
+        .{ .key = 'a', .action = .toggle_overview_mine, .other = null, .help = "mine only", .name = "toggle_overview_mine" },
+        .{ .key = 'o', .action = .toggle_overview_order, .other = .isolate, .help = "toggle Comment order", .name = "toggle_overview_order" },
+    };
+    for (cases) |case| {
+        var resolver: Resolver = .{};
+        try testing.expectEqual(case.action, resolver.feed(.default, .comment_overview, plain(case.key)).action);
+        try testing.expect(resolver.feed(.default, .comment_overview_query, plain(case.key)) == .none);
+        try testing.expectEqualStrings(case.help, helpFor(case.action));
+        for (std.enums.values(InteractionContext)) |context| try testing.expectEqual(context == .comment_overview, supportsContext(case.action, context));
+        if (case.other) |other| try testing.expectEqual(other, resolver.feed(.default, .diff, plain(case.key)).action);
+        try testing.expectEqual(Action.reanchor_review_item, resolver.feed(.default, .diff_review_card, plain('a')).action);
+
+        const rebound = [_]Override{.{ .action = case.name, .sequences = &.{"space x"} }};
+        var configured = try Keymap.fromOverrides(testing.allocator, &rebound);
+        defer configured.deinit(testing.allocator);
+        try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain(case.key)) == .none);
+        try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain(' ')) == .none);
+        try testing.expectEqual(case.action, resolver.feed(configured.keymap(), .comment_overview, plain('x')).action);
+
+        const unbound = [_]Override{.{ .action = case.name, .sequences = &.{} }};
+        var removed = try Keymap.fromOverrides(testing.allocator, &unbound);
+        defer removed.deinit(testing.allocator);
+        try testing.expect(resolver.feed(removed.keymap(), .comment_overview, plain(case.key)) == .none);
+    }
 }

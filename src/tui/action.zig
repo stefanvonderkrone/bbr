@@ -68,6 +68,11 @@ pub const Action = enum {
     show_comment_overview,
     show_diff_pane,
     open_overview_entry,
+    edit_overview_query,
+    toggle_overview_unresolved,
+    toggle_overview_drafts,
+    toggle_overview_mine,
+    toggle_overview_order,
 };
 
 /// The terminal-independent input surface and semantic cursor target used to
@@ -92,4 +97,5 @@ pub const InteractionContext = enum {
     unknown_resolution,
     delete_confirmation,
     comment_overview,
+    comment_overview_query,
 };

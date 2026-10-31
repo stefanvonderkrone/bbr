@@ -1290,7 +1290,7 @@ test "M29 overview hit testing targets Overview Entries only while the Comment O
         .navigation = Nav.init(lines.len, 10),
         .file_tree = .{ .entries = &tree_entries, .viewport = 10 },
         .version_title_targets = .{ .old = .{ .x = 60, .y = 0, .width = 6, .height = 1 } },
-        .overview = .{ .listing = .{ .entries = &listing_entries, .matches = 3, .records = 3 }, .state = .{ .scroll = 1 } },
+        .overview = .{ .listing = .{ .entries = &listing_entries, .matches = 3, .records = 3 }, .state = &.{ .scroll = 1 } },
     };
 
     try testing.expectEqual(HitTarget{ .diff_row = 0 }, hitTest(projection, rects.entries.x, rects.filter.y).?);

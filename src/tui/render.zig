@@ -135,15 +135,19 @@ pub fn drawCommentOverview(scratch: std.mem.Allocator, win: vaxis.Window, review
 const OverviewPart = @import("theme.zig").OverviewPart;
 const OverviewText = struct { text: []const u8, part: OverviewPart };
 
-/// A filter chip. Ticket 03 adds the toggle chips and ticket 04 the File
-/// Tree Filter chip to this table.
+/// A filter chip. Ticket 04 adds the File Tree Filter chip to this table.
 const OverviewChip = struct { text: []const u8, active: bool };
 
-fn overviewChips(state: *const comment_overview.State) [1]OverviewChip {
-    return .{.{ .text = switch (state.order) {
-        .review => "o review order",
-        .newest_first => "o newest first",
-    }, .active = false }};
+fn overviewChips(state: *const comment_overview.State) [4]OverviewChip {
+    return .{
+        .{ .text = "u unresolved", .active = state.unresolved_only },
+        .{ .text = "d drafts", .active = state.drafts_only },
+        .{ .text = "a mine", .active = state.mine_only },
+        .{ .text = switch (state.order) {
+            .review => "o review order",
+            .newest_first => "o newest first",
+        }, .active = false },
+    };
 }
 
 const overview_chip_gap: usize = 2;
@@ -164,7 +168,7 @@ fn drawOverviewFilter(win: vaxis.Window, overview: *const comment_overview.Frame
     var query_width: usize = 0;
     for (texts) |text| query_width += metrics.width(text.text);
 
-    const chips = overviewChips(&overview.state);
+    const chips = overviewChips(overview.state);
     var shown: usize = chips.len;
     var chips_width: usize = 0;
     while (true) : (shown -= 1) {
@@ -5664,6 +5668,7 @@ const overview_test_records = [_]comment_overview.Record{
         .excerpt = "Looks good to me",
         .haystack = "",
         .review_rank = 0,
+        .recency_rank = 0,
     },
     .{
         .owner = .{ .comment = 2 },
@@ -5678,6 +5683,7 @@ const overview_test_records = [_]comment_overview.Record{
         .excerpt = "Agreed",
         .haystack = "",
         .review_rank = 1,
+        .recency_rank = 1,
     },
     .{
         .owner = .{ .draft = 3 },
@@ -5692,6 +5698,7 @@ const overview_test_records = [_]comment_overview.Record{
         .excerpt = "Ship it",
         .haystack = "",
         .review_rank = 2,
+        .recency_rank = 2,
     },
 };
 
@@ -5771,7 +5778,53 @@ test "M29 overview the Comment Overview has rounded corners, its Title, and a ru
     try testing.expectEqualStrings("├", win.readCell(box.x, rects.filter.y + 1).?.char.grapheme);
     try testing.expectEqualStrings("┤", win.readCell(right, rects.filter.y + 1).?.char.grapheme);
     try testing.expectEqualStrings("/filter", try overviewRowText(a, win, rects.filter.x, rects.filter.y, 7));
-    try testing.expectEqualStrings("o review order", try overviewRowText(a, win, rects.filter.x + rects.filter.width - 14, rects.filter.y, 14));
+    try testing.expectEqualStrings("a mine", try overviewRowText(a, win, rects.filter.x + rects.filter.width - 6, rects.filter.y, 6));
+}
+
+test "M29 overview the filter row shows the query, the cursor cell, and the active chips" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const geometry: @import("frame.zig").Geometry = .{ .cols = 120, .rows = 12 };
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const rects = @import("frame.zig").overviewRects(geometry);
+    const chips = "u unresolved  d drafts  a mine  o newest first";
+    const chips_x = rects.filter.x + rects.filter.width - chips.len;
+    var overview = overview_test_frame;
+    var state: comment_overview.State = .{ .unresolved_only = true, .mine_only = true, .order = .newest_first };
+    state.setQuery("ada");
+    overview.state = &state;
+    overview.query_input = true;
+    drawCommentOverview(a, win, try overviewTestReview(geometry, overview), theme_dark);
+
+    try testing.expectEqualStrings("/ada▏ ", try overviewRowText(a, win, rects.filter.x, rects.filter.y, 6));
+    try testing.expectEqualStrings(chips, try overviewRowText(a, win, @intCast(chips_x), rects.filter.y, chips.len));
+    const style = struct {
+        fn at(w: vaxis.Window, x: usize, y: u16) vaxis.Style {
+            return w.readCell(@intCast(x), y).?.style;
+        }
+    }.at;
+    const active = theme_dark.overviewStyle(.chip_active, .comment);
+    const muted = theme_dark.overviewStyle(.chip, .comment);
+    try testing.expectEqual(theme_dark.overviewStyle(.query, .comment).fg, style(win, rects.filter.x + 1, rects.filter.y).fg);
+    for ([_]struct { offset: usize, style: vaxis.Style }{
+        .{ .offset = 0, .style = active },
+        .{ .offset = 14, .style = muted },
+        .{ .offset = 24, .style = active },
+        .{ .offset = 32, .style = muted },
+    }) |chip| {
+        const cell = style(win, chips_x + chip.offset, rects.filter.y);
+        try testing.expectEqual(chip.style.fg, cell.fg);
+        try testing.expectEqual(chip.style.bold, cell.bold);
+    }
+    try testing.expect(!std.meta.eql(active.fg, muted.fg) or active.bold != muted.bold);
+
+    state.setQuery("");
+    overview.query_input = false;
+    drawCommentOverview(a, win, try overviewTestReview(geometry, overview), theme_dark);
+    try testing.expectEqualStrings("/filter", try overviewRowText(a, win, rects.filter.x, rects.filter.y, 7));
+    try testing.expectEqual(theme_dark.overviewStyle(.placeholder, .comment).fg, style(win, rects.filter.x + 1, rects.filter.y).fg);
 }
 
 test "M29 overview the Main Pane paints one Pane at a time" {
@@ -5859,8 +5912,8 @@ test "M29 overview an entry row shows the indent, the resolved mark, the author,
     const geometry: @import("frame.zig").Geometry = .{ .cols = 100, .rows = 12 };
     const rects = @import("frame.zig").overviewRects(geometry);
     var records = overview_test_records ++ [_]comment_overview.Record{
-        .{ .owner = .{ .comment = 4 }, .parent = null, .depth = 0, .role = .comment, .author = "Lin", .scope = .{ .@"inline" = .{ .path = "lib.zig", .from = 7 } }, .scope_state = null, .resolved = false, .mine = false, .excerpt = "Why?", .haystack = "", .review_rank = 3 },
-        .{ .owner = .{ .comment = 5 }, .parent = null, .depth = 0, .role = .comment, .author = "Kim", .scope = .{ .file = .{ .path = "docs/a.md", .source_commit = "c" } }, .scope_state = .outdated, .resolved = false, .mine = false, .excerpt = "Typo", .haystack = "", .review_rank = 4 },
+        .{ .owner = .{ .comment = 4 }, .parent = null, .depth = 0, .role = .comment, .author = "Lin", .scope = .{ .@"inline" = .{ .path = "lib.zig", .from = 7 } }, .scope_state = null, .resolved = false, .mine = false, .excerpt = "Why?", .haystack = "", .review_rank = 3, .recency_rank = 3 },
+        .{ .owner = .{ .comment = 5 }, .parent = null, .depth = 0, .role = .comment, .author = "Kim", .scope = .{ .file = .{ .path = "docs/a.md", .source_commit = "c" } }, .scope_state = .outdated, .resolved = false, .mine = false, .excerpt = "Typo", .haystack = "", .review_rank = 4, .recency_rank = 4 },
     };
     records[0].scope_state = .moved;
     const entries = [_]comment_overview.Entry{ .{ .record = 0, .context = true }, .{ .record = 1, .context = false }, .{ .record = 2, .context = false }, .{ .record = 3, .context = false }, .{ .record = 4, .context = false } };

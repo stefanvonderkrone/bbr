@@ -4048,6 +4048,8 @@ const Published = struct {
     active_search: enum { none, buffer, review } = .none,
     main_pane: MainPane,
     overview: comment_overview.State,
+    /// The open query input of the Comment Overview.
+    overview_query_input: ?comment_overview.QueryInput,
     overview_indexes: ArenaRing(2),
     overview_listings: ArenaRing(2),
     overview_index: comment_overview.Index,
@@ -4144,6 +4146,7 @@ const Published = struct {
         errdefer published.overview_listings.deinit();
         published.main_pane = .diff_pane;
         published.overview = .{};
+        published.overview_query_input = null;
         published.overview_index = .{};
         published.overview_listing = .{};
         published.overview_index_stale = true;
@@ -4343,8 +4346,9 @@ const Published = struct {
                 .comment_overview => .{
                     .records = self.overview_index.records,
                     .listing = self.overview_listing,
-                    .state = self.overview,
+                    .state = &self.overview,
                     .selected = self.overviewSelectedEntry(),
+                    .query_input = self.overview_query_input != null,
                     .cell_metrics = self.cell_metrics,
                 },
             },
@@ -4944,9 +4948,10 @@ const Published = struct {
         return frame_mod.overviewRects(self.geometry).entries.height;
     }
 
-    /// Builds the index when it is stale, then the listing, and publishes
-    /// both in one infallible step. A failure keeps the previous ones.
-    fn rebuildOverview(self: *Published, authenticated_account_uuid: ?[]const u8) !void {
+    /// Builds the index when it is stale, then the listing for `state`, and
+    /// publishes both and `state` in one infallible step. A failure keeps the
+    /// previous ones.
+    fn rebuildOverview(self: *Published, authenticated_account_uuid: ?[]const u8, state: comment_overview.State) !void {
         var index = self.overview_index;
         var index_staged = false;
         errdefer if (index_staged) self.overview_indexes.abort();
@@ -4965,16 +4970,23 @@ const Published = struct {
         }
         const allocator = self.overview_listings.begin();
         errdefer self.overview_listings.abort();
-        const listing = try comment_overview.buildListing(allocator, &index, &self.overview);
-        const selected = try keptOverviewSelection(allocator, self.overview_index.records, self.overview_listing, index.records, listing, self.overview.selected);
+        const listing = try comment_overview.buildListing(allocator, &index, &state);
+        const selected = try keptOverviewSelection(allocator, self.overview_index.records, self.overview_listing, index.records, listing, state.selected);
         if (index_staged) self.overview_indexes.commit();
         self.overview_listings.commit();
         self.overview_index = index;
         self.overview_listing = listing;
         self.overview_index_stale = false;
+        self.overview = state;
         self.overview.selected = selected;
         self.followOverviewSelection();
         self.frame_revision += 1;
+    }
+
+    fn changeOverview(self: *Published, authenticated_account_uuid: ?[]const u8, change: comment_overview.Change) !void {
+        var state = self.overview;
+        state.apply(change);
+        try self.rebuildOverview(authenticated_account_uuid, state);
     }
 
     /// The scroll keeps its top entry until the selection leaves the
@@ -6926,6 +6938,7 @@ pub const Presentation = struct {
         if (self.delete_confirmation != null) return .delete_confirmation;
         if (self.list_overlay) |*overlay| return overlay.interactionContext();
         if (self.published) |published| if (published.buffer_search.input != null) return .buffer_search_input;
+        if (self.published) |published| if (published.overview_query_input != null) return .comment_overview_query;
         if (self.published) |published| if (published.review_search.open) return .review_search;
         return self.paneContext();
     }
@@ -7396,6 +7409,16 @@ pub const Presentation = struct {
             if (key.text) |text| return try self.insertBufferSearch(text);
             return;
         };
+        if (self.published) |published| if (published.overview_query_input) |*input| {
+            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.closeOverviewQuery(published, .{ .query = input.saved() });
+            if (key.matches(keymap_mod.special.enter, .{})) return self.closeOverviewQuery(published, null);
+            const query = published.overview.query();
+            if (key.matches(keymap_mod.special.backspace, .{})) return self.changeOverview(published, .{ .query = query[0..lastScalarStart(query)] });
+            if (key.matches('w', .{ .ctrl = true })) return self.changeOverview(published, .{ .query = query[0..searchWordStart(query)] });
+            if (key.matches('u', .{ .ctrl = true })) return self.changeOverview(published, .{ .query = "" });
+            if (key.text) |text| return self.insertOverviewQuery(published, text);
+            return;
+        };
         if (self.published) |published| if (published.review_search.open) {
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.closeReviewSearch();
             if (key.matches(keymap_mod.special.backspace, .{})) return self.editReviewSearch(.backspace);
@@ -7776,6 +7799,11 @@ pub const Presentation = struct {
             .show_comment_overview => self.showCommentOverview(published),
             .show_diff_pane => self.showDiffPane(published),
             .open_overview_entry => self.openOverviewEntry(published),
+            .edit_overview_query => openOverviewQuery(published),
+            .toggle_overview_unresolved => self.changeOverview(published, .unresolved_only),
+            .toggle_overview_drafts => self.changeOverview(published, .drafts_only),
+            .toggle_overview_mine => self.changeOverview(published, .mine_only),
+            .toggle_overview_order => self.changeOverview(published, .order),
             .review_comment => self.openComposer(published, .{ .kind = .comment, .label = "New comment", .scope = .review }),
             .file_comment => self.openFileComposer(published),
             .reply => self.openReplyComposer(published),
@@ -9924,7 +9952,7 @@ pub const Presentation = struct {
 
     fn showCommentOverview(self: *Presentation, published: *Published) void {
         if (published.main_pane == .comment_overview) return;
-        published.rebuildOverview(self.authenticatedAccountUuid()) catch {
+        published.rebuildOverview(self.authenticatedAccountUuid(), published.overview) catch {
             self.action_error = .out_of_memory;
             return;
         };
@@ -9932,6 +9960,48 @@ pub const Presentation = struct {
         published.focus = .diff;
         published.frame_revision += 1;
         cancelOverviewDestination(published);
+    }
+
+    /// Opens the query input and saves the query that Escape restores. A
+    /// pending Count ends here, so it never reaches the query.
+    fn openOverviewQuery(published: *Published) void {
+        published.navigation.count = 0;
+        if (published.main_pane != .comment_overview or published.overview_query_input != null) return;
+        published.overview_query_input = .init(&published.overview);
+        published.frame_revision += 1;
+    }
+
+    /// Closes the query input. A `restore` change that fails keeps the
+    /// input open with the edited query.
+    fn closeOverviewQuery(self: *Presentation, published: *Published, restore: ?comment_overview.Change) void {
+        if (restore) |change| published.changeOverview(self.authenticatedAccountUuid(), change) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.overview_query_input = null;
+        published.frame_revision += 1;
+    }
+
+    fn insertOverviewQuery(self: *Presentation, published: *Published, text: []const u8) void {
+        if (!std.unicode.utf8ValidateSlice(text)) return;
+        var joined: [comment_overview.max_query_bytes]u8 = undefined;
+        const query = published.overview.query();
+        const len = @min(text.len, joined.len - query.len);
+        @memcpy(joined[0..query.len], query);
+        @memcpy(joined[query.len..][0..len], text[0..len]);
+        self.changeOverview(published, .{ .query = joined[0 .. query.len + len] });
+    }
+
+    /// Rebuilds the listing for the changed Overview State. An allocation
+    /// failure keeps the previous listing and Overview State.
+    fn changeOverview(self: *Presentation, published: *Published, change: comment_overview.Change) void {
+        published.navigation.count = 0;
+        if (published.main_pane != .comment_overview) return;
+        published.changeOverview(self.authenticatedAccountUuid(), change) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.action_error = null;
     }
 
     fn showDiffPane(self: *Presentation, published: *Published) void {
@@ -9948,9 +10018,16 @@ pub const Presentation = struct {
     fn refreshOverview(self: *Presentation) void {
         const published = self.published orelse return;
         if (published.main_pane != .comment_overview or !published.overview_index_stale) return;
-        published.rebuildOverview(self.authenticatedAccountUuid()) catch {
+        published.rebuildOverview(self.authenticatedAccountUuid(), published.overview) catch {
             self.action_error = .out_of_memory;
         };
+    }
+
+    /// Without a known Authenticated Account, no Comment is mine, so the
+    /// Overview Index rebuilds.
+    fn forgetAuthenticatedAccount(self: *Presentation) void {
+        self.authenticated_account_uuid = null;
+        if (self.published) |published| published.overview_index_stale = true;
     }
 
     fn authenticatedAccountUuid(self: *const Presentation) ?[]const u8 {
@@ -10371,7 +10448,7 @@ pub const Presentation = struct {
         const durable = self.durable_comment_edit orelse return;
         if (!durableIdentityMatches(durable.key, completed.identity) or durable.comment_id != completed.comment_id) return;
         if (completed.outcome == .definitive_failure) {
-            if (completed.outcome.definitive_failure == error.Unauthorized) self.authenticated_account_uuid = null;
+            if (completed.outcome.definitive_failure == error.Unauthorized) self.forgetAuthenticatedAccount();
             self.restoreCommentEditComposer(durable);
             self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
             self.durable_comment_edit = null;
@@ -10411,7 +10488,7 @@ pub const Presentation = struct {
         const durable = self.durable_comment_delete orelse return;
         if (!durableIdentityMatches(durable.key, completed.identity) or durable.comment_id != completed.comment_id) return;
         if (completed.outcome == .definitive_failure) {
-            if (completed.outcome.definitive_failure == error.Unauthorized) self.authenticated_account_uuid = null;
+            if (completed.outcome.definitive_failure == error.Unauthorized) self.forgetAuthenticatedAccount();
             self.restoreCommentDeleteConfirmation(durable);
             self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
             self.durable_comment_delete = null;
@@ -10494,7 +10571,7 @@ pub const Presentation = struct {
                 return;
             },
         };
-        if (result.invalidatesAuthenticatedAccount()) self.authenticated_account_uuid = null;
+        if (result.invalidatesAuthenticatedAccount()) self.forgetAuthenticatedAccount();
         switch (result) {
             .success, .reconciled_success => {
                 const visible = !self.shutdown_requested and self.published != null and
@@ -29920,7 +29997,7 @@ test "M29 overview g o shows the Comment Overview and g d restores the DiffPane"
     frame = presentation.projection().review.?.frame;
     try testing.expectEqual(@as(?usize, viewport), frame.overview.selected);
     try testing.expect(frame.overview.selected.? >= frame.overview.state.scroll and frame.overview.selected.? < frame.overview.state.scroll + viewport);
-    const overview_before = frame.overview.state;
+    const overview_before = frame.overview.state.*;
 
     try presentation.dispatch(.{ .action = .show_diff_pane });
     frame = presentation.projection().review.?.frame;
@@ -30289,11 +30366,11 @@ test "M29 overview g o after the jump shows the same selection and scroll" {
     var presentation = try testOverviewJumpPresentation(&store, 1);
     defer presentation.deinit();
     try openOverviewOwner(&presentation, .{ .comment = 9 });
-    const before = presentation.projection().review.?.frame.overview.state;
+    const before = presentation.projection().review.?.frame.overview.state.*;
     try completeDisclosureBuild(&presentation);
     try expectCursorOnHeader(&presentation, .{ .comment = 9 });
     try presentation.dispatch(.{ .action = .show_comment_overview });
-    const after = presentation.projection().review.?.frame.overview.state;
+    const after = presentation.projection().review.?.frame.overview.state.*;
     try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
     try testing.expectEqual(before.selected, after.selected);
     try testing.expectEqual(before.scroll, after.scroll);
@@ -30404,12 +30481,13 @@ test "M29 overview a missing destination row keeps the Comment Overview and repo
     // the Review after the index build.
     job.overview_owner = .{ .comment = 999 };
     const before = presentation.projection().review.?.frame;
+    const selected_before = before.overview.state.selected;
     job.build();
     try presentation.dispatch(.{ .buffer_disclosure_built = job });
     const after = presentation.projection().review.?.frame;
     try testing.expectEqual(MainPane.comment_overview, after.main_pane);
     try testing.expectEqual(before.visual_rows.ptr, after.visual_rows.ptr);
-    try testing.expectEqual(before.overview.state.selected, after.overview.state.selected);
+    try testing.expectEqual(selected_before, after.overview.state.selected);
     try testing.expectEqual(ActionError.overview_entry_unavailable, presentation.projection().action_error.?);
 }
 
@@ -30446,4 +30524,197 @@ test "M29 overview a click on the selected entry opens it" {
     try presentation.dispatch(release);
     try completeDisclosureBuild(&presentation);
     try expectCursorOnHeader(&presentation, owner);
+}
+
+fn testOverviewQuery(presentation: *Presentation) []const u8 {
+    return presentation.published.?.overview.query();
+}
+
+fn testOverviewOwners(presentation: *Presentation, owners: []const review_card.Owner) !void {
+    const overview = presentation.projection().review.?.frame.overview;
+    try testing.expectEqual(owners.len, overview.listing.entries.len);
+    for (owners, overview.listing.entries) |owner, entry| try testing.expectEqual(owner, overview.records[entry.record].owner);
+}
+
+fn typeOverviewKey(presentation: *Presentation, text: []const u8) !void {
+    try presentation.dispatch(.{ .key = .{ .codepoint = text[0], .text = text } });
+}
+
+test "M29 overview the query input edits the query and a Count never reaches it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 3);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .push_count_digit = 3 });
+    try typeOverviewKey(&presentation, "/");
+    try testing.expectEqual(keymap_mod.InteractionContext.comment_overview_query, presentation.interactionContext());
+    try testing.expect(presentation.projection().review.?.frame.overview.query_input);
+    try testing.expectEqualStrings("", testOverviewQuery(&presentation));
+    try testing.expectEqual(@as(u32, 0), presentation.published.?.navigation.count);
+
+    try typeOverviewKey(&presentation, "2");
+    try testing.expectEqualStrings("2", testOverviewQuery(&presentation));
+    try testOverviewOwners(&presentation, &.{.{ .comment = 12 }});
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    try testing.expectEqualStrings("", testOverviewQuery(&presentation));
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 10 }, .{ .comment = 11 }, .{ .comment = 12 }, .{ .comment = 500 }, .{ .comment = 501 } });
+    try typeOverviewKey(&presentation, "inline ro");
+    try testOverviewOwners(&presentation, &.{.{ .comment = 500 }});
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'w', .mods = .{ .ctrl = true } } });
+    try testing.expectEqualStrings("inline ", testOverviewQuery(&presentation));
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 500 }, .{ .comment = 501 } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try testing.expectEqualStrings("", testOverviewQuery(&presentation));
+    for ([_][]const u8{ "j", "u", "o", "é" }) |text| try typeOverviewKey(&presentation, text);
+    try testing.expectEqualStrings("juoé", testOverviewQuery(&presentation));
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    try testing.expectEqualStrings("juo", testOverviewQuery(&presentation));
+    try testing.expect(!presentation.published.?.overview.unresolved_only);
+    try testing.expectEqual(comment_overview.Order.review, presentation.published.?.overview.order);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try typeOverviewKey(&presentation, "review");
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expectEqual(keymap_mod.InteractionContext.comment_overview, presentation.interactionContext());
+    try testing.expect(!presentation.projection().review.?.frame.overview.query_input);
+    try testing.expectEqualStrings("review", testOverviewQuery(&presentation));
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 10 }, .{ .comment = 11 }, .{ .comment = 12 } });
+
+    for ([_]keymap_mod.KeyStroke{ .{ .codepoint = keymap_mod.special.escape }, .{ .codepoint = 'c', .mods = .{ .ctrl = true } } }) |cancel| {
+        try typeOverviewKey(&presentation, "/");
+        try typeOverviewKey(&presentation, "x");
+        try testing.expectEqualStrings("reviewx", testOverviewQuery(&presentation));
+        try testOverviewOwners(&presentation, &.{});
+        try presentation.dispatch(.{ .key = cancel });
+        try testing.expectEqual(keymap_mod.InteractionContext.comment_overview, presentation.interactionContext());
+        try testing.expectEqualStrings("review", testOverviewQuery(&presentation));
+        try testOverviewOwners(&presentation, &.{ .{ .comment = 10 }, .{ .comment = 11 }, .{ .comment = 12 } });
+    }
+}
+
+test "M29 overview the query keeps whole scalars up to 256 bytes" {
+    var state: comment_overview.State = .{};
+    state.setQuery("a" ** 255 ++ "é");
+    try testing.expectEqual(@as(usize, 255), state.query_len);
+    state.setQuery("é\xff");
+    try testing.expectEqualStrings("é", state.query());
+}
+
+test "M29 overview a filter change that hides the selected entry selects the next shown entry" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 3);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try selectOverviewOwner(&presentation, .{ .comment = 11 });
+    try typeOverviewKey(&presentation, "/");
+    try typeOverviewKey(&presentation, "review 2");
+    try testing.expectEqual(review_card.Owner{ .comment = 12 }, testOverviewSelectedOwner(&presentation).?);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try testing.expectEqual(review_card.Owner{ .comment = 12 }, testOverviewSelectedOwner(&presentation).?);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+
+    try selectOverviewOwner(&presentation, .{ .comment = 500 });
+    try typeOverviewKey(&presentation, "u");
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 10 }, .{ .comment = 11 }, .{ .comment = 12 } });
+    try testing.expectEqual(review_card.Owner{ .comment = 12 }, testOverviewSelectedOwner(&presentation).?);
+}
+
+test "M29 overview an allocation failure during a query edit keeps the previous listing and query" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 3);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try typeOverviewKey(&presentation, "/");
+    try typeOverviewKey(&presentation, "review");
+    const before = presentation.projection().review.?.frame.overview.listing.entries;
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const listings = published.overview_listings;
+    published.overview_listings = ArenaRing(2).init(failing.allocator());
+    for ([_]keymap_mod.KeyStroke{
+        .{ .codepoint = 'x', .text = "x" },
+        .{ .codepoint = keymap_mod.special.backspace },
+        .{ .codepoint = 'w', .mods = .{ .ctrl = true } },
+        .{ .codepoint = 'u', .mods = .{ .ctrl = true } },
+        .{ .codepoint = keymap_mod.special.escape },
+    }) |key| {
+        presentation.action_error = null;
+        try presentation.dispatch(.{ .key = key });
+        try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+        try testing.expectEqualStrings("review", testOverviewQuery(&presentation));
+        try testing.expectEqual(before.ptr, presentation.projection().review.?.frame.overview.listing.entries.ptr);
+        try testing.expectEqual(keymap_mod.InteractionContext.comment_overview_query, presentation.interactionContext());
+    }
+    published.overview_listings.deinit();
+    published.overview_listings = listings;
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expectEqualStrings("", testOverviewQuery(&presentation));
+    try testing.expectEqual(keymap_mod.InteractionContext.comment_overview, presentation.interactionContext());
+}
+
+test "M29 overview u, d, a, and o change the listing, and g d and g o keep the query, the toggles, and the order" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 2);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try typeOverviewKey(&presentation, "u");
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 10 }, .{ .comment = 11 } });
+    try typeOverviewKey(&presentation, "u");
+    try typeOverviewKey(&presentation, "a");
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 10 }, .{ .comment = 11 } });
+    try typeOverviewKey(&presentation, "u");
+    try typeOverviewKey(&presentation, "o");
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 11 }, .{ .comment = 10 } });
+    try typeOverviewKey(&presentation, "d");
+    try testOverviewOwners(&presentation, &.{});
+    try typeOverviewKey(&presentation, "d");
+    try typeOverviewKey(&presentation, "/");
+    try typeOverviewKey(&presentation, "1");
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testOverviewOwners(&presentation, &.{.{ .comment = 11 }});
+    const state = presentation.published.?.overview;
+
+    try typeOverviewKey(&presentation, "g");
+    try typeOverviewKey(&presentation, "d");
+    try testing.expectEqual(MainPane.diff_pane, presentation.projection().review.?.frame.main_pane);
+    try typeOverviewKey(&presentation, "g");
+    try typeOverviewKey(&presentation, "o");
+    const overview = presentation.projection().review.?.frame.overview;
+    try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
+    try testing.expectEqualStrings("1", testOverviewQuery(&presentation));
+    try testing.expect(overview.state.unresolved_only and overview.state.mine_only and !overview.state.drafts_only);
+    try testing.expectEqual(comment_overview.Order.newest_first, overview.state.order);
+    try testing.expectEqual(state.selected, overview.state.selected);
+    try testOverviewOwners(&presentation, &.{.{ .comment = 11 }});
+}
+
+test "M29 overview a lost Authenticated Account keeps no Comment in mine only" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const loaded = try testOverviewSession(testing.allocator, 1, 2);
+    loaded.source.remote.author_uuid = "{author}";
+    loaded.source.remote.reviewer_verdicts = &.{};
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = loaded },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try typeOverviewKey(&presentation, "a");
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 10 }, .{ .comment = 11 } });
+    try presentation.dispatch(.{ .action = .set_verdict_approved });
+    const command = presentation.takeCommand().?.change_reviewer_verdict;
+    try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .target = command.target,
+        .outcome = .{ .completed = .{ .api_error = error.Unauthorized } },
+    } });
+    try testing.expect(presentation.authenticated_account_uuid == null);
+    try testOverviewOwners(&presentation, &.{});
 }

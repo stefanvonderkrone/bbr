@@ -1301,6 +1301,7 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
                 items.hint(.switch_review, "p", " switch");
             },
             .comment_overview => {
+                items.hint(.filter, "/", " filter");
                 items.hint(.open, "↵", " open");
                 items.hint(.main_pane, "g d", " DiffPane");
             },
@@ -1564,7 +1565,7 @@ test "M29 overview the status shows the Comment Overview hints and the listing p
     const a = arena.allocator();
     const rows = try testStatusRows(a, try testDrawStatus(a, theme.dark, .{ .main_pane = .comment_overview, .position = 3, .total = 12 }));
     try std.testing.expect(std.mem.endsWith(u8, rows[0], "3/12"));
-    try std.testing.expectEqualStrings("↵ open  ·  g d DiffPane  ·  X submit 2  ·  ? help  ·  q quit", rows[1]);
+    try std.testing.expectEqualStrings("/ filter  ·  ↵ open  ·  g d DiffPane  ·  X submit 2  ·  ? help  ·  q quit", rows[1]);
     try std.testing.expectEqualStrings("The entry is no longer in the Review", actionErrorText(.overview_entry_unavailable));
 }
 

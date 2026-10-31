@@ -9,14 +9,18 @@ const buffer_mod = @import("buffer.zig");
 const file_tree = @import("file_tree.zig");
 const review_card = @import("review_card.zig");
 const review_body = @import("review_body.zig");
+const list_overlay = @import("list_overlay.zig");
 const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 
 pub const Order = enum { review, newest_first };
 
+/// The longest query in bytes.
+pub const max_query_bytes = 256;
+
 /// The Overview State. It belongs to the Session, so a Session replacement
 /// resets it.
 pub const State = struct {
-    query_buf: [256]u8 = undefined,
+    query_buf: [max_query_bytes]u8 = undefined,
     query_len: usize = 0,
     unresolved_only: bool = false,
     drafts_only: bool = false,
@@ -28,6 +32,57 @@ pub const State = struct {
 
     pub fn query(self: *const State) []const u8 {
         return self.query_buf[0..self.query_len];
+    }
+
+    /// Keeps the whole UTF-8 scalars of `text` that fit in the query buffer.
+    pub fn setQuery(self: *State, text: []const u8) void {
+        var len: usize = 0;
+        while (len < text.len) {
+            const size = std.unicode.utf8ByteSequenceLength(text[len]) catch break;
+            if (len + size > text.len or len + size > self.query_buf.len) break;
+            len += size;
+        }
+        std.mem.copyForwards(u8, self.query_buf[0..len], text[0..len]);
+        self.query_len = len;
+    }
+
+    pub fn apply(self: *State, change: Change) void {
+        switch (change) {
+            .unresolved_only => self.unresolved_only = !self.unresolved_only,
+            .drafts_only => self.drafts_only = !self.drafts_only,
+            .mine_only => self.mine_only = !self.mine_only,
+            .order => self.order = switch (self.order) {
+                .review => .newest_first,
+                .newest_first => .review,
+            },
+            .query => |text| self.setQuery(text),
+        }
+    }
+};
+
+/// One Overview State change that rebuilds the listing.
+pub const Change = union(enum) {
+    unresolved_only,
+    drafts_only,
+    mine_only,
+    order,
+    /// The whole new query text. It can alias the current query.
+    query: []const u8,
+};
+
+/// The open query input. Escape restores the saved query.
+pub const QueryInput = struct {
+    saved_buf: [max_query_bytes]u8 = undefined,
+    saved_len: usize = 0,
+
+    pub fn init(state: *const State) QueryInput {
+        var input: QueryInput = .{ .saved_len = state.query_len };
+        @memcpy(input.saved_buf[0..state.query_len], state.query());
+        return input;
+    }
+
+    pub fn saved(self: *const QueryInput) []const u8 {
+        return self.saved_buf[0..self.saved_len];
     }
 };
 
@@ -59,6 +114,9 @@ pub const Record = struct {
     /// The author, the scope path, and the authored body, joined with newlines.
     haystack: []const u8,
     review_rank: usize,
+    /// The position in newest first. A Thread sorts by its newest member,
+    /// and its Replies keep their Review order.
+    recency_rank: usize,
 };
 
 /// Every record in Review order. The index owns every string.
@@ -79,10 +137,15 @@ pub const Listing = struct {
 
 /// What the renderer and hit testing read from a published Presentation
 /// Frame while the Comment Overview shows.
+const empty_state: State = .{};
+
 pub const Frame = struct {
     records: []const Record = &.{},
     listing: Listing = .{},
-    state: State = .{},
+    /// Borrowed from `Published`, so the query bytes outlive the paint.
+    /// vaxis cells keep their text until render, so a by-value copy of the
+    /// query buffer on a stack would leave dangling cells.
+    state: *const State = &empty_state,
     /// The listing entry of `state.selected`.
     selected: ?usize = null,
     query_input: bool = false,
@@ -125,8 +188,10 @@ pub fn buildIndex(allocator: std.mem.Allocator, inputs: IndexInputs) !Index {
 
     const records = try allocator.alloc(Record, nodes.len);
     var rank: usize = 0;
-    for (trees.items) |tree| {
+    for (trees.items) |*tree| {
         const root = nodes[tree.start];
+        tree.newest = 0;
+        for (nodes[tree.start..tree.end]) |node| tree.newest = @max(tree.newest, recency(node.owner));
         const scope = try copyScope(allocator, root.scope);
         const scope_state: ?bbr.review.ScopeState, const resolved = switch (root.source) {
             .comment => |comment| .{ comment.state, threads_by_root.get(comment.id).?.resolved },
@@ -158,19 +223,86 @@ pub fn buildIndex(allocator: std.mem.Allocator, inputs: IndexInputs) !Index {
                 .excerpt = try allocator.dupe(u8, try review_body.excerpt(scratch, parsed, excerpt_bytes)),
                 .haystack = try std.mem.join(allocator, "\n", &.{ author, scopePath(scope), body }),
                 .review_rank = rank,
+                .recency_rank = undefined,
             };
             rank += 1;
         }
     }
+
+    var review_start: usize = 0;
+    for (trees.items) |*tree| {
+        const len = tree.end - tree.start;
+        tree.start = review_start;
+        tree.end = review_start + len;
+        review_start = tree.end;
+    }
+    std.mem.sort(Tree, trees.items, {}, Tree.newerThan);
+    rank = 0;
+    for (trees.items) |tree| for (records[tree.start..tree.end]) |*record| {
+        record.recency_rank = rank;
+        rank += 1;
+    };
     return .{ .records = records };
 }
 
-/// Ticket 03 adds the filters, the context entries, and newest first.
+/// A larger value is newer. A Draft is newer than every Comment, and a
+/// larger TempId or CommentId is newer than a smaller one.
+fn recency(owner: review_card.Owner) u128 {
+    return switch (owner) {
+        .comment => |id| id,
+        .draft => |id| (@as(u128, 1) << 64) | id,
+    };
+}
+
+/// The matching entries in the Overview State order, each under its
+/// ancestors. An ancestor that does not match is a context entry.
 pub fn buildListing(allocator: std.mem.Allocator, index: *const Index, state: *const State) !Listing {
-    _ = state;
-    const entries = try allocator.alloc(Entry, index.records.len);
-    for (entries, 0..) |*entry, record| entry.* = .{ .record = record, .context = false };
-    return .{ .entries = entries, .matches = entries.len, .records = index.records.len };
+    const records = index.records;
+    var needles: list_overlay.Query.Needles = undefined;
+    const query = list_overlay.Query.parse(state.query(), &needles);
+
+    const Shown = enum { hidden, context, match };
+    const shown = try allocator.alloc(Shown, records.len);
+    defer allocator.free(shown);
+    var ancestors: std.ArrayList(usize) = .empty;
+    defer ancestors.deinit(allocator);
+    var matches: usize = 0;
+    for (records, 0..) |record, position| {
+        std.debug.assert(record.depth <= ancestors.items.len);
+        ancestors.shrinkRetainingCapacity(record.depth);
+        try ancestors.append(allocator, position);
+        shown[position] = .hidden;
+        if (!keeps(record, state, query)) continue;
+        shown[position] = .match;
+        matches += 1;
+        for (ancestors.items[0..record.depth]) |ancestor| {
+            if (shown[ancestor] == .hidden) shown[ancestor] = .context;
+        }
+    }
+
+    const ordered = try allocator.alloc(usize, records.len);
+    defer allocator.free(ordered);
+    for (records, 0..) |record, position| ordered[
+        switch (state.order) {
+            .review => record.review_rank,
+            .newest_first => record.recency_rank,
+        }
+    ] = position;
+
+    var entries: std.ArrayList(Entry) = .empty;
+    errdefer entries.deinit(allocator);
+    for (ordered) |position| if (shown[position] != .hidden)
+        try entries.append(allocator, .{ .record = position, .context = shown[position] == .context });
+    return .{ .entries = try entries.toOwnedSlice(allocator), .matches = matches, .records = records.len };
+}
+
+/// Every active filter keeps the record. A blank query keeps every record.
+fn keeps(record: Record, state: *const State, query: ?list_overlay.Query) bool {
+    if (state.unresolved_only and record.resolved) return false;
+    if (state.drafts_only and record.owner != .draft) return false;
+    if (state.mine_only and !record.mine) return false;
+    if (query) |value| if (value.rank(record.haystack) == null) return false;
+    return true;
 }
 
 /// One Thread root and its Replies, in Buffer order.
@@ -178,9 +310,15 @@ const Tree = struct {
     key: TreeKey,
     start: usize,
     end: usize,
+    /// The `recency` of the newest member.
+    newest: u128 = 0,
 
     fn lessThan(_: void, lhs: Tree, rhs: Tree) bool {
         return lhs.key.order(rhs.key) == .lt;
+    }
+
+    fn newerThan(_: void, lhs: Tree, rhs: Tree) bool {
+        return lhs.newest > rhs.newest;
     }
 };
 
@@ -451,14 +589,7 @@ test "M29 overview the index hides a submitting Draft and lists a posted Draft u
 const OwnerPair = struct { owner: Owner, parent: ?Owner };
 
 fn pairLessThan(_: void, lhs: OwnerPair, rhs: OwnerPair) bool {
-    return ownerKey(lhs.owner) < ownerKey(rhs.owner);
-}
-
-fn ownerKey(owner: Owner) u128 {
-    return switch (owner) {
-        .comment => |id| id,
-        .draft => |id| (@as(u128, 1) << 64) | id,
-    };
+    return recency(lhs.owner) < recency(rhs.owner);
 }
 
 test "M29 overview the index lists the DiffPane ReviewCards with every disclosure open" {
@@ -626,4 +757,141 @@ test "M29 overview the index and listing builds release every failed arena" {
             try testing.expectEqual(@as(usize, 5), listing.entries.len);
         }
     }.run, .{});
+}
+
+const Listed = struct { owner: Owner, context: bool = false };
+
+fn expectListing(expected: []const Listed, index: Index, state: State) !void {
+    const listing = try buildListing(testing.allocator, &index, &state);
+    defer testing.allocator.free(listing.entries);
+    var actual: std.ArrayList(Listed) = .empty;
+    defer actual.deinit(testing.allocator);
+    var matches: usize = 0;
+    for (listing.entries) |entry| {
+        try actual.append(testing.allocator, .{ .owner = index.records[entry.record].owner, .context = entry.context });
+        matches += @intFromBool(!entry.context);
+    }
+    try testing.expectEqualDeep(expected, actual.items);
+    try testing.expectEqual(matches, listing.matches);
+    try testing.expectEqual(index.records.len, listing.records);
+}
+
+fn queried(text: []const u8) State {
+    var state: State = .{};
+    state.setQuery(text);
+    return state;
+}
+
+/// A resolved Comment Thread on `a.txt` with a Reply, a Review-level Comment
+/// of the Authenticated Account, a File-level Comment on `a/b.txt`, and a
+/// Draft root with a Draft Reply.
+const filter_comments = [_]Comment{
+    .{ .id = 1, .author = "Ada", .author_uuid = "{ada}", .body = "review wide", .scope = .review },
+    .{ .id = 2, .author = "Bob", .author_uuid = "{bob}", .body = "inline root", .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 2 } }, .resolved = true },
+    .{ .id = 3, .parent_id = 2, .author = "Cy", .author_uuid = "{cy}", .body = "zebra reply" },
+    .{ .id = 4, .author = "Bob", .author_uuid = "{bob}", .body = "nested file", .scope = .{ .file = .{ .path = "a/b.txt", .source_commit = "abc" } } },
+};
+const filter_drafts = [_]Draft{
+    .{ .local_id = 1, .kind = .comment, .body = "draft root" },
+    .{ .local_id = 2, .kind = .comment, .body = "draft reply", .parent = .{ .comment = 4 } },
+};
+
+test "M29 overview the query matches the author, the body, and the path and keeps the order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const index = try (Fixture{ .comments = &filter_comments, .drafts = &filter_drafts, .account = "{ada}" }).index(arena.allocator());
+    const all = [_]Listed{ .{ .owner = .{ .comment = 1 } }, .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 } }, .{ .owner = .{ .draft = 2 } }, .{ .owner = .{ .comment = 2 } }, .{ .owner = .{ .comment = 3 } } };
+    try expectListing(&all, index, .{});
+    try expectListing(&all, index, queried("  \t "));
+    try expectListing(&.{ .{ .owner = .{ .comment = 4 } }, .{ .owner = .{ .comment = 2 } } }, index, queried("bob"));
+    try expectListing(&.{ .{ .owner = .{ .comment = 2 }, .context = true }, .{ .owner = .{ .comment = 3 } } }, index, queried("zebra"));
+    try expectListing(&.{ .{ .owner = .{ .comment = 4 } }, .{ .owner = .{ .draft = 2 } } }, index, queried("a/b.txt"));
+    try expectListing(&.{ .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 }, .context = true }, .{ .owner = .{ .draft = 2 } } }, index, queried("draft"));
+    try expectListing(&.{}, index, queried("zzzz"));
+}
+
+test "M29 overview each toggle keeps only matching items and the toggles combine with AND" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const index = try (Fixture{ .comments = &filter_comments, .drafts = &filter_drafts, .account = "{ada}" }).index(arena.allocator());
+    try expectListing(&.{ .{ .owner = .{ .comment = 1 } }, .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 } }, .{ .owner = .{ .draft = 2 } } }, index, .{ .unresolved_only = true });
+    try expectListing(&.{ .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 }, .context = true }, .{ .owner = .{ .draft = 2 } } }, index, .{ .drafts_only = true });
+    try expectListing(&.{ .{ .owner = .{ .comment = 1 } }, .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 }, .context = true }, .{ .owner = .{ .draft = 2 } } }, index, .{ .mine_only = true });
+    try expectListing(&.{ .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 }, .context = true }, .{ .owner = .{ .draft = 2 } } }, index, .{ .unresolved_only = true, .drafts_only = true, .mine_only = true });
+    var draft_root = queried("root");
+    draft_root.unresolved_only = true;
+    try expectListing(&.{.{ .owner = .{ .draft = 1 } }}, index, draft_root);
+}
+
+test "M29 overview mine only keeps every Draft and only the Comments of the Authenticated Account" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts_only = [_]Listed{ .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 }, .context = true }, .{ .owner = .{ .draft = 2 } } };
+    const cases = [_]struct { account: ?[]const u8, expected: []const Listed }{
+        .{ .account = null, .expected = &drafts_only },
+        .{ .account = "{nobody}", .expected = &drafts_only },
+        .{ .account = "{ada}", .expected = &.{ .{ .owner = .{ .comment = 1 } }, .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 }, .context = true }, .{ .owner = .{ .draft = 2 } } } },
+        .{ .account = "{bob}", .expected = &.{ .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 } }, .{ .owner = .{ .draft = 2 } }, .{ .owner = .{ .comment = 2 } } } },
+    };
+    for (cases) |case| {
+        const index = try (Fixture{ .comments = &filter_comments, .drafts = &filter_drafts, .account = case.account }).index(arena.allocator());
+        try expectListing(case.expected, index, .{ .mine_only = true });
+    }
+}
+
+test "M29 overview a matching Reply keeps its ancestors as context entries outside the Title count" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "root", .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 2 } } },
+        .{ .id = 2, .parent_id = 1, .author = "Bob", .body = "middle" },
+        .{ .id = 3, .parent_id = 2, .author = "Cy", .body = "zebra" },
+        .{ .id = 4, .parent_id = 1, .author = "Dee", .body = "sibling" },
+    };
+    const index = try (Fixture{ .comments = &comments }).index(arena.allocator());
+    try expectListing(&.{ .{ .owner = .{ .comment = 1 }, .context = true }, .{ .owner = .{ .comment = 2 }, .context = true }, .{ .owner = .{ .comment = 3 } } }, index, queried("zebra"));
+    const listing = try buildListing(arena.allocator(), &index, &queried("zebra"));
+    try testing.expectEqual(@as(usize, 1), listing.matches);
+    try testing.expectEqual(@as(usize, 4), listing.records);
+}
+
+test "M29 overview newest first puts Draft Threads first, sorts Comment Threads by their newest CommentId, and keeps Replies under their parents" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comments = [_]Comment{
+        .{ .id = 10, .author = "Ada", .body = "old review" },
+        .{ .id = 40, .parent_id = 10, .author = "Bob", .body = "newest reply" },
+        .{ .id = 20, .author = "Ada", .body = "inline", .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 2 } } },
+        .{ .id = 30, .author = "Ada", .body = "file", .scope = .{ .file = .{ .path = "a/b.txt", .source_commit = "abc" } } },
+        .{ .id = 21, .parent_id = 20, .author = "Bob", .body = "reply" },
+        .{ .id = 22, .parent_id = 20, .author = "Cy", .body = "second reply" },
+    };
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .comment, .body = "older Draft root", .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 3 } } },
+        .{ .local_id = 2, .kind = .comment, .body = "newer Draft root" },
+        .{ .local_id = 3, .kind = .comment, .body = "Draft Reply", .parent = .{ .comment = 30 } },
+    };
+    const index = try (Fixture{ .comments = &comments, .drafts = &drafts }).index(arena.allocator());
+    try expectListing(&.{
+        .{ .owner = .{ .comment = 10 } }, .{ .owner = .{ .comment = 40 } },
+        .{ .owner = .{ .draft = 2 } },    .{ .owner = .{ .comment = 30 } },
+        .{ .owner = .{ .draft = 3 } },    .{ .owner = .{ .comment = 20 } },
+        .{ .owner = .{ .comment = 21 } }, .{ .owner = .{ .comment = 22 } },
+        .{ .owner = .{ .draft = 1 } },
+    }, index, .{});
+    try expectListing(&.{
+        .{ .owner = .{ .comment = 30 } }, .{ .owner = .{ .draft = 3 } },
+        .{ .owner = .{ .draft = 2 } },    .{ .owner = .{ .draft = 1 } },
+        .{ .owner = .{ .comment = 10 } }, .{ .owner = .{ .comment = 40 } },
+        .{ .owner = .{ .comment = 20 } }, .{ .owner = .{ .comment = 21 } },
+        .{ .owner = .{ .comment = 22 } },
+    }, index, .{ .order = .newest_first });
+    var replies = queried("reply");
+    replies.order = .newest_first;
+    try expectListing(&.{
+        .{ .owner = .{ .comment = 30 }, .context = true }, .{ .owner = .{ .draft = 3 } },
+        .{ .owner = .{ .comment = 10 }, .context = true }, .{ .owner = .{ .comment = 40 } },
+        .{ .owner = .{ .comment = 20 }, .context = true }, .{ .owner = .{ .comment = 21 } },
+        .{ .owner = .{ .comment = 22 } },
+    }, index, replies);
 }
