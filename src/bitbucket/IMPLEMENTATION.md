@@ -41,6 +41,8 @@ A list request without `pagelen` gets 10 items a page.
 With that default, `list-repositories` needed 56 requests for 553 Repositories and took 20.7 s.
 So each list method sends the largest page of its endpoint unless the caller requests a size.
 `max_pagelen` in `client.zig` holds one value for each endpoint.
+Each `bbr api` list command also rejects a `--pagelen` above that value before it sends a request.
+`takePageFlag` in `src/api/workspaces.zig` takes the value as a required argument, and `pagelenHelp` states it in the help.
 
 Live checks on Workspace `check24` and Repository `pr-webapp` on 31 October 2026 found these maximums:
 
@@ -57,7 +59,7 @@ Live checks on Workspace `check24` and Repository `pr-webapp` on 31 October 2026
 | `/user/workspaces` | 100 | `pagelen=1000` returned HTTP 200 with `pagelen` 1000. |
 
 The last three endpoints accepted every size, and the test lists were too short to show a clamp.
-They use 100, the largest `--pagelen` that the commands accept and the maximum that the Bitbucket API reference states for most lists.
+They use 100, the maximum that the Bitbucket API reference states for most lists.
 A clamp would not break a list, because the commands follow the `next` links.
 
 The commit list has no `size` or `page`. Its `next` link carries an opaque `ctx` parameter.

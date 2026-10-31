@@ -35,7 +35,7 @@ fn parseList(args: []const []const u8) !ListArgs {
     var concurrency: ?usize = null;
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse break;
-        if (try ws.takePageFlag(&cur, f, &page)) continue;
+        if (try ws.takePageFlag(&cur, f, &page, bbr.bitbucket.max_pagelen.repositories)) continue;
         if (std.mem.eql(u8, f.name, "workspace")) {
             _ = cur.next();
             workspace = try arg.takeValue(&cur, f);

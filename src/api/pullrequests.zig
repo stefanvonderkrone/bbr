@@ -91,7 +91,7 @@ pub const commit_list_help =
     \\The Pull Request Commit Links app must exist. Bitbucket installs it when someone
     \\selects 'Go to pull request' on a commit's details page.
     \\
-;
+++ ws.pagelenHelp(bbr.bitbucket.max_pagelen.commit_pull_requests);
 
 pub const whoami_help =
     \\usage: bbr api whoami [--json]
@@ -136,7 +136,7 @@ fn parseList(args: []const []const u8) !ListArgs {
     var concurrency: ?usize = null;
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse break;
-        if (try ws.takePageFlag(&cur, f, &page)) continue;
+        if (try ws.takePageFlag(&cur, f, &page, bbr.bitbucket.max_pagelen.pull_requests)) continue;
         if (std.mem.eql(u8, f.name, "concurrency")) {
             _ = cur.next();
             try ws.takeConcurrency(&cur, f, &concurrency);
@@ -427,7 +427,7 @@ fn listCommitPullRequests(a: std.mem.Allocator, bb: bbr.bitbucket.Client, args: 
     while (cur.peek()) |text| {
         const f = arg.splitFlag(text) orelse return error.UnknownFlag;
         if (std.mem.eql(u8, f.name, "query") or std.mem.eql(u8, f.name, "sort")) return error.UnknownFlag;
-        if (try ws.takePageFlag(&cur, f, &page)) continue;
+        if (try ws.takePageFlag(&cur, f, &page, bbr.bitbucket.max_pagelen.commit_pull_requests)) continue;
         _ = cur.next();
         if (std.mem.eql(u8, f.name, "repository")) {
             try arg.setOption([]const u8, &repository, try arg.takeValue(&cur, f));
@@ -602,6 +602,7 @@ test "list-pull-requests rejects invalid page controls before HTTP" {
     try std.testing.expectError(error.MissingRequired, listPullRequests(a, std.testing.io, bb, &.{"--no-follow"}));
     try std.testing.expectError(error.MissingValue, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--page" }));
     try std.testing.expectError(error.InvalidNumber, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--pagelen=-1" }));
+    try std.testing.expectError(error.InvalidNumber, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--pagelen=51" }));
     try std.testing.expectError(error.InvalidNumber, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--limit=bad" }));
     try std.testing.expectError(error.UnknownFlag, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--no-follow=false" }));
     try std.testing.expectError(error.UnknownFlag, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--unknown" }));
@@ -650,6 +651,14 @@ test "list-pull-requests sends filters and page controls and does not follow wit
         "q=state%3D%22MERGED%22%20AND%20source.branch.name%3D%22feature%22%20AND%20%28title%3D%22Review%22%29",
     }) |part| try std.testing.expect(std.mem.indexOf(u8, url, part) != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "state=") == null);
+}
+
+test "list-pull-requests sends the PullRequest maximum --pagelen of 50" {
+    var fake: bbr.http.FakeHttpClient = .{ .body = "{\"values\":[]}" };
+    const items = try listPullRequests(std.testing.allocator, std.testing.io, testClient(&fake), &.{ "--repository=repository", "--pagelen", "50", "--no-follow" });
+    defer bbr.bitbucket.deinitSummaries(std.testing.allocator, items);
+    try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+    try std.testing.expect(std.mem.indexOf(u8, fake.lastUrl().?, "pagelen=50") != null);
 }
 
 test "list-pull-requests accepts a state in any letter case and sends it in uppercase" {

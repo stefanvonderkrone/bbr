@@ -44,7 +44,7 @@ fn parse(args: []const []const u8, kind: Kind) !Parsed {
     var p: Parsed = .{};
     while (cur.peek()) |text| {
         const f = arg.splitFlag(text) orelse return error.UnknownFlag;
-        if (kind == .list and try pages.takePageFlag(&cur, f, &p.page)) continue;
+        if (kind == .list and try pages.takePageFlag(&cur, f, &p.page, bbr.bitbucket.max_pagelen.branches)) continue;
         _ = cur.next();
         if (std.mem.eql(u8, f.name, "repository")) {
             try arg.setOption([]const u8, &p.repository, try arg.takeValue(&cur, f));

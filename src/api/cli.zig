@@ -458,6 +458,17 @@ test "every verb's help usage shows exactly the flags of its row" {
     try std.testing.expect(!failed);
 }
 
+test "every verb with --pagelen names its maximum in the help" {
+    var failed = false;
+    for (verbs) |verb| {
+        if (!contains(verb.value_flags, "pagelen") or std.mem.indexOf(u8, verb.help, "--pagelen accepts 1 to ") != null) continue;
+        std.debug.print("bbr api {s}: its help does not include `workspaces.pagelenHelp`\n", .{verb.name});
+        failed = true;
+    }
+    try std.testing.expect(!failed);
+    try std.testing.expect(std.mem.indexOf(u8, findVerb("list-pull-requests").?.help, "--pagelen accepts 1 to 50 ") != null);
+}
+
 test "skills/bbr/VERBS.md lists every bbr api verb once" {
     const doc = @embedFile("bbr_verbs_md");
     var failed = false;
