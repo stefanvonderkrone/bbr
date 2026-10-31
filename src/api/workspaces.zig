@@ -44,7 +44,7 @@ pub const search_members_help =
     \\Search always follows all pages. --limit caps ranked results per name, not requests.
 ++ std.fmt.comptimePrint("\nPage size defaults to {d}, the maximum. --pagelen overrides it.\n", .{bbr.bitbucket.max_pagelen.members}) ++
     \\Concurrency defaults to 8. --concurrency accepts a positive integer, capped by logical CPUs.
-    \\Fetch the next page as a request finishes. Unknown page counts can cause extra empty-page requests.
+    \\Page 1 gives the page count. The other pages load in parallel. Without a count, pages load in order.
     \\A failed page fails the complete search. HTTP 429 is not retried.
     \\Each JSON group contains name and matches with UUID, display name, and nickname.
     \\No matches is a successful empty result.
