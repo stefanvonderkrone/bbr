@@ -32,6 +32,8 @@ const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 const layouts = @import("layouts.zig");
 const view_paint = @import("view_paint.zig");
+const view_mod = @import("view.zig");
+const scroll_marks = @import("scroll_marks.zig");
 const frame_mod = @import("frame.zig");
 
 pub const sidebar_width: u16 = 28;
@@ -93,10 +95,13 @@ pub fn drawReview(
     _ = selected_file;
     win.clear();
     const frame = review.frame;
+    var diff_scroll = paneScroll(frame, .diff_pane);
+    const track = view_mod.solve(layouts.PaneSlot, layouts.panes, layouts.Panes{}, .{ .width = win.width, .height = win.height }).get(.diff).track;
+    diff_scroll.marks = scroll_marks.project(scratch, track.height, diff_scroll.total, frame.row_marks, &.{}, true) catch &.{};
     const panes = view_paint.paint(layouts.PaneSlot, layouts.panes, layouts.Panes{
         .sidebar_focused = frame.focus == .sidebar,
         .sidebar_scroll = paneScroll(frame, .sidebar),
-        .diff_scroll = paneScroll(frame, .diff_pane),
+        .diff_scroll = diff_scroll,
     }, win, theme);
     const cursor = frame.navigation.cursor;
     const buffer_index = if (cursor < frame.visual_rows.len) frame.visual_rows[cursor].buffer_index else 0;
@@ -5525,10 +5530,20 @@ fn expectPaneThumbs(win: vaxis.Window, frame: frame_mod.Projection) !void {
         const range = state.thumb();
         for (0..state.track.height) |cell| {
             const on_thumb = if (range) |thumb| cell >= thumb.first and cell < thumb.first + thumb.len else false;
-            const grapheme = win.readCell(state.track.x, @intCast(state.track.y + cell)).?.char.grapheme;
-            try testing.expectEqual(on_thumb, std.mem.eql(u8, grapheme, "┃"));
+            try testing.expectEqual(on_thumb, paintedThumb(win, frame, bar, state.track.x, @intCast(state.track.y + cell)));
         }
     }
+}
+
+/// A thumb cell holds the thumb glyph, or a Scroll Mark glyph in the thumb
+/// style.
+fn paintedThumb(win: vaxis.Window, frame: frame_mod.Projection, bar: frame_mod.ScrollBar, col: u16, row: u16) bool {
+    const cell = win.readCell(col, row).?;
+    if (std.mem.eql(u8, cell.char.grapheme, view_paint.vertical_thumbs[0])) return true;
+    const focused = (bar == .sidebar) == (frame.focus == .sidebar);
+    for (std.meta.tags(view_mod.ScrollMark)) |mark| if (std.mem.eql(u8, cell.char.grapheme, view_paint.scrollMarkGlyph(mark)))
+        return std.meta.eql(cell.style, view_paint.strokeStyle(theme_dark, .{ .focused = focused }));
+    return false;
 }
 
 test "M30 scrollbar every scroll bar hit target matches the painted thumb" {
@@ -5561,8 +5576,7 @@ test "M30 scrollbar every scroll bar hit target matches the painted thumb" {
                     const cell: u16 = @intCast(index);
                     const row = target.track.y + cell;
                     try testing.expectEqual(frame_mod.HitTarget{ .scroll_bar = .{ .bar = bar, .cell = cell } }, frame_mod.hitTest(shifted.frame, target.track.x, row).?);
-                    const painted = std.mem.eql(u8, win.readCell(target.track.x, row).?.char.grapheme, "┃");
-                    try testing.expectEqual(cell >= thumb.first and cell < thumb.first + thumb.len, painted);
+                    try testing.expectEqual(cell >= thumb.first and cell < thumb.first + thumb.len, paintedThumb(win, shifted.frame, bar, target.track.x, row));
                 }
             }
         }
@@ -5686,8 +5700,121 @@ test "M30 scrollbar a track of no cells paints nothing and a track of one cell p
         try testing.expectEqual(rows - 2, review.frame.panes.diff_track.height);
         var thumbs: usize = 0;
         for (0..rows) |row| {
-            if (std.mem.eql(u8, win.readCell(review.frame.panes.diff_track.x, @intCast(row)).?.char.grapheme, "┃")) thumbs += 1;
+            if (paintedThumb(win, review.frame, .diff_pane, review.frame.panes.diff_track.x, @intCast(row))) thumbs += 1;
         }
         try testing.expectEqual(@as(usize, rows - 2), thumbs);
     }
+}
+
+fn markOf(grapheme: []const u8) ?view_mod.ScrollMark {
+    for (std.meta.tags(view_mod.ScrollMark)) |mark| if (std.mem.eql(u8, grapheme, view_paint.scrollMarkGlyph(mark))) return mark;
+    return null;
+}
+
+test "M30 scrollbar a section rule join leaves a Scroll Mark alone" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try testScrollPresentation(&store, 60, 2, .{ .cols = 80, .rows = 12 });
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const review = state.projection().review.?;
+    const track = review.frame.panes.diff_track;
+    const total = review.frame.visual_rows.len;
+    var joined_marks: usize = 0;
+    for ([_]usize{ 0, (total - track.height) / 2, total - track.height }) |offset| {
+        var shifted = review;
+        shifted.frame.navigation.scroll = offset;
+        shifted.frame.navigation.cursor = offset;
+        win.clear();
+        drawReview(arena.allocator(), win, shifted, theme_dark, 0);
+        const marks = try scroll_marks.project(arena.allocator(), track.height, total, review.frame.row_marks, &.{}, true);
+        try testing.expectEqual(@as(usize, track.height), marks.len);
+        for (marks, 0..) |mark, cell| {
+            const grapheme = win.readCell(track.x, @intCast(track.y + cell)).?.char.grapheme;
+            try testing.expectEqual(mark, markOf(grapheme));
+            const visual = shifted.frame.visual_rows[offset + cell];
+            if (mark != null and visual.kind == .file_header) joined_marks += 1;
+        }
+        try expectPaneThumbs(win, shifted.frame);
+    }
+    try testing.expect(joined_marks > 0);
+}
+
+test "M30 scrollbar the File Tree scroll bar and a DiffPane whose rows fit paint no Scroll Mark" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_][2]usize{ .{ 60, 2 }, .{ 1, 3 } }) |shape| {
+        var state = try testScrollPresentation(&store, shape[0], shape[1], .{ .cols = 80, .rows = 12 });
+        defer state.deinit();
+        var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+        const win = headlessWindow(&screen);
+        const review = state.projection().review.?;
+        try testing.expect(review.frame.row_marks.len > 0);
+        drawReview(arena.allocator(), win, review, theme_dark, 0);
+        const sidebar = review.frame.panes.sidebar_track;
+        try testing.expect((frame_mod.scrollState(review.frame, .sidebar).?.thumb() != null) == (shape[0] > 1));
+        for (0..sidebar.height) |cell| try testing.expectEqual(@as(?view_mod.ScrollMark, null), markOf(win.readCell(sidebar.x, @intCast(sidebar.y + cell)).?.char.grapheme));
+        if (shape[0] > 1) continue;
+        const diff = review.frame.panes.diff_track;
+        for (0..diff.height) |cell| {
+            const grapheme = win.readCell(diff.x, @intCast(diff.y + cell)).?.char.grapheme;
+            try testing.expect(markOf(grapheme) == null and !std.mem.eql(u8, grapheme, "┃"));
+        }
+    }
+}
+
+test "M30 scrollbar an allocation failure in the mark projection paints the thumb without Scroll Marks" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try testScrollPresentation(&store, 60, 2, .{ .cols = 80, .rows = 12 });
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const review = state.projection().review.?;
+    var failing = testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = 0 });
+    drawReview(failing.allocator(), win, review, theme_dark, 0);
+    try testing.expect(failing.has_induced_failure);
+    const track = review.frame.panes.diff_track;
+    const thumb = frame_mod.scrollState(review.frame, .diff_pane).?.thumb().?;
+    for (0..track.height) |cell| {
+        const grapheme = win.readCell(track.x, @intCast(track.y + cell)).?.char.grapheme;
+        try testing.expectEqual(cell >= thumb.first and cell < thumb.first + thumb.len, std.mem.eql(u8, grapheme, "┃"));
+        try testing.expectEqual(@as(?view_mod.ScrollMark, null), markOf(grapheme));
+    }
+}
+
+test "M30 scrollbar a Theme preview paints the Scroll Marks in the previewed Theme" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try testScrollPresentation(&store, 60, 2, .{ .cols = 80, .rows = 12 });
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const themes = @import("theme.zig");
+    try state.dispatch(.{ .action = .open_theme_overlay });
+    try state.dispatch(.{ .key = .{ .codepoint = keymap.special.down } });
+    try state.dispatch(.{ .key = .{ .codepoint = keymap.special.down } });
+    const projection = state.projection();
+    try testing.expectEqual(ThemeId.light, projection.theme);
+    drawReview(arena.allocator(), win, projection.review.?, themes.value(projection.theme), 0);
+    const track = projection.review.?.frame.panes.diff_track;
+    const thumb = frame_mod.scrollState(projection.review.?.frame, .diff_pane).?.thumb().?;
+    var checked: usize = 0;
+    for (0..track.height) |cell| {
+        if (cell >= thumb.first and cell < thumb.first + thumb.len) continue;
+        const painted = win.readCell(track.x, @intCast(track.y + cell)).?;
+        const mark = markOf(painted.char.grapheme) orelse continue;
+        try testing.expectEqual(themes.light.scrollMarkStyle(mark), painted.style);
+        checked += 1;
+    }
+    try testing.expect(checked > 0);
 }

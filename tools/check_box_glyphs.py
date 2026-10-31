@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Fail when a terminal painter other than src/tui/view_paint.zig writes a border corner or junction glyph."""
+"""Fail when a terminal painter other than src/tui/view_paint.zig writes a border corner, a junction, a thumb, or a Scroll Mark glyph."""
 
 from pathlib import Path
 import re
 import sys
 
 PAINTERS = (Path("src/tui/render.zig"), Path("src/tui/app.zig"))
-GLYPHS = re.compile("[\u250c-\u254b\u2552-\u2570]")
+GLYPHS = re.compile("[\u250c-\u254b\u2552-\u2570\u2503\u25c6\u2501]")
 TEST_START = re.compile(r"^test\b.*\{\s*$")
 FIX = (
     "Declare a border, a rule, or a Title on a View in src/tui/layouts.zig and paint it with view_paint.paint. "
-    "To join a content row into a border, call view_paint.join."
+    "To join a content row into a border, call view_paint.join. "
+    "To show a thumb or a Scroll Mark, set view.Scrollbar.marks and let view_paint.drawScrollbar paint the track."
 )
 
 
@@ -38,7 +39,7 @@ def main():
         print(message, file=sys.stderr)
     if found:
         return 1
-    print("Only src/tui/view_paint.zig paints border corners and junctions.")
+    print("Only src/tui/view_paint.zig paints border corners, junctions, thumbs, and Scroll Marks.")
     return 0
 
 

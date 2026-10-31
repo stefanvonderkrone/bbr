@@ -107,6 +107,22 @@ pub const Scrollbar = struct {
     /// The first visible content cell.
     offset: usize = 0,
     stroke: Stroke = .{ .tone = .overlay },
+    /// No entry, or one Scroll Mark per track cell.
+    marks: []const ?ScrollMark = &.{},
+};
+
+/// The item that a Scroll Mark shows. The order of the arms is the priority,
+/// from high to low.
+pub const ScrollMark = enum {
+    buffer_search_hit,
+    draft,
+    unresolved_thread,
+    resolved_thread,
+    file_header,
+
+    pub fn outranks(a: ScrollMark, b: ScrollMark) bool {
+        return @intFromEnum(a) < @intFromEnum(b);
+    }
 };
 
 /// The size of a View along one axis, as its parent Composition reads it.

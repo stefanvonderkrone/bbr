@@ -1418,6 +1418,7 @@ test {
     _ = @import("tui/config.zig");
     _ = @import("tui/review_body.zig");
     _ = @import("tui/review_card.zig");
+    _ = @import("tui/scroll_marks.zig");
     _ = @import("tui/search.zig");
     _ = @import("persist/sqlite_store.zig");
 }

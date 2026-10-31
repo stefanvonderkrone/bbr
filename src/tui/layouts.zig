@@ -9,13 +9,13 @@ const view = @import("view.zig");
 const Rect = view.Rect;
 const Size = view.Size;
 
-/// The numbers of a scroll bar. A tree always declares its scroll bars, so
-/// the rects do not depend on these numbers, and a solve without them
-/// matches the paint.
-pub const Scroll = struct { total: usize = 0, offset: usize = 0 };
+/// The numbers and the Scroll Marks of a scroll bar. A tree always declares
+/// its scroll bars, so the rects do not depend on these, and a solve without
+/// them matches the paint.
+pub const Scroll = struct { total: usize = 0, offset: usize = 0, marks: []const ?view.ScrollMark = &.{} };
 
 fn bar(scroll: Scroll, ring: view.Ring, stroke: view.Stroke) view.Scrollbar {
-    return .{ .ring = ring, .total = scroll.total, .offset = scroll.offset, .stroke = stroke };
+    return .{ .ring = ring, .total = scroll.total, .offset = scroll.offset, .stroke = stroke, .marks = scroll.marks };
 }
 
 /// The terminal window: the content area above the status rows, as many as
@@ -426,7 +426,14 @@ test "the Help columns start at column 2 and one cell after the middle" {
 }
 
 test "M30 scrollbar the layout rects do not depend on the scroll numbers or the Scroll Marks" {
-    const scrolls = [_]Scroll{ .{}, .{ .total = 3 }, .{ .total = 500, .offset = 0 }, .{ .total = 500, .offset = 250 }, .{ .total = 500, .offset = 9000 } };
+    const marks = [_]?view.ScrollMark{ .draft, null, .file_header, .unresolved_thread, .resolved_thread, .buffer_search_hit } ** 20;
+    const scrolls = [_]Scroll{
+        .{},
+        .{ .total = 3 },
+        .{ .total = 500, .offset = 0 },
+        .{ .total = 500, .offset = 250, .marks = &marks },
+        .{ .total = 500, .offset = 9000, .marks = marks[0..7] },
+    };
     const areas = [_]Rect{ .{}, .{ .width = 1, .height = 1 }, .{ .width = 80, .height = 24 }, .{ .width = 40, .height = 100 }, .{ .width = 320, .height = 3 } };
     for (areas) |area| {
         const panes_base = view.solve(PaneSlot, panes, Panes{}, area);
