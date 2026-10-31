@@ -1,6 +1,6 @@
 # 02: Research terminal image protocols and multiplexer detection
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 Spec: [M32 spec](../SPEC.md)
 
@@ -33,11 +33,29 @@ Ticket 04 confirms each cell in a hands-on run.
 
 ## Acceptance criteria
 
-- [ ] `research/terminal-image-protocols.md` fills every cell of the protocol matrix, each with a source.
-- [ ] The note holds the detection rule as ordered checks for the five cases in the scope.
-- [ ] The detection rule reads no XDG variable.
-- [ ] The note lists the side effects of `queryTerminal` for bbr.
-- [ ] The note estimates the cost of the iTerm2 path, tmux passthrough, and kitty Unicode placeholders.
-- [ ] The note recommends a transmission medium for each column.
-- [ ] The note marks each cell that ticket 04 must check by hand.
-- [ ] `python3 tools/check_agent_docs.py` passes.
+- [x] `research/terminal-image-protocols.md` fills every cell of the protocol matrix, each with a source.
+- [x] The note holds the detection rule as ordered checks for the five cases in the scope.
+- [x] The detection rule reads no XDG variable.
+- [x] The note lists the side effects of `queryTerminal` for bbr.
+- [x] The note estimates the cost of the iTerm2 path, tmux passthrough, and kitty Unicode placeholders.
+- [x] The note recommends a transmission medium for each column.
+- [x] The note marks each cell that ticket 04 must check by hand.
+- [x] `python3 tools/check_agent_docs.py` passes.
+
+## Completion
+
+The research note is [terminal-image-protocols.md](../research/terminal-image-protocols.md).
+
+- Ghostty and kitty support the full kitty graphics protocol, with Unicode placeholders.
+- WezTerm supports the kitty graphics protocol without Unicode placeholders. It also supports OSC 1337.
+- iTerm2 supports the kitty graphics protocol since 3.5.5beta1, except animation. The brief statement about iTerm2 is out of date.
+- tmux passes an image only with `allow-passthrough on`. A query reply never comes back through tmux.
+- herdr parses the kitty graphics protocol itself and answers the query itself. Many herdr image issues are open.
+- The detection rule checks `TMUX`, then `HERDR_ENV`, then other multiplexer hints, and only then sends the kitty query and DA1.
+- The note recommends a kitty-only probe instead of `queryTerminal` and `enableDetectedFeatures`, because those have side effects on the bbr terminal setup.
+- The recommended medium is `t=d` in every column.
+- The note estimates that the inline iTerm2 path is large. tmux passthrough is about 40 lines. Unicode placeholders are medium. No path needs a vaxis change.
+- The note marks each cell that ticket 04 checks by hand with **T04**.
+
+Checks: `python3 tools/check_agent_docs.py` passes.
+Review: the runner read the matrix, the detection rule, and the sources for the iTerm2 cells.
