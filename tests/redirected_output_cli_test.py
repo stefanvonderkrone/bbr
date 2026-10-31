@@ -1,0 +1,39 @@
+"""Run with python3 tests/redirected_output_cli_test.py zig-out/bin/bbr. No network access."""
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+binary = str(Path(sys.argv[1]).resolve())
+env = {key: value for key, value in os.environ.items() if not key.startswith("BITBUCKET_") and key != "BBR_PROFILE"}
+prefix = b"written before bbr\n"
+
+
+def run_into_file(args, stdout_to_file, stderr_to_file):
+    """Run bbr with stdout and stderr on one file whose offset is already past earlier output."""
+    with tempfile.TemporaryFile() as output:
+        output.write(prefix)
+        output.flush()
+        subprocess.run(
+            [binary, *args],
+            stdout=output if stdout_to_file else subprocess.DEVNULL,
+            stderr=output if stderr_to_file else subprocess.DEVNULL,
+            env=env,
+            timeout=5,
+        )
+        output.seek(0)
+        return output.read()
+
+
+text = run_into_file(["api", "list-pull-requests", "--repository", "x", "--pagelen", "51"], False, True)
+assert text.startswith(prefix), text
+assert b"bbr api list-pull-requests: bad options (InvalidNumber)\n" in text, text
+assert b"usage: bbr api list-pull-requests --repository SLUG" in text, text
+
+text = run_into_file(["--version"], True, True)
+assert text.startswith(prefix + b"bbr "), text
+
+print("bbr appends stdout and stderr to a file at its current offset.")

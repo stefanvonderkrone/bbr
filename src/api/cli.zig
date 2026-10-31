@@ -207,7 +207,7 @@ fn parseGlobal(
 
 fn printHelp(init: std.process.Init, verb: ?[]const u8) !void {
     var buf: [8192]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
     try writeHelp(&stdout.interface, verb);
     try stdout.interface.flush();
 }
@@ -262,7 +262,7 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*cons
 
 fn printError(init: std.process.Init, verb: ?Verb, err: anyerror, detail: ?*const bbr.bitbucket.Client.ErrorDetail) !void {
     var buf: [8192]u8 = undefined;
-    var stderr = std.Io.File.stderr().writer(init.io, &buf);
+    var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
     try writeError(&stderr.interface, verb, err, detail);
     try stderr.interface.flush();
 }
@@ -1166,7 +1166,6 @@ const TestOutput = struct {
 
     const vtable: std.Io.VTable = blk: {
         var table = std.Io.failing.vtable.*;
-        table.fileWritePositional = writePositional;
         table.operate = operate;
         break :blk table;
     };
@@ -1188,10 +1187,6 @@ const TestOutput = struct {
 
     fn stderrBytes(self: *const TestOutput) []const u8 {
         return self.stderr_buffer[0..self.stderr_len];
-    }
-
-    fn writePositional(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, _: u64) std.Io.File.WritePositionalError!usize {
-        return capture(userdata, file, header, data, splat);
     }
 
     fn capture(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize) error{NoSpaceLeft}!usize {

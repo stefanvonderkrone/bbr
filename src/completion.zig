@@ -65,7 +65,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
 
     if (help_only and shell == null and !list_profiles) {
         var buf: [2048]u8 = undefined;
-        var stdout = std.Io.File.stdout().writer(init.io, &buf);
+        var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
         try stdout.interface.writeAll(completion_help);
         return stdout.interface.flush();
     }
@@ -74,7 +74,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
 
     const name = shell orelse return fail(init, "bbr completion: a shell name is required (bash|zsh|fish)\n");
     var buf: [131072]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
     if (std.mem.eql(u8, name, "bash")) {
         try stdout.interface.writeAll(bash_script);
     } else if (std.mem.eql(u8, name, "zsh")) {
@@ -89,7 +89,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
 
 fn fail(init: std.process.Init, comptime message: []const u8) error{UnknownFlag} {
     var buf: [512]u8 = undefined;
-    var stderr = std.Io.File.stderr().writer(init.io, &buf);
+    var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
     stderr.interface.writeAll(message) catch {};
     stderr.interface.flush() catch {};
     return error.UnknownFlag;
@@ -100,7 +100,7 @@ fn fail(init: std.process.Init, comptime message: []const u8) error{UnknownFlag}
 fn listProfiles(init: std.process.Init, gpa: std.mem.Allocator) !void {
     const loaded = try bbr.bitbucket.auth.load(gpa, init.io, init.environ_map);
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
     if (loaded) |l| {
         var owned = l;
         defer owned.deinit(gpa);
