@@ -67,6 +67,7 @@ pub const Action = enum {
     focus_next_pane,
     show_comment_overview,
     show_diff_pane,
+    open_overview_entry,
 };
 
 /// The terminal-independent input surface and semantic cursor target used to

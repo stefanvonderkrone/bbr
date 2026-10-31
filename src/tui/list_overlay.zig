@@ -363,6 +363,7 @@ pub const CommandPalette = struct {
         .{ .action = .focus_next_pane, .title = "Switch Pane", .description = "Move focus between the Sidebar and the Main Pane" },
         .{ .action = .show_comment_overview, .title = "Show Comment Overview", .description = "List every Comment, Reply, and Draft in this Review" },
         .{ .action = .show_diff_pane, .title = "Show DiffPane", .description = "Show the diff in the Main Pane" },
+        .{ .action = .open_overview_entry, .title = "Open in DiffPane", .description = "Show the selected entry's ReviewCard in the DiffPane" },
         .{ .action = .open_theme_overlay, .title = "Theme", .description = "Preview and choose the color Theme" },
         .{ .action = .help, .title = "Keybindings", .description = "Show the keybinding help" },
         .{ .action = .quit, .title = "Quit", .description = "Quit bbr" },
@@ -841,5 +842,21 @@ test "M29 overview the Command Palette lists the Main Pane Actions from every Pa
             if (context == .comment_overview) try testing.expect(entry.action != .open_file_finder and entry.action != .open_review_search);
         }
         try testing.expect(titles[0] and titles[1]);
+    }
+}
+
+test "M29 overview the Command Palette lists Open in DiffPane only from the Comment Overview" {
+    for ([_]InteractionContext{ .diff, .diff_review_card, .sidebar, .sidebar_file, .comment_overview }) |context| {
+        var palette = try ListOverlay.openCommandPalette(testing.allocator, context);
+        defer palette.deinit();
+        var listed = false;
+        for (0..palette.command_palette.row_count) |row| {
+            const entry = palette.command_palette.command(row);
+            if (entry.action != .open_overview_entry) continue;
+            try testing.expectEqualStrings("Open in DiffPane", entry.title);
+            try testing.expectEqualStrings("Show the selected entry's ReviewCard in the DiffPane", entry.description);
+            listed = true;
+        }
+        try testing.expectEqual(context == .comment_overview, listed);
     }
 }

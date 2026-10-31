@@ -218,6 +218,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one(vaxis.Key.tab), .action = .focus_next_pane, .help = "switch Pane" },
     .{ .chord = Chord.two('g', 'o'), .action = .show_comment_overview, .help = "show Comment Overview" },
     .{ .chord = Chord.two('g', 'd'), .action = .show_diff_pane, .help = "show DiffPane" },
+    .{ .chord = Chord.one(vaxis.Key.enter), .action = .open_overview_entry, .help = "open entry in DiffPane" },
 };
 
 pub const Keymap = struct {
@@ -414,6 +415,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .focus_next_pane,
             .show_comment_overview,
             .show_diff_pane,
+            .open_overview_entry,
             => true,
             else => false,
         },
@@ -909,4 +911,21 @@ test "M29 overview g o and g d resolve in every Pane context and remain configur
     try testing.expectEqual(Action.show_comment_overview, resolver.feed(configured.keymap(), .diff, plain('o')).action);
     try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain('g')) == .none);
     try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain('d')) == .none);
+}
+
+test "M29 overview Enter opens the selected entry only in the Comment Overview and remains configurable" {
+    try validateBindings(&default_bindings);
+    var resolver: Resolver = .{};
+    try testing.expectEqual(Action.open_overview_entry, resolver.feed(.default, .comment_overview, plain(vaxis.Key.enter)).action);
+    try testing.expectEqual(Action.toggle_disclosure, resolver.feed(.default, .diff_disclosure, plain(vaxis.Key.enter)).action);
+    try testing.expectEqual(Action.focus_file, resolver.feed(.default, .sidebar_file, plain(vaxis.Key.enter)).action);
+    try testing.expectEqualStrings("open entry in DiffPane", helpFor(.open_overview_entry));
+    inline for (.{ InteractionContext.diff, .diff_review_card, .sidebar, .review_search }) |context| try testing.expect(!supportsContext(.open_overview_entry, context));
+
+    const overrides = [_]Override{.{ .action = "open_overview_entry", .sequences = &.{"space enter"} }};
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+    try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain(vaxis.Key.enter)) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain(' ')) == .none);
+    try testing.expectEqual(Action.open_overview_entry, resolver.feed(configured.keymap(), .comment_overview, plain(vaxis.Key.enter)).action);
 }

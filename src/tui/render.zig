@@ -5596,8 +5596,10 @@ test "local help projection marks remote-only commands unavailable" {
     for (rows.commands) |row| {
         if (!row.available) unavailable += 1;
     }
-    // Remote-only commands, plus edit, re-anchor, and delete, stay visible.
-    try testing.expectEqual(@as(usize, 11), unavailable);
+    // Remote-only commands, plus edit, re-anchor, delete, and the Overview
+    // Entry open without a selection, stay visible.
+    try testing.expectEqual(@as(usize, 12), unavailable);
+    try testing.expect(!helpRowAvailable(rows.commands, "open entry in DiffPane").?);
     for (rows.motions) |row| try testing.expect(row.available);
 }
 

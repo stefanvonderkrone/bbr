@@ -500,6 +500,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .suggestion_requires_new_version => "Suggestions require the new File version",
         .target_action_unavailable => "This action is unavailable for the current target",
         .no_review_item => "This action requires a Comment or Draft under the cursor",
+        .overview_entry_unavailable => "The entry is no longer in the Review",
         .draft_owned_by_submission => "an active Submission owns this local Draft",
         .draft_submission_in_flight => "this local Draft is being submitted",
         .draft_outcome_unresolved => "outcome unknown — resolve before editing",
@@ -1299,7 +1300,10 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
                 items.hint(.main_pane, "g o", " comments");
                 items.hint(.switch_review, "p", " switch");
             },
-            .comment_overview => items.hint(.main_pane, "g d", " DiffPane"),
+            .comment_overview => {
+                items.hint(.open, "↵", " open");
+                items.hint(.main_pane, "g d", " DiffPane");
+            },
         }
         items.hint(.help, "?", " help");
         items.hint(.quit, "q", " quit");
@@ -1560,7 +1564,8 @@ test "M29 overview the status shows the Comment Overview hints and the listing p
     const a = arena.allocator();
     const rows = try testStatusRows(a, try testDrawStatus(a, theme.dark, .{ .main_pane = .comment_overview, .position = 3, .total = 12 }));
     try std.testing.expect(std.mem.endsWith(u8, rows[0], "3/12"));
-    try std.testing.expectEqualStrings("g d DiffPane  ·  X submit 2  ·  ? help  ·  q quit", rows[1]);
+    try std.testing.expectEqualStrings("↵ open  ·  g d DiffPane  ·  X submit 2  ·  ? help  ·  q quit", rows[1]);
+    try std.testing.expectEqualStrings("The entry is no longer in the Review", actionErrorText(.overview_entry_unavailable));
 }
 
 test "the status height does not change when only the cursor moves" {
