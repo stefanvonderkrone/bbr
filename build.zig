@@ -138,6 +138,26 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_buffer_search_bench.addArgs(args);
     buffer_search_bench_step.dependOn(&run_buffer_search_bench.step);
 
+    const file_cache_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/benchmark_file_cache.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "bbr", .module = bench_core_mod },
+            .{ .name = "zf", .module = zf.module("zf") },
+            .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+        },
+    });
+    file_cache_bench_mod.addOptions("build_options", build_options);
+    addTreeSitter(b, file_cache_bench_mod);
+    addRe2(b, file_cache_bench_mod, target, macos_sdk);
+    const file_cache_bench = b.addExecutable(.{ .name = "bbr-file-cache-bench", .root_module = file_cache_bench_mod });
+    const run_file_cache_bench = b.addRunArtifact(file_cache_bench);
+    if (b.args) |args| run_file_cache_bench.addArgs(args);
+    const file_cache_bench_step = b.step("bench-file-cache", "Run the opt-in M28 File cache benchmark");
+    file_cache_bench_step.dependOn(&run_file_cache_bench.step);
+
     // Live smoke check against real Bitbucket (opt-in; needs BITBUCKET_* env):
     //   zig build check -- <repo-slug> <pr-id>
     const check_cmd = b.addRunArtifact(exe);
@@ -266,6 +286,14 @@ pub fn build(b: *std.Build) void {
     });
     const reply_ancestry_step = b.step("test-reply-ancestry", "Run Reply ancestry presentation tests");
     reply_ancestry_step.dependOn(&b.addRunArtifact(reply_ancestry_tests).step);
+
+    const file_cache_tests = b.addTest(.{
+        .name = "file-cache-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M28 cache"},
+    });
+    const file_cache_test_step = b.step("test-file-cache", "Run M28 File cache benchmark tests");
+    file_cache_test_step.dependOn(&b.addRunArtifact(file_cache_tests).step);
 
     const yank_tests = b.addTest(.{
         .name = "yank-tests",

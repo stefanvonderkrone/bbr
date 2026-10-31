@@ -104,6 +104,11 @@ pub fn calibrate(gpa: std.mem.Allocator, io: std.Io) !Calibrations {
     };
 }
 
+/// The nearest-rank p95 index into `count` sorted samples. `count` must not be zero.
+pub fn p95Index(count: usize) usize {
+    return (count * 95 + 99) / 100 - 1;
+}
+
 pub fn run(
     writer: *std.Io.Writer,
     io: std.Io,
@@ -154,7 +159,7 @@ pub fn run(
     std.mem.sort(usize, &peaks, {}, std.sort.asc(usize));
     std.mem.sort(usize, &retained, {}, std.sort.asc(usize));
     const median_ns = durations[sample_count / 2];
-    const p95_ns = durations[(sample_count * 95 + 99) / 100 - 1];
+    const p95_ns = durations[p95Index(sample_count)];
     const ceiling_rate = switch (ceiling) {
         .instruction_throughput => calibrations.instruction_units_per_second,
         .memory_bandwidth => calibrations.memory_bytes_per_second,
@@ -238,7 +243,7 @@ pub fn runSplit(
     std.mem.sort(usize, &peaks, {}, std.sort.asc(usize));
     std.mem.sort(usize, &retained, {}, std.sort.asc(usize));
     const median_ns = durations[sample_count / 2];
-    const p95_ns = durations[(sample_count * 95 + 99) / 100 - 1];
+    const p95_ns = durations[p95Index(sample_count)];
     const ceiling_rate = switch (ceiling) {
         .instruction_throughput => calibrations.instruction_units_per_second,
         .memory_bandwidth => calibrations.memory_bytes_per_second,
