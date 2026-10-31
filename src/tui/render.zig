@@ -5567,6 +5567,62 @@ test "M30 scrollbar every scroll bar hit target matches the painted thumb" {
             }
         }
     }
+
+    for ([_]frame_mod.Geometry{ .{ .cols = 100, .rows = 24 }, .{ .cols = 60, .rows = 70 } }) |geometry| {
+        var state = try testScrollSearchPresentation(&store, geometry);
+        defer state.deinit();
+        var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+        const win = headlessWindow(&screen);
+        const projection = state.projection();
+        const search = projection.review_search.?;
+        try testing.expectEqual(geometry.cols >= geometry.rows, search.geometry.landscape);
+        const bottom = search.list_total - search.geometry.list_track.height;
+        for ([_][2]usize{ .{ 0, 1 }, .{ 1, 3 }, .{ 1, 2 }, .{ 2, 3 }, .{ 1, 1 } }) |fraction| {
+            var shifted_search = search;
+            shifted_search.list_scroll = bottom * fraction[0] / fraction[1];
+            var frame = projection.review.?.frame;
+            frame.overlay.?.scroll = shifted_search.list_scroll;
+            drawReviewSearch(arena.allocator(), win, shifted_search, theme_dark);
+            const target = frame_mod.scrollTarget(frame, .review_search_list).?;
+            const thumb = target.thumb().?;
+            if (fraction[0] == 0) try testing.expectEqual(@as(u16, 0), thumb.first);
+            if (fraction[0] == fraction[1]) try testing.expectEqual(target.track.height, thumb.first + thumb.len);
+            for (0..target.track.height) |index| {
+                const cell: u16 = @intCast(index);
+                const row = target.track.y + cell;
+                try testing.expectEqual(frame_mod.HitTarget{ .scroll_bar = .{ .bar = .review_search_list, .cell = cell } }, frame_mod.hitTest(frame, target.track.x, row).?);
+                const painted = std.mem.eql(u8, win.readCell(target.track.x, row).?.char.grapheme, "│");
+                try testing.expectEqual(cell >= thumb.first and cell < thumb.first + thumb.len, painted);
+            }
+        }
+    }
+}
+
+/// Review Search with 60 results over the Session of `testScrollSession`.
+fn testScrollSearchPresentation(store: *bbr.review.InMemoryStore, geometry: frame_mod.Geometry) !presentation.Presentation {
+    const session = try testScrollSession(30, 2);
+    errdefer session.destroy();
+    const comments = try session.arena.allocator().alloc(bbr.review.Comment, 60);
+    for (comments, 0..) |*comment, index| comment.* = .{ .id = index + 1, .author = "Ada", .body = "note" };
+    session.threads = try bbr.review.buildThreads(session.arena.allocator(), comments);
+    var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .cell_metrics = terminal_cell_metrics }, .{
+        .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = geometry,
+    });
+    errdefer state.deinit();
+    try state.dispatch(.{ .action = .open_review_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 't', .text = "t" } });
+    var scan = state.takeCommand().?;
+    while (scan == .build_buffer_disclosure) {
+        scan.build_buffer_disclosure.build();
+        try state.dispatch(.{ .buffer_disclosure_built = scan.build_buffer_disclosure });
+        scan = state.takeCommand().?;
+    }
+    const completed = presentation.executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search);
+    scan.deinit();
+    try state.dispatch(.{ .buffer_search_scanned = completed });
+    try testing.expectEqual(@as(usize, 60), state.projection().review_search.?.list_total);
+    return state;
 }
 
 test "M30 scrollbar a Pane whose rows fit paints no thumb and keeps its border" {
