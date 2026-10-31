@@ -344,3 +344,17 @@ test "M30 scrollbar the binary search and a linear scan give the same hit cells"
         try testing.expectEqualSlices(?view.ScrollMark, try project(a, extent, total, &.{}, hits, false), try project(a, extent, total, &.{}, hits, true));
     }
 }
+
+test "M30 scrollbar the projection ignores a hit at or past the total" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var hits: [3]frame.ProjectedSourceRange = undefined;
+    for (&hits, [_]usize{ 19, 20, 23 }) |*hit, row| hit.* = .{ .visual_row = row, .relation = .neutral, .source = .{ .start = 0, .end = 1 }, .row = .{ .start = 0, .end = 1 }, .active = false };
+    var expected = [_]?view.ScrollMark{null} ** 10;
+    expected[9] = .buffer_search_hit;
+    for ([_]bool{ true, false }) |sorted| {
+        try testing.expectEqualSlices(?view.ScrollMark, &expected, try project(a, 10, 20, &.{}, &hits, sorted));
+        for (try project(a, 10, 20, &.{}, hits[1..], sorted)) |cell| try testing.expectEqual(@as(?view.ScrollMark, null), cell);
+    }
+}
