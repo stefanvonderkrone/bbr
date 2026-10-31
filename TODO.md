@@ -336,14 +336,14 @@ Highlight common languages without a UserGrammar. Add Zig, C, C++, C#, PHP, Pyth
 Kotlin, Java, Groovy, TOML, Dockerfile, Make, Ruby, HTML, XML, Markdown, and SQL as BuiltInGrammars
 with the same hermetic delivery as the M13 Grammars (ADR-0009).
 
-- [ ] Vendor each Grammar from the upstream repository that nvim-treesitter pins, at a pinned commit under `vendors/tree-sitter/<name>`. Record the repository, commit, and checksums in `manifest.zig.zon`. Commit generated `parser.c` sources; a Grammar that needs generation is generated once during vendoring, never during the build.
-- [ ] Vendor the highlight and injection queries from nvim-treesitter at one pinned commit. Resolve `; inherits:` lines, and rewrite or remove Neovim-only predicates. A test fails on every unsupported predicate.
-- [ ] Add language injection to `TreeSitterHighlighter` for BuiltInGrammars: Markdown inline content and fenced code, HTML `<script>` and `<style>`, and PHP with embedded HTML. Injected Spans must stay ordered and line-relative, and the `Highlighter` seam must not change.
-- [ ] Check that every Grammar ABI is compatible with the vendored tree-sitter runtime.
-- [ ] Add GrammarMatch rules for each new Grammar, including exact filenames such as `Dockerfile`, `Makefile`, and `Gemfile`. Confirm that an active UserGrammar still takes precedence.
-- [ ] Map the new Captures to existing Theme Captures. Add no new Theme color unless a Capture has no reasonable existing match.
-- [ ] Add a Capture fixture test for each Grammar, injection fixtures, and GrammarMatch tests.
-- [ ] Record the binary size before and after. No Grammar is dropped for size.
+- [x] Vendor each Grammar from the upstream repository that nvim-treesitter pins, at a pinned commit under `vendors/tree-sitter/<name>`. Record the repository, commit, and checksums in `manifest.zig.zon`. Commit generated `parser.c` sources; a Grammar that needs generation is generated once during vendoring, never during the build.
+- [x] Vendor the highlight and injection queries from nvim-treesitter at one pinned commit. Resolve `; inherits:` lines, and rewrite or remove Neovim-only predicates. A test fails on every unsupported predicate.
+- [x] Add language injection to `TreeSitterHighlighter` for BuiltInGrammars: Markdown inline content and fenced code, HTML `<script>` and `<style>`, and PHP with embedded HTML. Injected Spans must stay ordered and line-relative, and the `Highlighter` seam must not change.
+- [x] Check that every Grammar ABI is compatible with the vendored tree-sitter runtime.
+- [x] Add GrammarMatch rules for each new Grammar, including exact filenames such as `Dockerfile`, `Makefile`, and `Gemfile`. Confirm that an active UserGrammar still takes precedence.
+- [x] Map the new Captures to existing Theme Captures. Add no new Theme color unless a Capture has no reasonable existing match.
+- [x] Add a Capture fixture test for each Grammar, injection fixtures, and GrammarMatch tests.
+- [x] Record the binary size before and after. No Grammar is dropped for size.
 
 _Deferred:_ the UserGrammar sandbox research (threat model, Wasm runtime, confined helper process, ADR) is deferred without a milestone. M17's native-code warning stays.
 

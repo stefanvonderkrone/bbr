@@ -1,6 +1,6 @@
 # M27 BuiltInGrammar expansion
 
-Status: ready-for-agent
+Status: claimed
 Milestone: M27
 
 The [M27 brief](brief.md) records the approved decisions.

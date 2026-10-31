@@ -307,6 +307,70 @@ Syntax highlighting is loaded lazily for the focused File. `max_file_bytes` limi
 file side independently; the 2 MiB default avoids expensive parsing of generated or minified
 files. Set it to `0` for no limit. Files above the limit remain readable as plain text.
 
+### BuiltInGrammars
+
+`bbr` highlights these Grammars with no installation.
+Each BuiltInGrammar is compiled into the executable from the pinned sources in
+[`vendors/tree-sitter/`](vendors/tree-sitter/README.md).
+
+A GrammarMatch rule selects the BuiltInGrammar for a File.
+`bbr` checks every exact filename first, then every extension, then every shebang interpreter.
+The first match wins.
+An exact filename compares with the basename of the path.
+Filenames and extensions are case-sensitive.
+The shebang interpreter is the basename of the first word after `#!`.
+For `/usr/bin/env`, it is the first argument that does not start with `-`.
+Trailing digits and dots are dropped, so `#!/usr/bin/env python3.12` selects Python.
+
+| BuiltInGrammar | Exact filenames | Extensions | Shebang interpreters |
+| --- | --- | --- | --- |
+| TSX | none | `.tsx` | none |
+| TypeScript | none | `.ts`, `.mts`, `.cts` | none |
+| JavaScript | none | `.js`, `.jsx`, `.mjs`, `.cjs` | none |
+| CSS | none | `.css` | none |
+| Go | none | `.go` | none |
+| Bash | `.bashrc`, `Bashfile` | `.sh`, `.bash` | `bash`, `sh` |
+| JSON | none | `.json` | none |
+| YAML | none | `.yaml`, `.yml` | none |
+| Zig | none | `.zig`, `.zon` | none |
+| C | none | `.c` | none |
+| C++ | none | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.h` | none |
+| Rust | none | `.rs` | none |
+| Odin | none | `.odin` | none |
+| Java | none | `.java` | none |
+| Kotlin | none | `.kt`, `.kts` | none |
+| Groovy | `Jenkinsfile` | `.groovy`, `.gradle` | none |
+| C# | none | `.cs` | none |
+| Python | none | `.py`, `.pyi` | `python` |
+| Ruby | `Gemfile`, `Rakefile` | `.rb`, `.gemspec` | `ruby` |
+| Swift | none | `.swift` | none |
+| SQL | none | `.sql` | none |
+| TOML | none | `.toml` | none |
+| Dockerfile | `Dockerfile`, `Containerfile` | `.dockerfile` | none |
+| Make | `Makefile`, `makefile`, `GNUmakefile` | `.mk` | none |
+| HTML | none | `.html`, `.htm` | none |
+| XML | none | `.xml`, `.svg` | none |
+| Markdown inline | none | none | none |
+| Markdown | none | `.md`, `.markdown` | none |
+| PHP | none | `.php` | none |
+
+Markdown inline has no GrammarMatch rule.
+Only an Injection selects it.
+
+An Injection gives a region of a File to another BuiltInGrammar:
+
+- Markdown gives inline content to Markdown inline, and fenced code to the Grammar of its info string.
+- Markdown inline gives inline HTML to HTML.
+- HTML gives `<script>` to JavaScript and `<style>` to CSS.
+- PHP gives the text around the PHP code to HTML.
+
+An Injection uses only BuiltInGrammars.
+A UserGrammar is never the host of an Injection and never an injected Grammar.
+So a fenced `js` block in Markdown uses the JavaScript BuiltInGrammar, also when a UserGrammar claims `.js`.
+
+An active UserGrammar takes precedence over a BuiltInGrammar for the same File.
+`bbr grammar check` names each BuiltInGrammar that a UserGrammar overlaps.
+
 ### Manage UserGrammars
 
 > **Warning:** A UserGrammar contains native code. It runs in the `bbr` process with your

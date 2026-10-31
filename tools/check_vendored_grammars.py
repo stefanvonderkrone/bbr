@@ -163,6 +163,8 @@ def violations(root):
         for path in [*entry["sources"], *(entry[field] for field in ("highlights", "injections", "locals") if entry[field] is not None)]:
             if path not in paths:
                 yield f"{MANIFEST}: .{name} uses {path}, which is not in .{name}.files"
+            if not path.startswith(f"{name}/"):
+                yield f"{MANIFEST}: .{name} uses {path}, but the build compiles only files under {name}/"
         if entry["query_source"] == "nvim_treesitter":
             yield from adapted_query_violations(vendor, manifest, name, entry, paths)
 

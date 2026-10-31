@@ -25,6 +25,7 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Jump-to-file** — motion to scroll the pane to a File's header. `M8`
 - [ ] **Durable File read state** — unread Files are bold; locally persisted read Files return to unread when their reviewed content changes. `M22`
 - [x] **Syntax highlighting** — tree-sitter foreground over diff background. `M13`
+- [x] **BuiltInGrammar expansion** — Zig, C, C++, C#, PHP, Python, Rust, Odin, Swift, Kotlin, Java, Groovy, TOML, Dockerfile, Make, Ruby, HTML, XML, Markdown, and SQL highlight with no UserGrammar. Markdown, HTML, and PHP highlight their embedded languages through Injection. `M27`
 - [ ] **Binary and removed-file completeness** — safe placeholders and old-side whole-file splice. `M17`
 - [ ] **User-installed Grammars** — managed, validated tree-sitter Grammars and match rules. `M17`
 

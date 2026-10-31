@@ -59,9 +59,36 @@ Two directories hold no Grammar:
   Each Grammar lists in `.files` every raw query that its adaptation reads.
 - `common/scanner.h` belongs to the TypeScript and TSX Grammars, and both list it.
 
+The build compiles the sources and embeds the adapted queries in `<tag>/` only.
+It never reads `nvim-treesitter/queries/`.
+Only `tools/adapt_queries.py` reads the raw queries.
+
+## Licences
+
+Each Grammar directory keeps the `LICENSE` file of its upstream repository.
+`tools/vendor_grammar.py` stops when the Grammar checkout has no `LICENSE` file at the pinned commit.
+`.files` lists each `LICENSE` file with its checksum.
+
 The nvim-treesitter queries are Apache-2.0.
 `nvim-treesitter/LICENSE` holds that licence.
 Each adapted query starts with a comment that names the source path and the commit, and states that bbr changed the query.
+This comment meets the Apache-2.0 notice rule for changed files.
+
+## Generated parser.c
+
+Swift is the only BuiltInGrammar with a generated `parser.c`.
+Its repository has no `src/parser.c` at the pinned commit.
+`tools/vendor_grammar.py` generated it once with tree-sitter CLI 0.26.9, the version of the vendored runtime.
+The Swift entry records the generation:
+
+```zig
+.generated = .{ .cli = "0.26.9", .command = "tree-sitter generate --abi 15", .js_runtime = "node v24.18.0" },
+```
+
+The generated `parser.c` and `src/tree_sitter/*.h` are committed and checksummed like every copied file.
+Two runs of the tool gave the same `parser.c`.
+The M27 brief expected a generated `parser.c` for SQL too.
+The pinned `gh-pages` commit contains the upstream-generated file, so the tool copies it.
 
 ## Tools
 
@@ -91,6 +118,7 @@ It fails in these cases:
 - A file under a Grammar directory is not in the `.files` of that Grammar.
 - A file under a shared directory is in no `.files` list.
 - An entry uses a source or a query that is not in its `.files`.
+- An entry uses a source or a query outside its `<tag>/` directory, such as a raw query in `nvim-treesitter/queries/`.
 - An adapted query differs from a new adaptation of the raw queries.
 - The raw queries in `.files` differ from the raw queries that the adaptation reads.
 - A manifest entry has no directory, or a directory has no manifest entry.
@@ -121,6 +149,8 @@ Use the nvim-treesitter name as the tag.
 
    Add `--injections` for an Injection host.
    Add `--tree-sitter <path to the tree-sitter 0.26.9 CLI>` when `parser.c` needs generation.
+   The tool writes the adapted queries to `vendors/tree-sitter/<tag>/queries/`.
+   The build compiles that adapted copy, not the raw copy in `vendors/tree-sitter/nvim-treesitter/queries/`.
 3. Add the tag as the last tag of `BuiltInGrammar` in `src/highlight/grammar_match.zig`.
    The tags and the manifest entries must have the same order, or the build fails.
 4. Add a Capture fixture test named `M27 grammar ...` to `src/highlight/tree_sitter_highlighter.zig`.
@@ -129,7 +159,7 @@ Use the nvim-treesitter name as the tag.
    "M27 grammar the GrammarMatch table equals the manifest" already tests each filename, extension, and shebang.
 6. If the tag is a new fence name or alias, add it to `src/highlight/grammar_name.zig`.
 7. Run `python3 tools/check_vendored_grammars.py .`.
-   If an adapted injection query of a host differs, rerun the tool for that host.
+   If an adapted injection query of a host differs, rerun the tool for that host with `--injections`.
    A new tag can change which static Injection names the host keeps.
 8. Run `zig fmt --check build.zig src`, `zig build`, `zig build test-builtin-grammars`, and `zig build test --summary all`.
 

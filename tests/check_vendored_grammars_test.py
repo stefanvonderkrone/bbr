@@ -133,6 +133,13 @@ class VendoredGrammarsTest(unittest.TestCase):
         self.write_manifest()
         self.assertOneViolation("adapted query differs from a new adaptation")
 
+    def test_the_build_uses_no_raw_query(self):
+        manifest = self.vendor / "manifest.zig.zon"
+        text = manifest.read_text(encoding="utf-8")
+        manifest.write_text(text.replace('.highlights = "demo/queries/highlights.scm"', '.highlights = "nvim-treesitter/queries/demo/highlights.scm"'), encoding="utf-8")
+        found = self.violations()
+        self.assertIn(f"{checker.MANIFEST}: .demo uses nvim-treesitter/queries/demo/highlights.scm, but the build compiles only files under demo/", found)
+
     def test_command_exit_status(self):
         script = TOOLS / "check_vendored_grammars.py"
         clean = subprocess.run([sys.executable, script, self.root], capture_output=True, text=True)
