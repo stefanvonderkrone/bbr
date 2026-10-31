@@ -97,7 +97,8 @@ pub fn drawReview(
     const frame = review.frame;
     var diff_scroll = paneScroll(frame, .diff_pane);
     const track = view_mod.solve(layouts.PaneSlot, layouts.panes, layouts.Panes{}, .{ .width = win.width, .height = win.height }).get(.diff).track;
-    diff_scroll.marks = scroll_marks.project(scratch, track.height, diff_scroll.total, frame.row_marks, &.{}, true) catch &.{};
+    const hits = if (frame.buffer_search_ranges) frame.search_ranges else &.{};
+    diff_scroll.marks = scroll_marks.project(scratch, track.height, diff_scroll.total, frame.row_marks, hits, frame.search_ranges_sorted) catch &.{};
     const panes = view_paint.paint(layouts.PaneSlot, layouts.panes, layouts.Panes{
         .sidebar_focused = frame.focus == .sidebar,
         .sidebar_scroll = paneScroll(frame, .sidebar),
@@ -5500,17 +5501,24 @@ fn helpRowAvailable(rows: []const HelpRow, help: []const u8) ?bool {
 
 /// A Session of `files` Files with `lines` added Lines each.
 fn testScrollSession(files: usize, lines: usize) !*@import("session.zig").Session {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(testing.allocator);
+    for (0..files) |file| {
+        try raw.print(testing.allocator, "diff --git a/f{d}.zig b/f{d}.zig\n--- a/f{d}.zig\n+++ b/f{d}.zig\n@@ -0,0 +1,{d} @@\n", .{ file, file, file, file, lines });
+        for (0..lines) |index| try raw.print(testing.allocator, "+line {d}\n", .{index});
+    }
+    return testRawSession(raw.items, &.{});
+}
+
+/// A Session of Pull Request 1 over the diff `raw` with `comments`.
+fn testRawSession(raw: []const u8, comments: []const bbr.review.Comment) !*@import("session.zig").Session {
     const session = try @import("session.zig").create(testing.allocator);
     errdefer session.destroy();
     const a = session.arena.allocator();
     session.source = .{ .remote = .{ .id = 1, .title = "Scroll", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
     session.header = .{ .title = "Scroll", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
-    var raw: std.ArrayList(u8) = .empty;
-    for (0..files) |file| {
-        try raw.print(a, "diff --git a/f{d}.zig b/f{d}.zig\n--- a/f{d}.zig\n+++ b/f{d}.zig\n@@ -0,0 +1,{d} @@\n", .{ file, file, file, file, lines });
-        for (0..lines) |index| try raw.print(a, "+line {d}\n", .{index});
-    }
-    session.diff = try bbr.diff.parse(a, raw.items);
+    session.diff = try bbr.diff.parse(a, try a.dupe(u8, raw));
+    if (comments.len > 0) session.threads = try bbr.review.buildThreads(a, try a.dupe(bbr.review.Comment, comments));
     try session.initializeEnrichment();
     return session;
 }
@@ -5817,4 +5825,183 @@ test "M30 scrollbar a Theme preview paints the Scroll Marks in the previewed The
         checked += 1;
     }
     try testing.expect(checked > 0);
+}
+
+/// A Presentation over `raw` with `comments` and `drafts` on Pull Request 1.
+fn testHitPresentation(store: *bbr.review.InMemoryStore, raw: []const u8, comments: []const bbr.review.Comment, drafts: []const bbr.review.Draft) !presentation.Presentation {
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
+    for (drafts) |draft| try store.store().put(key.identity().remote, draft);
+    return presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .cell_metrics = terminal_cell_metrics }, .{
+        .initial = .{ .key = key, .session = try testRawSession(raw, comments) },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+}
+
+/// Runs the disclosure builds and the Buffer Search scans that `state` asks for.
+fn settleBufferSearch(state: *presentation.Presentation) !void {
+    while (state.takeCommand()) |taken| {
+        var command = taken;
+        switch (command) {
+            .build_buffer_disclosure => |build| {
+                build.build();
+                try state.dispatch(.{ .buffer_disclosure_built = build });
+            },
+            .scan_buffer_search => |*scan| {
+                const completed = presentation.executeBufferSearchScan(testing.allocator, scan);
+                command.deinit();
+                try state.dispatch(.{ .buffer_search_scanned = completed });
+            },
+            else => {
+                command.deinit();
+                return error.UnexpectedCommand;
+            },
+        }
+    }
+}
+
+fn typeBufferSearch(state: *presentation.Presentation, text: []const u8) !void {
+    try state.dispatch(.{ .key = .{ .codepoint = text[0], .text = text } });
+    try settleBufferSearch(state);
+}
+
+/// Paints `frame` and checks that each DiffPane track cell shows a hit mark
+/// exactly when a Buffer Search range has a row in it, and its row mark
+/// otherwise. Returns the count of hit cells.
+fn expectHitMarks(a: std.mem.Allocator, win: vaxis.Window, review: ReviewProjection) !usize {
+    const frame = review.frame;
+    win.clear();
+    drawReview(a, win, review, theme_dark, 0);
+    const track = frame.panes.diff_track;
+    const total = frame.visual_rows.len;
+    try testing.expect(total > track.height);
+    const row_cells = try scroll_marks.project(a, track.height, total, frame.row_marks, &.{}, true);
+    var hits: usize = 0;
+    for (0..track.height) |cell| {
+        var hit = false;
+        if (frame.buffer_search_ranges) for (frame.search_ranges) |range| {
+            hit = hit or (range.visual_row < total and view_mod.trackCell(track.height, total, range.visual_row) == cell);
+        };
+        const painted = markOf(win.readCell(track.x, @intCast(track.y + cell)).?.char.grapheme);
+        try testing.expectEqual(if (hit) .buffer_search_hit else row_cells[cell], painted);
+        hits += @intFromBool(hit);
+    }
+    return hits;
+}
+
+const m30_hit_diff = blk: {
+    var raw: []const u8 = "diff --git a/h.txt b/h.txt\n--- a/h.txt\n+++ b/h.txt\n@@ -0,0 +1,40 @@\n";
+    for (1..41) |line| raw = raw ++ std.fmt.comptimePrint("+line {d}\n", .{line});
+    break :blk raw ++ "diff --git a/n.txt b/n.txt\n--- a/n.txt\n+++ b/n.txt\n@@ -1 +1 @@\n-old\n+a needle\n";
+};
+
+test "M30 scrollbar a Buffer Search hit in a source Line and in a ReviewBody outranks the row marks of its cell" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const comments = [_]bbr.review.Comment{.{ .id = 1, .author = "Ada", .body = "a needle in a Thread", .anchor = .{ .path = "h.txt", .to = 5 } }};
+    const drafts = [_]bbr.review.Draft{.{ .local_id = 1, .kind = .comment, .scope = .{ .@"inline" = .{ .path = "h.txt", .to = 30 } }, .body = "a needle in a Draft" }};
+    var state = try testHitPresentation(&store, m30_hit_diff, &comments, &drafts);
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    try testing.expectEqual(@as(usize, 0), try expectHitMarks(a, win, state.projection().review.?));
+    try state.dispatch(.{ .action = .open_buffer_search });
+    try typeBufferSearch(&state, "needle");
+    const review = state.projection().review.?;
+    const frame = review.frame;
+    try testing.expectEqual(@as(usize, 3), state.projection().buffer_search.?.total);
+    try testing.expectEqual(@as(usize, 3), try expectHitMarks(a, win, review));
+    const track = frame.panes.diff_track;
+    const row_cells = try scroll_marks.project(a, track.height, frame.visual_rows.len, frame.row_marks, &.{}, true);
+    var found = std.EnumSet(buffer_mod.RowKind).initEmpty();
+    for (frame.search_ranges) |range| {
+        const kind = std.meta.activeTag(frame.buffer.rows[frame.visual_rows[range.visual_row].buffer_index]);
+        found.insert(kind);
+        const outranked: ?view_mod.ScrollMark = switch (kind) {
+            .comment => .unresolved_thread,
+            .draft => .draft,
+            else => null,
+        };
+        if (outranked) |mark| try testing.expectEqual(@as(?view_mod.ScrollMark, mark), row_cells[view_mod.trackCell(track.height, frame.visual_rows.len, range.visual_row)]);
+    }
+    try testing.expect(found.contains(.line) and found.contains(.comment) and found.contains(.draft));
+}
+
+test "M30 scrollbar a query edit changes the hit marks and clearing the query keeps the row marks" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const comments = [_]bbr.review.Comment{.{ .id = 1, .author = "Ada", .body = "a Thread", .anchor = .{ .path = "h.txt", .to = 5 } }};
+    var state = try testHitPresentation(&store, m30_hit_diff, &comments, &.{});
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    try state.dispatch(.{ .action = .open_buffer_search });
+    try typeBufferSearch(&state, "line 1");
+    const broad = state.projection().review.?.frame.search_ranges;
+    const broad_cells = try expectHitMarks(a, win, state.projection().review.?);
+    try typeBufferSearch(&state, "5");
+    try testing.expectEqualStrings("line 15", state.projection().buffer_search.?.query);
+    const narrow = state.projection().review.?.frame.search_ranges;
+    try testing.expectEqual(@as(usize, 1), narrow.len);
+    try testing.expect(broad.len > narrow.len);
+    try testing.expect(broad_cells > try expectHitMarks(a, win, state.projection().review.?));
+    for ("line 15") |_| {
+        try state.dispatch(.{ .key = .{ .codepoint = keymap.special.backspace } });
+        try settleBufferSearch(&state);
+    }
+    const cleared = state.projection();
+    try testing.expectEqualStrings("", cleared.buffer_search.?.query);
+    try testing.expectEqual(@as(usize, 0), try expectHitMarks(a, win, cleared.review.?));
+    const track = cleared.review.?.frame.panes.diff_track;
+    var row_marked: usize = 0;
+    for (0..track.height) |cell| row_marked += @intFromBool(markOf(win.readCell(track.x, @intCast(track.y + cell)).?.char.grapheme) != null);
+    try testing.expect(row_marked > 0);
+}
+
+test "M30 scrollbar a Search Occurrence inside a closed Fold gives no mark" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const raw = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,25 +1,25 @@\n-a\n+A\n" ++
+        " c1\n c2\n c3\n c4\n c5 needle\n c6\n c7\n c8\n c9\n c10\n-m\n+M\n" ++
+        " d1\n d2\n d3\n d4\n d5 needle\n d6\n d7\n d8\n d9\n d10\n-b\n+B\n";
+    var state = try testHitPresentation(&store, raw, &.{}, &.{});
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    try state.dispatch(.{ .action = .open_buffer_search });
+    try typeBufferSearch(&state, "needle");
+    const review = state.projection().review.?;
+    try testing.expectEqual(@as(usize, 2), state.projection().buffer_search.?.total);
+    var closed_folds: usize = 0;
+    for (review.frame.visual_rows) |visual| {
+        const row = review.frame.buffer.rows[visual.buffer_index];
+        closed_folds += @intFromBool(row == .disclosure and row.disclosure.kind == .fold and !row.disclosure.expanded);
+    }
+    try testing.expectEqual(@as(usize, 1), closed_folds);
+    try testing.expectEqual(@as(usize, 1), review.frame.search_ranges.len);
+    try testing.expectEqual(@as(usize, 1), try expectHitMarks(a, win, review));
+}
+
+test "M30 scrollbar Review Search highlights in the DiffPane give no mark" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try testScrollSearchPresentation(&store, .{ .cols = 80, .rows = 12 });
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const review = state.projection().review.?;
+    try testing.expect(!review.frame.buffer_search_ranges);
+    try testing.expect(review.frame.search_ranges.len > 0);
+    try testing.expectEqual(@as(usize, 0), try expectHitMarks(a, win, review));
 }
