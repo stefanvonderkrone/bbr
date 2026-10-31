@@ -161,6 +161,7 @@ pub const Traffic = struct {
     rate_limited: usize = 0,
     request_median_ns: u64 = 0,
     request_p95_ns: u64 = 0,
+    retries: usize = 0,
     paused_ns: u64 = 0,
 };
 
@@ -192,7 +193,7 @@ pub const ScenarioReport = struct {
         try out.print(" requests={d} src_requests={d} failures={d} rate_limited={d} request_median_ms={d:.1} request_p95_ms={d:.1}", .{
             t.requests, t.src_requests, t.failures, t.rate_limited, ms(t.request_median_ns), ms(t.request_p95_ns),
         });
-        try out.print(" paused_ms={d:.1} paced_samples={d}", .{ ms(t.paused_ns), self.paced_samples });
+        try out.print(" retries={d} paused_ms={d:.1} paced_samples={d}", .{ t.retries, ms(t.paused_ns), self.paced_samples });
         try out.print(" peak_retained_bytes={d} retained_bytes={d} full_review_bytes={d} peak_rss_bytes={d}", .{
             self.peak_retained_bytes, self.retained_bytes, self.full_review_bytes, self.peak_rss_bytes,
         });
@@ -394,6 +395,15 @@ pub const RequestWindow = struct {
         return null;
     }
 
+    /// A 429 response means the server counts more requests than the window. The marks fill it.
+    fn fill(self: *RequestWindow) !void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        _ = self.deadline(0);
+        const wall_now = self.clock.wall();
+        while (self.entries.items.len < self.hourly) try self.append(wall_now);
+    }
+
     /// Waits until `estimate` requests fit. The harness calls it only between scenarios.
     fn reserve(self: *RequestWindow, scenario: Scenario, estimate: usize) void {
         while (true) {
@@ -409,14 +419,31 @@ pub const RequestWindow = struct {
     }
 };
 
-/// Wraps an `HttpClient`, gates each request on the request window, and counts
-/// its traffic. It never stores a URL, a header, or a body. File Enrichments
-/// send from many threads at once.
+pub const RetryPolicy = struct {
+    base_ns: u64 = 2 * std.time.ns_per_s,
+    factor: u64 = 2,
+    cap_ns: u64 = 15 * std.time.ns_per_min,
+    max_attempts: usize = 8,
+
+    /// The full jitter range of the retry after failed attempt `attempt`, 1-based.
+    fn ceiling(self: RetryPolicy, attempt: usize) u64 {
+        var value = self.base_ns;
+        for (1..attempt) |_| value *|= self.factor;
+        return @min(value, self.cap_ns);
+    }
+};
+
+/// Wraps an `HttpClient`, gates each request on the request window, retries a
+/// failed GET, and counts its traffic. It never stores a URL, a header, or a
+/// body. File Enrichments send from many threads at once.
 pub const MeasuringHttpClient = struct {
     inner: bbr.http.HttpClient,
     clock: Clock,
     window: *RequestWindow,
     notes: *Notes,
+    random: std.Random,
+    policy: RetryPolicy = .{},
+    gave_up: bool = false,
     traffic: Traffic = .{},
     latencies: std.ArrayList(u64) = .empty,
     out_of_memory: bool = false,
@@ -441,29 +468,83 @@ pub const MeasuringHttpClient = struct {
         const self: *MeasuringHttpClient = @ptrCast(@alignCast(ptr));
         self.change(.in_flight, true);
         defer self.change(.in_flight, false);
-        while (try self.window.tryAcquire()) |until| {
-            const ns = @max(until -| self.clock.wall(), 1);
-            self.notes.wait(self.clock, ns, "reason=window", .{});
+        var attempt: usize = 0;
+        while (true) {
+            if (self.gaveUp()) return error.RetriesExhausted;
+            attempt += 1;
+            while (try self.window.tryAcquire()) |until| {
+                const ns = @max(until -| self.clock.wall(), 1);
+                self.notes.wait(self.clock, ns, "reason=window", .{});
+                self.pause(ns);
+            }
+            const start = self.clock.now();
+            const result = self.inner.send(allocator, request);
+            const elapsed = self.clock.now() -| start;
+            const retryable = request.method == .GET and if (result) |response|
+                response.status == 429 or (response.status >= 500 and response.status <= 599)
+            else |err|
+                err != error.OutOfMemory;
+            const give_up = retryable and attempt >= self.policy.max_attempts;
+            self.count(request, result, elapsed, retryable, give_up);
+            if (!retryable) return result;
+            var retry_after_ns: u64 = 0;
+            if (result) |response| {
+                allocator.free(response.body);
+                retry_after_ns = (response.retry_after_ms orelse 0) *| std.time.ns_per_ms;
+                if (response.status == 429) try self.window.fill();
+            } else |_| {}
+            if (give_up) {
+                if (result) |response|
+                    self.notes.print("give_up attempts={d} status={d}", .{ attempt, response.status })
+                else |err|
+                    self.notes.print("give_up attempts={d} error={s}", .{ attempt, @errorName(err) });
+                return error.RetriesExhausted;
+            }
+            const ns = @max(self.jitter(attempt), retry_after_ns);
+            if (result) |response|
+                self.notes.wait(self.clock, ns, "reason=retry status={d} attempt={d}", .{ response.status, attempt })
+            else |err|
+                self.notes.wait(self.clock, ns, "reason=retry error={s} attempt={d}", .{ @errorName(err), attempt });
             self.pause(ns);
         }
-        const start = self.clock.now();
-        const result = self.inner.send(allocator, request);
-        const elapsed = self.clock.now() -| start;
-        const src = std.mem.indexOf(u8, request.url, "/src/") != null;
+    }
+
+    /// Counts one attempt. `requests` counts attempts like the window, and `failures` counts final failures.
+    fn count(self: *MeasuringHttpClient, request: bbr.http.client.Request, result: anyerror!bbr.http.client.Response, elapsed: u64, retryable: bool, give_up: bool) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         self.traffic.requests += 1;
-        if (src) self.traffic.src_requests += 1;
+        if (std.mem.indexOf(u8, request.url, "/src/") != null) self.traffic.src_requests += 1;
         if (result) |response| {
+            if (response.status == 429) self.traffic.rate_limited += 1;
+        } else |_| {}
+        if (retryable) {
+            self.traffic.retries += 1;
+            if (give_up) {
+                self.gave_up = true;
+                self.traffic.failures += 1;
+            }
+        } else if (result) |response| {
             // A 404 is a missing side, which the merged PullRequest check counts.
-            if (response.status == 429) {
-                self.traffic.rate_limited += 1;
-            } else if (response.status >= 400 and response.status != 404) self.traffic.failures += 1;
+            if (response.status >= 400 and response.status != 404) self.traffic.failures += 1;
         } else |_| self.traffic.failures += 1;
         self.latencies.append(std.heap.page_allocator, elapsed) catch {
             self.out_of_memory = true;
         };
-        return result;
+    }
+
+    /// Full jitter: a uniform wait up to the ceiling of the retry.
+    fn jitter(self: *MeasuringHttpClient, attempt: usize) u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.random.uintAtMost(u64, self.policy.ceiling(attempt));
+    }
+
+    /// True after one request used every attempt. Later requests then fail without a send.
+    fn gaveUp(self: *MeasuringHttpClient) bool {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.gave_up;
     }
 
     fn pause(self: *MeasuringHttpClient, ns: u64) void {
@@ -521,6 +602,7 @@ pub const MeasuringHttpClient = struct {
             .src_requests = self.traffic.src_requests - start.traffic.src_requests,
             .failures = self.traffic.failures - start.traffic.failures,
             .rate_limited = self.traffic.rate_limited - start.traffic.rate_limited,
+            .retries = self.traffic.retries - start.traffic.retries,
             .request_median_ns = median(latencies),
             .request_p95_ns = p95(latencies),
             .paused_ns = self.excludedLocked() - start.excluded_ns,
@@ -662,6 +744,7 @@ pub const Environment = struct {
     bbr_version: []const u8,
     out: *std.Io.Writer,
     notes: *std.Io.Writer,
+    random: std.Random,
 };
 
 pub fn main(init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_version: []const u8) !void {
@@ -703,6 +786,7 @@ pub fn main(init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_
     defer owned.deinit(arena);
     var transport: StdTransport = .{ .io = init.io, .arena = arena, .environ_map = init.environ_map };
     var clock: IoClock = .{ .io = init.io };
+    var prng: std.Random.DefaultPrng = .init(clock.clock().wall());
     try run(.{
         .gpa = init.gpa,
         .io = init.io,
@@ -713,6 +797,7 @@ pub fn main(init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_
         .bbr_version = bbr_version,
         .out = out,
         .notes = &stderr.interface,
+        .random = prng.random(),
     }, options, repository, pull_request_id);
 }
 
@@ -755,15 +840,21 @@ pub fn run(env: Environment, options: Options, repository: []const u8, pull_requ
     defer lock_file.close(env.io);
     var window: RequestWindow = try .open(env.io, dir, env.clock, &notes, options.hourly_request_budget);
     defer window.deinit();
-    var measuring: MeasuringHttpClient = .{ .inner = try env.transport.open(), .clock = env.clock, .window = &window, .notes = &notes };
+    var measuring: MeasuringHttpClient = .{ .inner = try env.transport.open(), .clock = env.clock, .window = &window, .notes = &notes, .random = env.random };
     defer measuring.deinit();
     defer env.transport.close();
     env.clock.watch(&measuring);
     defer env.clock.watch(null);
+    chain(env, options, &measuring, &window, repository, pull_request_id) catch |err| {
+        // A request that gave up fails its caller with an error of the caller's own choice.
+        return if (measuring.gaveUp()) error.RetriesExhausted else err;
+    };
+}
 
-    const probe_ns = try probe(env, &measuring, repository, pull_request_id);
+fn chain(env: Environment, options: Options, measuring: *MeasuringHttpClient, window: *RequestWindow, repository: []const u8, pull_request_id: u64) !void {
+    const probe_ns = try probe(env, measuring, repository, pull_request_id);
     var driver: Driver = undefined;
-    try driver.init(env, options, &measuring, repository, pull_request_id);
+    try driver.init(env, options, measuring, repository, pull_request_id);
     defer driver.deinit();
     _ = try driver.start();
 
@@ -1070,6 +1161,7 @@ const Driver = struct {
         self.outstanding -= 1;
         self.observe(input);
         try self.send(input);
+        if (self.measuring.gaveUp()) return error.RetriesExhausted;
     }
 
     fn waitUntil(self: *Driver, condition: anytype) !void {
@@ -1677,7 +1769,7 @@ const FakeClock = struct {
 };
 
 const FakeTransport = struct {
-    fake: *bbr.http.FakeHttpClient,
+    client: bbr.http.HttpClient,
 
     fn transport(self: *FakeTransport) Transport {
         return .{ .ptr = self, .vtable = &.{ .open = open, .close = close } };
@@ -1685,10 +1777,56 @@ const FakeTransport = struct {
 
     fn open(ptr: *anyopaque) anyerror!bbr.http.HttpClient {
         const self: *FakeTransport = @ptrCast(@alignCast(ptr));
-        return self.fake.httpClient();
+        return self.client;
     }
 
     fn close(_: *anyopaque) void {}
+};
+
+/// Wraps the fake. A request that matches `key` takes the next response of `script`.
+/// After `healthy_calls` calls, every call fails with `error.ConnectionResetByPeer`.
+const FlakyHttpClient = struct {
+    fake: *bbr.http.FakeHttpClient,
+    key: ?[]const u8 = null,
+    script: []const bbr.http.Canned = &.{},
+    healthy_calls: ?usize = null,
+    calls: usize = 0,
+    scripted: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn httpClient(self: *FlakyHttpClient) bbr.http.HttpClient {
+        return .{ .ptr = self, .vtable = &.{ .send = send } };
+    }
+
+    fn send(ptr: *anyopaque, allocator: Allocator, request: bbr.http.client.Request) anyerror!bbr.http.client.Response {
+        const self: *FlakyHttpClient = @ptrCast(@alignCast(ptr));
+        const canned = blk: {
+            lock(&self.mutex);
+            defer self.mutex.unlock();
+            self.calls += 1;
+            if (self.healthy_calls) |healthy| if (self.calls > healthy) return error.ConnectionResetByPeer;
+            const key = self.key orelse break :blk null;
+            if (self.scripted == self.script.len or std.mem.indexOf(u8, request.url, key) == null) break :blk null;
+            self.scripted += 1;
+            break :blk self.script[self.scripted - 1];
+        };
+        const response = canned orelse return self.fake.httpClient().send(allocator, request);
+        return .{ .status = response.status, .body = try allocator.dupe(u8, response.body), .retry_after_ms = response.retry_after_ms };
+    }
+};
+
+/// A Random that repeats one value. `uintAtMost` returns the bound for `maxInt(u64)` and 0 for 1.
+const FixedRandom = struct {
+    value: u64,
+
+    fn random(self: *FixedRandom) std.Random {
+        return .init(self, fill);
+    }
+
+    fn fill(self: *FixedRandom, buffer: []u8) void {
+        const bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, self.value));
+        for (buffer, 0..) |*byte, index| byte.* = bytes[index % bytes.len];
+    }
 };
 
 const fixture_pull_request =
@@ -1749,6 +1887,7 @@ fn tmpPath(tmp: *const testing.TmpDir) ![]u8 {
 /// Runs the chain with the run files in `output_dir` and returns the printed output.
 fn runIn(transport: *FakeTransport, output_dir: []const u8, options: Options, clock: *FakeClock, notes: *std.Io.Writer) ![]u8 {
     var plain: bbr.highlight.PlainHighlighter = .{};
+    var prng: std.Random.DefaultPrng = .init(28);
     var output: std.Io.Writer.Allocating = .init(testing.allocator);
     errdefer output.deinit();
     var with_dir = options;
@@ -1763,6 +1902,7 @@ fn runIn(transport: *FakeTransport, output_dir: []const u8, options: Options, cl
         .bbr_version = "test",
         .out = &output.writer,
         .notes = notes,
+        .random = prng.random(),
     }, with_dir, "repo", 7);
     return output.toOwnedSlice();
 }
@@ -1774,7 +1914,7 @@ fn runFixture(responses: []const bbr.http.Canned, options: Options, clock: *Fake
     const path = try tmpPath(&tmp);
     defer testing.allocator.free(path);
     var fake: bbr.http.FakeHttpClient = .{ .responses = responses };
-    var transport: FakeTransport = .{ .fake = &fake };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
     var notes: std.Io.Writer.Allocating = .init(testing.allocator);
     defer notes.deinit();
     return runIn(&transport, path, options, clock, &notes.writer);
@@ -1914,15 +2054,107 @@ test "M28 cache an unlimited budget refetches nothing in S2, S3, S5, and S6" {
 }
 
 test "M28 cache a 429 response counts in rate_limited, also after the retry" {
-    const responses = fixtureResponses(.{ .request_key = "/src/aaaa/PATHSENTINEL/b.zig", .status = 429, .retry_after_ms = 1 });
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var flaky: FlakyHttpClient = .{ .fake = &fake, .key = "/src/aaaa/PATHSENTINEL/b.zig", .script = &.{.{ .status = 429, .retry_after_ms = 1 }} };
+    var transport: FakeTransport = .{ .client = flaky.httpClient() };
     var clock: FakeClock = .{};
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
     var options = fixture_options;
     options.scenarios = .initOne(.s1);
-    const output = try runFixture(&responses, options, &clock);
+    const output = try runIn(&transport, path, options, &clock, &notes.writer);
     defer testing.allocator.free(output);
-    // S1 fetches b.zig once. RemoteBlobSource retries the new side once.
-    try testing.expectEqual(@as(usize, 2), try intField(output, "scenario=s1 ", "rate_limited"));
+    // S1 fetches b.zig once. The harness retries the 429 below RemoteBlobSource, so the retry succeeds.
+    try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s1 ", "rate_limited"));
+    try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s1 ", "retries"));
     try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s1 ", "failures"));
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=retry status=429 attempt=1 seconds=") != null);
+}
+
+/// One GET through a MeasuringHttpClient on a fresh request window.
+const RetryProbe = struct {
+    tmp: testing.TmpDir,
+    clock: FakeClock = .{},
+    notes_text: std.Io.Writer.Allocating,
+    notes: Notes,
+    window: RequestWindow,
+    measuring: MeasuringHttpClient,
+
+    fn init(self: *RetryProbe, inner: bbr.http.HttpClient, random: std.Random, policy: RetryPolicy, hourly: usize) !void {
+        self.tmp = testing.tmpDir(.{});
+        self.clock = .{};
+        self.notes_text = .init(testing.allocator);
+        self.notes = .{ .writer = &self.notes_text.writer };
+        self.window = try .open(testing.io, self.tmp.dir, self.clock.clock(), &self.notes, hourly);
+        self.measuring = .{ .inner = inner, .clock = self.clock.clock(), .window = &self.window, .notes = &self.notes, .random = random, .policy = policy };
+    }
+
+    fn deinit(self: *RetryProbe) void {
+        self.measuring.deinit();
+        self.window.deinit();
+        self.notes_text.deinit();
+        self.tmp.cleanup();
+    }
+
+    fn get(self: *RetryProbe) !u16 {
+        const response = try self.measuring.httpClient().send(testing.allocator, .{ .method = .GET, .url = "https://example.test/x" });
+        defer testing.allocator.free(response.body);
+        return response.status;
+    }
+};
+
+test "M28 cache retries back off with full jitter up to the cap and honour Retry-After" {
+    const s = std.time.ns_per_s;
+    var max_jitter: FixedRandom = .{ .value = std.math.maxInt(u64) };
+    var zero_jitter: FixedRandom = .{ .value = 1 };
+    const cases = [_]struct {
+        responses: []const bbr.http.Canned,
+        random: *FixedRandom,
+        policy: RetryPolicy = .{},
+        sleeps: []const u64,
+        retries: usize,
+        rate_limited: usize = 0,
+    }{
+        .{ .responses = &.{ .{ .status = 503 }, .{ .status = 503 }, .{ .status = 503 }, .{ .status = 200 } }, .random = &max_jitter, .sleeps = &.{ 2 * s, 4 * s, 8 * s }, .retries = 3 },
+        .{ .responses = &.{ .{ .status = 503 }, .{ .status = 503 }, .{ .status = 503 }, .{ .status = 503 }, .{ .status = 200 } }, .random = &max_jitter, .policy = .{ .cap_ns = 5 * s }, .sleeps = &.{ 2 * s, 4 * s, 5 * s, 5 * s }, .retries = 4 },
+        // The 429 also fills the window, so the retry then waits at the request gate.
+        .{ .responses = &.{ .{ .status = 429, .retry_after_ms = 7000 }, .{ .status = 200 } }, .random = &zero_jitter, .sleeps = &.{ 7 * s, hour_ns - 7 * s }, .retries = 1, .rate_limited = 1 },
+    };
+    for (cases) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
+        var probe_client: RetryProbe = undefined;
+        try probe_client.init(fake.httpClient(), case.random.random(), case.policy, 900);
+        defer probe_client.deinit();
+        try testing.expectEqual(@as(u16, 200), try probe_client.get());
+        try testing.expectEqualSlices(u64, case.sleeps, probe_client.clock.recordedSleeps());
+        const traffic = try probe_client.measuring.since(testing.allocator, .{ .traffic = .{}, .latency_count = 0, .excluded_ns = 0 });
+        try testing.expectEqual(case.retries, traffic.retries);
+        try testing.expectEqual(case.retries + 1, traffic.requests);
+        try testing.expectEqual(case.rate_limited, traffic.rate_limited);
+        try testing.expectEqual(@as(usize, 0), traffic.failures);
+    }
+}
+
+test "M28 cache a 429 marks the request window full" {
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &.{ .{ .status = 429 }, .{ .status = 200 } } };
+    var max_jitter: FixedRandom = .{ .value = std.math.maxInt(u64) };
+    var probe_client: RetryProbe = undefined;
+    try probe_client.init(fake.httpClient(), max_jitter.random(), .{}, 5);
+    defer probe_client.deinit();
+    try testing.expectEqual(@as(u16, 200), try probe_client.get());
+    const notes = probe_client.notes_text.written();
+    const retry_at = std.mem.indexOf(u8, notes, "wait reason=retry status=429 attempt=1 seconds=2.0") orelse return error.MissingNote;
+    try testing.expect(std.mem.indexOfPos(u8, notes, retry_at, "wait reason=window seconds=3598.0") != null);
+    // The 429 and its marks hold the whole budget at time 0. The retry comes one hour later.
+    const log = try probe_client.tmp.dir.readFileAlloc(testing.io, "requests.log", testing.allocator, .unlimited);
+    defer testing.allocator.free(log);
+    const expected = "0\n" ** 5 ++ std.fmt.comptimePrint("{d}\n", .{hour_ns});
+    try testing.expectEqualStrings(expected, log);
 }
 
 test "M28 cache merged PullRequest check counts Hunk mismatch Files" {
@@ -1947,7 +2179,7 @@ fn runWithNotes(responses: []const bbr.http.Canned, options: Options, clock: *Fa
     const path = try tmpPath(&tmp);
     defer testing.allocator.free(path);
     var fake: bbr.http.FakeHttpClient = .{ .responses = responses };
-    var transport: FakeTransport = .{ .fake = &fake };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
     return runIn(&transport, path, options, clock, &notes.writer);
 }
 
@@ -2014,7 +2246,7 @@ test "M28 cache the request window survives a restart and never exceeds the budg
     for ([_][]const u8{ "first", "second" }) |run_label| {
         notes.clearRetainingCapacity();
         var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-        var transport: FakeTransport = .{ .fake = &fake };
+        var transport: FakeTransport = .{ .client = fake.httpClient() };
         options.run_label = run_label;
         const output = try runIn(&transport, path, options, &clock, &notes.writer);
         testing.allocator.free(output);
@@ -2045,7 +2277,7 @@ test "M28 cache a second harness on the same output directory fails" {
     defer held.close(testing.io);
     const responses = fixtureResponses(matching_b);
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    var transport: FakeTransport = .{ .fake = &fake };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
     var clock: FakeClock = .{};
     var notes: std.Io.Writer.Allocating = .init(testing.allocator);
     defer notes.deinit();
@@ -2071,7 +2303,7 @@ test "M28 cache a remote run needs a run label and an output directory" {
 test "M28 cache an unsupported command kind fails the run and names the kind" {
     const responses = fixtureResponses(matching_b);
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    var transport: FakeTransport = .{ .fake = &fake };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
     var plain: bbr.highlight.PlainHighlighter = .{};
     var clock: FakeClock = .{};
     var tmp = testing.tmpDir(.{});
@@ -2081,7 +2313,8 @@ test "M28 cache an unsupported command kind fails the run and names the kind" {
     var notes: Notes = .{ .writer = &notes_text.writer };
     var window: RequestWindow = try .open(testing.io, tmp.dir, clock.clock(), &notes, 900);
     defer window.deinit();
-    var measuring: MeasuringHttpClient = .{ .inner = try transport.transport().open(), .clock = clock.clock(), .window = &window, .notes = &notes };
+    var prng: std.Random.DefaultPrng = .init(28);
+    var measuring: MeasuringHttpClient = .{ .inner = try transport.transport().open(), .clock = clock.clock(), .window = &window, .notes = &notes, .random = prng.random() };
     defer measuring.deinit();
     const env: Environment = .{
         .gpa = testing.allocator,
@@ -2093,6 +2326,7 @@ test "M28 cache an unsupported command kind fails the run and names the kind" {
         .bbr_version = "test",
         .out = undefined,
         .notes = undefined,
+        .random = prng.random(),
     };
     var driver: Driver = undefined;
     try driver.init(env, fixture_options, &measuring, "repo", 7);
