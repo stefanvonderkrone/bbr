@@ -6,6 +6,18 @@
     },
     "read": {
       "/opt/homebrew/Cellar/zig/**": "allow"
+    },
+    "bash": {
+      "bbr": "deny",
+      "bbr *": "deny",
+      "zig build run": "deny",
+      "zig build run *": "deny",
+      "zig-out/bin/bbr": "deny",
+      "zig-out/bin/bbr *": "deny",
+      "./zig-out/bin/bbr": "deny",
+      "./zig-out/bin/bbr *": "deny",
+      "/*/bin/bbr": "deny",
+      "/*/bin/bbr *": "deny"
     }
   },
   "mcp": {
