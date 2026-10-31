@@ -41,3 +41,14 @@ An ADR records the M32 image decision and its evidence.
 ## Required checks
 
 - `python3 tools/check_agent_docs.py`
+
+## Comments
+
+The M32 runner planned the ADR number on 2026-10-31.
+`docs/adr/` ends at ADR-0013 on this branch.
+The unmerged branches of M27 and M28 both plan ADR-0014.
+So the M32 ADR uses ADR-0015.
+Check the number again when this ticket runs, and use the next free number if 0015 is taken.
+
+Ticket 03 found a decoder panic in the Zig 0.16 flate decoder on the `zigimg` path.
+The ADR must record it in the "Decoding" section, with the decision of ticket 05.
