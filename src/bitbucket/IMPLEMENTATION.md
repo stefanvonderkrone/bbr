@@ -23,6 +23,18 @@ Without a `q` filter, it sends one `state` parameter for each state.
 With a `q` filter, it puts the states into `q`, for example `(state="OPEN" OR state="MERGED") AND reviewers.uuid="{uuid}"`.
 A live check returned the same PullRequests for `state=DECLINED&state=OPEN` and for `q=(state="DECLINED" OR state="OPEN") AND (id > 0)`.
 
+### Partial responses
+
+A full PullRequest or Repository page is slow to serve. The `fields` parameter selects only the decoded fields and makes the page much faster.
+`partialFields` in `client.zig` derives the `fields` value from the page type that the adapter decodes, so the two cannot drift.
+The `next` links keep the `fields` parameter.
+Live checks on Workspace `check24` measured these wall times:
+
+- `list-repositories --pagelen 100`, six pages for 553 Repositories: 25.5 s and 12.4 s before, 3.8 s and 2.3 s with `fields`.
+- `list-pull-requests --repository pr-webapp --state MERGED --pagelen 50 --limit 50`: 6.2 s, 5.3 s, and 5.7 s before, 1.3 s, 0.8 s, and 0.7 s with `fields`.
+
+The JSON output of both commands did not change.
+
 ### Outdated Comments
 
 The Comments list endpoint, `/pullrequests/{id}/comments`, omits `inline.outdated`.

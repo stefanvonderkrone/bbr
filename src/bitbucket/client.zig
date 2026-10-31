@@ -1154,6 +1154,7 @@ pub const Client = struct {
         defer first.deinit(allocator);
         try first.appendSlice(allocator, base_url ++ "/repositories/");
         try percentEncodeInto(allocator, &first, workspace_override orelse self.cred.workspace);
+        try first.appendSlice(allocator, "?fields=" ++ comptime partialFields(RepositoryPage));
         return self.listPages(allocator, types.Repository, RepositoryPage, dupeRepository, deinitRepository, .{}, first.items, opts, null, false);
     }
 
@@ -1715,6 +1716,25 @@ pub const PageOptions = struct {
     task_state: ?types.TaskState = null,
 };
 
+/// The Bitbucket `fields` value that selects exactly the fields `Page` decodes.
+/// A full PullRequest or Repository page takes several seconds longer to serve.
+fn partialFields(comptime Page: type) []const u8 {
+    return comptime fieldPaths(Page, "")[1..];
+}
+
+fn fieldPaths(comptime T: type, comptime prefix: []const u8) []const u8 {
+    var paths: []const u8 = "";
+    for (@typeInfo(T).@"struct".fields) |field| {
+        const Field = switch (@typeInfo(field.type)) {
+            .optional => |optional| optional.child,
+            .pointer => |pointer| if (@typeInfo(pointer.child) == .@"struct") pointer.child else field.type,
+            else => field.type,
+        };
+        paths = paths ++ if (@typeInfo(Field) == .@"struct") fieldPaths(Field, prefix ++ field.name ++ ".") else "," ++ prefix ++ field.name;
+    }
+    return paths;
+}
+
 const PageRejection = struct { reason: ApiError, retry_after_ms: ?u64 };
 
 fn pageUrlWithBase(allocator: Allocator, first: []const u8, opts: PageOptions) ![]u8 {
@@ -2241,6 +2261,8 @@ pub const WorkspacePullRequestOptions = struct {
 /// Bitbucket's largest PullRequest page.
 const pull_request_pagelen = 50;
 
+const pull_request_fields = "&fields=" ++ partialFields(PrListPage);
+
 /// The filter of one PullRequest list request. `states` must not be empty.
 const PullRequestListFilter = struct {
     states: std.EnumSet(types.PullRequestState),
@@ -2267,6 +2289,7 @@ fn pullRequestListUrl(allocator: Allocator, endpoint: []const u8, filter: PullRe
     if (filter.source_branch == null and filter.reviewer == null and opts.query == null) {
         var separator: []const u8 = "";
         while (states.next()) |state| : (separator = "&") try url.print(allocator, "{s}state={s}", .{ separator, @tagName(state) });
+        try url.appendSlice(allocator, pull_request_fields);
         return .{ .url = try url.toOwnedSlice(allocator), .page = page };
     }
     // Bitbucket ignores the state parameter when q is present, so q must hold the states.
@@ -2288,6 +2311,7 @@ fn pullRequestListUrl(allocator: Allocator, endpoint: []const u8, filter: PullRe
     if (opts.query) |query| try q.print(allocator, " AND ({s})", .{query});
     try url.appendSlice(allocator, "q=");
     try percentEncodeInto(allocator, &url, q.items);
+    try url.appendSlice(allocator, pull_request_fields);
     return .{ .url = try url.toOwnedSlice(allocator), .page = page };
 }
 
@@ -3421,7 +3445,7 @@ test "listPullRequests builds a filtered, percent-encoded URL" {
 
     try testing.expectEqualStrings(
         "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests" ++
-            "?pagelen=50&q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22feature%2Fx%20y%22",
+            "?pagelen=50&q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22feature%2Fx%20y%22" ++ pull_request_fields,
         fake.lastUrl().?,
     );
 }
@@ -3429,10 +3453,10 @@ test "listPullRequests builds a filtered, percent-encoded URL" {
 test "PullRequest lists send the states as parameters without q and inside q with q" {
     const repo = "https://api.bitbucket.org/2.0/repositories/check24/repo/pullrequests";
     for ([_]struct { filter: ListOptions, opts: PageOptions, url: []const u8 }{
-        .{ .filter = .{}, .opts = .{ .pagelen = 50 }, .url = repo ++ "?pagelen=50&state=OPEN" },
-        .{ .filter = .{ .state = .MERGED }, .opts = .{}, .url = repo ++ "?state=MERGED" },
-        .{ .filter = .{ .state = .MERGED }, .opts = .{ .query = "id=1" }, .url = repo ++ "?q=state%3D%22MERGED%22%20AND%20%28id%3D1%29" },
-        .{ .filter = .{ .source_branch = "x" }, .opts = .{ .pagelen = 50 }, .url = repo ++ "?pagelen=50&q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22x%22" },
+        .{ .filter = .{}, .opts = .{ .pagelen = 50 }, .url = repo ++ "?pagelen=50&state=OPEN" ++ pull_request_fields },
+        .{ .filter = .{ .state = .MERGED }, .opts = .{}, .url = repo ++ "?state=MERGED" ++ pull_request_fields },
+        .{ .filter = .{ .state = .MERGED }, .opts = .{ .query = "id=1" }, .url = repo ++ "?q=state%3D%22MERGED%22%20AND%20%28id%3D1%29" ++ pull_request_fields },
+        .{ .filter = .{ .source_branch = "x" }, .opts = .{ .pagelen = 50 }, .url = repo ++ "?pagelen=50&q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22x%22" ++ pull_request_fields },
     }) |case| {
         var fake: FakeHttpClient = .{ .body = "{\"values\":[]}" };
         const items = try Client.init(fake.httpClient(), testCredential()).listPullRequestsPage(testing.allocator, "repo", case.filter, case.opts);
@@ -4708,6 +4732,7 @@ test "Workspace author PullRequests keep Bitbucket order, stop paging at the lim
             base_url ++ "/workspaces/check24/pullrequests/%7Bauthor%7D?pagelen=",
             case.pagelen,
             "&q=%28state%3D%22OPEN%22%20OR%20state%3D%22MERGED%22%29%20AND%20reviewers.uuid%3D%22%7Breviewer%7D%22%20AND%20%28title%20~%20%22x%22%29",
+            pull_request_fields,
         });
         defer testing.allocator.free(url);
         try testing.expectEqualStrings(url, fake.urlAt(0).?);
@@ -4719,7 +4744,7 @@ test "Workspace author PullRequests keep Bitbucket order, stop paging at the lim
     var fake: FakeHttpClient = .{ .body = "{\"values\":[]}" };
     const none = try Client.init(fake.httpClient(), testCredential()).listWorkspacePullRequests(testing.io, testing.allocator, .{ .party = .{ .author = "{author}" } }, .{});
     defer deinitSummaries(testing.allocator, none);
-    try testing.expectEqualStrings(base_url ++ "/workspaces/check24/pullrequests/%7Bauthor%7D?pagelen=50&state=OPEN", fake.lastUrl().?);
+    try testing.expectEqualStrings(base_url ++ "/workspaces/check24/pullrequests/%7Bauthor%7D?pagelen=50&state=OPEN" ++ pull_request_fields, fake.lastUrl().?);
 }
 
 const reviewer_repositories = "{\"values\":[{\"slug\":\"gamma\"},{\"slug\":\"alpha\"},{\"slug\":\"beta\"}]}";
@@ -4761,8 +4786,8 @@ test "Workspace reviewer PullRequests merge every Repository in slug order and h
     var done: std.atomic.Value(bool) = .init(false);
     const items = try listReviewerPullRequestsForTest(Client.init(fake.httpClient(), testCredential()), null, 1, &done);
     defer deinitSummaries(testing.allocator, items);
-    try testing.expectEqualStrings(base_url ++ "/repositories/check24?pagelen=100", fake.urlAt(0).?);
-    try testing.expectEqualStrings(base_url ++ "/repositories/check24/alpha/pullrequests?pagelen=50&q=%28state%3D%22OPEN%22%20OR%20state%3D%22DECLINED%22%29%20AND%20reviewers.uuid%3D%22%7Breviewer%7D%22", fake.urlAt(1).?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24?fields=" ++ comptime partialFields(RepositoryPage) ++ "&pagelen=100", fake.urlAt(0).?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/alpha/pullrequests?pagelen=50&q=%28state%3D%22OPEN%22%20OR%20state%3D%22DECLINED%22%29%20AND%20reviewers.uuid%3D%22%7Breviewer%7D%22" ++ pull_request_fields, fake.urlAt(1).?);
     try testing.expectEqual(@as(usize, 5), fake.call_count);
 }
 
@@ -5170,7 +5195,7 @@ test "review fixes PullRequest source branch and query combine in one encoded fi
     const items = try Client.init(fake.httpClient(), testCredential()).listPullRequestsPage(testing.allocator, "repo", .{ .source_branch = "feature/\"x\\y" }, .{ .query = "id=1 OR id=2", .sort = "-id", .follow = false });
     defer deinitSummaries(testing.allocator, items);
     try testing.expectEqualStrings(
-        "https://api.bitbucket.org/2.0/repositories/check24/repo/pullrequests?q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22feature%2F%5C%22x%5C%5Cy%22%20AND%20%28id%3D1%20OR%20id%3D2%29&sort=-id",
+        "https://api.bitbucket.org/2.0/repositories/check24/repo/pullrequests?q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22feature%2F%5C%22x%5C%5Cy%22%20AND%20%28id%3D1%20OR%20id%3D2%29" ++ pull_request_fields ++ "&sort=-id",
         fake.lastUrl().?,
     );
 }
@@ -5261,4 +5286,13 @@ test "review followups commits prefer linked display name and retain raw-only au
     try testing.expectEqualStrings("External Author <author@example.test>", items[0].author);
     try testing.expectEqualStrings("Linked Author", items[1].author);
     try testing.expectEqualStrings("Display Author", items[2].author);
+}
+
+test "partial responses request exactly the decoded PullRequest and Repository fields" {
+    try testing.expectEqualStrings(
+        "values.id,values.title,values.state,values.author.display_name,values.source.branch.name," ++
+            "values.destination.branch.name,values.destination.repository.full_name,values.draft,next",
+        partialFields(PrListPage),
+    );
+    try testing.expectEqualStrings("values.slug,values.full_name,values.name,values.uuid,values.is_private,next", partialFields(RepositoryPage));
 }

@@ -666,7 +666,7 @@ test "list-workspace-pull-requests rejects invalid options before HTTP" {
     try std.testing.expectEqual(@as(usize, 0), fake.call_count);
     const repeated = try listWorkspacePullRequests(std.testing.allocator, std.Io.failing, bb, &.{ "--author={a}", "--author={a}", "--state=MERGED", "--state=MERGED", "--state=OPEN" });
     defer bbr.bitbucket.deinitSummaries(std.testing.allocator, repeated);
-    try std.testing.expectEqualStrings(bbr.bitbucket.base_url ++ "/workspaces/workspace/pullrequests/%7Ba%7D?pagelen=50&state=OPEN&state=MERGED", fake.lastUrl().?);
+    try std.testing.expect(std.mem.startsWith(u8, fake.lastUrl().?, bbr.bitbucket.base_url ++ "/workspaces/workspace/pullrequests/%7Ba%7D?pagelen=50&state=OPEN&state=MERGED&fields="));
 }
 
 test "set-verdict rejects a spoofed uuid before HTTP" {
