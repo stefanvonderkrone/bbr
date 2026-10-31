@@ -6,6 +6,35 @@ The [Bitbucket glossary](./GLOSSARY.md) defines the domain terms used here.
 
 These observations come from live PullRequest checks.
 
+### PullRequest states and q
+
+A PullRequest list ignores the `state` parameter when the request also has a `q` parameter.
+This applies to `/repositories/{ws}/{repo}/pullrequests` and to `/workspaces/{ws}/pullrequests/{user}`.
+Live checks on Repository `pr-reise-cockpit` showed this behavior:
+
+- `state=OPEN` with `q=reviewers.uuid="{uuid}"` returned MERGED PullRequests.
+- The same request with `q=reviewers.uuid="{uuid}" AND state="OPEN"` returned no PullRequests.
+- `state=OPEN` with `q=source.branch.name="PCO-89-fe-login-für-internen-cockpit-adm"` returned the MERGED PullRequest 146.
+  The TUI uses this request to find the AdjacentPullRequest.
+- The author endpoint without `q` returned only DECLINED PullRequests for `state=DECLINED`.
+
+`pullRequestListUrl` in `client.zig` builds every PullRequest list URL.
+Without a `q` filter, it sends one `state` parameter for each state.
+With a `q` filter, it puts the states into `q`, for example `(state="OPEN" OR state="MERGED") AND reviewers.uuid="{uuid}"`.
+A live check returned the same PullRequests for `state=DECLINED&state=OPEN` and for `q=(state="DECLINED" OR state="OPEN") AND (id > 0)`.
+
+### Partial responses
+
+A full PullRequest or Repository page is slow to serve. The `fields` parameter selects only the decoded fields and makes the page much faster.
+`partialFields` in `client.zig` derives the `fields` value from the page type that the adapter decodes, so the two cannot drift.
+The `next` links keep the `fields` parameter.
+Live checks on Workspace `check24` measured these wall times:
+
+- `list-repositories --pagelen 100`, six pages for 553 Repositories: 25.5 s and 12.4 s before, 3.8 s and 2.3 s with `fields`.
+- `list-pull-requests --repository pr-webapp --state MERGED --pagelen 50 --limit 50`: 6.2 s, 5.3 s, and 5.7 s before, 1.3 s, 0.8 s, and 0.7 s with `fields`.
+
+The JSON output of both commands did not change.
+
 ### Outdated Comments
 
 The Comments list endpoint, `/pullrequests/{id}/comments`, omits `inline.outdated`.

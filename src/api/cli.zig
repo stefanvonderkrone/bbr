@@ -22,48 +22,52 @@ pub const Verb = struct {
     summary: []const u8,
     help: []const u8,
     example: []const u8,
+    /// Long flags without `--`, except the `global_flags` that every verb takes.
+    value_flags: []const []const u8 = &.{},
+    switch_flags: []const []const u8 = &.{},
     handler: *const fn (std.process.Init, bbr.bitbucket.Client, []const []const u8, bool) anyerror!void,
 };
 
 pub const verbs = [_]Verb{
-    .{ .name = "list-workspaces", .summary = "list workspaces for the authenticated account", .help = workspaces.list_help, .example = "bbr api list-workspaces --pagelen 10 --no-follow", .handler = workspaces.runList },
+    .{ .name = "list-workspaces", .summary = "list workspaces for the authenticated account", .help = workspaces.list_help, .example = "bbr api list-workspaces --pagelen 10 --no-follow", .value_flags = &.{ "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = workspaces.runList },
     .{ .name = "get-workspace", .summary = "get one workspace", .help = workspaces.get_help, .example = "bbr api get-workspace --workspace demo", .handler = workspaces.runGet },
-    .{ .name = "list-workspace-members", .summary = "list Workspace Member names and UUIDs", .help = workspaces.members_help, .example = "bbr api list-workspace-members --json", .handler = workspaces.runListMembers },
-    .{ .name = "search-workspace-members", .summary = "find Workspace Member UUIDs by name", .help = workspaces.search_members_help, .example = "bbr api search-workspace-members --name 'Ada Lovelace' --json", .handler = workspaces.runSearchMembers },
-    .{ .name = "list-repositories", .summary = "list repositories in a workspace", .help = repositories.list_help, .example = "bbr api list-repositories --workspace demo --limit 10", .handler = repositories.runList },
-    .{ .name = "get-repository", .summary = "get one repository", .help = repositories.get_help, .example = "bbr api get-repository --workspace demo --repository sample", .handler = repositories.runGet },
-    .{ .name = "create-branch", .summary = "create a branch from a commit or branch", .help = branches.create_help, .example = "bbr api create-branch --repository sample --name feature/example --target main", .handler = branches.runCreate },
-    .{ .name = "list-branches", .summary = "list branches in a repository", .help = branches.list_help, .example = "bbr api list-branches --repository sample --sort name --limit 10", .handler = branches.runList },
-    .{ .name = "get-branch", .summary = "get a branch and its target commit", .help = branches.get_help, .example = "bbr api get-branch --repository sample --name feature/example", .handler = branches.runGet },
-    .{ .name = "list-pull-requests", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .handler = pullrequests.runList },
-    .{ .name = "get-pull-request", .summary = "get one pull request", .help = pullrequests.get_help, .example = "bbr api get-pull-request --repository sample --pull-request-id 42", .handler = pullrequests.runGet },
-    .{ .name = "create-pull-request", .summary = "create a ready or draft pull request", .help = pullrequests.create_help, .example = "bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true", .handler = pullrequests.runCreate },
-    .{ .name = "update-pull-request", .summary = "update an open pull request", .help = pullrequests.update_help, .example = "bbr api update-pull-request --repository sample --pull-request-id 42 --draft false", .handler = pullrequests.runUpdate },
-    .{ .name = "decline-pull-request", .summary = "close a pull request without merging", .help = pullrequests.decline_help, .example = "bbr api decline-pull-request --repository sample --pull-request-id 42", .handler = pullrequests.runDecline },
-    .{ .name = "list-commit-pull-requests", .summary = "list pull requests for a commit", .help = pullrequests.commit_list_help, .example = "bbr api list-commit-pull-requests --repository sample --commit abc123 --limit 10", .handler = pullrequests.runListCommit },
-    .{ .name = "list-commits", .summary = "list commits (PR, revision, or from..to range)", .help = commits.help, .example = "bbr api list-commits --repository sample --revision main --limit 10", .handler = commits.run },
-    .{ .name = "get-diff", .summary = "raw diff of a pull request", .help = files.diff_help, .example = "bbr api get-diff --repository sample --pull-request-id 42 --out review.diff", .handler = files.runDiff },
-    .{ .name = "get-compare-diff", .summary = "raw diff between two commits", .help = files.compare_help, .example = "bbr api get-compare-diff --repository sample --from abc123 --to def456 --patch", .handler = files.runCompare },
-    .{ .name = "get-blob", .summary = "file bytes at a commit", .help = files.blob_help, .example = "bbr api get-blob --repository sample --commit abc123 --path src/main.zig --out main.zig", .handler = files.runBlob },
-    .{ .name = "check-blob", .summary = "verify file metadata at a commit", .help = files.check_help, .example = "bbr api check-blob --repository sample --commit abc123 --path src/main.zig --attributes -", .handler = files.runCheck },
-    .{ .name = "list-comments", .summary = "list comments on a pull request", .help = comments.list_help, .example = "bbr api list-comments --repository sample --pull-request-id 42 --no-head --limit 10", .handler = comments.runList },
-    .{ .name = "get-comment", .summary = "get one comment", .help = comments.get_help, .example = "bbr api get-comment --repository sample --pull-request-id 42 --comment-id 7", .handler = comments.runGet },
-    .{ .name = "create-comment", .summary = "create a comment or reply", .help = comments.create_help, .example = "bbr api create-comment --repository sample --pull-request-id 42 --body 'Please add a test.'", .handler = comments.runCreate },
-    .{ .name = "update-comment", .summary = "edit a comment body", .help = comments.update_help, .example = "bbr api update-comment --repository sample --pull-request-id 42 --comment-id 7 --body 'Please test this case.'", .handler = comments.runUpdate },
-    .{ .name = "delete-comment", .summary = "delete a comment", .help = comments.delete_help, .example = "bbr api delete-comment --repository sample --pull-request-id 42 --comment-id 7", .handler = comments.runDelete },
-    .{ .name = "resolve-comment", .summary = "resolve a comment thread", .help = comments.resolve_help, .example = "bbr api resolve-comment --repository sample --pull-request-id 42 --comment-id 7", .handler = comments.runResolve },
-    .{ .name = "reopen-comment", .summary = "reopen a comment thread", .help = comments.reopen_help, .example = "bbr api reopen-comment --repository sample --pull-request-id 42 --comment-id 7", .handler = comments.runReopen },
-    .{ .name = "list-tasks", .summary = "list tasks on a pull request", .help = tasks.list_help, .example = "bbr api list-tasks --repository sample --pull-request-id 42 --state-filter UNRESOLVED --limit 10", .handler = tasks.runList },
-    .{ .name = "get-task", .summary = "get one task", .help = tasks.get_help, .example = "bbr api get-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runGet },
-    .{ .name = "create-task", .summary = "create a task", .help = tasks.create_help, .example = "bbr api create-task --repository sample --pull-request-id 42 --content 'Add a test.'", .handler = tasks.runCreate },
-    .{ .name = "update-task", .summary = "update a task (content and/or state)", .help = tasks.update_help, .example = "bbr api update-task --repository sample --pull-request-id 42 --task-id 3 --state RESOLVED", .handler = tasks.runUpdate },
-    .{ .name = "delete-task", .summary = "delete a task", .help = tasks.delete_help, .example = "bbr api delete-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runDelete },
-    .{ .name = "resolve-task", .summary = "resolve a task", .help = tasks.resolve_help, .example = "bbr api resolve-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runResolve },
-    .{ .name = "reopen-task", .summary = "reopen a task", .help = tasks.reopen_help, .example = "bbr api reopen-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runReopen },
+    .{ .name = "list-workspace-members", .summary = "list Workspace Member names and UUIDs", .help = workspaces.members_help, .example = "bbr api list-workspace-members --json", .value_flags = &.{ "pagelen", "page", "limit" }, .switch_flags = &.{"no-follow"}, .handler = workspaces.runListMembers },
+    .{ .name = "search-workspace-members", .summary = "find Workspace Member UUIDs by name", .help = workspaces.search_members_help, .example = "bbr api search-workspace-members --name 'Ada Lovelace' --json", .value_flags = &.{ "name", "pagelen", "concurrency", "limit" }, .handler = workspaces.runSearchMembers },
+    .{ .name = "list-repositories", .summary = "list repositories in a workspace", .help = repositories.list_help, .example = "bbr api list-repositories --workspace demo --limit 10", .value_flags = &.{ "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = repositories.runList },
+    .{ .name = "get-repository", .summary = "get one repository", .help = repositories.get_help, .example = "bbr api get-repository --workspace demo --repository sample", .value_flags = &.{"repository"}, .handler = repositories.runGet },
+    .{ .name = "create-branch", .summary = "create a branch from a commit or branch", .help = branches.create_help, .example = "bbr api create-branch --repository sample --name feature/example --target main", .value_flags = &.{ "repository", "name", "target" }, .handler = branches.runCreate },
+    .{ .name = "list-branches", .summary = "list branches in a repository", .help = branches.list_help, .example = "bbr api list-branches --repository sample --sort name --limit 10", .value_flags = &.{ "repository", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = branches.runList },
+    .{ .name = "get-branch", .summary = "get a branch and its target commit", .help = branches.get_help, .example = "bbr api get-branch --repository sample --name feature/example", .value_flags = &.{ "repository", "name" }, .handler = branches.runGet },
+    .{ .name = "list-pull-requests", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .value_flags = &.{ "repository", "state", "source-branch", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = pullrequests.runList },
+    .{ .name = "list-workspace-pull-requests", .summary = "list Workspace pull requests by author or reviewer", .help = pullrequests.workspace_list_help, .example = "bbr api list-workspace-pull-requests --reviewer '{reviewer}' --repository sample --repository other --state OPEN --state MERGED --limit 20", .value_flags = &.{ "author", "reviewer", "repository", "state", "query", "concurrency", "limit" }, .handler = pullrequests.runListWorkspace },
+    .{ .name = "get-pull-request", .summary = "get one pull request", .help = pullrequests.get_help, .example = "bbr api get-pull-request --repository sample --pull-request-id 42", .value_flags = &.{ "repository", "pull-request-id" }, .handler = pullrequests.runGet },
+    .{ .name = "create-pull-request", .summary = "create a ready or draft pull request", .help = pullrequests.create_help, .example = "bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true", .value_flags = &.{ "repository", "title", "source-branch", "source-repository", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }, .switch_flags = &.{"clear-reviewers"}, .handler = pullrequests.runCreate },
+    .{ .name = "update-pull-request", .summary = "update an open pull request", .help = pullrequests.update_help, .example = "bbr api update-pull-request --repository sample --pull-request-id 42 --draft false", .value_flags = &.{ "repository", "pull-request-id", "title", "source-branch", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }, .switch_flags = &.{"clear-reviewers"}, .handler = pullrequests.runUpdate },
+    .{ .name = "decline-pull-request", .summary = "close a pull request without merging", .help = pullrequests.decline_help, .example = "bbr api decline-pull-request --repository sample --pull-request-id 42", .value_flags = &.{ "repository", "pull-request-id" }, .handler = pullrequests.runDecline },
+    .{ .name = "list-commit-pull-requests", .summary = "list pull requests for a commit", .help = pullrequests.commit_list_help, .example = "bbr api list-commit-pull-requests --repository sample --commit abc123 --limit 10", .value_flags = &.{ "repository", "commit", "pagelen", "page", "limit" }, .switch_flags = &.{"no-follow"}, .handler = pullrequests.runListCommit },
+    .{ .name = "list-commits", .summary = "list commits (PR, revision, or from..to range)", .help = commits.help, .example = "bbr api list-commits --repository sample --revision main --limit 10", .value_flags = &.{ "repository", "pull-request-id", "revision", "from", "to", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = commits.run },
+    .{ .name = "get-diff", .summary = "raw diff of a pull request", .help = files.diff_help, .example = "bbr api get-diff --repository sample --pull-request-id 42 --out review.diff", .value_flags = &.{ "repository", "pull-request-id", "out" }, .handler = files.runDiff },
+    .{ .name = "get-compare-diff", .summary = "raw diff between two commits", .help = files.compare_help, .example = "bbr api get-compare-diff --repository sample --from abc123 --to def456 --patch", .value_flags = &.{ "repository", "from", "to", "out" }, .switch_flags = &.{"patch"}, .handler = files.runCompare },
+    .{ .name = "get-blob", .summary = "file bytes at a commit", .help = files.blob_help, .example = "bbr api get-blob --repository sample --commit abc123 --path src/main.zig --out main.zig", .value_flags = &.{ "repository", "commit", "path", "out" }, .handler = files.runBlob },
+    .{ .name = "check-blob", .summary = "verify file metadata at a commit", .help = files.check_help, .example = "bbr api check-blob --repository sample --commit abc123 --path src/main.zig --attributes -", .value_flags = &.{ "repository", "commit", "path", "attributes" }, .handler = files.runCheck },
+    .{ .name = "list-comments", .summary = "list comments on a pull request", .help = comments.list_help, .example = "bbr api list-comments --repository sample --pull-request-id 42 --no-head --limit 10", .value_flags = &.{ "repository", "pull-request-id", "source-commit", "destination-commit", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{ "no-head", "no-follow" }, .handler = comments.runList },
+    .{ .name = "get-comment", .summary = "get one comment", .help = comments.get_help, .example = "bbr api get-comment --repository sample --pull-request-id 42 --comment-id 7", .value_flags = &.{ "repository", "pull-request-id", "comment-id" }, .handler = comments.runGet },
+    .{ .name = "create-comment", .summary = "create a comment or reply", .help = comments.create_help, .example = "bbr api create-comment --repository sample --pull-request-id 42 --body 'Please add a test.'", .value_flags = &.{ "repository", "pull-request-id", "body", "body-file", "parent-id", "path", "to", "from", "start-to", "start-from", "file-path", "source-commit" }, .handler = comments.runCreate },
+    .{ .name = "update-comment", .summary = "edit a comment body", .help = comments.update_help, .example = "bbr api update-comment --repository sample --pull-request-id 42 --comment-id 7 --body 'Please test this case.'", .value_flags = &.{ "repository", "pull-request-id", "comment-id", "body", "body-file" }, .handler = comments.runUpdate },
+    .{ .name = "delete-comment", .summary = "delete a comment", .help = comments.delete_help, .example = "bbr api delete-comment --repository sample --pull-request-id 42 --comment-id 7", .value_flags = &.{ "repository", "pull-request-id", "comment-id" }, .handler = comments.runDelete },
+    .{ .name = "resolve-comment", .summary = "resolve a comment thread", .help = comments.resolve_help, .example = "bbr api resolve-comment --repository sample --pull-request-id 42 --comment-id 7", .value_flags = &.{ "repository", "pull-request-id", "comment-id" }, .handler = comments.runResolve },
+    .{ .name = "reopen-comment", .summary = "reopen a comment thread", .help = comments.reopen_help, .example = "bbr api reopen-comment --repository sample --pull-request-id 42 --comment-id 7", .value_flags = &.{ "repository", "pull-request-id", "comment-id" }, .handler = comments.runReopen },
+    .{ .name = "list-tasks", .summary = "list tasks on a pull request", .help = tasks.list_help, .example = "bbr api list-tasks --repository sample --pull-request-id 42 --state-filter UNRESOLVED --limit 10", .value_flags = &.{ "repository", "pull-request-id", "state-filter", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = tasks.runList },
+    .{ .name = "get-task", .summary = "get one task", .help = tasks.get_help, .example = "bbr api get-task --repository sample --pull-request-id 42 --task-id 3", .value_flags = &.{ "repository", "pull-request-id", "task-id" }, .handler = tasks.runGet },
+    .{ .name = "create-task", .summary = "create a task", .help = tasks.create_help, .example = "bbr api create-task --repository sample --pull-request-id 42 --content 'Add a test.'", .value_flags = &.{ "repository", "pull-request-id", "content", "content-file", "comment-id" }, .handler = tasks.runCreate },
+    .{ .name = "update-task", .summary = "update a task (content and/or state)", .help = tasks.update_help, .example = "bbr api update-task --repository sample --pull-request-id 42 --task-id 3 --state RESOLVED", .value_flags = &.{ "repository", "pull-request-id", "task-id", "content", "content-file", "state" }, .handler = tasks.runUpdate },
+    .{ .name = "delete-task", .summary = "delete a task", .help = tasks.delete_help, .example = "bbr api delete-task --repository sample --pull-request-id 42 --task-id 3", .value_flags = &.{ "repository", "pull-request-id", "task-id" }, .handler = tasks.runDelete },
+    .{ .name = "resolve-task", .summary = "resolve a task", .help = tasks.resolve_help, .example = "bbr api resolve-task --repository sample --pull-request-id 42 --task-id 3", .value_flags = &.{ "repository", "pull-request-id", "task-id" }, .handler = tasks.runResolve },
+    .{ .name = "reopen-task", .summary = "reopen a task", .help = tasks.reopen_help, .example = "bbr api reopen-task --repository sample --pull-request-id 42 --task-id 3", .value_flags = &.{ "repository", "pull-request-id", "task-id" }, .handler = tasks.runReopen },
     .{ .name = "whoami", .summary = "authenticated account UUID", .help = pullrequests.whoami_help, .example = "bbr api whoami --json", .handler = pullrequests.runWhoami },
-    .{ .name = "get-user", .summary = "get an account by account ID or UUID", .help = users.get_help, .example = "bbr api get-user --user-id ACCOUNT_ID --json", .handler = users.runGet },
-    .{ .name = "get-verdict", .summary = "reviewer verdict for an account", .help = pullrequests.get_verdict_help, .example = "bbr api get-verdict --repository sample --pull-request-id 42 --uuid '{reviewer}'", .handler = pullrequests.runGetVerdict },
-    .{ .name = "set-verdict", .summary = "set the reviewer verdict", .help = pullrequests.set_verdict_help, .example = "bbr api set-verdict --repository sample --pull-request-id 42 --verdict approved --expected-source-commit abc123", .handler = pullrequests.runSetVerdict },
+    .{ .name = "get-user", .summary = "get an account by account ID or UUID", .help = users.get_help, .example = "bbr api get-user --user-id ACCOUNT_ID --json", .value_flags = &.{"user-id"}, .handler = users.runGet },
+    .{ .name = "get-verdict", .summary = "reviewer verdict for an account", .help = pullrequests.get_verdict_help, .example = "bbr api get-verdict --repository sample --pull-request-id 42 --uuid '{reviewer}'", .value_flags = &.{ "repository", "pull-request-id", "uuid" }, .handler = pullrequests.runGetVerdict },
+    .{ .name = "set-verdict", .summary = "set the reviewer verdict", .help = pullrequests.set_verdict_help, .example = "bbr api set-verdict --repository sample --pull-request-id 42 --verdict approved --expected-source-commit abc123", .value_flags = &.{ "repository", "pull-request-id", "verdict", "expected-source-commit" }, .handler = pullrequests.runSetVerdict },
 };
 
 pub const help = blk: {
@@ -88,92 +92,44 @@ pub const help = blk: {
         "Workspace selection: --workspace, BITBUCKET_WORKSPACE, selected Profile.\n";
 };
 
-const value_flags = [_][]const u8{
-    "workspace",        "repository",        "pull-request-id",    "comment-id",
-    "parent-id",        "task-id",           "body",               "body-file",
-    "content",          "content-file",      "path",               "file-path",
-    "to",               "from",              "start-to",           "start-from",
-    "state",            "state-filter",      "source-branch",      "commit",
-    "revision",         "source-commit",     "destination-commit", "expected-source-commit",
-    "uuid",             "out",               "pagelen",            "page",
-    "query",            "sort",              "limit",              "attributes",
-    "verdict",          "profile",           "name",               "target",
-    "title",            "source-repository", "destination-branch", "description",
-    "description-file", "reviewer",          "draft",              "close-source-branch",
-    "concurrency",      "user-id",
-};
-
-fn takesValue(name: []const u8) bool {
-    return completionTakesValue(name);
-}
-
 /// Global `bbr api` flags, also completed before and after the verb.
 pub const global_flags = [_][]const u8{ "profile", "workspace", "json", "help" };
 
-/// Whether a flag name takes a value (space or `=` form). Shared with the
-/// `bbr completion` scripts so value flags don't complete as booleans.
-pub fn completionTakesValue(name: []const u8) bool {
-    for (value_flags) |v| if (std.mem.eql(u8, v, name)) return true;
+const flag_sets = blk: {
+    @setEvalBranchQuota(200_000);
+    var values: []const []const u8 = &.{ "profile", "workspace" };
+    var switches: []const []const u8 = &.{"json"};
+    for (verbs) |verb| {
+        for (verb.value_flags, 0..) |flag, index| {
+            checkRowFlag(verb, flag, contains(verb.value_flags[0..index], flag) or contains(verb.switch_flags, flag));
+            if (contains(switches, flag)) @compileError("--" ++ flag ++ " takes a value in bbr api " ++ verb.name ++ " but is a switch in another row of `verbs` in src/api/cli.zig");
+            if (!contains(values, flag)) values = values ++ &[_][]const u8{flag};
+        }
+        for (verb.switch_flags, 0..) |flag, index| {
+            checkRowFlag(verb, flag, contains(verb.switch_flags[0..index], flag));
+            if (contains(values, flag)) @compileError("--" ++ flag ++ " is a switch in bbr api " ++ verb.name ++ " but takes a value in another row of `verbs` in src/api/cli.zig");
+            if (!contains(switches, flag)) switches = switches ++ &[_][]const u8{flag};
+        }
+    }
+    break :blk .{ .values = values, .switches = switches };
+};
+
+fn checkRowFlag(comptime verb: Verb, comptime flag: []const u8, comptime repeated: bool) void {
+    if (contains(&global_flags, flag)) @compileError("bbr api " ++ verb.name ++ " lists global flag --" ++ flag ++ "; remove it from its row of `verbs` in src/api/cli.zig");
+    if (repeated) @compileError("bbr api " ++ verb.name ++ " lists --" ++ flag ++ " twice in its row of `verbs` in src/api/cli.zig");
+}
+
+fn contains(list: []const []const u8, name: []const u8) bool {
+    for (list) |item| if (std.mem.eql(u8, item, name)) return true;
     return false;
 }
 
-/// Value-flag names for embedding in completion scripts.
-pub const completion_value_flags = value_flags;
+/// Every flag that takes a value (space or `=` form), globals first. The
+/// `bbr completion` scripts embed it so value flags don't complete as switches.
+pub const value_flags: []const []const u8 = flag_sets.values;
 
-/// Per-verb flags for completion. Keep beside `verbs[]`: a new verb row needs
-/// its flag row or `bbr completion` won't offer the verb's options. Names are
-/// the long `--kebab-case` form without `--`; boolean flags (`--no-follow`,
-/// `--no-head`, `--patch`, `--json`) are included too.
-pub const VerbFlags = struct {
-    verb: []const u8,
-    flags: []const []const u8,
-};
-
-pub const verb_flags = [_]VerbFlags{
-    .{ .verb = "list-workspaces", .flags = &.{ "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
-    .{ .verb = "get-workspace", .flags = &.{ "workspace", "json" } },
-    .{ .verb = "list-workspace-members", .flags = &.{ "pagelen", "page", "no-follow", "limit", "json" } },
-    .{ .verb = "search-workspace-members", .flags = &.{ "name", "pagelen", "concurrency", "limit", "json" } },
-    .{ .verb = "list-repositories", .flags = &.{ "workspace", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
-    .{ .verb = "get-repository", .flags = &.{ "repository", "workspace", "json" } },
-    .{ .verb = "create-branch", .flags = &.{ "repository", "name", "target", "json" } },
-    .{ .verb = "list-branches", .flags = &.{ "repository", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
-    .{ .verb = "get-branch", .flags = &.{ "repository", "name", "json" } },
-    .{ .verb = "list-pull-requests", .flags = &.{ "repository", "state", "source-branch", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
-    .{ .verb = "get-pull-request", .flags = &.{ "repository", "pull-request-id", "json" } },
-    .{ .verb = "create-pull-request", .flags = &.{ "repository", "title", "source-branch", "source-repository", "destination-branch", "description", "description-file", "reviewer", "clear-reviewers", "draft", "close-source-branch", "json" } },
-    .{ .verb = "update-pull-request", .flags = &.{ "repository", "pull-request-id", "title", "source-branch", "destination-branch", "description", "description-file", "reviewer", "clear-reviewers", "draft", "close-source-branch", "json" } },
-    .{ .verb = "decline-pull-request", .flags = &.{ "repository", "pull-request-id", "json" } },
-    .{ .verb = "list-commit-pull-requests", .flags = &.{ "repository", "commit", "pagelen", "page", "no-follow", "limit", "json" } },
-    .{ .verb = "list-commits", .flags = &.{ "repository", "pull-request-id", "revision", "from", "to", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
-    .{ .verb = "get-diff", .flags = &.{ "repository", "pull-request-id", "out", "json" } },
-    .{ .verb = "get-compare-diff", .flags = &.{ "repository", "from", "to", "patch", "out", "json" } },
-    .{ .verb = "get-blob", .flags = &.{ "repository", "commit", "path", "out", "json" } },
-    .{ .verb = "check-blob", .flags = &.{ "repository", "commit", "path", "attributes", "json" } },
-    .{ .verb = "list-comments", .flags = &.{ "repository", "pull-request-id", "source-commit", "destination-commit", "no-head", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
-    .{ .verb = "get-comment", .flags = &.{ "repository", "pull-request-id", "comment-id", "json" } },
-    .{ .verb = "create-comment", .flags = &.{ "repository", "pull-request-id", "body", "body-file", "parent-id", "path", "to", "from", "start-to", "start-from", "file-path", "source-commit", "json" } },
-    .{ .verb = "update-comment", .flags = &.{ "repository", "pull-request-id", "comment-id", "body", "body-file", "json" } },
-    .{ .verb = "delete-comment", .flags = &.{ "repository", "pull-request-id", "comment-id" } },
-    .{ .verb = "resolve-comment", .flags = &.{ "repository", "pull-request-id", "comment-id", "json" } },
-    .{ .verb = "reopen-comment", .flags = &.{ "repository", "pull-request-id", "comment-id", "json" } },
-    .{ .verb = "list-tasks", .flags = &.{ "repository", "pull-request-id", "state-filter", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
-    .{ .verb = "get-task", .flags = &.{ "repository", "pull-request-id", "task-id", "json" } },
-    .{ .verb = "create-task", .flags = &.{ "repository", "pull-request-id", "content", "content-file", "comment-id", "json" } },
-    .{ .verb = "update-task", .flags = &.{ "repository", "pull-request-id", "task-id", "content", "content-file", "state", "json" } },
-    .{ .verb = "delete-task", .flags = &.{ "repository", "pull-request-id", "task-id" } },
-    .{ .verb = "resolve-task", .flags = &.{ "repository", "pull-request-id", "task-id", "json" } },
-    .{ .verb = "reopen-task", .flags = &.{ "repository", "pull-request-id", "task-id", "json" } },
-    .{ .verb = "whoami", .flags = &.{"json"} },
-    .{ .verb = "get-user", .flags = &.{ "user-id", "json" } },
-    .{ .verb = "get-verdict", .flags = &.{ "repository", "pull-request-id", "uuid", "json" } },
-    .{ .verb = "set-verdict", .flags = &.{ "repository", "pull-request-id", "verdict", "expected-source-commit", "json" } },
-};
-
-/// Flag names for one verb, or `null` for an unknown verb.
-pub fn flagsForVerb(name: []const u8) ?[]const []const u8 {
-    for (verb_flags) |entry| if (std.mem.eql(u8, entry.verb, name)) return entry.flags;
-    return null;
+pub fn takesValue(name: []const u8) bool {
+    return contains(value_flags, name);
 }
 
 /// Split argv (after `api`) into globals + verb + verb args.
@@ -322,12 +278,7 @@ fn diagnosticVerb(argv: []const []const u8) ?Verb {
             if (takesValue(f.name)) {
                 i += 1;
                 if (i >= argv.len) return null;
-            } else if (!std.mem.eql(u8, f.name, "json") and
-                !std.mem.eql(u8, f.name, "no-follow") and
-                !std.mem.eql(u8, f.name, "no-head") and
-                !std.mem.eql(u8, f.name, "clear-reviewers") and
-                !std.mem.eql(u8, f.name, "patch"))
-            {
+            } else if (!contains(flag_sets.switches, f.name)) {
                 // An unknown flag can take a value. Do not guess its meaning.
                 return null;
             }
@@ -451,7 +402,6 @@ test "parseGlobal extracts Profiles without consuming verb flag values" {
 }
 
 test "verb registry is unique and every entry has matching help" {
-    try std.testing.expectEqual(@as(usize, 38), verbs.len);
     var summary_column: ?usize = null;
     inline for (verbs, 0..) |verb, index| {
         for (verbs[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, verb.name, other.name));
@@ -470,6 +420,71 @@ test "verb registry is unique and every entry has matching help" {
     try std.testing.expectEqualStrings(help, verbHelp("frobnicate"));
     try std.testing.expectEqualStrings(pullrequests.list_help, verbHelp("list-pull-requests"));
     try std.testing.expectEqualStrings(pullrequests.set_verdict_help, verbHelp("set-verdict"));
+}
+
+const UsageFlag = struct { name: []const u8, takes_value: bool };
+
+/// The next `--flag` in a help usage block. A flag takes a value when a word
+/// such as `N`, `SLUG`, or `true|false` follows it.
+fn nextUsageFlag(usage: []const u8, pos: *usize) ?UsageFlag {
+    const start = std.mem.indexOfPos(u8, usage, pos.*, "--") orelse return null;
+    var end = start + 2;
+    while (end < usage.len and (std.ascii.isLower(usage[end]) or std.ascii.isDigit(usage[end]) or usage[end] == '-')) end += 1;
+    pos.* = end;
+    const takes_value = end + 1 < usage.len and usage[end] == ' ' and std.mem.indexOfScalar(u8, "[(|-", usage[end + 1]) == null;
+    return .{ .name = usage[start + 2 .. end], .takes_value = takes_value };
+}
+
+test "every verb's help usage shows exactly the flags of its row" {
+    var failed = false;
+    for (verbs) |verb| {
+        const usage = verb.help[0 .. std.mem.indexOf(u8, verb.help, "\n\n") orelse verb.help.len];
+        var pos: usize = 0;
+        while (nextUsageFlag(usage, &pos)) |flag| {
+            if (contains(&global_flags, flag.name)) continue;
+            if (contains(if (flag.takes_value) verb.value_flags else verb.switch_flags, flag.name)) continue;
+            std.debug.print("bbr api {s}: help usage shows --{s} as a {s}, but its row of `verbs` in src/api/cli.zig does not\n", .{ verb.name, flag.name, if (flag.takes_value) "value flag" else "switch" });
+            failed = true;
+        }
+        for ([_][]const []const u8{ verb.value_flags, verb.switch_flags }) |row_flags| {
+            row: for (row_flags) |name| {
+                pos = 0;
+                while (nextUsageFlag(usage, &pos)) |flag| if (std.mem.eql(u8, flag.name, name)) continue :row;
+                std.debug.print("bbr api {s}: its row of `verbs` in src/api/cli.zig lists --{s}, but its help usage does not\n", .{ verb.name, name });
+                failed = true;
+            }
+        }
+    }
+    try std.testing.expect(!failed);
+}
+
+test "skills/bbr/VERBS.md lists every bbr api verb once" {
+    const doc = @embedFile("bbr_verbs_md");
+    var failed = false;
+    var lines = std.mem.splitScalar(u8, doc, '\n');
+    while (lines.next()) |line| {
+        const name = bulletVerb(line) orelse continue;
+        if (findVerb(name) != null) continue;
+        std.debug.print("skills/bbr/VERBS.md lists `{s}`, which is not a row of `verbs` in src/api/cli.zig\n", .{name});
+        failed = true;
+    }
+    for (verbs) |verb| {
+        var count: usize = 0;
+        lines.reset();
+        while (lines.next()) |line| {
+            if (std.mem.eql(u8, bulletVerb(line) orelse continue, verb.name)) count += 1;
+        }
+        if (count == 1) continue;
+        std.debug.print("skills/bbr/VERBS.md must list `{s}` in one bullet; it lists it {d} times\n", .{ verb.name, count });
+        failed = true;
+    }
+    try std.testing.expect(!failed);
+}
+
+fn bulletVerb(line: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, "- `")) return null;
+    const rest = line["- `".len..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, '`') orelse return null];
 }
 
 test "CLI workspace override works without an environment workspace" {
@@ -776,7 +791,7 @@ test "API lifecycle globals preserve every new value option and clear-reviewers 
             try std.testing.expect(!parsed.help_only);
         }
     }
-    try std.testing.expect(!completionTakesValue("clear-reviewers"));
+    try std.testing.expect(!takesValue("clear-reviewers"));
     try std.testing.expectEqualStrings("update-pull-request", diagnosticVerb(&.{ "--clear-reviewers", "update-pull-request" }).?.name);
 }
 
@@ -1039,6 +1054,46 @@ test "Workspace Member search failure on any page produces no partial success ou
                 try std.testing.expectError(expected, workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{ "--name=Ada", "--name=Nadia", "--concurrency=1" }, json));
                 try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
                 try std.testing.expectEqual(@as(usize, if (later) 2 else 1), fake.call_count);
+            }
+        }
+    }
+}
+
+test "list-workspace-pull-requests prints the named Repositories once in the given order and no stdout on a failed Repository" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const beta = "{\"id\":7,\"title\":\"Review\",\"state\":\"OPEN\",\"draft\":true,\"source\":{\"branch\":{\"name\":\"feature\"}}," ++
+        "\"destination\":{\"branch\":{\"name\":\"main\"},\"repository\":{\"full_name\":\"demo/beta\"}}}";
+    const alpha = "{\"id\":8,\"title\":\"Fix\",\"state\":\"OPEN\",\"source\":{\"branch\":{\"name\":\"fix\"}}," ++
+        "\"destination\":{\"branch\":{\"name\":\"main\"},\"repository\":{\"full_name\":\"demo/alpha\"}}}";
+    for ([_]bbr.http.Canned{ .{ .body = "{\"values\":[" ++ alpha ++ "]}" }, .{ .status = 403 } }) |alpha_response| {
+        var responses = [_]bbr.http.Canned{ .{ .request_key = "/beta/pullrequests", .body = "{\"values\":[" ++ beta ++ "]}" }, alpha_response };
+        responses[1].request_key = "/alpha/pullrequests";
+        for ([_]bool{ false, true }) |json| {
+            var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+            const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+            var output: TestOutput = .{};
+            const args = [_][]const u8{ "--reviewer={reviewer}", "--repository=beta", "--repository=alpha", "--repository=beta" };
+            const result = findVerb("list-workspace-pull-requests").?.handler(output.init(&env, &arena), bb, &args, json);
+            try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+            if (alpha_response.status != 200) {
+                try std.testing.expectError(error.Forbidden, result);
+                try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+            } else if (json) {
+                try result;
+                const decoded = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+                defer decoded.deinit();
+                try std.testing.expectEqual(@as(usize, 2), decoded.value.array.items.len);
+                try std.testing.expectEqualStrings("demo/beta", decoded.value.array.items[0].object.get("destination_repository").?.string);
+            } else {
+                try result;
+                try std.testing.expectEqualStrings(
+                    "demo/beta#7 [OPEN draft] Review (feature -> main)\ndemo/alpha#8 [OPEN] Fix (fix -> main)\nok: 2 pull request(s)\n",
+                    output.stdoutBytes(),
+                );
             }
         }
     }
