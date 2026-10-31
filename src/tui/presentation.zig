@@ -30122,3 +30122,190 @@ test "M30 scrollbar a Scroll Drag ends when its thumb goes away" {
     try m30Left(&presentation, track.x, track.y + 5, .drag);
     try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .sidebar).offset);
 }
+
+const m30_search_geometries = [_]frame_mod.Geometry{ .{ .cols = 100, .rows = 24 }, .{ .cols = 60, .rows = 70 } };
+
+/// Review Search over 30 Files with 60 results for "t", or the 30 Files
+/// while the results of "tw" are pending.
+fn m30ReviewSearchState(store: *bbr.review.InMemoryStore, geometry: frame_mod.Geometry, pending: bool) !Presentation {
+    const session = try m30ManyFilesSession(1);
+    errdefer session.destroy();
+    const comments = try session.arena.allocator().alloc(bbr.review.Comment, 60);
+    for (comments, 0..) |*comment, index| comment.* = .{ .id = index + 1, .author = "Ada", .body = "note" };
+    session.threads = try bbr.review.buildThreads(session.arena.allocator(), comments);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = geometry,
+    });
+    errdefer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 't', .text = "t" } });
+    try completeBufferSearchScan(&presentation);
+    try testing.expectEqual(@as(usize, 60), presentation.projection().review_search.?.results.len);
+    if (pending) {
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'w', .text = "w" } });
+        try testing.expect(presentation.projection().review_search.?.pending);
+    }
+    return presentation;
+}
+
+fn m30Selected(presentation: *const Presentation) ?usize {
+    return presentation.projection().review_search.?.selected;
+}
+
+test "M30 scrollbar a press on the Review Search list thumb keeps the scroll and a press off it jumps" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    for (m30_search_geometries) |geometry| {
+        var presentation = try m30ReviewSearchState(&store, geometry, false);
+        defer presentation.deinit();
+        const selected = m30Selected(&presentation);
+        try testing.expect(selected != null);
+        const before = m30Scroll(&presentation, .review_search_list);
+        const track = before.track;
+        const thumb = before.thumb().?;
+        try testing.expectEqual(@as(usize, 60), before.total);
+        try testing.expect(thumb.len < track.height);
+        try m30Left(&presentation, track.x, track.y + thumb.len - 1, .press);
+        try testing.expectEqual(before.offset, m30Scroll(&presentation, .review_search_list).offset);
+        try testing.expectEqual(thumb.len - 1, presentation.scroll_drag.?.grab);
+        try m30Left(&presentation, track.x, track.y + thumb.len - 1, .release);
+        try testing.expect(presentation.scroll_drag == null);
+        try testing.expectEqual(selected, m30Selected(&presentation));
+
+        for ([_]u16{ track.height - 1, track.height / 2 + 1, thumb.len }) |cell| {
+            try m30Left(&presentation, track.x, track.y + cell, .press);
+            const jumped = m30Scroll(&presentation, .review_search_list);
+            const covering = jumped.thumb().?;
+            try testing.expect(cell >= covering.first and cell < covering.first + covering.len);
+            try testing.expectEqual(cell - covering.first, presentation.scroll_drag.?.grab);
+            try testing.expectEqual(jumped.offset, presentation.projection().review_search.?.list_scroll);
+            try testing.expectEqual(selected, m30Selected(&presentation));
+            try m30Left(&presentation, track.x, track.y + cell, .release);
+            try testing.expect(presentation.projection().review_search != null);
+        }
+        try testing.expect(m30Scroll(&presentation, .review_search_list).offset != before.offset);
+        try testing.expectEqual(selected, m30Selected(&presentation));
+        for (m30_pane_bars) |bar| try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, bar).offset);
+    }
+}
+
+test "M30 scrollbar a Review Search list drag outside the Overlay and past both track ends reaches the first and the last result" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    for (m30_search_geometries) |geometry| {
+        var presentation = try m30ReviewSearchState(&store, geometry, false);
+        defer presentation.deinit();
+        const selected = m30Selected(&presentation);
+        const start = m30Scroll(&presentation, .review_search_list);
+        const track = start.track;
+        const rect = presentation.projection().review_search.?.geometry.rect;
+        const bottom_row = geometry.rows - 1;
+        try testing.expect(rect.x + rect.width < geometry.cols or rect.y + rect.height < geometry.rows);
+        const outside_col: u16 = if (rect.x > 0) 0 else geometry.cols - 1;
+        const grab = start.thumb().?.len - 1;
+        try m30Left(&presentation, track.x, track.y + grab, .press);
+
+        const bottom_first = view_mod.thumb(track.height, start.total, start.total - track.height).?.first;
+        for (0..bottom_first + 1) |index| {
+            const cell: u16 = @intCast(index);
+            try m30Left(&presentation, outside_col, track.y + grab + cell, .drag);
+            try testing.expectEqual(cell, m30Scroll(&presentation, .review_search_list).thumb().?.first);
+            try testing.expectEqual(selected, m30Selected(&presentation));
+        }
+
+        try m30Left(&presentation, outside_col, bottom_row, .drag);
+        const last = presentation.projection().review_search.?;
+        try testing.expectEqual(last.results.len, last.list_scroll + track.height);
+        try m30Left(&presentation, outside_col, 0, .drag);
+        try testing.expectEqual(@as(usize, 0), presentation.projection().review_search.?.list_scroll);
+        try m30Left(&presentation, 0, bottom_row, .drag);
+        try testing.expectEqual(start.total - track.height, presentation.projection().review_search.?.list_scroll);
+        try testing.expectEqual(selected, m30Selected(&presentation));
+
+        try m30Left(&presentation, outside_col, 0, .release);
+        try testing.expect(presentation.scroll_drag == null);
+        try testing.expect(presentation.projection().review_search != null);
+        try testing.expectEqual(selected, m30Selected(&presentation));
+        for (m30_pane_bars) |bar| try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, bar).offset);
+    }
+}
+
+test "M30 scrollbar a Review Search list press while results are pending uses the File count as the total" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try m30ReviewSearchState(&store, m30_search_geometries[0], true);
+    defer presentation.deinit();
+    const files = presentation.published.?.session.diff.files.len;
+    const state = m30Scroll(&presentation, .review_search_list);
+    try testing.expectEqual(files, state.total);
+    const track = state.track;
+    const cell = track.height - 1;
+    try m30Left(&presentation, track.x, track.y + cell, .press);
+    const jumped = m30Scroll(&presentation, .review_search_list);
+    try testing.expectEqual(files, jumped.total);
+    const thumb = jumped.thumb().?;
+    try testing.expect(cell >= thumb.first and cell < thumb.first + thumb.len);
+    try testing.expectEqual(@min(view_mod.cellFirstRow(track.height, files, cell) - track.height / 2, files - track.height), jumped.offset);
+    try m30Left(&presentation, track.x, presentation.geometry.rows - 1, .drag);
+    try testing.expectEqual(files - track.height, presentation.projection().review_search.?.list_scroll);
+    try testing.expect(presentation.projection().review_search.?.pending);
+}
+
+test "M30 scrollbar a Review Search close during the drag ends it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try m30ReviewSearchState(&store, m30_search_geometries[0], false);
+    defer presentation.deinit();
+    const track = m30Scroll(&presentation, .review_search_list).track;
+    const bottom = presentation.geometry.rows - 1;
+
+    try m30Left(&presentation, track.x, track.y, .press);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().review_search == null);
+    try testing.expect(presentation.scroll_drag == null);
+    try m30Left(&presentation, track.x, bottom, .drag);
+    for (m30_pane_bars) |bar| try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, bar).offset);
+
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try testing.expectEqual(@as(usize, 60), presentation.projection().review_search.?.results.len);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().review_search != null);
+    try m30Left(&presentation, track.x, track.y, .press);
+    try testing.expect(presentation.scroll_drag != null);
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.projection().review_search == null);
+    try testing.expect(frame_mod.scrollState(presentation.frameProjection(), .review_search_list) == null);
+    const opened = m30Scroll(&presentation, .diff_pane).offset;
+    try m30Left(&presentation, track.x, bottom, .drag);
+    try testing.expect(presentation.scroll_drag == null);
+    try testing.expectEqual(opened, m30Scroll(&presentation, .diff_pane).offset);
+    try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .sidebar).offset);
+}
+
+test "M30 scrollbar a Review Search entry click and a double click behave as before" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try m30ReviewSearchState(&store, m30_search_geometries[0], false);
+    defer presentation.deinit();
+    const geometry = presentation.projection().review_search.?.geometry;
+    const track = m30Scroll(&presentation, .review_search_list).track;
+    try m30Left(&presentation, track.x, track.y + track.height - 1, .press);
+    try m30Left(&presentation, track.x, track.y + track.height - 1, .release);
+    const scroll = presentation.projection().review_search.?.list_scroll;
+    try testing.expect(scroll > 0);
+
+    const point: MouseInput = .{ .col = geometry.list.x, .row = geometry.list.y + 2, .button = .left, .type = .press, .time_ns = 1_000_000_000 };
+    try presentation.dispatch(.{ .mouse = point });
+    try testing.expect(presentation.scroll_drag == null);
+    try presentation.dispatch(.{ .mouse = .{ .col = point.col, .row = point.row, .button = .left, .type = .release, .time_ns = point.time_ns } });
+    try testing.expectEqual(@as(?usize, scroll + 2), m30Selected(&presentation));
+    try testing.expectEqual(scroll, presentation.projection().review_search.?.list_scroll);
+
+    var again = point;
+    again.time_ns = 1_100_000_000;
+    try presentation.dispatch(.{ .mouse = again });
+    try presentation.dispatch(.{ .mouse = .{ .col = point.col, .row = point.row, .button = .left, .type = .release, .time_ns = again.time_ns } });
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.projection().review_search == null);
+}

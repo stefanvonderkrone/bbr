@@ -149,12 +149,13 @@ pub fn scrollState(projection: Projection, bar: ScrollBar) ?ScrollState {
     };
 }
 
-/// The numbers of `bar` while it takes a press and a Scroll Drag: no Overlay
-/// covers it and it shows a thumb. Hit testing and the Scroll Drag share it.
+/// The numbers of `bar` while it takes a press and a Scroll Drag: it shows a
+/// thumb, and only its own Overlay covers it. Hit testing and the Scroll Drag
+/// share it.
 pub fn scrollTarget(projection: Projection, bar: ScrollBar) ?ScrollState {
     const covered = switch (bar) {
         .sidebar, .diff_pane => projection.overlay != null,
-        .review_search_list => false,
+        .review_search_list => if (projection.overlay) |overlay| overlay.kind != .review_search else true,
     };
     if (covered) return null;
     const state = scrollState(projection, bar) orelse return null;
@@ -299,6 +300,7 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
     if (frame.overlay) |overlay| {
         if (overlay.kind == .review_search) {
             const geometry = overlay.review_search orelse return null;
+            if (scrollBarHit(frame, .review_search_list, col, row)) |hit| return .{ .scroll_bar = hit };
             if (geometry.list.contains(col, row)) {
                 const index = overlay.scroll + row - geometry.list.y;
                 if (index < overlay.row_count) return .{ .review_search_entry = index };
@@ -1543,4 +1545,53 @@ test "M30 scrollbar a track without a thumb or under an Overlay has no scroll ba
     }
     try testing.expect(hitTest(frame, panes.sidebar_track.x, panes.sidebar_track.y) == null);
     try testing.expect(hitTest(frame, panes.diff_track.x, panes.diff_track.y) == null);
+}
+
+test "M30 scrollbar the Review Search list track takes a press before the list while it shows a thumb" {
+    for ([_]Geometry{ .{ .cols = 100, .rows = 40 }, .{ .cols = 40, .rows = 100 } }) |geometry| {
+        const surface = reviewSearchGeometry(geometry).?;
+        const track = surface.list_track;
+        try testing.expect(track.height > 1);
+        const panes = paneRects(geometry);
+        const entries = [_]file_tree.Entry{.{ .identity = .{ .file = 0 }, .parent = null, .depth = 0, .label = "a.zig" }} ** 200;
+        const rows = [_]VisualRow{.{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } } }} ** 200;
+        var frame: Projection = .{
+            .revision = 1,
+            .visual_rows_revision = 1,
+            .geometry = geometry,
+            .panes = panes,
+            .visual_rows = &rows,
+            .buffer = .{ .rows = &.{}, .layout = .unified },
+            .navigation = Nav.init(rows.len, panes.diff_content.height),
+            .file_tree = .{ .entries = &entries, .viewport = panes.sidebar_content.height },
+        };
+        try testing.expect(scrollTarget(frame, .review_search_list) == null);
+
+        frame.overlay = .{ .kind = .review_search, .rect = surface.rect, .review_search = surface, .row_count = 200, .list_total = 200, .scroll = 7 };
+        for (0..track.height) |index| {
+            const cell: u16 = @intCast(index);
+            try testing.expectEqual(HitTarget{ .scroll_bar = .{ .bar = .review_search_list, .cell = cell } }, hitTest(frame, track.x, track.y + cell).?);
+        }
+        try testing.expectEqual(HitTarget{ .review_search_entry = 7 }, hitTest(frame, surface.list.x, surface.list.y).?);
+        try testing.expectEqual(HitTarget{ .review_search_entry = 7 }, hitTest(frame, track.x - 1, track.y).?);
+        try testing.expectEqual(HitTarget.review_search_preview, hitTest(frame, surface.preview.x, surface.preview.y).?);
+        for ([_]ScrollBar{ .sidebar, .diff_pane }) |bar| {
+            try testing.expect(scrollState(frame, bar).?.thumb() != null);
+            try testing.expect(scrollTarget(frame, bar) == null);
+        }
+        try testing.expect(hitTest(frame, panes.diff_track.x, panes.diff_track.y) == null);
+
+        var fits = frame;
+        fits.overlay.?.list_total = track.height;
+        fits.overlay.?.scroll = 0;
+        try testing.expect(scrollTarget(fits, .review_search_list) == null);
+        for (0..track.height) |index| {
+            const hit = hitTest(fits, track.x, @intCast(track.y + index));
+            try testing.expect(hit == null or hit.? != .scroll_bar);
+        }
+
+        var covered = frame;
+        covered.overlay.?.kind = .other;
+        try testing.expect(scrollTarget(covered, .review_search_list) == null);
+    }
 }
