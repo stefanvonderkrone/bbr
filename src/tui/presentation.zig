@@ -31170,6 +31170,58 @@ test "M29 overview a Review-level Review Search result shows the Comment Overvie
     try testing.expectEqual(diff_before.visual_rows.ptr, diff_after.visual_rows.ptr);
 }
 
+test "M29 overview an allocation failure in the Review Search route keeps the previous Frame and Review Search" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try testOverviewPresentation(&store, 3);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try selectReviewSearchOwner(&presentation, "review 2", .{ .comment = 12 });
+    const before = presentation.projection().review.?.frame;
+    try testing.expect(published.overview_index_stale);
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var indexes = published.overview_indexes;
+        var trees = published.trees;
+        var listings = published.overview_listings;
+        published.overview_indexes = ArenaRing(2).init(failing.allocator());
+        published.trees = ArenaRing(2).init(failing.allocator());
+        published.overview_listings = ArenaRing(2).init(failing.allocator());
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        if (!failing.has_induced_failure) {
+            indexes.deinit();
+            trees.deinit();
+            listings.deinit();
+            break;
+        }
+
+        const after = presentation.projection().review.?.frame;
+        try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+        try testing.expect(presentation.projection().review_search != null);
+        try testing.expectEqual(MainPane.diff_pane, after.main_pane);
+        try testing.expectEqual(before.focus, after.focus);
+        try testing.expectEqual(before.visual_rows.ptr, after.visual_rows.ptr);
+        try testing.expectEqual(before.file_tree.entries.ptr, after.file_tree.entries.ptr);
+        try testing.expectEqual(before.file_tree.cursor, after.file_tree.cursor);
+        try testing.expectEqual(before.overview.listing.entries.ptr, after.overview.listing.entries.ptr);
+        try testing.expect(published.overview_index_stale);
+        try testing.expectEqual(@as(?review_card.Owner, null), published.overview.selected);
+        published.overview_indexes.deinit();
+        published.trees.deinit();
+        published.overview_listings.deinit();
+        published.overview_indexes = indexes;
+        published.trees = trees;
+        published.overview_listings = listings;
+    }
+    try testing.expect(fail_index > 0);
+    try testing.expect(presentation.takeCommand() == null);
+    try expectOverviewShows(&presentation, .{ .comment = 12 });
+    try testing.expect(presentation.projection().action_error == null);
+}
+
 fn setOverviewQuery(presentation: *Presentation, text: []const u8) !void {
     try presentation.dispatch(.{ .action = .edit_overview_query });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });

@@ -360,12 +360,12 @@ the memory, storage, and invalidation cost of a replacement.
 Add one place to inspect and navigate every authored item in the current Review with its scope
 context. Keep M21 navigation to the existing DiffPane ReviewCard until this milestone ships.
 
-- [ ] Define the Comment Overview projection and interaction before implementation. Add the accepted term to the Presentation glossary.
-- [ ] List every Comment, Reply, and Draft. Include resolved, outdated, unavailable, and collapsed items without changing their saved disclosure state.
-- [ ] Show nearby source Lines for an inline item, File context for a File-level item, and ReviewHeader context for a Review-level item. Do not invent source context for a Review-level item.
-- [ ] Navigate from an overview item to its ReviewCard in the DiffPane. Preserve the overview query, selection, and scroll position when the reviewer returns.
-- [ ] After the overview ships, route a Review Search result for a Review-level item through the overview when that route gives clearer context than the all-Files Buffer.
-- [ ] Add Presentation coverage for each CommentScope, nested Replies, Drafts, disclosures, stale Session work, navigation, and return-state restoration.
+- [x] Define the Comment Overview projection and interaction before implementation. Add the accepted term to the Presentation glossary.
+- [x] List every Comment, Reply, and Draft. Include resolved, outdated, unavailable, and collapsed items without changing their saved disclosure state.
+- [ ] Show nearby source Lines for an inline item, File context for a File-level item, and ReviewHeader context for a Review-level item. Do not invent source context for a Review-level item. Deferred by decision 8 of the [M29 brief](.scratch/m29-comment-overview/brief.md). A row shows only the scope, the author, and a one-line excerpt.
+- [x] Navigate from an overview item to its ReviewCard in the DiffPane. Preserve the overview query, selection, and scroll position when the reviewer returns.
+- [x] After the overview ships, route a Review Search result for a Review-level item through the overview when that route gives clearer context than the all-Files Buffer.
+- [x] Add Presentation coverage for each CommentScope, nested Replies, Drafts, disclosures, stale Session work, navigation, and return-state restoration.
 
 ## M30 - Viewer scrollbars  ·  S/M  ·  needs M15
 Show the visible range in both viewer Panes. Use a thin thumb without a full-height track,

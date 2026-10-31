@@ -186,6 +186,23 @@ pub const Frame = struct {
     /// The path of the File Tree Filter, or empty without one.
     filter_path: []const u8 = "",
     cell_metrics: CellMetrics = .bytes,
+
+    comptime {
+        for (@typeInfo(Frame).@"struct".fields) |field| {
+            if (containsArray(field.type)) @compileError("comment_overview.Frame." ++ field.name ++ " holds an array by value. vaxis cells keep their text until render, so borrow it from Published as a pointer or a slice.");
+        }
+    }
+
+    fn containsArray(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .array => true,
+            .@"struct" => |info| for (info.fields) |field| {
+                if (containsArray(field.type)) break true;
+            } else false,
+            .optional => |info| containsArray(info.child),
+            else => false,
+        };
+    }
 };
 
 /// The longest excerpt in bytes. The cut keeps whole UTF-8 scalars.

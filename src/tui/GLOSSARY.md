@@ -29,7 +29,7 @@ It also does not select a SideBySide column as an Anchor target.
 _Avoid_: selected side, active side, Anchor side.
 
 **Pane**:
-A tiled region of the screen with a defined role (Sidebar, DiffPane, ThreadPane). Panes tile; they do not overlap.
+A tiled region of the screen with a defined role (Sidebar, DiffPane, Comment Overview, ThreadPane). Panes tile; they do not overlap.
 A View lays out each Pane, but a Pane is the role, not the View.
 _Avoid_: window (reserved for vaxis's surface), view, panel.
 
@@ -45,12 +45,45 @@ _Avoid_: layout (the whole tree), container type.
 The persistent Pane containing the current review's File Tree, with change status and comment/draft counts.
 _Avoid_: nav, drawer.
 
+**Main Pane**:
+The Pane right of the Sidebar.
+It shows the DiffPane or the Comment Overview, never both.
+The DiffPane shows at start and after each Session replacement.
+_Avoid_: main area, main view, content Pane.
+
+**Comment Overview**:
+The Pane in the Main Pane that lists every Comment, Reply, and Draft of the current Review as Overview Entries.
+Its Overview State belongs to the Session.
+It never changes a disclosure.
+_Avoid_: comment list, conversations panel, ThreadPane, overview (alone).
+
+**Overview Entry**:
+One row of the Comment Overview.
+It names one Comment or Draft and sits one indent step under its parent.
+A context entry is a dim ancestor that does not match the filters.
+_Avoid_: item, row, result.
+
+**Overview State**:
+The query, the three toggles, the order, the File Tree Filter, the selection, and the scroll of the Comment Overview.
+The toggles are unresolved only, Drafts only, and mine only.
+The order is Review order or newest first.
+_Avoid_: overview settings, view state.
+
 **File Tree**:
 The collapsible repository-path hierarchy shown inside the Sidebar. Its entries are Directories and Files.
+While the Comment Overview shows, a root entry with the label "All Files" leads the File Tree.
 _Avoid_: Sidebar (the containing Pane), flat file list.
+
+**File Tree Filter**:
+The File Tree entry under the cursor while the Comment Overview shows.
+A File or a Directory narrows the Overview Entries to its path.
+The root entry clears it.
+_Avoid_: path filter, scope filter (Scope is a Diff term).
 
 **File Jump**:
 A move of the DiffPane cursor to the File header of another File: `]`, `[`, a File Tree File, the File Finder, or the isolate view. The File header lands on the top DiffPane row, unless the end of the Buffer stops the scroll.
+A File Jump always shows the DiffPane.
+A File Tree File is a File Jump only while the DiffPane shows.
 _Avoid_: file navigation, go to file.
 
 **File Read State**:
@@ -95,6 +128,7 @@ _Avoid_: Review Search (crosses File boundaries), find (the Action has defined s
 
 **Review Search**:
 The Overlay for fuzzy-searching both complete versions of every changed File and every authored Comment, Reply, and Draft body in the current PullRequest or LocalReview. Results stream as File Enrichment arrives and retain exact source or ReviewBody locations for preview and navigation. Selected Version does not limit Review Search.
+A result for a Review-level Comment or Draft opens in the Comment Overview.
 _Avoid_: Pull Request search (also applies to LocalReview), repository search (only the current Review participates), Picker (switches PullRequests).
 
 **Search Occurrence**:
@@ -188,7 +222,7 @@ The semantic operation input resolves to in the current Interaction Context: a M
 _Avoid_: command, handler, event.
 
 **Interaction Context**:
-The active input surface and semantic target from the current Presentation Frame: an Overlay when one captures input, otherwise the focused Pane and its cursor target. It determines Action resolution and ActionAvailability without becoming Review state.
+The active input surface and semantic target from the current Presentation Frame: an Overlay when one captures input, otherwise the focused Pane and its cursor target. The Comment Overview and its query input are input surfaces too. It determines Action resolution and ActionAvailability without becoming Review state.
 _Avoid_: mode (too broad), focus alone (omits the target), input state.
 
 **ActionAvailability**:

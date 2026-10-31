@@ -107,7 +107,7 @@ pub fn drawReview(
     const diff_pane = childRect(win, panes.get(.diff).content);
     var diff_theme = theme;
     diff_theme.section_rule = if (frame.focus == .diff) theme.pane_border_focused else theme.pane_border;
-    drawFileTree(sidebar, review.frame.file_tree, theme);
+    drawFileTree(sidebar, review.frame.file_tree, .diff_pane, theme);
     drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, diff_theme, review.frame.navigation);
     drawCodeHighlights(diff_pane, review.frame, theme);
     drawSearchRanges(diff_pane, review.frame, theme);
@@ -127,7 +127,7 @@ pub fn drawCommentOverview(scratch: std.mem.Allocator, win: vaxis.Window, review
         .title = title,
         .entries_scroll = .{ .total = overview.listing.entries.len, .offset = overview.state.scroll },
     }, win, theme);
-    drawFileTree(childRect(win, rects.get(.sidebar).content), frame.file_tree, theme);
+    drawFileTree(childRect(win, rects.get(.sidebar).content), frame.file_tree, .comment_overview, theme);
     drawOverviewFilter(scratch, childRect(win, rects.get(.filter).content), &overview, theme);
     drawOverviewEntries(scratch, childRect(win, rects.get(.entries).content), &overview, theme);
 }
@@ -506,17 +506,23 @@ fn childRect(win: vaxis.Window, rect: @import("frame.zig").Rect) vaxis.Window {
     return win.child(.{ .x_off = rect.x, .y_off = rect.y, .width = rect.width, .height = rect.height });
 }
 
-fn drawFileTree(win: vaxis.Window, tree: @import("file_tree.zig").Projection, theme: Theme) void {
+/// The active File belongs to the DiffPane. While the Comment Overview
+/// shows, only the cursor on the File Tree Filter is selected.
+fn drawFileTree(win: vaxis.Window, tree: @import("file_tree.zig").Projection, main_pane: @import("frame.zig").MainPane, theme: Theme) void {
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
         const index = tree.scroll + screen_row;
         if (index >= tree.entries.len) break;
         const entry = tree.entries[index];
-        const style = if (entry.active or index == tree.cursor) theme.sidebar_selected else theme.sidebar_item;
+        const active, const active_descendant = switch (main_pane) {
+            .diff_pane => .{ entry.active, entry.active_descendant },
+            .comment_overview => .{ false, false },
+        };
+        const style = if (active or index == tree.cursor) theme.sidebar_selected else theme.sidebar_item;
         fillRow(win, screen_row, style);
         var col: u16 = @intCast(@min(entry.depth * 2, win.width));
         if (col < win.width) {
-            const marker = if (entry.active) "›" else if (entry.active_descendant) "·" else " ";
+            const marker = if (active) "›" else if (active_descendant) "·" else " ";
             win.writeCell(col, screen_row, .{ .char = .{ .grapheme = marker, .width = 1 }, .style = style });
             col += 1;
         }
@@ -4246,7 +4252,7 @@ test "focused Pane frames and File Tree tallies use Frame-owned geometry" {
         .tally_width = 5,
     }};
     const content = childRect(win, panes.sidebar_content);
-    drawFileTree(content, .{ .entries = &entries, .cursor = 0, .scroll = 0, .viewport = content.height }, theme_dark);
+    drawFileTree(content, .{ .entries = &entries, .cursor = 0, .scroll = 0, .viewport = content.height }, .diff_pane, theme_dark);
     try testing.expectEqualStrings("1", content.readCell(content.width - 1, 0).?.char.grapheme);
     try testing.expectEqualStrings("●", content.readCell(content.width - 5, 0).?.char.grapheme);
 }
@@ -6059,4 +6065,29 @@ test "M29 overview the File Tree paints the root entry and the filter row shows 
     try testing.expectEqualStrings("●2 ✎1", try overviewRowText(a, win, sidebar.x + sidebar.width - 5, sidebar.y, 5));
     try testing.expectEqualStrings(" ▾ src/", try overviewRowText(a, win, sidebar.x, sidebar.y + 1, 7));
     try testing.expectEqual(theme_dark.sidebar_selected.bg, win.readCell(sidebar.x, sidebar.y + 1).?.style.bg);
+}
+
+test "M29 overview the File Tree selects only the cursor and marks no active File" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const geometry: @import("frame.zig").Geometry = .{ .cols = 120, .rows = 12 };
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const sidebar = @import("frame.zig").overviewRects(geometry).sidebar_content;
+    const diff = try bbr.diff.parse(a, "diff --git a/src/a.zig b/src/a.zig\n--- a/src/a.zig\n+++ b/src/a.zig\n@@ -1 +1 @@\n-a\n+b\n" ++
+        "diff --git a/top.zig b/top.zig\n--- a/top.zig\n+++ b/top.zig\n@@ -1 +1 @@\n-a\n+b\n");
+    // The hidden DiffPane's active File is top.zig, and the cursor is on the root entry.
+    const tree = try @import("file_tree.zig").build(a, diff, &.{ .{}, .{} }, &.{}, 1, sidebar.width, sidebar.height, .root, 0, terminal_cell_metrics, true);
+    try testing.expect(tree.entries[3].active and tree.entries[1].active_descendant == false);
+    var review = try overviewTestReview(geometry, overview_test_frame);
+    review.frame.file_tree = tree;
+    drawCommentOverview(a, win, review, theme_dark);
+
+    try testing.expectEqual(theme_dark.sidebar_selected.bg, win.readCell(sidebar.x, sidebar.y).?.style.bg);
+    for (1..tree.entries.len) |row| {
+        const cell = win.readCell(sidebar.x, sidebar.y + @as(u16, @intCast(row))).?;
+        try testing.expectEqual(theme_dark.sidebar_item.bg, cell.style.bg);
+        try testing.expectEqualStrings(" ", cell.char.grapheme);
+    }
 }

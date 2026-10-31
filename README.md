@@ -296,6 +296,41 @@ Set `[comments].collapsed_rows = 0` to disable automatic ReviewCard collapse. Ro
 target the Review (`C`), the focused File (`I`), or an inline source location (`i`); Replies keep
 their root Comment's scope.
 
+The Main Pane, the Pane right of the Sidebar, shows the DiffPane or the Comment Overview.
+`g o` (`show_comment_overview`) shows the Comment Overview, and `g d` (`show_diff_pane`) shows
+the DiffPane. Each key also moves focus to the Main Pane, and it does nothing when its view
+already shows. The DiffPane shows at start and after each Session replacement.
+
+The Comment Overview lists every Comment, Reply, and Draft that the DiffPane shows as a ReviewCard.
+It also lists resolved, outdated, moved, unavailable, deleted, and collapsed items, and it never
+changes a disclosure. Each row shows the author, the scope of its Thread root, and a one-line
+excerpt. A Reply sits one indent step under its parent. The Title shows the matching entries and
+the total entries, as in `Comment Overview 12/40`. The Comment Overview has these default keys:
+
+| Key | Action name | Effect |
+| --- | --- | --- |
+| Enter | `open_overview_entry` | Show the DiffPane with the cursor on the ReviewCard header of the selected entry. |
+| `/` | `edit_overview_query` | Edit the fuzzy query over the author, the body, and the path. Enter keeps the query. Escape restores it. |
+| `u` | `toggle_overview_unresolved` | Keep only the items of unresolved Threads. A Thread with a Draft root is unresolved. |
+| `d` | `toggle_overview_drafts` | Keep only Drafts. |
+| `a` | `toggle_overview_mine` | Keep only your items. Every Draft is yours. A Comment is yours when its author is the Authenticated Account. |
+| `o` | `toggle_overview_order` | Switch between Review order and newest first. A Draft is newer than every Comment. |
+
+The filters combine with AND. A matching Reply keeps its ancestors visible as dim context entries,
+and the Title count does not include them. The Motions, Tab, `F`, `g f`, and the mouse also work in
+the Comment Overview. A click selects an entry, and a click on the selected entry opens it.
+
+While the Comment Overview shows, the File Tree starts with an "All Files" root entry. The File Tree
+entry under the cursor is the File Tree Filter. A File or a Directory keeps only the items under its
+path, and the root entry clears the filter. Enter on a File moves focus to the Comment Overview and
+does not jump. A File Finder choice shows the DiffPane and then jumps to the File.
+
+`g o` after Enter or `g d` shows the same query, filters, order, selection, and scroll. `g d` shows
+the DiffPane with its cursor and scroll unchanged. A Session replacement resets the Comment Overview.
+A Review Search result for a Review-level Comment or Draft opens in the Comment Overview and selects
+that item. If a filter hides the item, bbr clears only the filters that hide it and reports this in
+the status. Other Review Search results open in the DiffPane.
+
 Mouse navigation is enabled by default as an optional keyboard-equivalent convenience. Left-click
 focuses Panes, activates File Tree entries and disclosures, or selects a Picker row; Picker clicks
 never confirm. The vertical wheel scrolls three rows by default. Set `[input.mouse].enabled = false`
