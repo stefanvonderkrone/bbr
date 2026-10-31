@@ -992,54 +992,50 @@ pub const Client = struct {
         return finishMemberPages(allocator, &pages, terminal.?);
     }
 
-    /// PullRequests in the Workspace that one account authored or reviews. An author filter
-    /// reads the Workspace author endpoint, keeps its order, and stops at `opts.limit`.
-    /// A reviewer-only filter lists every Repository and filters each one, with at most
-    /// `opts.concurrency` active requests. Its result is in Repository slug order, then in
-    /// Bitbucket order. `opts.limit` caps the merged result.
+    /// PullRequests in the Workspace that one account authored or reviews. The Workspace
+    /// author scope keeps the order of the author endpoint and stops paging at `opts.limit`.
+    /// The Repositories scope lists each named Repository with at most `opts.concurrency`
+    /// active requests. Its result is in the given Repository order, then in Bitbucket order.
+    /// `opts.limit` caps the merged result.
     /// Only the coordinator uses `allocator`. Free the result with `deinitSummaries`.
     pub fn listWorkspacePullRequests(self: Client, io: std.Io, allocator: Allocator, filter: WorkspacePullRequestFilter, opts: WorkspacePullRequestOptions) ![]PullRequestSummary {
         if (self.cred.workspace.len == 0 or filter.states.count() == 0 or opts.concurrency == 0) return error.BadRequest;
-        const author = switch (filter.party) {
-            .author => |uuid| uuid,
-            .reviewer => |uuid| return self.listReviewerPullRequests(io, allocator, uuid, filter, opts),
-            .author_and_reviewer => |party| party.author,
+        const scope = switch (filter.scope) {
+            .workspace_author => |scope| scope,
+            .repositories => |scope| return self.listRepositoryPullRequests(io, allocator, scope.slugs, scope.party, filter, opts),
         };
-        const reviewer: ?[]const u8 = if (filter.party == .author_and_reviewer) filter.party.author_and_reviewer.reviewer else null;
-        if (author.len == 0 or reviewer != null and reviewer.?.len == 0) return error.BadRequest;
+        if (scope.author.len == 0 or scope.reviewer != null and scope.reviewer.?.len == 0) return error.BadRequest;
         var endpoint: std.ArrayList(u8) = .empty;
         defer endpoint.deinit(allocator);
         try endpoint.appendSlice(allocator, base_url ++ "/workspaces/");
         try percentEncodeInto(allocator, &endpoint, self.cred.workspace);
         try endpoint.appendSlice(allocator, "/pullrequests/");
-        try percentEncodeInto(allocator, &endpoint, author);
+        try percentEncodeInto(allocator, &endpoint, scope.author);
         // Bitbucket answers a smaller page faster, and a MERGED page of 50 takes seconds.
-        const list = try pullRequestListUrl(allocator, endpoint.items, .{ .states = filter.states, .reviewer = reviewer }, .{ .pagelen = @intCast(@max(1, @min(opts.limit orelse pull_request_pagelen, pull_request_pagelen))), .query = filter.query, .limit = opts.limit });
+        const list = try pullRequestListUrl(allocator, endpoint.items, .{ .states = filter.states, .reviewer = scope.reviewer }, .{ .pagelen = @intCast(@max(1, @min(opts.limit orelse pull_request_pagelen, pull_request_pagelen))), .query = filter.query, .limit = opts.limit });
         defer allocator.free(list.url);
         return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, list.url, list.page, null, false);
     }
 
-    fn listReviewerPullRequests(self: Client, io: std.Io, allocator: Allocator, reviewer: []const u8, filter: WorkspacePullRequestFilter, opts: WorkspacePullRequestOptions) ![]PullRequestSummary {
-        if (reviewer.len == 0) return error.BadRequest;
-        if (opts.limit == 0) return allocator.alloc(PullRequestSummary, 0);
-        const repositories = try self.listRepositories(allocator, null, .{ .pagelen = 100 });
-        defer deinitRepositories(allocator, repositories);
-        const Order = struct {
-            fn less(_: void, lhs: types.Repository, rhs: types.Repository) bool {
-                return std.mem.lessThan(u8, lhs.slug, rhs.slug);
-            }
+    fn listRepositoryPullRequests(self: Client, io: std.Io, allocator: Allocator, slugs: []const []const u8, party: types.PullRequestParty, filter: WorkspacePullRequestFilter, opts: WorkspacePullRequestOptions) ![]PullRequestSummary {
+        const author: ?[]const u8, const reviewer: ?[]const u8 = switch (party) {
+            .author => |uuid| .{ uuid, null },
+            .reviewer => |uuid| .{ null, uuid },
+            .author_and_reviewer => |both| .{ both.author, both.reviewer },
         };
-        std.mem.sort(types.Repository, repositories, {}, Order.less);
-        const jobs = try allocator.alloc(RepositoryPullRequests, repositories.len);
+        if (slugs.len == 0) return error.BadRequest;
+        for ([_]?[]const u8{ author, reviewer }) |value| if (value) |uuid| if (uuid.len == 0) return error.BadRequest;
+        if (opts.limit == 0) return allocator.alloc(PullRequestSummary, 0);
+        const jobs = try allocator.alloc(RepositoryPullRequests, slugs.len);
         for (jobs) |*job| job.* = .{};
         defer {
             for (jobs) |*job| job.deinit(allocator);
             allocator.free(jobs);
         }
-        for (repositories, jobs) |repository, *job| {
-            const endpoint = try self.repositoryEndpoint(allocator, repository.slug, "/pullrequests");
+        for (slugs, jobs) |slug, *job| {
+            const endpoint = try self.repositoryEndpoint(allocator, slug, "/pullrequests");
             defer allocator.free(endpoint);
-            const list = try pullRequestListUrl(allocator, endpoint, .{ .states = filter.states, .reviewer = reviewer }, .{ .pagelen = pull_request_pagelen, .query = filter.query });
+            const list = try pullRequestListUrl(allocator, endpoint, .{ .states = filter.states, .author = author, .reviewer = reviewer }, .{ .pagelen = pull_request_pagelen, .query = filter.query });
             job.url = list.url;
         }
 
@@ -2245,16 +2241,16 @@ pub const ListOptions = struct {
 };
 
 /// Filter for `listWorkspacePullRequests`. `states` must not be empty.
-/// `query` is a Bitbucket `q` expression joined to the reviewer filter with AND.
+/// `query` is a Bitbucket `q` expression joined to the account filter with AND.
 pub const WorkspacePullRequestFilter = struct {
-    party: types.PullRequestParty,
+    scope: types.PullRequestScope,
     states: std.EnumSet(types.PullRequestState) = .initOne(.OPEN),
     query: ?[]const u8 = null,
 };
 
 pub const WorkspacePullRequestOptions = struct {
     limit: ?usize = null,
-    /// The bound on parallel Repository requests when only a reviewer is selected.
+    /// The bound on parallel requests of the Repositories scope.
     concurrency: usize = 1,
 };
 
@@ -2267,6 +2263,7 @@ const pull_request_fields = "&fields=" ++ partialFields(PrListPage);
 const PullRequestListFilter = struct {
     states: std.EnumSet(types.PullRequestState),
     source_branch: ?[]const u8 = null,
+    author: ?[]const u8 = null,
     reviewer: ?[]const u8 = null,
 };
 
@@ -2286,7 +2283,7 @@ fn pullRequestListUrl(allocator: Allocator, endpoint: []const u8, filter: PullRe
     page.pagelen = null;
     page.query = null;
     var states = filter.states.iterator();
-    if (filter.source_branch == null and filter.reviewer == null and opts.query == null) {
+    if (filter.source_branch == null and filter.author == null and filter.reviewer == null and opts.query == null) {
         var separator: []const u8 = "";
         while (states.next()) |state| : (separator = "&") try url.print(allocator, "{s}state={s}", .{ separator, @tagName(state) });
         try url.appendSlice(allocator, pull_request_fields);
@@ -2302,6 +2299,7 @@ fn pullRequestListUrl(allocator: Allocator, endpoint: []const u8, filter: PullRe
     if (grouped) try q.append(allocator, ')');
     for ([_]struct { []const u8, ?[]const u8 }{
         .{ "source.branch.name", filter.source_branch },
+        .{ "author.uuid", filter.author },
         .{ "reviewers.uuid", filter.reviewer },
     }) |condition| if (condition[1]) |value| {
         const quoted = try std.json.Stringify.valueAlloc(allocator, value, .{});
@@ -2315,7 +2313,7 @@ fn pullRequestListUrl(allocator: Allocator, endpoint: []const u8, filter: PullRe
     return .{ .url = try url.toOwnedSlice(allocator), .page = page };
 }
 
-/// One Repository's reviewer-filtered PullRequests. Its worker owns the arena until it completes.
+/// One Repository's account-filtered PullRequests. Its worker owns the arena until it completes.
 const RepositoryPullRequests = struct {
     url: []u8 = &.{},
     arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
@@ -4723,7 +4721,7 @@ test "Workspace author PullRequests keep Bitbucket order, stop paging at the lim
     }) |case| {
         var fake: FakeHttpClient = .{ .responses = &responses };
         const items = try Client.init(fake.httpClient(), testCredential()).listWorkspacePullRequests(testing.io, testing.allocator, .{
-            .party = .{ .author_and_reviewer = .{ .author = "{author}", .reviewer = "{reviewer}" } },
+            .scope = .{ .workspace_author = .{ .author = "{author}", .reviewer = "{reviewer}" } },
             .states = .initMany(&.{ .MERGED, .OPEN }),
             .query = "title ~ \"x\"",
         }, .{ .limit = case.limit, .concurrency = 8 });
@@ -4742,97 +4740,109 @@ test "Workspace author PullRequests keep Bitbucket order, stop paging at the lim
         try testing.expectEqualStrings("check24/zeta", items[0].destination_repository);
     }
     var fake: FakeHttpClient = .{ .body = "{\"values\":[]}" };
-    const none = try Client.init(fake.httpClient(), testCredential()).listWorkspacePullRequests(testing.io, testing.allocator, .{ .party = .{ .author = "{author}" } }, .{});
+    const none = try Client.init(fake.httpClient(), testCredential()).listWorkspacePullRequests(testing.io, testing.allocator, .{ .scope = .{ .workspace_author = .{ .author = "{author}" } } }, .{});
     defer deinitSummaries(testing.allocator, none);
     try testing.expectEqualStrings(base_url ++ "/workspaces/check24/pullrequests/%7Bauthor%7D?pagelen=50&state=OPEN" ++ pull_request_fields, fake.lastUrl().?);
 }
 
-const reviewer_repositories = "{\"values\":[{\"slug\":\"gamma\"},{\"slug\":\"alpha\"},{\"slug\":\"beta\"}]}";
-
-fn reviewerResponses(beta: httpc_fixture.Canned, released: ?*std.atomic.Value(bool)) [5]httpc_fixture.Canned {
+fn repositoryResponses(beta: httpc_fixture.Canned, released: ?*std.atomic.Value(bool)) [4]httpc_fixture.Canned {
     var responses = [_]httpc_fixture.Canned{
-        .{ .request_key = "/repositories/check24?", .body = reviewer_repositories },
         .{ .request_key = "/alpha/pullrequests?pagelen", .body = "{\"values\":[" ++ comptime workspacePr("alpha", "1") ++ "],\"next\":\"https://api.bitbucket.org/2.0/repositories/check24/alpha/pullrequests?page=2\"}" },
         .{ .request_key = "/alpha/pullrequests?page=2", .body = "{\"values\":[" ++ comptime workspacePr("alpha", "2") ++ "]}" },
         beta,
         .{ .request_key = "/gamma/pullrequests?pagelen", .body = "{\"values\":[" ++ comptime workspacePr("gamma", "4") ++ "]}" },
     };
-    responses[3].request_key = "/beta/pullrequests?pagelen";
-    for (responses[1..]) |*response| response.released = released;
+    responses[2].request_key = "/beta/pullrequests?pagelen";
+    for (&responses) |*response| response.released = released;
     return responses;
 }
 
-fn listReviewerPullRequestsForTest(bb: Client, limit: ?usize, concurrency: usize, done: *std.atomic.Value(bool)) ![]PullRequestSummary {
+fn listRepositoryPullRequestsForTest(bb: Client, party: types.PullRequestParty, limit: ?usize, concurrency: usize, done: *std.atomic.Value(bool)) ![]PullRequestSummary {
     defer done.store(true, .release);
-    return bb.listWorkspacePullRequests(testing.io, testing.allocator, .{ .party = .{ .reviewer = "{reviewer}" }, .states = .initMany(&.{ .OPEN, .DECLINED }) }, .{ .limit = limit, .concurrency = concurrency });
+    return bb.listWorkspacePullRequests(testing.io, testing.allocator, .{
+        .scope = .{ .repositories = .{ .slugs = &.{ "gamma", "alpha", "beta" }, .party = party } },
+        .states = .initMany(&.{ .OPEN, .DECLINED }),
+    }, .{ .limit = limit, .concurrency = concurrency });
 }
 
-test "Workspace reviewer PullRequests merge every Repository in slug order and honor the limit" {
+test "Repository PullRequests merge the named Repositories in the given order and honor the limit" {
     const beta: httpc_fixture.Canned = .{ .body = "{\"values\":[" ++ comptime workspacePr("beta", "3") ++ "]}" };
     for ([_]usize{ 1, 3 }) |concurrency| {
-        for ([_]?usize{ null, 3, 2 }, [_][]const u64{ &.{ 1, 2, 3, 4 }, &.{ 1, 2, 3 }, &.{ 1, 2 } }) |limit, ids| {
-            const responses = reviewerResponses(beta, null);
+        for ([_]?usize{ null, 3, 2 }, [_][]const u64{ &.{ 4, 1, 2, 3 }, &.{ 4, 1, 2 }, &.{ 4, 1 } }) |limit, ids| {
+            const responses = repositoryResponses(beta, null);
             var fake: FakeHttpClient = .{ .responses = &responses };
             var done: std.atomic.Value(bool) = .init(false);
-            const items = try listReviewerPullRequestsForTest(Client.init(fake.httpClient(), testCredential()), limit, concurrency, &done);
+            const items = try listRepositoryPullRequestsForTest(Client.init(fake.httpClient(), testCredential()), .{ .reviewer = "{reviewer}" }, limit, concurrency, &done);
             defer deinitSummaries(testing.allocator, items);
             try testing.expectEqual(ids.len, items.len);
             for (ids, items) |id, item| try testing.expectEqual(id, item.id);
-            try testing.expectEqualStrings("check24/alpha", items[0].destination_repository);
+            try testing.expectEqualStrings("check24/gamma", items[0].destination_repository);
         }
     }
-    const responses = reviewerResponses(beta, null);
-    var fake: FakeHttpClient = .{ .responses = &responses };
-    var done: std.atomic.Value(bool) = .init(false);
-    const items = try listReviewerPullRequestsForTest(Client.init(fake.httpClient(), testCredential()), null, 1, &done);
-    defer deinitSummaries(testing.allocator, items);
-    try testing.expectEqualStrings(base_url ++ "/repositories/check24?fields=" ++ comptime partialFields(RepositoryPage) ++ "&pagelen=100", fake.urlAt(0).?);
-    try testing.expectEqualStrings(base_url ++ "/repositories/check24/alpha/pullrequests?pagelen=50&q=%28state%3D%22OPEN%22%20OR%20state%3D%22DECLINED%22%29%20AND%20reviewers.uuid%3D%22%7Breviewer%7D%22" ++ pull_request_fields, fake.urlAt(1).?);
-    try testing.expectEqual(@as(usize, 5), fake.call_count);
+    const states = "q=%28state%3D%22OPEN%22%20OR%20state%3D%22DECLINED%22%29";
+    for ([_]types.PullRequestParty{
+        .{ .reviewer = "{reviewer}" },
+        .{ .author = "{author}" },
+        .{ .author_and_reviewer = .{ .author = "{author}", .reviewer = "{reviewer}" } },
+    }, [_][]const u8{
+        states ++ "%20AND%20reviewers.uuid%3D%22%7Breviewer%7D%22",
+        states ++ "%20AND%20author.uuid%3D%22%7Bauthor%7D%22",
+        states ++ "%20AND%20author.uuid%3D%22%7Bauthor%7D%22%20AND%20reviewers.uuid%3D%22%7Breviewer%7D%22",
+    }) |party, q| {
+        const responses = repositoryResponses(beta, null);
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        var done: std.atomic.Value(bool) = .init(false);
+        const items = try listRepositoryPullRequestsForTest(Client.init(fake.httpClient(), testCredential()), party, null, 1, &done);
+        defer deinitSummaries(testing.allocator, items);
+        const url = try std.mem.concat(testing.allocator, u8, &.{ base_url ++ "/repositories/check24/gamma/pullrequests?pagelen=50&", q, pull_request_fields });
+        defer testing.allocator.free(url);
+        try testing.expectEqualStrings(url, fake.urlAt(0).?);
+        try testing.expectEqual(@as(usize, 4), fake.call_count);
+    }
 }
 
-test "Workspace reviewer PullRequests overlap Repository requests up to the concurrency" {
+test "Repository PullRequests overlap Repository requests up to the concurrency" {
     var released: std.atomic.Value(bool) = .init(false);
     var done: std.atomic.Value(bool) = .init(false);
-    const responses = reviewerResponses(.{ .body = "{\"values\":[" ++ comptime workspacePr("beta", "3") ++ "]}" }, &released);
+    const responses = repositoryResponses(.{ .body = "{\"values\":[" ++ comptime workspacePr("beta", "3") ++ "]}" }, &released);
     var fake: FakeHttpClient = .{ .responses = &responses };
     var claimed = false;
-    var future = try testing.io.concurrent(listReviewerPullRequestsForTest, .{ Client.init(fake.httpClient(), testCredential()), null, 3, &done });
+    var future = try testing.io.concurrent(listRepositoryPullRequestsForTest, .{ Client.init(fake.httpClient(), testCredential()), types.PullRequestParty{ .reviewer = "{reviewer}" }, null, 2, &done });
     defer {
         released.store(true, .release);
         if (future.await(testing.io)) |items| {
             if (!claimed) deinitSummaries(testing.allocator, items);
         } else |_| {}
     }
-    try waitMemberCalls(&fake, 4);
-    try testing.expectEqual(@as(usize, 3), fake.maxActiveRequests());
+    try waitMemberCalls(&fake, 2);
+    try testing.expectEqual(@as(usize, 2), fake.maxActiveRequests());
     try testing.expect(!done.load(.acquire));
     released.store(true, .release);
     const items = try future.await(testing.io);
     claimed = true;
     defer deinitSummaries(testing.allocator, items);
     try testing.expectEqual(@as(usize, 4), items.len);
-    try testing.expectEqual(@as(usize, 3), fake.maxActiveRequests());
+    try testing.expectEqual(@as(usize, 2), fake.maxActiveRequests());
 }
 
-test "Workspace reviewer PullRequests fail on a failed Repository request unless the limit is already reached" {
+test "Repository PullRequests fail on a failed Repository request unless the limit is already reached" {
     for ([_]usize{ 1, 3 }) |concurrency| {
-        for ([_]?usize{ null, 3, 2 }, [_]bool{ true, true, false }) |limit, fails| {
-            const responses = reviewerResponses(.{ .status = 429, .body = "{\"error\":{\"message\":\"Slow down\"}}" }, null);
+        for ([_]?usize{ null, 4, 3 }, [_]bool{ true, true, false }) |limit, fails| {
+            const responses = repositoryResponses(.{ .status = 429, .body = "{\"error\":{\"message\":\"Slow down\"}}" }, null);
             var fake: FakeHttpClient = .{ .responses = &responses };
             var detail: Client.ErrorDetail = .{ .allocator = testing.allocator, .io = testing.io };
             defer detail.deinit();
             var bb = Client.init(fake.httpClient(), testCredential());
             bb.error_detail = &detail;
             var done: std.atomic.Value(bool) = .init(false);
-            const result = listReviewerPullRequestsForTest(bb, limit, concurrency, &done);
+            const result = listRepositoryPullRequestsForTest(bb, .{ .reviewer = "{reviewer}" }, limit, concurrency, &done);
             if (fails) {
                 try testing.expectError(error.RateLimited, result);
                 try testing.expectEqualStrings("Slow down", detail.message.?);
             } else {
                 const items = try result;
                 defer deinitSummaries(testing.allocator, items);
-                try testing.expectEqual(@as(usize, 2), items.len);
+                try testing.expectEqual(@as(usize, 3), items.len);
             }
             try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
         }

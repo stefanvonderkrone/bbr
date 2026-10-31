@@ -103,7 +103,7 @@ Approval uses `set-verdict --verdict approved` with the expected SourceCommit. `
 
 ## PullRequests by author or reviewer
 
-`list-workspace-pull-requests` lists the PullRequests in the Workspace that one account authored (`--author UUID`) or reviews (`--reviewer UUID`). Use `whoami` for the Authenticated Account, or resolve a name to a UUID first. Only `--reviewer` reads every Repository, so it sends one request or more for each Repository. Each row names its Repository by `full_name`.
+`list-workspace-pull-requests` lists the PullRequests in the Workspace that one account authored (`--author UUID`) or reviews (`--reviewer UUID`). Use `whoami` for the Authenticated Account, or resolve a name to a UUID first. Without `--repository`, the command needs `--author` and reads the Workspace author endpoint. Bitbucket has no reviewer endpoint, so a reviewer search needs each Repository named with a repeated `--repository SLUG`. The command sends one request or more for each named Repository. Each row names its Repository by `full_name`.
 
 ## Commit lookup
 

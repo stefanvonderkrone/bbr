@@ -15,19 +15,24 @@ pub const list_help =
 ;
 
 pub const workspace_list_help =
-    \\usage: bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author UUID --reviewer UUID)
-    \\      [--state OPEN|MERGED|DECLINED|SUPERSEDED ...] [--query Q] [--concurrency N] [--limit N] [--json]
+    \\usage: bbr api list-workspace-pull-requests --author UUID [--reviewer UUID]
+    \\      [--state OPEN|MERGED|DECLINED|SUPERSEDED ...] [--query Q] [--limit N] [--json]
+    \\   or: bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author UUID --reviewer UUID)
+    \\      --repository SLUG ... [--state OPEN|MERGED|DECLINED|SUPERSEDED ...] [--query Q]
+    \\      [--concurrency N] [--limit N] [--json]
     \\
     \\List PullRequests in the selected Workspace that one account authored or reviews.
-    \\--author and --reviewer take account UUIDs. Supply at least one.
-    \\With --author, read the Workspace author endpoint. --reviewer then filters its results.
-    \\With only --reviewer, list every Repository and filter the PullRequests of each one.
+    \\--author and --reviewer take account UUIDs.
+    \\Without --repository, --author is required. The command reads the Workspace author endpoint,
+    \\and --reviewer filters its results. Rows keep the Bitbucket order, and paging stops at --limit.
+    \\Bitbucket has no reviewer endpoint, so a scan with only --reviewer needs --repository.
+    \\Repeat --repository to name each Repository to scan. Supply --author, --reviewer, or both.
+    \\Rows follow the given Repository order, then the Bitbucket order in each Repository.
+    \\A repeated Repository is scanned once.
     \\Repeat --state to select several states. The default is OPEN.
     \\--query is a Bitbucket q expression. The command joins it to its own filter with AND.
-    \\Concurrency bounds the parallel Repository requests with only --reviewer.
-    \\It defaults to 8. --concurrency accepts a positive integer, capped by logical CPUs.
-    \\With --author, rows keep the Bitbucket order, and paging stops at --limit.
-    \\With only --reviewer, rows follow Repository slug order, then the Bitbucket order in each Repository.
+    \\Concurrency bounds the parallel Repository requests. It defaults to 8.
+    \\--concurrency accepts a positive integer, capped by logical CPUs.
     \\--limit caps the total. A failed request fails the complete list. HTTP 429 is not retried.
     \\
 ;
@@ -171,10 +176,13 @@ const WorkspaceListArgs = struct {
     concurrency: usize,
 };
 
-fn parseWorkspaceList(args: []const []const u8) !WorkspaceListArgs {
+/// The returned Repository slugs are owned by `allocator`.
+fn parseWorkspaceList(allocator: std.mem.Allocator, args: []const []const u8) !WorkspaceListArgs {
     var cur: arg.Cursor = .{ .args = args };
     var author: ?[]const u8 = null;
     var reviewer: ?[]const u8 = null;
+    var slugs: std.ArrayList([]const u8) = .empty;
+    errdefer slugs.deinit(allocator);
     var states: std.EnumSet(bbr.bitbucket.PullRequestState) = .empty;
     var query: ?[]const u8 = null;
     var limit: ?usize = null;
@@ -185,6 +193,12 @@ fn parseWorkspaceList(args: []const []const u8) !WorkspaceListArgs {
             try arg.setOption([]const u8, &author, try arg.takeValue(&cur, f));
         } else if (std.mem.eql(u8, f.name, "reviewer")) {
             try arg.setOption([]const u8, &reviewer, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "repository")) {
+            const slug = try arg.takeValue(&cur, f);
+            if (slug.len == 0) return error.BadRequest;
+            for (slugs.items) |seen| {
+                if (std.mem.eql(u8, seen, slug)) break;
+            } else try slugs.append(allocator, slug);
         } else if (std.mem.eql(u8, f.name, "state")) {
             states.insert(std.meta.stringToEnum(bbr.bitbucket.PullRequestState, try arg.takeValue(&cur, f)) orelse return error.BadRequest);
         } else if (std.mem.eql(u8, f.name, "query")) {
@@ -196,19 +210,25 @@ fn parseWorkspaceList(args: []const []const u8) !WorkspaceListArgs {
         } else return error.UnknownFlag;
     }
     for ([_]?[]const u8{ author, reviewer, query }) |value| if (value) |text| if (text.len == 0) return error.BadRequest;
-    const party: bbr.bitbucket.PullRequestParty = if (author) |author_uuid|
-        if (reviewer) |reviewer_uuid| .{ .author_and_reviewer = .{ .author = author_uuid, .reviewer = reviewer_uuid } } else .{ .author = author_uuid }
-    else
-        .{ .reviewer = reviewer orelse return error.MissingRequired };
+    const scope: bbr.bitbucket.PullRequestScope = if (slugs.items.len == 0)
+        .{ .workspace_author = .{ .author = author orelse return error.MissingRequired, .reviewer = reviewer } }
+    else blk: {
+        const party: bbr.bitbucket.PullRequestParty = if (author) |author_uuid|
+            if (reviewer) |reviewer_uuid| .{ .author_and_reviewer = .{ .author = author_uuid, .reviewer = reviewer_uuid } } else .{ .author = author_uuid }
+        else
+            .{ .reviewer = reviewer orelse return error.MissingRequired };
+        break :blk .{ .repositories = .{ .slugs = try slugs.toOwnedSlice(allocator), .party = party } };
+    };
     return .{
-        .filter = .{ .party = party, .states = if (states.count() == 0) .initOne(.OPEN) else states, .query = query },
+        .filter = .{ .scope = scope, .states = if (states.count() == 0) .initOne(.OPEN) else states, .query = query },
         .limit = limit,
         .concurrency = concurrency orelse ws.default_concurrency,
     };
 }
 
 fn listWorkspacePullRequests(allocator: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client, args: []const []const u8) ![]bbr.bitbucket.PullRequestSummary {
-    const parsed = try parseWorkspaceList(args);
+    const parsed = try parseWorkspaceList(allocator, args);
+    defer if (parsed.filter.scope == .repositories) allocator.free(parsed.filter.scope.repositories.slugs);
     return bb.listWorkspacePullRequests(io, allocator, parsed.filter, .{
         .limit = parsed.limit,
         .concurrency = ws.effectiveConcurrency(parsed.concurrency, std.Thread.getCpuCount()),
@@ -651,17 +671,19 @@ test "list-workspace-pull-requests rejects invalid options before HTTP" {
     for ([_]struct { args: []const []const u8, err: anyerror }{
         .{ .args = &.{}, .err = error.MissingRequired },
         .{ .args = &.{ "--state=OPEN", "--limit=2" }, .err = error.MissingRequired },
+        .{ .args = &.{"--reviewer={a}"}, .err = error.MissingRequired },
+        .{ .args = &.{ "--repository=sample", "--repository=other" }, .err = error.MissingRequired },
+        .{ .args = &.{ "--author={a}", "--repository=" }, .err = error.BadRequest },
         .{ .args = &.{ "--author={a}", "--state=open" }, .err = error.BadRequest },
         .{ .args = &.{ "--author={a}", "--state", "CLOSED" }, .err = error.BadRequest },
         .{ .args = &.{ "--author={a}", "--author={b}" }, .err = error.BadRequest },
-        .{ .args = &.{ "--reviewer={a}", "--reviewer", "{b}" }, .err = error.BadRequest },
-        .{ .args = &.{"--reviewer="}, .err = error.BadRequest },
-        .{ .args = &.{ "--reviewer={a}", "--concurrency=0" }, .err = error.InvalidNumber },
-        .{ .args = &.{ "--reviewer={a}", "--limit=bad" }, .err = error.InvalidNumber },
-        .{ .args = &.{ "--reviewer={a}", "--page=2" }, .err = error.UnknownFlag },
-        .{ .args = &.{ "--reviewer={a}", "--no-follow" }, .err = error.UnknownFlag },
-        .{ .args = &.{ "--reviewer={a}", "--repository=sample" }, .err = error.UnknownFlag },
-        .{ .args = &.{ "--reviewer={a}", "--state" }, .err = error.MissingValue },
+        .{ .args = &.{ "--author={a}", "--reviewer={a}", "--reviewer", "{b}" }, .err = error.BadRequest },
+        .{ .args = &.{ "--author={a}", "--reviewer=" }, .err = error.BadRequest },
+        .{ .args = &.{ "--reviewer={a}", "--repository=sample", "--concurrency=0" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--author={a}", "--limit=bad" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--reviewer={a}", "--repository=sample", "--page=2" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--author={a}", "--no-follow" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--reviewer={a}", "--repository" }, .err = error.MissingValue },
     }) |case| try std.testing.expectError(case.err, listWorkspacePullRequests(std.testing.allocator, std.Io.failing, bb, case.args));
     try std.testing.expectEqual(@as(usize, 0), fake.call_count);
     const repeated = try listWorkspacePullRequests(std.testing.allocator, std.Io.failing, bb, &.{ "--author={a}", "--author={a}", "--state=MERGED", "--state=MERGED", "--state=OPEN" });

@@ -165,6 +165,7 @@ pub const bitbucket = struct {
     pub const PullRequestSummary = types.PullRequestSummary;
     pub const PullRequestState = types.PullRequestState;
     pub const PullRequestParty = types.PullRequestParty;
+    pub const PullRequestScope = types.PullRequestScope;
     pub const ApiError = types.ApiError;
     pub const Workspace = types.Workspace;
     pub const WorkspaceMember = types.WorkspaceMember;

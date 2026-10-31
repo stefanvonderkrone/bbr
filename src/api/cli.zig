@@ -39,7 +39,7 @@ pub const verbs = [_]Verb{
     .{ .name = "list-branches", .summary = "list branches in a repository", .help = branches.list_help, .example = "bbr api list-branches --repository sample --sort name --limit 10", .value_flags = &.{ "repository", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = branches.runList },
     .{ .name = "get-branch", .summary = "get a branch and its target commit", .help = branches.get_help, .example = "bbr api get-branch --repository sample --name feature/example", .value_flags = &.{ "repository", "name" }, .handler = branches.runGet },
     .{ .name = "list-pull-requests", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .value_flags = &.{ "repository", "state", "source-branch", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = pullrequests.runList },
-    .{ .name = "list-workspace-pull-requests", .summary = "list Workspace pull requests by author or reviewer", .help = pullrequests.workspace_list_help, .example = "bbr api list-workspace-pull-requests --reviewer '{reviewer}' --state OPEN --state MERGED --limit 20", .value_flags = &.{ "author", "reviewer", "state", "query", "concurrency", "limit" }, .handler = pullrequests.runListWorkspace },
+    .{ .name = "list-workspace-pull-requests", .summary = "list Workspace pull requests by author or reviewer", .help = pullrequests.workspace_list_help, .example = "bbr api list-workspace-pull-requests --reviewer '{reviewer}' --repository sample --repository other --state OPEN --state MERGED --limit 20", .value_flags = &.{ "author", "reviewer", "repository", "state", "query", "concurrency", "limit" }, .handler = pullrequests.runListWorkspace },
     .{ .name = "get-pull-request", .summary = "get one pull request", .help = pullrequests.get_help, .example = "bbr api get-pull-request --repository sample --pull-request-id 42", .value_flags = &.{ "repository", "pull-request-id" }, .handler = pullrequests.runGet },
     .{ .name = "create-pull-request", .summary = "create a ready or draft pull request", .help = pullrequests.create_help, .example = "bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true", .value_flags = &.{ "repository", "title", "source-branch", "source-repository", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }, .switch_flags = &.{"clear-reviewers"}, .handler = pullrequests.runCreate },
     .{ .name = "update-pull-request", .summary = "update an open pull request", .help = pullrequests.update_help, .example = "bbr api update-pull-request --repository sample --pull-request-id 42 --draft false", .value_flags = &.{ "repository", "pull-request-id", "title", "source-branch", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }, .switch_flags = &.{"clear-reviewers"}, .handler = pullrequests.runUpdate },
@@ -1059,38 +1059,41 @@ test "Workspace Member search failure on any page produces no partial success ou
     }
 }
 
-test "list-workspace-pull-requests prints Repository-qualified rows and no stdout on a failed Repository" {
+test "list-workspace-pull-requests prints the named Repositories once in the given order and no stdout on a failed Repository" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const pr = "{\"id\":7,\"title\":\"Review\",\"state\":\"OPEN\",\"draft\":true,\"source\":{\"branch\":{\"name\":\"feature\"}}," ++
+    const beta = "{\"id\":7,\"title\":\"Review\",\"state\":\"OPEN\",\"draft\":true,\"source\":{\"branch\":{\"name\":\"feature\"}}," ++
         "\"destination\":{\"branch\":{\"name\":\"main\"},\"repository\":{\"full_name\":\"demo/beta\"}}}";
-    for ([_]bbr.http.Canned{ .{ .body = "{\"values\":[" ++ pr ++ "]}" }, .{ .status = 403 } }) |beta| {
-        var responses = [_]bbr.http.Canned{
-            .{ .request_key = "/repositories/demo?", .body = "{\"values\":[{\"slug\":\"beta\"},{\"slug\":\"alpha\"}]}" },
-            .{ .request_key = "/alpha/pullrequests", .body = "{\"values\":[]}" },
-            beta,
-        };
-        responses[2].request_key = "/beta/pullrequests";
+    const alpha = "{\"id\":8,\"title\":\"Fix\",\"state\":\"OPEN\",\"source\":{\"branch\":{\"name\":\"fix\"}}," ++
+        "\"destination\":{\"branch\":{\"name\":\"main\"},\"repository\":{\"full_name\":\"demo/alpha\"}}}";
+    for ([_]bbr.http.Canned{ .{ .body = "{\"values\":[" ++ alpha ++ "]}" }, .{ .status = 403 } }) |alpha_response| {
+        var responses = [_]bbr.http.Canned{ .{ .request_key = "/beta/pullrequests", .body = "{\"values\":[" ++ beta ++ "]}" }, alpha_response };
+        responses[1].request_key = "/alpha/pullrequests";
         for ([_]bool{ false, true }) |json| {
             var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
             const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
             var output: TestOutput = .{};
-            const result = findVerb("list-workspace-pull-requests").?.handler(output.init(&env, &arena), bb, &.{"--reviewer={reviewer}"}, json);
-            try std.testing.expectEqual(@as(usize, 3), fake.call_count);
-            if (beta.status != 200) {
+            const args = [_][]const u8{ "--reviewer={reviewer}", "--repository=beta", "--repository=alpha", "--repository=beta" };
+            const result = findVerb("list-workspace-pull-requests").?.handler(output.init(&env, &arena), bb, &args, json);
+            try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+            if (alpha_response.status != 200) {
                 try std.testing.expectError(error.Forbidden, result);
                 try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
             } else if (json) {
                 try result;
                 const decoded = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
                 defer decoded.deinit();
+                try std.testing.expectEqual(@as(usize, 2), decoded.value.array.items.len);
                 try std.testing.expectEqualStrings("demo/beta", decoded.value.array.items[0].object.get("destination_repository").?.string);
             } else {
                 try result;
-                try std.testing.expectEqualStrings("demo/beta#7 [OPEN draft] Review (feature -> main)\nok: 1 pull request(s)\n", output.stdoutBytes());
+                try std.testing.expectEqualStrings(
+                    "demo/beta#7 [OPEN draft] Review (feature -> main)\ndemo/alpha#8 [OPEN] Fix (fix -> main)\nok: 2 pull request(s)\n",
+                    output.stdoutBytes(),
+                );
             }
         }
     }

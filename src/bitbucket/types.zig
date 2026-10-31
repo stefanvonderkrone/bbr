@@ -125,6 +125,15 @@ pub const PullRequestParty = union(enum) {
     author_and_reviewer: struct { author: []const u8, reviewer: []const u8 },
 };
 
+/// Where Workspace PullRequests are read. Bitbucket has an author endpoint for a Workspace
+/// but no reviewer endpoint, so a reviewer scan needs the Repositories named.
+pub const PullRequestScope = union(enum) {
+    /// The Workspace author endpoint. `reviewer` narrows its results.
+    workspace_author: struct { author: []const u8, reviewer: ?[]const u8 = null },
+    /// One PullRequest list for each Repository. `slugs` are distinct and not empty.
+    repositories: struct { slugs: []const []const u8, party: PullRequestParty },
+};
+
 /// The commit pair identifying a PR's current diff revision. A comment whose
 /// anchored `links.code` range differs from this is outdated.
 pub const HeadCommits = struct {
