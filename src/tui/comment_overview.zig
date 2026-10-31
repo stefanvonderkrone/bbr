@@ -62,7 +62,22 @@ pub const State = struct {
             } else null,
         }
     }
+
+    pub fn clear(self: *State, filters: Filters) void {
+        var iterator = filters.iterator();
+        while (iterator.next()) |filter| switch (filter) {
+            .query => self.query_len = 0,
+            .unresolved_only => self.unresolved_only = false,
+            .drafts_only => self.drafts_only = false,
+            .mine_only => self.mine_only = false,
+            .file_tree_filter => self.file_tree_filter = null,
+        };
+    }
 };
+
+/// One Overview filter. The order is not a filter, because it hides no entry.
+pub const Filter = enum { query, unresolved_only, drafts_only, mine_only, file_tree_filter };
+pub const Filters = std.EnumSet(Filter);
 
 /// One Overview State change that rebuilds the listing.
 pub const Change = union(enum) {
@@ -133,6 +148,14 @@ pub const Record = struct {
 /// Every record in Review order. The index owns every string.
 pub const Index = struct {
     records: []const Record = &.{},
+
+    /// The position of the record of `owner`.
+    pub fn find(self: Index, owner: review_card.Owner) ?usize {
+        for (self.records, 0..) |record, position| {
+            if (std.meta.eql(record.owner, owner)) return position;
+        }
+        return null;
+    }
 };
 
 pub const Entry = struct {
@@ -313,21 +336,42 @@ pub fn buildListing(allocator: std.mem.Allocator, index: *const Index, state: *c
     return .{ .entries = try entries.toOwnedSlice(allocator), .matches = matches, .records = records.len };
 }
 
+/// The active filters that hide `record`. The filters combine with AND, so
+/// a State without exactly these filters lists `record` as a match.
+pub fn hidingFilters(record: Record, state: *const State) Filters {
+    var needles: list_overlay.Query.Needles = undefined;
+    const query = list_overlay.Query.parse(state.query(), &needles);
+    var hiding: Filters = .initEmpty();
+    for (std.enums.values(Filter)) |filter| {
+        if (!passes(filter, record, state, query)) hiding.insert(filter);
+    }
+    return hiding;
+}
+
 /// Every active filter keeps the record. A blank query keeps every record.
 fn keeps(record: Record, state: *const State, query: ?list_overlay.Query) bool {
-    if (state.unresolved_only and record.resolved) return false;
-    if (state.drafts_only and record.owner != .draft) return false;
-    if (state.mine_only and !record.mine) return false;
-    if (state.file_tree_filter) |filter| switch (filter) {
-        .root => {},
-        .file => |file_index| if (record.file != file_index) return false,
-        .directory => |path| {
-            const scope_path = scopePath(record.scope);
-            if (record.scope == .review or !(scope_path.len > path.len and std.mem.startsWith(u8, scope_path, path) and scope_path[path.len] == '/')) return false;
-        },
-    };
-    if (query) |value| if (value.rank(record.haystack) == null) return false;
+    for (std.enums.values(Filter)) |filter| {
+        if (!passes(filter, record, state, query)) return false;
+    }
     return true;
+}
+
+fn passes(filter: Filter, record: Record, state: *const State, query: ?list_overlay.Query) bool {
+    return switch (filter) {
+        .query => if (query) |value| value.rank(record.haystack) != null else true,
+        .unresolved_only => !state.unresolved_only or !record.resolved,
+        .drafts_only => !state.drafts_only or record.owner == .draft,
+        .mine_only => !state.mine_only or record.mine,
+        .file_tree_filter => if (state.file_tree_filter) |value| switch (value) {
+            .root => true,
+            .file => |file_index| record.file == file_index,
+            .directory => |path| record.scope != .review and underDirectory(scopePath(record.scope), path),
+        } else true,
+    };
+}
+
+fn underDirectory(path: []const u8, directory: []const u8) bool {
+    return path.len > directory.len and std.mem.startsWith(u8, path, directory) and path[directory.len] == '/';
 }
 
 /// One Thread root and its Replies, in Buffer order.

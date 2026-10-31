@@ -501,6 +501,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .target_action_unavailable => "This action is unavailable for the current target",
         .no_review_item => "This action requires a Comment or Draft under the cursor",
         .overview_entry_unavailable => "The entry is no longer in the Review",
+        .overview_filters_cleared => "Comment Overview filters cleared to show the entry",
         .draft_owned_by_submission => "an active Submission owns this local Draft",
         .draft_submission_in_flight => "this local Draft is being submitted",
         .draft_outcome_unresolved => "outcome unknown — resolve before editing",
@@ -1567,6 +1568,7 @@ test "M29 overview the status shows the Comment Overview hints and the listing p
     try std.testing.expect(std.mem.endsWith(u8, rows[0], "3/12"));
     try std.testing.expectEqualStrings("/ filter  ·  ↵ open  ·  g d DiffPane  ·  X submit 2  ·  ? help  ·  q quit", rows[1]);
     try std.testing.expectEqualStrings("The entry is no longer in the Review", actionErrorText(.overview_entry_unavailable));
+    try std.testing.expectEqualStrings("Comment Overview filters cleared to show the entry", actionErrorText(.overview_filters_cleared));
 }
 
 test "the status height does not change when only the cursor moves" {

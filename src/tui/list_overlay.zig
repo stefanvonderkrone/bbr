@@ -845,16 +845,17 @@ test "M29 overview the Command Palette lists the Main Pane Actions from every Pa
     for ([_]InteractionContext{ .diff, .sidebar, .sidebar_file, .comment_overview }) |context| {
         var palette = try ListOverlay.openCommandPalette(testing.allocator, context);
         defer palette.deinit();
-        var titles: [3]bool = .{ false, false, false };
+        var titles: [4]bool = .{ false, false, false, false };
         for (0..palette.command_palette.row_count) |row| {
             const entry = palette.command_palette.command(row);
             if (entry.action == .show_comment_overview) titles[0] = std.mem.eql(u8, entry.title, "Show Comment Overview");
             if (entry.action == .show_diff_pane) titles[1] = std.mem.eql(u8, entry.title, "Show DiffPane");
             if (entry.action == .open_file_finder) titles[2] = true;
+            if (entry.action == .open_review_search) titles[3] = true;
             if (entry.action == .focus_next_pane) try testing.expectEqualStrings("Move focus between the Sidebar and the Main Pane", entry.description);
-            if (context == .comment_overview) try testing.expect(entry.action != .open_review_search);
         }
         try testing.expect(titles[0] and titles[1] and titles[2]);
+        try testing.expectEqual(context == .diff or context == .comment_overview, titles[3]);
     }
 }
 

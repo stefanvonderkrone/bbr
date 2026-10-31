@@ -497,8 +497,10 @@ test "M21 authored destination launch failure and closed sink preserve the Overl
         session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
         session.source = .{ .local = .{ .common_dir = "." } };
         const a = session.arena.allocator();
-        session.diff = try bbr.diff.parse(a, "");
-        session.threads = try bbr.review.buildThreads(a, &.{.{ .id = 1, .author = "Reviewer", .body = "needle" }});
+        session.diff = try bbr.diff.parse(a, "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\n");
+        try session.initializeEnrichment();
+        // M29 opens a Review-level result in the Comment Overview, so a File-level Comment keeps the DiffPane route.
+        session.threads = try bbr.review.buildThreads(a, &.{.{ .id = 1, .author = "Reviewer", .body = "needle", .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } } }});
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{

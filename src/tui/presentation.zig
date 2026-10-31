@@ -2560,6 +2560,15 @@ pub const DisclosureBuild = struct {
                 .input, .accepted, .restore, .general, .clear_input, .open_input => false,
             };
         }
+
+        /// The Main Pane that a job of this kind publishes. A destination
+        /// shows the DiffPane. Every other job keeps the Main Pane it read.
+        fn publishedPane(kind: Kind, main_pane: MainPane) MainPane {
+            return switch (kind) {
+                .review_destination, .overview_destination => .diff_pane,
+                .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .enrichment, .cache_update, .draft_save, .draft_mutation => main_pane,
+            };
+        }
     };
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
     arena: std.heap.ArenaAllocator,
@@ -2916,9 +2925,7 @@ pub const DisclosureBuild = struct {
         if (self.version_restoration) |target| self.version_destination = versionNavigationDestination(self.session, self.buffer, self.visual_rows, target, self.preferences.selected_version);
         if (self.deletion_origin) |origin| self.surviving_row = survivingRowAfterDeletion(origin.deletion_rows, self.deleted_ids);
         const panes = frame_mod.paneRects(self.geometry);
-        // An Overview destination publishes the DiffPane.
-        const tree_pane: MainPane = if (self.kind == .overview_destination) .diff_pane else self.main_pane;
-        self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics, hasRootEntry(tree_pane));
+        self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics, hasRootEntry(self.kind.publishedPane(self.main_pane)));
         self.projection = try SearchProjection.create(self.buffer, self.visual_rows, .{
             .session = self.session,
             .drafts = self.drafts,
@@ -3696,6 +3703,7 @@ pub const ActionError = enum {
     published_comment_edit_unsupported,
     no_review_item,
     overview_entry_unavailable,
+    overview_filters_cleared,
     draft_edit_conflict,
     draft_reply_has_no_anchor,
     draft_scope_not_inline,
@@ -4982,22 +4990,33 @@ const Published = struct {
     /// previous ones. The listing arena owns the Directory path of the File
     /// Tree Filter, so the path lives as long as the published listing.
     fn rebuildOverview(self: *Published, authenticated_account_uuid: ?[]const u8, borrowed: comment_overview.State) !void {
-        var index = self.overview_index;
-        var index_staged = false;
-        errdefer if (index_staged) self.overview_indexes.abort();
-        if (self.overview_index_stale) {
-            const allocator = self.overview_indexes.begin();
-            index_staged = true;
-            index = try comment_overview.buildIndex(allocator, .{
-                .diff = self.session.diff,
-                .threads = self.session.threads,
-                .drafts = self.review.drafts.items,
-                .scope_projections = self.scope_projection.items,
-                .mention_names = &self.session.mention_names,
-                .authenticated_account_uuid = authenticated_account_uuid,
-                .emphasis_cache = &self.emphasis_cache,
-            });
-        }
+        try self.publishOverview(try self.stageOverviewIndex(authenticated_account_uuid), borrowed);
+    }
+
+    /// Builds the index into the next index arena when it is stale. Without
+    /// a stale index it stages nothing and returns null. `publishOverview`
+    /// commits or aborts a staged index.
+    fn stageOverviewIndex(self: *Published, authenticated_account_uuid: ?[]const u8) !?comment_overview.Index {
+        if (!self.overview_index_stale) return null;
+        const allocator = self.overview_indexes.begin();
+        errdefer self.overview_indexes.abort();
+        return try comment_overview.buildIndex(allocator, .{
+            .diff = self.session.diff,
+            .threads = self.session.threads,
+            .drafts = self.review.drafts.items,
+            .scope_projections = self.scope_projection.items,
+            .mention_names = &self.session.mention_names,
+            .authenticated_account_uuid = authenticated_account_uuid,
+            .emphasis_cache = &self.emphasis_cache,
+        });
+    }
+
+    /// Builds the listing for `borrowed` over the `staged` index, or over
+    /// the published index without one.
+    fn publishOverview(self: *Published, staged: ?comment_overview.Index, borrowed: comment_overview.State) !void {
+        errdefer if (staged != null) self.overview_indexes.abort();
+        const index = staged orelse self.overview_index;
+        const index_staged = staged != null;
         const allocator = self.overview_listings.begin();
         errdefer self.overview_listings.abort();
         var state = borrowed;
@@ -7843,7 +7862,7 @@ pub const Presentation = struct {
             .toggle_review_card => self.toggleDisclosure(published),
             .toggle_directory, .focus_file => self.activateSidebarEntry(published),
             .focus_next_pane => self.togglePaneFocus(published),
-            .show_comment_overview => self.showCommentOverview(published),
+            .show_comment_overview => _ = self.showCommentOverview(published, null),
             .show_diff_pane => self.showDiffPane(published),
             .open_overview_entry => self.openOverviewEntry(published),
             .edit_overview_query => openOverviewQuery(published),
@@ -8562,6 +8581,16 @@ pub const Presentation = struct {
         // while the Overlay is open; never open an obsolete occurrence.
         const current = reviewSearchResult(published, occurrence);
         if (!std.mem.eql(u8, current.body, result.body)) return;
+        if (current.scope == .review) {
+            const owner: review_card.Owner = switch (occurrence.location.review_body.owner) {
+                .comment => |id| .{ .comment = id },
+                .draft => |id| .{ .draft = id },
+            };
+            const cleared = self.showCommentOverview(published, owner) orelse return;
+            self.closeReviewSearch();
+            self.action_error = if (cleared.count() > 0) .overview_filters_cleared else null;
+            return;
+        }
         const destination = reviewCardDestination(published, self.preferences, current.scope, current.scope_state);
         var required = requiredSearchDisclosure(published, occurrence);
         for (destination.outdated.items[0..destination.outdated.len]) |key| required.append(key);
@@ -8578,9 +8607,7 @@ pub const Presentation = struct {
     /// always shows.
     fn queueOverviewDestination(self: *Presentation, published: *Published, owner: review_card.Owner) void {
         const records = published.overview_index.records;
-        const position = for (records, 0..) |record, index| {
-            if (std.meta.eql(record.owner, owner)) break index;
-        } else {
+        const position = published.overview_index.find(owner) orelse {
             self.action_error = .overview_entry_unavailable;
             return;
         };
@@ -9353,6 +9380,7 @@ pub const Presentation = struct {
         published.buffer = job.buffer;
         published.visual_rows = job.visual_rows;
         published.tree = job.tree;
+        published.main_pane = job.kind.publishedPane(published.main_pane);
         published.navigation = switch (job.navigation_policy) {
             .restore, .file_header, .center, .version => frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation),
             .reset => Nav.init(job.visual_rows.len, frame_mod.paneRects(job.geometry).diff_content.height),
@@ -9443,6 +9471,7 @@ pub const Presentation = struct {
             published.navigation.jumpTo(job.destination_row.?);
             published.focus = .diff;
             published.cursorToActiveFile();
+            cancelOverviewDestination(published);
             published.review_search.open = false;
             published.review_search.pending = false;
             self.discardQueuedReviewSearchScans();
@@ -9458,7 +9487,6 @@ pub const Presentation = struct {
             disclosures = .empty;
             published.disclosure_keys.release();
             published.disclosure_keys = job.disclosure_keys.?.retain();
-            published.main_pane = .diff_pane;
             published.focus = .diff;
             published.navigation.jumpTo(job.destination_row.?);
             published.navigation.center();
@@ -9988,19 +10016,40 @@ pub const Presentation = struct {
     }
 
     /// The File Tree cursor goes to the stored File Tree Filter, or to the
-    /// root entry. The filter then names the entry under the cursor.
-    fn showCommentOverview(self: *Presentation, published: *Published) void {
-        if (published.main_pane == .comment_overview) return;
-        const tree = published.stageFileTree(.comment_overview, published.overview.file_tree_filter orelse .root) catch {
+    /// root entry. The filter then names the entry under the cursor. With
+    /// `reveal`, it first clears the filters that hide that Owner and
+    /// selects it, also while the Comment Overview shows. It returns the
+    /// cleared filters, or null after a failure that keeps the previous
+    /// Presentation Frame.
+    fn showCommentOverview(self: *Presentation, published: *Published, reveal: ?review_card.Owner) ?comment_overview.Filters {
+        if (published.main_pane == .comment_overview and reveal == null) return .initEmpty();
+        const staged = published.stageOverviewIndex(self.authenticatedAccountUuid()) catch {
             self.action_error = .out_of_memory;
-            return;
+            return null;
         };
         var state = published.overview;
+        var cleared: comment_overview.Filters = .initEmpty();
+        if (reveal) |owner| {
+            const index = staged orelse published.overview_index;
+            const position = index.find(owner) orelse {
+                if (staged != null) published.overview_indexes.abort();
+                self.action_error = .overview_entry_unavailable;
+                return null;
+            };
+            cleared = comment_overview.hidingFilters(index.records[position], &state);
+            state.clear(cleared);
+            state.selected = owner;
+        }
+        const tree = published.stageFileTree(.comment_overview, state.file_tree_filter orelse .root) catch {
+            if (staged != null) published.overview_indexes.abort();
+            self.action_error = .out_of_memory;
+            return null;
+        };
         state.apply(.{ .file_tree_filter = tree.entries[tree.cursor].identity });
-        published.rebuildOverview(self.authenticatedAccountUuid(), state) catch {
+        published.publishOverview(staged, state) catch {
             published.trees.abort();
             self.action_error = .out_of_memory;
-            return;
+            return null;
         };
         published.trees.commit();
         published.tree = tree;
@@ -10008,6 +10057,7 @@ pub const Presentation = struct {
         published.focus = .diff;
         published.frame_revision += 1;
         cancelOverviewDestination(published);
+        return cleared;
     }
 
     /// Opens the query input and saves the query that Escape restores. A
@@ -17265,15 +17315,18 @@ test "M21 authored scope opening resolves Review File Reply and outdated locatio
         try completeBufferSearchScan(&presentation);
         try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        // M29: a Review-level result shows the Comment Overview and leaves the DiffPane as it is.
+        if (index == 0) {
+            try testing.expect(presentation.takeCommand() == null);
+            try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
+            try testing.expectEqualDeep(@as(?review_card.Owner, .{ .comment = 1 }), testOverviewSelectedOwner(&presentation));
+            try presentation.dispatch(.{ .action = .show_diff_pane });
+            try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
+            continue;
+        }
         try completeDisclosureBuild(&presentation);
         const review = presentation.projection().review.?;
-        if (index == 0) {
-            try testing.expectEqual(@as(?usize, null), review.isolated_file);
-            try testing.expectEqual(@as(bbr.review.CommentId, 1), review.frame.visual_rows[review.navigation.cursor].owner.comment.id);
-            try presentation.dispatch(.{ .action = .next_file });
-            try dispatchView(&presentation, .{ .action = .isolate });
-            try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
-        } else try testing.expectEqual(@as(?usize, 1), review.isolated_file);
+        try testing.expectEqual(@as(?usize, 1), review.isolated_file);
         if (index == 1) {
             try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(review.frame.visual_rows[review.navigation.cursor].buffer_index));
             try testing.expect(review.frame.file_tree.entries[review.frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
@@ -20993,7 +21046,8 @@ test "M23 emoji search navigates exact authored owners and keeps counts and raw 
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         const key = if (local) try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
-        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
+        // M29 opens a Review-level result in the Comment Overview, so a File-level Draft keeps the DiffPane route.
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } }, .target = if (local) .local else .bitbucket });
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1, .cell_metrics = MatrixGraphemeMetrics.value }, .{
             .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
             .geometry = .{ .cols = 38, .rows = 20 },
@@ -21074,7 +21128,8 @@ test "M23 tables search reveals authored cells and retains occurrence identity a
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         const key = if (local) try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
-        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
+        // M29 opens a Review-level result in the Comment Overview, so a File-level Draft keeps the DiffPane route.
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } }, .target = if (local) .local else .bitbucket });
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
             .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
             .geometry = .{ .cols = 38, .rows = 20 },
@@ -21168,7 +21223,8 @@ test "M23 links search navigates reference uses across resize and disclosure as 
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         const key = if (local) try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
-        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
+        // M29 opens a Review-level result in the Comment Overview, so a File-level Draft keeps the DiffPane route.
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } }, .target = if (local) .local else .bitbucket });
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
             .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
             .geometry = .{ .cols = 39, .rows = 20 },
@@ -21295,7 +21351,8 @@ test "M23 inline joined search reveals exact rows and retains occurrences across
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         const key = if (local) try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
-        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
+        // M29 opens a Review-level result in the Comment Overview, so a File-level Draft keeps the DiffPane route.
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } }, .target = if (local) .local else .bitbucket });
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
             .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
             .geometry = .{ .cols = 38, .rows = 20 },
@@ -31044,4 +31101,221 @@ test "M29 overview a File Jump shows the DiffPane" {
         try expectFileHeaderOnTop(frame, 0);
         try testing.expect(presentation.projection().action_error == null);
     }
+}
+
+/// Opens Review Search with `g f`, scans `query`, and selects the first
+/// result of `owner`.
+fn selectReviewSearchOwner(presentation: *Presentation, query: []const u8, owner: review_card.Owner) !void {
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'f', .text = "f" } });
+    try testing.expect(presentation.projection().review_search != null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = query[0], .text = query } });
+    try completeBufferSearchScan(presentation);
+    for (presentation.projection().review_search.?.results, 0..) |result, index| {
+        if (result.occurrence.location != .review_body) continue;
+        const found: review_card.Owner = switch (result.occurrence.location.review_body.owner) {
+            .comment => |id| .{ .comment = id },
+            .draft => |id| .{ .draft = id },
+        };
+        if (!std.meta.eql(found, owner)) continue;
+        for (0..index) |_| try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+        return;
+    }
+    return error.TestExpectedReviewSearchResult;
+}
+
+fn expectOverviewShows(presentation: *Presentation, owner: review_card.Owner) !void {
+    const frame = presentation.projection().review.?.frame;
+    try testing.expect(presentation.projection().review_search == null);
+    try testing.expectEqual(MainPane.comment_overview, frame.main_pane);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try testing.expectEqualDeep(@as(?review_card.Owner, owner), testOverviewSelectedOwner(presentation));
+    const selected = frame.overview.selected.?;
+    const viewport = frame_mod.overviewRects(frame.geometry).entries.height;
+    try testing.expect(selected >= frame.overview.state.scroll and selected < frame.overview.state.scroll + viewport);
+    try testing.expect(frame.file_tree.entries[0].identity == .root);
+}
+
+test "M29 overview a Review-level Review Search result shows the Comment Overview with the item selected" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "pending note" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testOverviewSession(testing.allocator, 1, 30) },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+    const diff_before = presentation.projection().review.?.frame;
+
+    try selectReviewSearchOwner(&presentation, "review 27", .{ .comment = 37 });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.takeCommand() == null);
+    try expectOverviewShows(&presentation, .{ .comment = 37 });
+    try testing.expect(presentation.projection().review.?.frame.overview.state.scroll > 0);
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expectEqual(diff_before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+
+    try presentation.dispatch(.{ .action = .to_top });
+    try selectReviewSearchOwner(&presentation, "pending note", .{ .draft = 1 });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.takeCommand() == null);
+    try expectOverviewShows(&presentation, .{ .draft = 1 });
+    try testing.expect(presentation.projection().action_error == null);
+
+    try presentation.dispatch(.{ .action = .show_diff_pane });
+    const diff_after = presentation.projection().review.?.frame;
+    try testing.expectEqual(diff_before.navigation.cursor, diff_after.navigation.cursor);
+    try testing.expectEqual(diff_before.visual_rows.ptr, diff_after.visual_rows.ptr);
+}
+
+fn setOverviewQuery(presentation: *Presentation, text: []const u8) !void {
+    try presentation.dispatch(.{ .action = .edit_overview_query });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    if (text.len > 0) try presentation.dispatch(.{ .key = .{ .codepoint = text[0], .text = text } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+}
+
+test "M29 overview the Review Search route clears only the filters that hide the item and keeps the order" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewJumpPresentation(&store, 1);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try setOverviewQuery(&presentation, "folded");
+    try presentation.dispatch(.{ .action = .toggle_overview_unresolved });
+    try presentation.dispatch(.{ .action = .toggle_overview_order });
+    var state = presentation.projection().review.?.frame.overview.state.*;
+    try testing.expect(state.file_tree_filter.?.eql(.{ .file = 0 }));
+
+    // The query and the File Tree Filter hide the Review-level Comment. Unresolved only does not.
+    try selectReviewSearchOwner(&presentation, "review", .{ .comment = 1 });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try expectOverviewShows(&presentation, .{ .comment = 1 });
+    state = presentation.projection().review.?.frame.overview.state.*;
+    try testing.expectEqualStrings("", state.query());
+    try testing.expect(state.file_tree_filter == null);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.frame.file_tree.cursor);
+    try testing.expect(state.unresolved_only and !state.drafts_only and !state.mine_only);
+    try testing.expectEqual(comment_overview.Order.newest_first, state.order);
+    try testing.expectEqual(ActionError.overview_filters_cleared, presentation.projection().action_error.?);
+
+    // No filter hides the Review-level Draft, so the route clears nothing.
+    try setOverviewQuery(&presentation, "draft");
+    try presentation.dispatch(.{ .action = .toggle_overview_drafts });
+    try presentation.dispatch(.{ .action = .toggle_overview_mine });
+    try selectReviewSearchOwner(&presentation, "review draft", .{ .draft = 2 });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try expectOverviewShows(&presentation, .{ .draft = 2 });
+    state = presentation.projection().review.?.frame.overview.state.*;
+    try testing.expectEqualStrings("draft", state.query());
+    try testing.expect(state.unresolved_only and state.drafts_only and state.mine_only);
+    try testing.expectEqual(comment_overview.Order.newest_first, state.order);
+    try testing.expect(presentation.projection().action_error == null);
+
+    // The query, Drafts only, and mine only hide the Comment of another author.
+    try selectReviewSearchOwner(&presentation, "review", .{ .comment = 1 });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try expectOverviewShows(&presentation, .{ .comment = 1 });
+    state = presentation.projection().review.?.frame.overview.state.*;
+    try testing.expectEqualStrings("", state.query());
+    try testing.expect(state.unresolved_only and !state.drafts_only and !state.mine_only);
+    try testing.expectEqual(comment_overview.Order.newest_first, state.order);
+    try testing.expectEqual(ActionError.overview_filters_cleared, presentation.projection().action_error.?);
+}
+
+test "M29 overview a File-level or inline Review Search result from the Comment Overview shows the DiffPane once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewJumpPresentation(&store, 1);
+    defer presentation.deinit();
+    const Case = struct { query: []const u8, owner: review_card.Owner };
+    for ([_]Case{ .{ .query = "file", .owner = .{ .comment = 2 } }, .{ .query = "new side", .owner = .{ .comment = 3 } } }) |case| {
+        try presentation.dispatch(.{ .action = .show_comment_overview });
+        try selectReviewSearchOwner(&presentation, case.query, case.owner);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const command = presentation.takeCommand() orelse return error.MissingDisclosureBuild;
+        try testing.expectEqual(DisclosureBuild.Kind.review_destination, command.build_buffer_disclosure.kind);
+        try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
+        command.build_buffer_disclosure.build();
+        try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+        try testing.expect(presentation.takeCommand() == null);
+        const review = presentation.projection().review.?;
+        try testing.expect(presentation.projection().review_search == null);
+        try testing.expectEqual(MainPane.diff_pane, review.frame.main_pane);
+        try testing.expectEqual(frame_mod.PaneFocus.diff, review.frame.focus);
+        try testing.expectEqual(case.owner.comment, review.frame.visual_rows[review.navigation.cursor].owner.comment.id);
+        for (review.frame.file_tree.entries) |entry| try testing.expect(entry.identity != .root);
+        try testing.expect(presentation.projection().action_error == null);
+    }
+}
+
+test "M29 overview a source Review Search result from the Comment Overview shows the DiffPane once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 70, .rows = 25 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'f', .text = "f" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    try completeBufferSearchScan(&presentation);
+    var command = presentation.takeCommand().?;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "old\n" },
+        .{ .status = 200, .body = "new\nneedle after hunk\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    const enrichment = try file_enrichment.enrich(testing.allocator, bb, plain.highlighter(), command.enrich_file.request());
+    const work_id = command.enrich_file.work_id;
+    const command_id = command.enrich_file.command_id;
+    command.deinit();
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command_id,
+        .work_id = work_id,
+        .session_epoch = 1,
+        .file_index = 0,
+        .outcome = .{ .completed = enrichment },
+    } });
+    try completeDisclosureBuild(&presentation);
+    var scan_command = presentation.takeCommand().?;
+    const completed = executeReviewSourceScan(testing.allocator, &scan_command.scan_review_source);
+    scan_command.deinit();
+    try presentation.dispatch(.{ .review_source_scanned = completed });
+    try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.takeCommand() == null);
+    const review = presentation.projection().review.?;
+    try testing.expect(presentation.projection().review_search == null);
+    try testing.expectEqual(MainPane.diff_pane, review.frame.main_pane);
+    try testing.expectEqual(@as(?u32, 2), review.frame.visual_rows[review.navigation.cursor].yank_candidates.new.?.newNo());
+    for (review.frame.file_tree.entries) |entry| try testing.expect(entry.identity != .root);
+}
+
+test "M29 overview a Review-level result from an earlier Session Epoch does nothing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewJumpPresentation(&store, 1);
+    defer presentation.deinit();
+    try selectReviewSearchOwner(&presentation, "review", .{ .comment = 1 });
+    const published = presentation.published.?;
+    published.review_search.results.?[published.review_search.selected.?].occurrence.session_epoch = published.epoch - 1;
+    const revision = presentation.projection().revision.frame;
+    const queued = presentation.commands.items.len;
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expectEqual(queued, presentation.commands.items.len);
+    try testing.expect(presentation.projection().review_search != null);
+    try testing.expectEqual(MainPane.diff_pane, presentation.projection().review.?.frame.main_pane);
+    try testing.expectEqual(revision, presentation.projection().revision.frame);
+    try testing.expect(presentation.projection().action_error == null);
 }

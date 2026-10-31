@@ -411,6 +411,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .open_theme_overlay,
             .open_pull_request_picker,
             .open_file_finder,
+            .open_review_search,
             .refresh,
             .review_comment,
             .set_verdict_approved,
@@ -904,8 +905,6 @@ test "M29 overview g o and g d resolve in every Pane context and remain configur
     var overview: Resolver = .{};
     try testing.expectEqual(Action.down, overview.feed(.default, .comment_overview, plain('j')).action);
     try testing.expectEqual(Action.open_file_finder, overview.feed(.default, .comment_overview, plain('F')).action);
-    try testing.expect(overview.feed(.default, .comment_overview, plain('g')) == .none);
-    try testing.expect(overview.feed(.default, .comment_overview, plain('f')) == .none);
     try testing.expectEqualStrings("show Comment Overview", helpFor(.show_comment_overview));
     try testing.expectEqualStrings("show DiffPane", helpFor(.show_diff_pane));
 
@@ -922,6 +921,22 @@ test "M29 overview g o and g d resolve in every Pane context and remain configur
     try testing.expectEqual(Action.show_comment_overview, resolver.feed(configured.keymap(), .diff, plain('o')).action);
     try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain('g')) == .none);
     try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain('d')) == .none);
+}
+
+test "M29 overview g f opens Review Search from the Comment Overview and remains configurable" {
+    try validateBindings(&default_bindings);
+    var resolver: Resolver = .{};
+    try testing.expect(resolver.feed(.default, .comment_overview, plain('g')) == .none);
+    try testing.expectEqual(Action.open_review_search, resolver.feed(.default, .comment_overview, plain('f')).action);
+    try testing.expect(!supportsContext(.open_review_search, .comment_overview_query));
+
+    const overrides = [_]Override{.{ .action = "open_review_search", .sequences = &.{"space f"} }};
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+    try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain('g')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain('f')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain(' ')) == .none);
+    try testing.expectEqual(Action.open_review_search, resolver.feed(configured.keymap(), .comment_overview, plain('f')).action);
 }
 
 test "M29 overview Enter opens the selected entry only in the Comment Overview and remains configurable" {
