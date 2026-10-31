@@ -367,13 +367,18 @@ context. Keep M21 navigation to the existing DiffPane ReviewCard until this mile
 - [ ] After the overview ships, route a Review Search result for a Review-level item through the overview when that route gives clearer context than the all-Files Buffer.
 - [ ] Add Presentation coverage for each CommentScope, nested Replies, Drafts, disclosures, stale Session work, navigation, and return-state restoration.
 
-## M30 - Viewer scrollbars  ·  S/M  ·  needs M15
+## M30 - Viewer scrollbars  ·  M  ·  needs M15
 Show the visible range in both viewer Panes. Use a thin thumb without a full-height track,
-as in Review Search.
+as in Review Search. The [M30 brief](.scratch/m30-viewer-scrollbars/brief.md) records why M30
+grew from S/M to M.
 
-- [ ] Add a scrollbar to the Sidebar File Tree. Size and place the thumb from the visible rows, total rows, and scroll offset. Hide it when every row fits.
-- [ ] Add a scrollbar to the DiffPane. Track its visual rows across layouts, wrapped lines, Folds, and isolated Files. Hide it when every row fits.
-- [ ] Add headless Presentation tests for thumb size and position at the top, middle, and bottom, plus resize and content changes.
+- [x] Add a scrollbar to the Sidebar File Tree. Size and place the thumb from the visible rows, total rows, and scroll offset. Hide it when every row fits.
+- [x] Add a scrollbar to the DiffPane. Track its visual rows across layouts, wrapped lines, Folds, and isolated Files. Hide it when every row fits.
+- [x] Add headless Presentation tests for thumb size and position at the top, middle, and bottom, plus resize and content changes.
+- [x] Show Scroll Marks in the DiffPane scroll bar for Buffer Search hits, Drafts, unresolved Threads, resolved Threads, and File headers. A Scroll Mark on the thumb keeps its glyph in the thumb style.
+- [x] Take a track press and a Scroll Drag on the File Tree, DiffPane, and Review Search Results list scroll bars. Keep the wheel as before.
+- [ ] Run the live outside check on `pr-webapp` #14 ([ticket 07](.scratch/m30-viewer-scrollbars/issues/07-run-the-live-m30-outside-check.md)).
+- [ ] Decide on a separate mark column after the hands-on test ([ticket 08](.scratch/m30-viewer-scrollbars/issues/08-decide-on-a-separate-mark-column.md)).
 
 ## M31 - Product reference navigation and preview investigation  ·  S/M  ·  needs M23
 Decide how reviewers can follow or preview product references in a ReviewBody, such as

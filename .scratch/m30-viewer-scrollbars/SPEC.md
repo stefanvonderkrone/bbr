@@ -1,6 +1,6 @@
 # M30 Viewer scrollbars
 
-Status: ready-for-agent
+Status: claimed
 Milestone: M30
 
 The [M30 brief](brief.md) records the approved decisions.

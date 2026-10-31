@@ -41,3 +41,130 @@ Run each step in a terminal with 30 rows, then repeat it in a terminal with 80 r
 - [ ] The wheel works as before.
 - [ ] Notes on how readable the marks are in a crowded track are recorded for ticket 08.
 - [ ] The results, the terminal sizes, and the bbr commit are recorded under `## Completion` in this ticket.
+
+## Agent notes for the human
+
+An agent wrote these notes from the source and the README.
+No agent ran bbr or sent a request to Bitbucket.
+
+### Prepare
+
+1. Check out the M30 commit in a clean checkout, and record it:
+
+   ```sh
+   git status --short
+   git rev-parse HEAD
+   ```
+
+   `git status --short` must print nothing.
+2. Build bbr:
+
+   ```sh
+   zig build -Doptimize=ReleaseFast
+   ```
+
+   The build writes the executable to `zig-out/bin/bbr`.
+3. Record the source identity with `zig-out/bin/bbr --version`.
+4. Run `zig-out/bin/bbr auth status`. It must exit with `0`.
+   Add `--profile <name>` to every command if you do not use the default Profile.
+5. Keep mouse input on.
+   `[input.mouse].enabled` is `true` by default, so remove a `false` value from `config.toml` for this check.
+
+### Set the terminal size
+
+Most xterm-compatible terminals, such as Terminal.app and iTerm2, take a resize request:
+
+```sh
+printf '\e[8;30;120t'   # 30 rows, 120 columns
+printf '\e[8;80;160t'   # 80 rows, 160 columns
+tput lines
+```
+
+`tput lines` must print `30` or `80`.
+If the terminal ignores the request, set the window size in the terminal settings.
+
+### Open the PullRequest
+
+```sh
+zig-out/bin/bbr pr-webapp 14
+```
+
+The M28 benchmark uses the same Repository and PullRequest ID.
+
+### Keys
+
+| Work | Key |
+| --- | --- |
+| Switch the focus between the File Tree and the DiffPane | `Tab` |
+| Open Buffer Search | `/` |
+| Accept the Buffer Search query | `Enter` |
+| Delete the whole Buffer Search query | `Ctrl-U` |
+| Cancel the Buffer Search input | `Esc` |
+| Next and previous Search Occurrence | `n` and `N` |
+| Open Review Search | `g f` |
+| Close Review Search | `Esc` |
+| Isolate the File at the cursor, and end the isolation | `o` |
+| Switch between the Unified and the SideBySide Layout | `s` |
+| Start an inline Draft on a source Line | `i` |
+| Save the Draft in the Composer | `Ctrl-S` or `Ctrl-D` |
+| Open or close a resolved Thread disclosure | `Enter` on the disclosure row |
+| Delete the Draft at the cursor | `D`, then confirm |
+| Show the help Overlay | `?` |
+
+A saved Draft stays local.
+Do not press `X`, because `X` submits the review.
+Use `D` only on your own test Drafts, not on a published Comment.
+
+### What to look for
+
+The DiffPane scroll bar is the right border of the DiffPane.
+The thumb is the run of `┃` cells.
+Each Scroll Mark is one glyph in a track cell:
+
+| Glyph | Scroll Mark | Style off the thumb |
+| --- | --- | --- |
+| `◆` | Buffer Search hit | Accent color, bold |
+| `✎` | Draft | Draft color, bold |
+| `●` | Unresolved Thread | Renamed-status color, bold |
+| `✓` | Resolved Thread | Added-status color, dim |
+| `━` | File header | Border color |
+
+A cell shows only its highest priority Scroll Mark, in the order of this table.
+A Scroll Mark on a thumb cell keeps its glyph in the thumb style.
+So a thumb can show `┃`, `◆`, and `●` cells together.
+
+Per step:
+
+- Step 2. Add each Draft with `i` on a source Line, type a short body, and save it.
+  Each Draft gives a `✎` mark.
+  A collapsed resolved Thread gives one `✓` mark on its disclosure row.
+  `Enter` on that row opens the Thread, and its mark then covers the root ReviewCard and its Replies.
+- Step 3. A press on a mark cell off the thumb jumps the scroll.
+  The thumb then covers the pressed cell.
+  The item of the mark must be in the visible DiffPane rows.
+  The jump centers the pressed cell's first row when it can.
+  So the item can be some rows above or below the middle, because one cell can hold many rows.
+- Step 4. The mouse does nothing while the Buffer Search input is open.
+  Press `Enter` to accept the query before you press a hit mark.
+  A Search Occurrence inside a closed Fold has no hit mark.
+- Step 5. The hit marks follow the DiffPane search highlights.
+  To clear the query, press `/`, type the query, then press `Ctrl-U` in the same input.
+  The source shows that an empty query in a later input falls back to the accepted query.
+  That is a reading of the source, not a run.
+  If the hit marks and the highlights stay after `/` and `Ctrl-U`, record it, and record whether the highlights also stay.
+- Steps 6 to 8. The pointer column does not matter during a Scroll Drag.
+  The drag follows the pointer row over the other Pane, the status, and outside the window.
+- Step 9. The Review Search Results list scroll bar is the `│` thumb in the padding ring right of the list.
+  It shows no Scroll Marks.
+- Step 10. With an isolated File, the track shows only the rows of that File.
+  Only one `━` File header mark shows.
+- Step 12. Resize with the `printf` commands from a second shell, or with the window edge.
+- Step 13. Scroll with the wheel over the Pane content.
+  The wheel over a track does nothing, as before M30.
+  This is by design, so it is not a failure.
+
+### Record
+
+Under `## Completion`, record the bbr commit from `git rev-parse HEAD`, the `--version` output, the terminal program, and both terminal sizes.
+For ticket 08, record how readable the marks are in a crowded track.
+Record whether the thumb style hides the mark kinds, and whether the `━` marks crowd the border.

@@ -114,6 +114,24 @@ class AgentDocsTest(unittest.TestCase):
         self.write("AGENTS.md", "Text[^note].\n\n[^note]: [Reference](docs/code-navigation.md)\n")
         self.assertEqual(checker.check(self.root), [])
 
+    def test_rule_table_tests_exist_in_their_files(self):
+        self.write("src/a.zig", 'test "first" {}\ntest "second" {}\n')
+        self.write("AGENTS.md", "| Rule | Enforcement |\n| --- | --- |\n"
+                   '| One. | The tests "first" and "second" in `src/a.zig`. |\n'
+                   '| Two. | The block in `src/a.zig`. The test "second". |\n')
+        self.assertEqual(checker.check(self.root), [])
+
+    def test_rule_table_test_drift_fails(self):
+        self.write("src/a.zig", 'test "first" {}\n')
+        self.write("AGENTS.md", "| Rule | Enforcement |\n| --- | --- |\n"
+                   '| One. | The test "frist" in `src/a.zig`. |\n'
+                   '| Two. | The test "first". |\n'
+                   '| Three. | The test "first" in `src/b.zig`. |\n')
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn('line 3: src/a.zig has no test "frist"', errors)
+        self.assertIn('line 4: test "first" names no file', errors)
+        self.assertIn('line 5: test "first" names the missing file src/b.zig', errors)
+
 
 if __name__ == "__main__":
     unittest.main()
