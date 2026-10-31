@@ -42,6 +42,9 @@ pub const StatusSlot = enum {
     layout,
     scope,
     isolate,
+    filter,
+    open,
+    main_pane,
     message,
     submit,
     comment,
@@ -123,7 +126,12 @@ pub fn statusRects(params: Status, area: Rect) view.Rects(StatusSlot) {
 /// The Sidebar and the DiffPane. Each Pane has a rounded border with its
 /// Title in the top border, and its body starts in the next row. The scroll
 /// bars sit in the right border.
-pub const PaneSlot = enum { sidebar, diff };
+pub const PaneSlot = enum {
+    sidebar,
+    /// The Main Pane. It shows the DiffPane or the Comment Overview. The name
+    /// stays `diff` because a rename conflicts with other worktrees.
+    diff,
+};
 
 pub const Panes = struct {
     sidebar_focused: bool = false,
@@ -133,20 +141,27 @@ pub const Panes = struct {
 
 pub const sidebar_width: u16 = 28;
 
+/// The Sidebar beside the Main Pane. Both Pane trees use it with
+/// `sidebarView`, so the Comment Overview takes exactly the DiffPane rects.
+const pane_split: view.Composition = .{ .sidebar = .{ .content_min = 3, .wrap = false } };
+
+fn sidebarView(comptime Slot: type, slot: Slot, focused: bool, scroll: Scroll) view.View(Slot) {
+    const stroke: view.Stroke = .{ .focused = focused };
+    return .{
+        .slot = slot,
+        .width = .cells(sidebar_width),
+        .border = .{ .stroke = stroke },
+        .title = .{ .text = "Files" },
+        .scrollbar = bar(scroll, .border, stroke),
+    };
+}
+
 pub fn panes(params: Panes, area: Rect, visitor: anytype) void {
-    const V = view.View(PaneSlot);
-    const sidebar_stroke: view.Stroke = .{ .focused = params.sidebar_focused };
     const diff_stroke: view.Stroke = .{ .focused = !params.sidebar_focused };
-    const root: V = .{
-        .composition = .{ .sidebar = .{ .content_min = 3, .wrap = false } },
+    const root: view.View(PaneSlot) = .{
+        .composition = pane_split,
         .children = &.{
-            .{
-                .slot = .sidebar,
-                .width = .cells(sidebar_width),
-                .border = .{ .stroke = sidebar_stroke },
-                .title = .{ .text = "Files" },
-                .scrollbar = bar(params.sidebar_scroll, .border, sidebar_stroke),
-            },
+            sidebarView(PaneSlot, .sidebar, params.sidebar_focused, params.sidebar_scroll),
             .{
                 .slot = .diff,
                 .border = .{ .stroke = diff_stroke },
@@ -155,6 +170,41 @@ pub fn panes(params: Panes, area: Rect, visitor: anytype) void {
         },
     };
     view.walk(PaneSlot, &root, area, visitor);
+}
+
+/// The Sidebar and the Comment Overview. The Comment Overview is the filter
+/// row above a rule and the entries. The entries scroll bar sits in their
+/// padding ring.
+pub const OverviewPaneSlot = enum { sidebar, overview, filter, entries };
+
+pub const OverviewPanes = struct {
+    sidebar_focused: bool = false,
+    sidebar_scroll: Scroll = .{},
+    title: []const u8 = "",
+    entries_scroll: Scroll = .{},
+};
+
+pub fn commentOverviewPanes(params: OverviewPanes, area: Rect, visitor: anytype) void {
+    const stroke: view.Stroke = .{ .focused = !params.sidebar_focused };
+    const root: view.View(OverviewPaneSlot) = .{
+        .composition = pane_split,
+        .children = &.{
+            sidebarView(OverviewPaneSlot, .sidebar, params.sidebar_focused, params.sidebar_scroll),
+            .{
+                .slot = .overview,
+                .fill = true,
+                .border = .{ .stroke = stroke },
+                .title = .{ .text = params.title },
+                .composition = .{ .flow = .{} },
+                .children = &.{
+                    .{ .slot = .filter, .height = .cells(1) },
+                    .{ .composition = .{ .rule = stroke } },
+                    .{ .slot = .entries, .scrollbar = bar(params.entries_scroll, .padding, stroke) },
+                },
+            },
+        },
+    };
+    view.walk(OverviewPaneSlot, &root, area, visitor);
 }
 
 pub const Box = struct { width: u16, height: u16 };
@@ -373,7 +423,24 @@ test "every layout places each of its Slots" {
         _ = view.solve(HelpSlot, help, @as(usize, 20), area);
         _ = view.solve(SubmissionSlot, submission, {}, area);
         _ = view.solve(SearchSlot, reviewSearch, ReviewSearch{ .list_scroll = .{ .total = 50, .offset = 0 } }, area);
+        _ = view.solve(OverviewPaneSlot, commentOverviewPanes, OverviewPanes{ .title = "Comment Overview 1/1", .entries_scroll = .{ .total = 40, .offset = 2 } }, area);
     }
+}
+
+test "M29 overview the Comment Overview Panes match the DiffPane Panes at every size" {
+    const sizes = [_][2]u16{ .{ 0, 0 }, .{ 1, 1 }, .{ 5, 2 }, .{ 12, 4 }, .{ 31, 3 }, .{ 40, 24 }, .{ 80, 24 }, .{ 200, 60 } };
+    for (sizes) |size| for ([_]bool{ false, true }) |sidebar_focused| {
+        const area: Rect = .{ .width = size[0], .height = size[1] };
+        const diff = view.solve(PaneSlot, panes, Panes{ .sidebar_focused = sidebar_focused }, area);
+        const overview = view.solve(OverviewPaneSlot, commentOverviewPanes, OverviewPanes{ .sidebar_focused = sidebar_focused, .title = "Comment Overview 0/0" }, area);
+        try testing.expectEqual(diff.get(.sidebar).border, overview.get(.sidebar).border);
+        try testing.expectEqual(diff.get(.sidebar).content, overview.get(.sidebar).content);
+        try testing.expectEqual(diff.get(.diff).border, overview.get(.overview).border);
+    };
+    const wide = view.solve(OverviewPaneSlot, commentOverviewPanes, OverviewPanes{}, .{ .width = 80, .height = 24 });
+    try testing.expectEqual(Rect{ .x = 29, .y = 1, .width = 50, .height = 1 }, wide.get(.filter).content);
+    try testing.expectEqual(Rect{ .x = 29, .y = 3, .width = 49, .height = 20 }, wide.get(.entries).content);
+    try testing.expectEqual(Rect{ .x = 78, .y = 3, .width = 1, .height = 20 }, wide.get(.entries).track);
 }
 
 test "the Panes touch with no gap and a 28-cell Sidebar" {

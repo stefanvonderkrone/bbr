@@ -216,6 +216,8 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('y'), .action = .yank, .help = "yank text" },
     .{ .chord = Chord.one('?'), .action = .help, .help = "toggle this help" },
     .{ .chord = Chord.one(vaxis.Key.tab), .action = .focus_next_pane, .help = "switch Pane" },
+    .{ .chord = Chord.two('g', 'o'), .action = .show_comment_overview, .help = "show Comment Overview" },
+    .{ .chord = Chord.two('g', 'd'), .action = .show_diff_pane, .help = "show DiffPane" },
 };
 
 pub const Keymap = struct {
@@ -382,6 +384,39 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
     return switch (context) {
         .composer => action == .external_edit,
         .help, .unknown_resolution, .delete_confirmation, .buffer_search_input => false,
+        .comment_overview => switch (action) {
+            .down,
+            .up,
+            .half_page_down,
+            .half_page_up,
+            .page_down,
+            .page_up,
+            .to_top,
+            .to_bottom,
+            .center,
+            .cursor_view_top,
+            .cursor_view_middle,
+            .cursor_view_bottom,
+            .scroll_row_up,
+            .scroll_row_down,
+            .quit,
+            .help,
+            .open_command_palette,
+            .open_theme_overlay,
+            .open_pull_request_picker,
+            .refresh,
+            .review_comment,
+            .set_verdict_approved,
+            .set_verdict_changes_requested,
+            .set_verdict_none,
+            .submit,
+            .recover_submission,
+            .focus_next_pane,
+            .show_comment_overview,
+            .show_diff_pane,
+            => true,
+            else => false,
+        },
         .review_search => switch (action) {
             .next_review_search_occurrence,
             .previous_review_search_occurrence,
@@ -423,6 +458,8 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .cycle_scope,
             .toggle_directory,
             .focus_next_pane,
+            .show_comment_overview,
+            .show_diff_pane,
             => true,
             else => false,
         },
@@ -455,6 +492,8 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .cycle_scope,
             .focus_file,
             .focus_next_pane,
+            .show_comment_overview,
+            .show_diff_pane,
             => true,
             else => false,
         },
@@ -475,6 +514,8 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .set_verdict_none,
             .help,
             .focus_next_pane,
+            .show_comment_overview,
+            .show_diff_pane,
             => true,
             else => false,
         },
@@ -542,6 +583,8 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .next_file,
             .prev_file,
             .focus_next_pane,
+            .show_comment_overview,
+            .show_diff_pane,
             => true,
             else => false,
         },
@@ -834,4 +877,36 @@ test "M21 Buffer Search Actions resolve in every DiffPane context and remain con
     try testing.expect(resolver.feed(configured.keymap(), .diff, plain('/')) == .none);
     try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
     try testing.expectEqual(Action.open_buffer_search, resolver.feed(configured.keymap(), .diff, plain('s')).action);
+}
+
+test "M29 overview g o and g d resolve in every Pane context and remain configurable" {
+    try validateBindings(&default_bindings);
+    inline for (.{ InteractionContext.diff, .diff_source, .diff_disclosure, .diff_review_card, .sidebar, .sidebar_directory, .sidebar_file, .comment_overview }) |context| {
+        var resolver: Resolver = .{};
+        try testing.expect(resolver.feed(.default, context, plain('g')) == .none);
+        try testing.expectEqual(Action.show_comment_overview, resolver.feed(.default, context, plain('o')).action);
+        try testing.expect(resolver.feed(.default, context, plain('g')) == .none);
+        try testing.expectEqual(Action.show_diff_pane, resolver.feed(.default, context, plain('d')).action);
+    }
+    var overview: Resolver = .{};
+    try testing.expectEqual(Action.down, overview.feed(.default, .comment_overview, plain('j')).action);
+    try testing.expect(overview.feed(.default, .comment_overview, plain('F')) == .none);
+    try testing.expect(overview.feed(.default, .comment_overview, plain('g')) == .none);
+    try testing.expect(overview.feed(.default, .comment_overview, plain('f')) == .none);
+    try testing.expectEqualStrings("show Comment Overview", helpFor(.show_comment_overview));
+    try testing.expectEqualStrings("show DiffPane", helpFor(.show_diff_pane));
+
+    const overrides = [_]Override{
+        .{ .action = "show_comment_overview", .sequences = &.{"space o"} },
+        .{ .action = "show_diff_pane", .sequences = &.{} },
+    };
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+    var resolver: Resolver = .{};
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('g')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('o')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
+    try testing.expectEqual(Action.show_comment_overview, resolver.feed(configured.keymap(), .diff, plain('o')).action);
+    try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain('g')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .comment_overview, plain('d')) == .none);
 }

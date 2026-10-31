@@ -335,6 +335,14 @@ pub fn build(b: *std.Build) void {
     const acceptance_step = b.step("test-m23-acceptance", "Run combined M23 acceptance tests");
     acceptance_step.dependOn(&b.addRunArtifact(acceptance_tests).step);
 
+    const comment_overview_tests = b.addTest(.{
+        .name = "comment-overview-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M29 overview"},
+    });
+    const comment_overview_step = b.step("test-comment-overview", "Run Comment Overview tests");
+    comment_overview_step.dependOn(&b.addRunArtifact(comment_overview_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

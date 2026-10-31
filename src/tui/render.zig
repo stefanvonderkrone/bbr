@@ -32,6 +32,7 @@ const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 const layouts = @import("layouts.zig");
 const view_paint = @import("view_paint.zig");
+const comment_overview = @import("comment_overview.zig");
 
 pub const sidebar_width: u16 = 28;
 
@@ -111,6 +112,182 @@ pub fn drawReview(
     drawCodeHighlights(diff_pane, review.frame, theme);
     drawSearchRanges(diff_pane, review.frame, theme);
     joinSectionRules(win, panes.get(.diff).border, panes.get(.diff).content, review.frame.visual_rows, review.frame.navigation);
+}
+
+/// Render the Comment Overview in the Main Pane. view_paint.zig paints the
+/// Panes, the Title, the rule, and the scroll bars. This paints only content.
+pub fn drawCommentOverview(scratch: std.mem.Allocator, win: vaxis.Window, review: ReviewProjection, theme: Theme) void {
+    win.clear();
+    const frame = review.frame;
+    const overview = frame.overview;
+    const title = std.fmt.allocPrint(scratch, "Comment Overview {d}/{d}", .{ overview.listing.matches, overview.listing.records }) catch "Comment Overview";
+    const rects = view_paint.paint(layouts.OverviewPaneSlot, layouts.commentOverviewPanes, layouts.OverviewPanes{
+        .sidebar_focused = frame.focus == .sidebar,
+        .sidebar_scroll = .{ .total = frame.file_tree.entries.len, .offset = frame.file_tree.scroll },
+        .title = title,
+        .entries_scroll = .{ .total = overview.listing.entries.len, .offset = overview.state.scroll },
+    }, win, theme);
+    drawFileTree(childRect(win, rects.get(.sidebar).content), frame.file_tree, theme);
+    drawOverviewFilter(childRect(win, rects.get(.filter).content), &overview, theme);
+    drawOverviewEntries(scratch, childRect(win, rects.get(.entries).content), &overview, theme);
+}
+
+const OverviewPart = @import("theme.zig").OverviewPart;
+const OverviewText = struct { text: []const u8, part: OverviewPart };
+
+/// A filter chip. Ticket 03 adds the toggle chips and ticket 04 the File
+/// Tree Filter chip to this table.
+const OverviewChip = struct { text: []const u8, active: bool };
+
+fn overviewChips(state: *const comment_overview.State) [1]OverviewChip {
+    return .{.{ .text = switch (state.order) {
+        .review => "o review order",
+        .newest_first => "o newest first",
+    }, .active = false }};
+}
+
+const overview_chip_gap: usize = 2;
+
+/// The query on the left and the chips on the right. Chips that do not fit
+/// drop from the end, as a repel without wrap shrinks its last children.
+fn drawOverviewFilter(win: vaxis.Window, overview: *const comment_overview.Frame, theme: Theme) void {
+    if (win.height == 0) return;
+    const metrics = overview.cell_metrics;
+    const query = overview.state.query();
+    const cursor: []const u8 = if (overview.query_input) "▏" else "";
+    const texts = [_]OverviewText{
+        .{ .text = "/", .part = .query },
+        .{ .text = query, .part = .query },
+        .{ .text = cursor, .part = .query },
+        .{ .text = if (query.len == 0) "filter" else "", .part = .placeholder },
+    };
+    var query_width: usize = 0;
+    for (texts) |text| query_width += metrics.width(text.text);
+
+    const chips = overviewChips(&overview.state);
+    var shown: usize = chips.len;
+    var chips_width: usize = 0;
+    while (true) : (shown -= 1) {
+        chips_width = 0;
+        for (chips[0..shown]) |chip| chips_width += metrics.width(chip.text) + overview_chip_gap;
+        if (shown == 0 or query_width + chips_width <= win.width) break;
+    }
+    drawOverviewLine(win.child(.{ .width = @intCast(win.width - @min(chips_width, win.width)) }), 0, &texts, .comment, false, false, metrics, theme);
+    var col: usize = win.width - @min(chips_width, win.width);
+    for (chips[0..shown]) |chip| {
+        col += overview_chip_gap;
+        const style = theme.overviewStyle(if (chip.active) .chip_active else .chip, .comment);
+        _ = win.printSegment(.{ .text = chip.text, .style = style }, .{ .col_offset = @intCast(col), .wrap = .none });
+        col += metrics.width(chip.text);
+    }
+}
+
+fn drawOverviewEntries(scratch: std.mem.Allocator, win: vaxis.Window, overview: *const comment_overview.Frame, theme: Theme) void {
+    const metrics = overview.cell_metrics;
+    const entries = overview.listing.entries;
+    const message: ?[]const u8 = if (overview.records.len == 0)
+        "No Comments or Drafts in this Review"
+    else if (entries.len == 0)
+        "No entry matches the filters"
+    else
+        null;
+    if (message) |text| {
+        if (win.height > 0) drawOverviewLine(win, 0, &.{.{ .text = text, .part = .message }}, .comment, false, false, metrics, theme);
+        return;
+    }
+    var row: u16 = 0;
+    while (row < win.height) : (row += 1) {
+        const index = overview.state.scroll + row;
+        if (index >= entries.len) break;
+        const entry = entries[index];
+        if (entry.record >= overview.records.len) continue;
+        const record = overview.records[entry.record];
+        const root = record.parent == null;
+        const texts = [_]OverviewText{
+            .{ .text = overview_indent[0 .. 2 * @min(record.depth, max_overview_depth)], .part = .excerpt },
+            .{ .text = if (root and record.resolved) "✓ " else "", .part = .resolved },
+            .{ .text = record.author, .part = .author },
+            .{ .text = if (root) "  " else "", .part = .scope },
+            .{ .text = if (root) overviewScopeLabel(scratch, record, metrics) else "", .part = .scope },
+            .{ .text = "  ", .part = .excerpt },
+            .{ .text = record.excerpt, .part = .excerpt },
+        };
+        drawOverviewLine(win, row, &texts, record.role, entry.context, overview.selected == index, metrics, theme);
+    }
+}
+
+const max_overview_depth: usize = 8;
+const overview_indent = " " ** (2 * max_overview_depth);
+const max_overview_path_cells: usize = 40;
+
+/// `Review`, the File path, or the path with its Lines, then the side and
+/// the ScopeState.
+fn overviewScopeLabel(scratch: std.mem.Allocator, record: comment_overview.Record, metrics: @import("cell_metrics.zig").CellMetrics) []const u8 {
+    const state: []const u8 = if (record.scope_state) |scope_state| switch (scope_state) {
+        .current => "",
+        .moved => " (moved)",
+        .outdated => " (outdated)",
+    } else " (unavailable)";
+    return switch (record.scope) {
+        .review => std.fmt.allocPrint(scratch, "Review{s}", .{state}),
+        .file => |file| std.fmt.allocPrint(scratch, "{s}{s}", .{ overviewPath(scratch, file.path, metrics), state }),
+        .@"inline" => |anchor| blk: {
+            const path = overviewPath(scratch, anchor.path, metrics);
+            const side: []const u8 = if (anchor.to == null and anchor.from != null) " old" else "";
+            const bottom = anchor.line() orelse 0;
+            const top = anchor.top() orelse bottom;
+            break :blk if (top == bottom)
+                std.fmt.allocPrint(scratch, "{s}:L{d}{s}{s}", .{ path, bottom, side, state })
+            else
+                std.fmt.allocPrint(scratch, "{s}:L{d}-L{d}{s}{s}", .{ path, top, bottom, side, state });
+        },
+    } catch "";
+}
+
+/// A path longer than 40 cells loses its start, and `…` takes its first cell.
+fn overviewPath(scratch: std.mem.Allocator, path: []const u8, metrics: @import("cell_metrics.zig").CellMetrics) []const u8 {
+    var width = metrics.width(path);
+    if (width <= max_overview_path_cells) return path;
+    var rest = path;
+    while (width > max_overview_path_cells - 1 and rest.len > 0) {
+        const measured = metrics.next(rest);
+        rest = rest[measured.byte_len..];
+        width -|= measured.cell_width;
+    }
+    return std.fmt.allocPrint(scratch, "…{s}", .{rest}) catch rest;
+}
+
+/// Paint `texts` from the left of `row`. A row that does not fit stops one
+/// cell early, and `…` takes the last cell. The selected entry paints the
+/// cursor band across the row, and a context entry paints every part dim.
+fn drawOverviewLine(win: vaxis.Window, row: u16, texts: []const OverviewText, role: @import("review_card.zig").CardRole, context: bool, selected: bool, metrics: @import("cell_metrics.zig").CellMetrics, theme: Theme) void {
+    if (win.width == 0) return;
+    const bg = if (selected) theme.cursorBg(theme.context.bg) else theme.context.bg;
+    fillRow(win, row, .{ .fg = theme.context.fg, .bg = bg });
+    var total: usize = 0;
+    for (texts) |text| total += metrics.width(text.text);
+    const cut = total > win.width;
+    const budget: usize = if (cut) win.width - 1 else win.width;
+    var col: usize = 0;
+    var last: vaxis.Style = .{ .fg = theme.context.fg, .bg = bg };
+    for (texts) |text| {
+        if (text.text.len == 0) continue;
+        var style = theme.overviewStyle(if (context) .context else text.part, role);
+        style.bg = bg;
+        last = style;
+        var len: usize = 0;
+        var width: usize = 0;
+        while (len < text.text.len) {
+            const measured = metrics.next(text.text[len..]);
+            if (col + width + measured.cell_width > budget) break;
+            len += measured.byte_len;
+            width += measured.cell_width;
+        }
+        if (len > 0) _ = win.printSegment(.{ .text = text.text[0..len], .style = style }, .{ .row_offset = row, .col_offset = @intCast(col), .wrap = .none });
+        col += width;
+        if (len < text.text.len) break;
+    }
+    if (cut) win.writeCell(win.width - 1, row, .{ .char = .{ .grapheme = "…", .width = 1 }, .style = last });
 }
 
 fn drawCodeHighlights(win: vaxis.Window, frame: @import("frame.zig").Projection, theme: Theme) void {
@@ -5469,4 +5646,310 @@ test "edit stays discoverable in the help Overlay when it is refused" {
 fn helpRowAvailable(rows: []const HelpRow, help: []const u8) ?bool {
     for (rows) |row| if (std.mem.indexOf(u8, row.text, help) != null) return row.available;
     return null;
+}
+
+const overview_test_records = [_]comment_overview.Record{
+    .{
+        .owner = .{ .comment = 1 },
+        .parent = null,
+        .depth = 0,
+        .role = .comment,
+        .author = "Ada",
+        .scope = .{ .@"inline" = .{ .path = "src/tui/render.zig", .to = 12, .start_to = 10 } },
+        .scope_state = .current,
+        .resolved = true,
+        .mine = false,
+        .excerpt = "Looks good to me",
+        .haystack = "",
+        .review_rank = 0,
+    },
+    .{
+        .owner = .{ .comment = 2 },
+        .parent = .{ .comment = 1 },
+        .depth = 1,
+        .role = .comment_reply,
+        .author = "Grace",
+        .scope = .{ .@"inline" = .{ .path = "src/tui/render.zig", .to = 12, .start_to = 10 } },
+        .scope_state = .current,
+        .resolved = true,
+        .mine = false,
+        .excerpt = "Agreed",
+        .haystack = "",
+        .review_rank = 1,
+    },
+    .{
+        .owner = .{ .draft = 3 },
+        .parent = null,
+        .depth = 0,
+        .role = .draft,
+        .author = "You",
+        .scope = .review,
+        .scope_state = .current,
+        .resolved = false,
+        .mine = true,
+        .excerpt = "Ship it",
+        .haystack = "",
+        .review_rank = 2,
+    },
+};
+
+const overview_test_entries = [_]comment_overview.Entry{
+    .{ .record = 0, .context = false },
+    .{ .record = 1, .context = false },
+    .{ .record = 2, .context = false },
+};
+
+const overview_test_frame: comment_overview.Frame = .{
+    .records = &overview_test_records,
+    .listing = .{ .entries = &overview_test_entries, .matches = 3, .records = 3 },
+    .selected = 1,
+    .cell_metrics = terminal_cell_metrics,
+};
+
+const overview_test_diff: bbr.diff.Diff = .{ .files = &.{} };
+
+/// drawCommentOverview reads only the Frame, so the other fields hold no Review.
+fn overviewTestReview(geometry: @import("frame.zig").Geometry, overview: comment_overview.Frame) !ReviewProjection {
+    const frame_mod = @import("frame.zig");
+    const buffer: Buffer = .{ .rows = &.{}, .layout = .unified };
+    return .{
+        .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1),
+        .identity = .{ .remote = .{ .workspace = "workspace", .repository = "repo", .pull_request_id = 1 } },
+        .session_epoch = 1,
+        .header = .{ .title = "Overview", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" },
+        .pull_request = null,
+        .reviewer_verdict = null,
+        .diff = &overview_test_diff,
+        .threads = &.{},
+        .drafts = &.{},
+        .buffer = buffer,
+        .navigation = Nav.init(0, geometry.rows),
+        .preferences = .{},
+        .selected_version = .new,
+        .isolated_file = null,
+        .frame = .{
+            .revision = 1,
+            .visual_rows_revision = 1,
+            .geometry = geometry,
+            .panes = frame_mod.paneRects(geometry),
+            .visual_rows = &.{},
+            .buffer = buffer,
+            .navigation = Nav.init(0, geometry.rows),
+            .main_pane = .comment_overview,
+            .overview = overview,
+        },
+    };
+}
+
+fn overviewRowText(a: std.mem.Allocator, win: vaxis.Window, x: u16, row: u16, width: u16) ![]const u8 {
+    var text: std.ArrayList(u8) = .empty;
+    for (x..x + width) |col| try text.appendSlice(a, win.readCell(@intCast(col), row).?.char.grapheme);
+    return text.items;
+}
+
+test "M29 overview the Comment Overview has rounded corners, its Title, and a rule that joins the border" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const geometry: @import("frame.zig").Geometry = .{ .cols = 80, .rows = 12 };
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    drawCommentOverview(a, win, try overviewTestReview(geometry, overview_test_frame), theme_dark);
+
+    const rects = @import("frame.zig").overviewRects(geometry);
+    const box = rects.overview;
+    const right = box.x + box.width - 1;
+    const bottom = box.y + box.height - 1;
+    try testing.expectEqualStrings("╭", win.readCell(box.x, box.y).?.char.grapheme);
+    try testing.expectEqualStrings("╮", win.readCell(right, box.y).?.char.grapheme);
+    try testing.expectEqualStrings("╰", win.readCell(box.x, bottom).?.char.grapheme);
+    try testing.expectEqualStrings("╯", win.readCell(right, bottom).?.char.grapheme);
+    try testing.expectEqualStrings("─ Comment Overview 3/3 ─", try overviewRowText(a, win, box.x + 1, box.y, 24));
+    try testing.expectEqual(rects.filter.y + 2, rects.entries.y);
+    try testing.expectEqualStrings("├", win.readCell(box.x, rects.filter.y + 1).?.char.grapheme);
+    try testing.expectEqualStrings("┤", win.readCell(right, rects.filter.y + 1).?.char.grapheme);
+    try testing.expectEqualStrings("/filter", try overviewRowText(a, win, rects.filter.x, rects.filter.y, 7));
+    try testing.expectEqualStrings("o review order", try overviewRowText(a, win, rects.filter.x + rects.filter.width - 14, rects.filter.y, 14));
+}
+
+test "M29 overview the Main Pane paints one Pane at a time" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const frame_mod = @import("frame.zig");
+    const geometry: frame_mod.Geometry = .{ .cols = 80, .rows = 12 };
+    const diff = try a.create(bbr.diff.Diff);
+    diff.* = try bbr.diff.parse(a,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+needle
+        \\
+    );
+    const buf = try buffer_mod.build(a, diff.*, .unified);
+    var review = try overviewTestReview(geometry, overview_test_frame);
+    review.diff = diff;
+    review.buffer = buf;
+    review.frame.buffer = buf;
+    review.frame.visual_rows = try frame_mod.buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = .unified, .width = review.frame.panes.diff_content.width });
+    review.frame.navigation = Nav.init(review.frame.visual_rows.len, review.frame.panes.diff_content.height);
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const Text = struct {
+        fn has(alloc: std.mem.Allocator, w: vaxis.Window, needle: []const u8) !bool {
+            for (0..w.height) |row| {
+                const text = try overviewRowText(alloc, w, 0, @intCast(row), w.width);
+                if (std.mem.indexOf(u8, text, needle) != null) return true;
+            }
+            return false;
+        }
+    };
+
+    review.frame.main_pane = .diff_pane;
+    drawReview(a, win, review, theme_dark, 0);
+    try testing.expect(try Text.has(a, win, "needle"));
+    try testing.expect(try Text.has(a, win, "a.zig · Changes"));
+    try testing.expect(!try Text.has(a, win, "Comment Overview"));
+
+    review.frame.main_pane = .comment_overview;
+    drawCommentOverview(a, win, review, theme_dark);
+    try testing.expect(try Text.has(a, win, "Comment Overview 3/3"));
+    try testing.expect(!try Text.has(a, win, "needle"));
+    try testing.expect(!try Text.has(a, win, "Changes"));
+}
+
+test "M29 overview paints the Theme base background" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const geometry: @import("frame.zig").Geometry = .{ .cols = 90, .rows = 14 };
+    const rects = @import("frame.zig").overviewRects(geometry);
+    var overview = overview_test_frame;
+    overview.query_input = true;
+    const contexts = [_]comment_overview.Entry{ .{ .record = 0, .context = true }, .{ .record = 1, .context = false }, .{ .record = 2, .context = false } };
+    overview.listing.entries = &contexts;
+    const review = try overviewTestReview(geometry, overview);
+    const selected: @import("frame.zig").Rect = .{ .x = rects.entries.x, .y = rects.entries.y + 1, .width = rects.entries.width, .height = 1 };
+    const backdrop: vaxis.Cell.Color = .{ .rgb = .{ 1, 2, 3 } };
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        win.fill(.{ .style = .{ .bg = backdrop } });
+        drawCommentOverview(a, win, review, theme);
+        const box = rects.overview;
+        for (box.y..box.y + box.height) |row| for (box.x..box.x + box.width) |col| {
+            errdefer std.debug.print("Theme {s} cell {d},{d}\n", .{ builtin.name, col, row });
+            const style = win.readCell(@intCast(col), @intCast(row)).?.style;
+            const expected = if (selected.contains(@intCast(col), @intCast(row))) theme.cursorBg(theme.context.bg) else theme.context.bg;
+            try testing.expectEqual(expected, style.bg);
+            try testing.expect(!style.reverse);
+        };
+    }
+}
+
+test "M29 overview an entry row shows the indent, the resolved mark, the author, the scope label, and the excerpt" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const geometry: @import("frame.zig").Geometry = .{ .cols = 100, .rows = 12 };
+    const rects = @import("frame.zig").overviewRects(geometry);
+    var records = overview_test_records ++ [_]comment_overview.Record{
+        .{ .owner = .{ .comment = 4 }, .parent = null, .depth = 0, .role = .comment, .author = "Lin", .scope = .{ .@"inline" = .{ .path = "lib.zig", .from = 7 } }, .scope_state = null, .resolved = false, .mine = false, .excerpt = "Why?", .haystack = "", .review_rank = 3 },
+        .{ .owner = .{ .comment = 5 }, .parent = null, .depth = 0, .role = .comment, .author = "Kim", .scope = .{ .file = .{ .path = "docs/a.md", .source_commit = "c" } }, .scope_state = .outdated, .resolved = false, .mine = false, .excerpt = "Typo", .haystack = "", .review_rank = 4 },
+    };
+    records[0].scope_state = .moved;
+    const entries = [_]comment_overview.Entry{ .{ .record = 0, .context = true }, .{ .record = 1, .context = false }, .{ .record = 2, .context = false }, .{ .record = 3, .context = false }, .{ .record = 4, .context = false } };
+    var overview = overview_test_frame;
+    overview.records = &records;
+    overview.listing = .{ .entries = &entries, .matches = 4, .records = 5 };
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    drawCommentOverview(a, win, try overviewTestReview(geometry, overview), theme_dark);
+
+    const x = rects.entries.x;
+    const y = rects.entries.y;
+    const expected = [_][]const u8{
+        "✓ Ada  src/tui/render.zig:L10-L12 (moved)  Looks good to me",
+        "  Grace  Agreed",
+        "You  Review  Ship it",
+        "Lin  lib.zig:L7 old (unavailable)  Why?",
+        "Kim  docs/a.md (outdated)  Typo",
+    };
+    for (expected, 0..) |text, row| {
+        const width: u16 = @intCast(try std.unicode.utf8CountCodepoints(text));
+        try testing.expectEqualStrings(text, try overviewRowText(a, win, x, y + @as(u16, @intCast(row)), width));
+    }
+    try testing.expectEqualStrings("Comment Overview 4/5", try overviewRowText(a, win, rects.overview.x + 3, rects.overview.y, 20));
+
+    for (0..try std.unicode.utf8CountCodepoints(expected[0])) |col| try testing.expectEqual(theme_dark.card_border_dim.fg, win.readCell(x + @as(u16, @intCast(col)), y).?.style.fg);
+    try testing.expectEqual(theme_dark.cursorBg(theme_dark.context.bg), win.readCell(x + rects.entries.width - 1, y + 1).?.style.bg);
+    try testing.expectEqual(theme_dark.reviewCardStyle(.comment_reply, .header, .{}).fg, win.readCell(x + 2, y + 1).?.style.fg);
+    try testing.expectEqual(theme_dark.reviewCardStyle(.draft, .header, .{}).fg, win.readCell(x, y + 2).?.style.fg);
+    try testing.expectEqual(theme_dark.section.fg, win.readCell(x + 5, y + 2).?.style.fg);
+    try testing.expectEqual(theme_dark.context.fg, win.readCell(x + 13, y + 2).?.style.fg);
+    try testing.expectEqual(theme_dark.context.bg, win.readCell(x, y + 2).?.style.bg);
+
+    overview.listing.entries = &overview_test_entries;
+    drawCommentOverview(a, win, try overviewTestReview(geometry, overview), theme_dark);
+    try testing.expectEqualStrings("✓", win.readCell(x, y).?.char.grapheme);
+    try testing.expectEqual(theme_dark.resolvedThreadStyle().fg, win.readCell(x, y).?.style.fg);
+    try testing.expectEqual(theme_dark.reviewCardStyle(.comment, .header, .{}).fg, win.readCell(x + 2, y).?.style.fg);
+}
+
+test "M29 overview a narrow row cuts the path start and the row end with …" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "src/very/long/directory/structure/for/the/overview/file.zig";
+    var records = [_]comment_overview.Record{overview_test_records[2]};
+    records[0].scope = .{ .@"inline" = .{ .path = path, .to = 3 } };
+    records[0].excerpt = "hello";
+    const entries = [_]comment_overview.Entry{.{ .record = 0, .context = false }};
+    var overview = overview_test_frame;
+    overview.records = &records;
+    overview.listing = .{ .entries = &entries, .matches = 1, .records = 1 };
+    overview.selected = null;
+
+    const wide: @import("frame.zig").Geometry = .{ .cols = 120, .rows = 8 };
+    var screen = try vaxis.Screen.init(a, .{ .rows = wide.rows, .cols = wide.cols, .x_pixel = 0, .y_pixel = 0 });
+    var win = headlessWindow(&screen);
+    drawCommentOverview(a, win, try overviewTestReview(wide, overview), theme_dark);
+    var rects = @import("frame.zig").overviewRects(wide);
+    const label = "You  …" ++ path[path.len - 39 ..] ++ ":L3  hello";
+    try testing.expectEqualStrings(label, try overviewRowText(a, win, rects.entries.x, rects.entries.y, @intCast(try std.unicode.utf8CountCodepoints(label))));
+
+    const narrow: @import("frame.zig").Geometry = .{ .cols = 60, .rows = 8 };
+    var narrow_screen = try vaxis.Screen.init(a, .{ .rows = narrow.rows, .cols = narrow.cols, .x_pixel = 0, .y_pixel = 0 });
+    win = headlessWindow(&narrow_screen);
+    drawCommentOverview(a, win, try overviewTestReview(narrow, overview), theme_dark);
+    rects = @import("frame.zig").overviewRects(narrow);
+    const row = try overviewRowText(a, win, rects.entries.x, rects.entries.y, rects.entries.width);
+    try testing.expectEqual(@as(u16, 29), rects.entries.width);
+    try testing.expectEqualStrings("You  …" ++ path[path.len - 39 ..][0..22] ++ "…", row);
+}
+
+test "M29 overview an empty Review shows the empty message" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const geometry: @import("frame.zig").Geometry = .{ .cols = 80, .rows = 10 };
+    const rects = @import("frame.zig").overviewRects(geometry);
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+
+    drawCommentOverview(a, win, try overviewTestReview(geometry, .{ .cell_metrics = terminal_cell_metrics }), theme_dark);
+    const empty = "No Comments or Drafts in this Review";
+    try testing.expectEqualStrings(empty, try overviewRowText(a, win, rects.entries.x, rects.entries.y, empty.len));
+    try testing.expectEqual(theme_dark.gutter.fg, win.readCell(rects.entries.x, rects.entries.y).?.style.fg);
+    try testing.expectEqualStrings("Comment Overview 0/0", try overviewRowText(a, win, rects.overview.x + 3, rects.overview.y, 20));
+
+    var filtered = overview_test_frame;
+    filtered.listing = .{ .matches = 0, .records = 3 };
+    filtered.selected = null;
+    drawCommentOverview(a, win, try overviewTestReview(geometry, filtered), theme_dark);
+    const none = "No entry matches the filters";
+    try testing.expectEqualStrings(none, try overviewRowText(a, win, rects.entries.x, rects.entries.y, none.len));
 }

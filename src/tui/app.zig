@@ -205,7 +205,10 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             const visual_cursor = review_projection.frame.navigation.cursor;
             const buffer_cursor = if (visual_cursor < review_projection.frame.visual_rows.len) review_projection.frame.visual_rows[visual_cursor].buffer_index else 0;
             const selected_file = review_projection.frame.buffer.fileIndexForRow(buffer_cursor) orelse 0;
-            render.drawReview(frame, content_win, review_projection, active_theme, selected_file);
+            switch (review_projection.frame.main_pane) {
+                .diff_pane => render.drawReview(frame, content_win, review_projection, active_theme, selected_file),
+                .comment_overview => render.drawCommentOverview(frame, content_win, review_projection, active_theme),
+            }
         } else {
             const status = presentationStatus(frame, projection, null);
             render.drawLoading(frame, content_win, projection.loading_pull_request_id, active_theme, status);
@@ -1191,7 +1194,8 @@ fn cancelPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id
 const StatusFacts = struct {
     header: session.ReviewHeader,
     reviewer_verdict: ?bbr.bitbucket.ReviewerVerdict,
-    /// The 1-based cursor row, or 0 in an empty Buffer.
+    main_pane: presentation.MainPane = .diff_pane,
+    /// The 1-based cursor row or selected Overview Entry, or 0 when empty.
     position: usize,
     total: usize,
     layout: buffer_mod.Layout,
@@ -1209,11 +1213,19 @@ fn projectionStatusItems(frame: std.mem.Allocator, projection: presentation.Proj
     const active_theme = theme.value(projection.theme);
     const review = projection.review orelse return loadingStatusItems(active_theme, presentationStatus(frame, projection, null));
     const visual_cursor = review.navigation.cursor;
+    const overview = review.frame.overview;
     return statusItems(frame, active_theme, .{
         .header = review.header,
         .reviewer_verdict = review.reviewer_verdict,
-        .position = @min(visual_cursor + 1, review.buffer.rows.len),
-        .total = review.buffer.rows.len,
+        .main_pane = review.frame.main_pane,
+        .position = switch (review.frame.main_pane) {
+            .diff_pane => @min(visual_cursor + 1, review.buffer.rows.len),
+            .comment_overview => if (overview.selected) |index| index + 1 else 0,
+        },
+        .total = switch (review.frame.main_pane) {
+            .diff_pane => review.buffer.rows.len,
+            .comment_overview => overview.listing.entries.len,
+        },
         .layout = review.preferences.layout,
         .scope = switch (review.preferences.scope) {
             .changes => .changes,
@@ -1253,14 +1265,19 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
         items.add(.position, std.fmt.allocPrint(frame, "{d}/{d}", .{ facts.position, facts.total }) catch "", .position);
         items.position_width = @intCast(std.fmt.count("{d}/{d}", .{ facts.total, facts.total }));
     }
-    items.hint(.layout, "s", if (facts.layout == .unified) " split" else " unified");
-    // Names the *current* scope; `f` cycles Changes → fetched → whole.
-    items.hint(.scope, "f", switch (facts.scope) {
-        .changes => ": changes",
-        .fetched => ": fetched",
-        .whole => ": whole",
-    });
-    items.hint(.isolate, "o", if (facts.isolate) " all files" else " isolate");
+    switch (facts.main_pane) {
+        .diff_pane => {
+            items.hint(.layout, "s", if (facts.layout == .unified) " split" else " unified");
+            // Names the *current* scope; `f` cycles Changes → fetched → whole.
+            items.hint(.scope, "f", switch (facts.scope) {
+                .changes => ": changes",
+                .fetched => ": fetched",
+                .whole => ": whole",
+            });
+            items.hint(.isolate, "o", if (facts.isolate) " all files" else " isolate");
+        },
+        .comment_overview => {},
+    }
     // A transient message (error/summary) or an in-progress indicator takes the
     // place of the key hints, with the pending-draft count on `X`.
     const message = if (facts.searching) null else facts.status_msg;
@@ -1275,9 +1292,15 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
             items.add(.submit, "X", .key);
             items.add(.submit, std.fmt.allocPrint(frame, " submit {d}", .{facts.draft_count}) catch " submit", .drafts);
         }
-        items.hint(.comment, "c/i", " comment");
-        items.hint(.file, "[ ]", " file");
-        items.hint(.switch_review, "p", " switch");
+        switch (facts.main_pane) {
+            .diff_pane => {
+                items.hint(.comment, "c/i", " comment");
+                items.hint(.file, "[ ]", " file");
+                items.hint(.main_pane, "g o", " comments");
+                items.hint(.switch_review, "p", " switch");
+            },
+            .comment_overview => items.hint(.main_pane, "g d", " DiffPane"),
+        }
         items.hint(.help, "?", " help");
         items.hint(.quit, "q", " quit");
     }
@@ -1454,12 +1477,14 @@ const TestStatus = struct {
     status_msg: ?[]const u8 = null,
     searching: bool = false,
     search_has_no_matches: bool = false,
+    main_pane: presentation.MainPane = .diff_pane,
 };
 
 fn testStatusItems(arena: std.mem.Allocator, active_theme: theme.Theme, case: TestStatus) StatusItems {
     return statusItems(arena, active_theme, .{
         .header = .{ .pull_request_id = 7, .title = case.title, .source_ref = "review", .base_ref = "main", .source_commit = "", .base_commit = "", .locator = "", .source_label = "" },
         .reviewer_verdict = case.verdict,
+        .main_pane = case.main_pane,
         .position = case.position,
         .total = case.total,
         .layout = .unified,
@@ -1505,7 +1530,7 @@ test "the status puts the meta items above the hint items and separates items on
     const wide = try testStatusRows(a, try testDrawStatus(a, theme.dark, .{}));
     try std.testing.expectEqual(@as(usize, 2), wide.len);
     try std.testing.expectEqualStrings("#7 Fix parser  ·  Approved  ·  review → main  ·  1/1", wide[0]);
-    try std.testing.expectEqualStrings("s split  ·  f: changes  ·  o isolate  ·  X submit 2  ·  c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit", wide[1]);
+    try std.testing.expectEqualStrings("s split  ·  f: changes  ·  o isolate  ·  g o comments  ·  X submit 2  ·  c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit", wide[1]);
 
     const case: TestStatus = .{ .title = "Teach the parser to keep comments" };
     const win = try testDrawStatusAt(a, theme.dark, case, 50);
@@ -1527,6 +1552,15 @@ test "the status puts the meta items above the hint items and separates items on
         for (narrow) |row| rows_with_item += @intFromBool(std.mem.indexOf(u8, row, item) != null);
         try std.testing.expectEqual(@as(usize, 1), rows_with_item);
     }
+}
+
+test "M29 overview the status shows the Comment Overview hints and the listing position" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows = try testStatusRows(a, try testDrawStatus(a, theme.dark, .{ .main_pane = .comment_overview, .position = 3, .total = 12 }));
+    try std.testing.expect(std.mem.endsWith(u8, rows[0], "3/12"));
+    try std.testing.expectEqualStrings("g d DiffPane  ·  X submit 2  ·  ? help  ·  q quit", rows[1]);
 }
 
 test "the status height does not change when only the cursor moves" {

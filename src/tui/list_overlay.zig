@@ -360,13 +360,15 @@ pub const CommandPalette = struct {
         .{ .action = .recover_submission, .title = "Resume Submission", .description = "Continue an interrupted Submission" },
         .{ .action = .resolve_unpublished, .title = "Mark Draft Unpublished", .description = "Confirm that an unknown-outcome Draft was not posted" },
         .{ .action = .link_existing_comment, .title = "Link Existing Comment", .description = "Link an unknown-outcome Draft to a posted Comment" },
-        .{ .action = .focus_next_pane, .title = "Switch Pane", .description = "Move focus between the Sidebar and the DiffPane" },
+        .{ .action = .focus_next_pane, .title = "Switch Pane", .description = "Move focus between the Sidebar and the Main Pane" },
+        .{ .action = .show_comment_overview, .title = "Show Comment Overview", .description = "List every Comment, Reply, and Draft in this Review" },
+        .{ .action = .show_diff_pane, .title = "Show DiffPane", .description = "Show the diff in the Main Pane" },
         .{ .action = .open_theme_overlay, .title = "Theme", .description = "Preview and choose the color Theme" },
         .{ .action = .help, .title = "Keybindings", .description = "Show the keybinding help" },
         .{ .action = .quit, .title = "Quit", .description = "Quit bbr" },
     };
 
-    const pane_contexts = [_]InteractionContext{ .diff, .diff_source, .diff_disclosure, .diff_review_card, .sidebar, .sidebar_directory, .sidebar_file };
+    const pane_contexts = [_]InteractionContext{ .diff, .diff_source, .diff_disclosure, .diff_review_card, .sidebar, .sidebar_directory, .sidebar_file, .comment_overview };
 
     comptime {
         @setEvalBranchQuota(100_000);
@@ -824,4 +826,20 @@ test "scroll top keeps the selected row inside the viewport" {
     p.moveDown();
     try testing.expectEqual(@as(usize, 1), p.list().scrollTop(2));
     try testing.expectEqual(@as(usize, 0), p.list().scrollTop(0));
+}
+
+test "M29 overview the Command Palette lists the Main Pane Actions from every Pane" {
+    for ([_]InteractionContext{ .diff, .sidebar, .sidebar_file, .comment_overview }) |context| {
+        var palette = try ListOverlay.openCommandPalette(testing.allocator, context);
+        defer palette.deinit();
+        var titles: [2]bool = .{ false, false };
+        for (0..palette.command_palette.row_count) |row| {
+            const entry = palette.command_palette.command(row);
+            if (entry.action == .show_comment_overview) titles[0] = std.mem.eql(u8, entry.title, "Show Comment Overview");
+            if (entry.action == .show_diff_pane) titles[1] = std.mem.eql(u8, entry.title, "Show DiffPane");
+            if (entry.action == .focus_next_pane) try testing.expectEqualStrings("Move focus between the Sidebar and the Main Pane", entry.description);
+            if (context == .comment_overview) try testing.expect(entry.action != .open_file_finder and entry.action != .open_review_search);
+        }
+        try testing.expect(titles[0] and titles[1]);
+    }
 }

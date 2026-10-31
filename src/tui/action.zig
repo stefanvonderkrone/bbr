@@ -65,6 +65,8 @@ pub const Action = enum {
     confirm_picker,
     yank,
     focus_next_pane,
+    show_comment_overview,
+    show_diff_pane,
 };
 
 /// The terminal-independent input surface and semantic cursor target used to
@@ -88,4 +90,5 @@ pub const InteractionContext = enum {
     help,
     unknown_resolution,
     delete_confirmation,
+    comment_overview,
 };

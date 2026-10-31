@@ -1004,13 +1004,8 @@ pub fn buildSearchCandidates(
     var disclosures: std.ArrayList(DisclosureKey) = .empty;
     defer disclosures.deinit(allocator);
     try disclosures.appendSlice(allocator, opts.expanded_disclosures);
-    try disclosures.append(allocator, .outdated_review);
-    for (diff.files) |*file| {
-        try disclosures.append(allocator, .{ .outdated_file = file });
-        try disclosures.append(allocator, .{ .opposite_version = file });
-    }
+    try appendCardDisclosures(allocator, &disclosures, diff, threads);
     for (threads) |thread| {
-        if (thread.resolved) try disclosures.append(allocator, .{ .resolved_thread = thread.root.id });
         try disclosures.append(allocator, .{ .review_card = .{ .comment = thread.root.id } });
         for (thread.replies) |reply| try disclosures.append(allocator, .{ .review_card = .{ .comment = reply.id } });
     }
@@ -1057,6 +1052,62 @@ pub fn buildSearchCandidates(
         else => {},
     };
     return candidates.toOwnedSlice(allocator);
+}
+
+/// Every disclosure that can hide a whole ReviewCard: each resolved Thread and
+/// each outdated and opposite-version section.
+fn appendCardDisclosures(allocator: std.mem.Allocator, disclosures: *std.ArrayList(DisclosureKey), diff: model.Diff, threads: []const Thread) !void {
+    try disclosures.append(allocator, .outdated_review);
+    for (diff.files) |*file| {
+        try disclosures.append(allocator, .{ .outdated_file = file });
+        try disclosures.append(allocator, .{ .opposite_version = file });
+    }
+    for (threads) |thread| {
+        if (thread.resolved) try disclosures.append(allocator, .{ .resolved_thread = thread.root.id });
+    }
+}
+
+/// One ReviewCard of the unified Buffer with every disclosure open.
+pub const ReviewCardNode = struct {
+    owner: review_card.Owner,
+    parent: ?review_card.Owner,
+    depth: usize,
+    role: review_card.CardRole,
+    /// The scope of the card's Thread root, projected for a Draft.
+    scope: review.CommentScope,
+    source: review_card.Source,
+};
+
+/// The ReviewCards that `buildWithComments` shows when every disclosure is
+/// open, in Buffer row order. Weave decides placement, parents, and posted
+/// aliases, so this list cannot disagree with the DiffPane. Every temporary
+/// row also uses `allocator`, so pass an arena.
+pub fn reviewCardNodes(allocator: std.mem.Allocator, diff: model.Diff, threads: []const Thread, opts: BuildOptions) BuildError![]ReviewCardNode {
+    var disclosures: std.ArrayList(DisclosureKey) = .empty;
+    try appendCardDisclosures(allocator, &disclosures, diff, threads);
+    var options = opts;
+    options.scratch_allocator = allocator;
+    options.fold_context = false;
+    options.whole_file = false;
+    options.only_file = null;
+    options.collapsed_rows = 1;
+    options.expanded_disclosures = disclosures.items;
+    const buf = try buildWithComments(allocator, diff, .unified, threads, options);
+    var nodes: std.ArrayList(ReviewCardNode) = .empty;
+    for (buf.rows, 0..) |row, index| {
+        const card_row = cardAt(row) orelse continue;
+        const card = card_row.card.?;
+        if (card.rows.start != index) continue;
+        try nodes.append(allocator, .{
+            .owner = card_row.owner,
+            .parent = if (card.parent) |parent| cardAt(buf.rows[parent.rows.start]).?.owner else null,
+            .depth = card.depth,
+            .role = card.role,
+            .scope = card_row.scope,
+            .source = card_row.source,
+        });
+    }
+    return nodes.toOwnedSlice(allocator);
 }
 
 fn fileIndex(diff: model.Diff, file: *const model.File) ?usize {
@@ -1232,10 +1283,7 @@ const Weave = struct {
         const is_reply = depth > 0 or c.parent_id != null;
         const owner: review_card.Owner = .{ .comment = c.id };
         const author = if (resolved_thread) |thread| try std.fmt.allocPrint(w.a, "▾ ✓ Resolved · {s} · {d} replies", .{ c.author, thread.replies.len }) else c.author;
-        const title = try cardTitle(w.a, try indentation.state(w.a, depth), author, &.{
-            if (c.deleted) "deleted" else null,
-            if (c.suggestion() != null) "suggestion" else null,
-        });
+        const title = try cardTitle(w.a, try indentation.state(w.a, depth), author, &commentStates(c));
         const parsed = try review_card.ReviewBody.parseWithMentions(w.a, c.body, w.opts.mention_names);
         try w.projectCard(parsed, .{
             .owner = owner,
@@ -1297,10 +1345,7 @@ const Weave = struct {
             const is_reply = d.parent != null;
             const owner: review_card.Owner = .{ .draft = d.local_id };
             const ancestry = try indentation.state(w.a, depth);
-            const states = [_]?[]const u8{
-                if (d.state == .outcome_unknown) "outcome unknown" else if (d.state == .posted) "posted" else null,
-                if (d.kind == .suggestion) "suggestion" else null,
-            };
+            const states = draftStates(d);
             const parsed = try review_card.ReviewBody.parseWithMentions(w.a, d.body, w.opts.mention_names);
             const role: review_card.CardRole = if (d.state == .outcome_unknown)
                 (if (is_reply) .outcome_unknown_reply else .outcome_unknown)
@@ -1801,6 +1846,29 @@ fn cardTitle(allocator: std.mem.Allocator, ancestry: ?[]const u8, name: []const 
     return title.toOwnedSlice(allocator);
 }
 
+fn commentStates(c: *const Comment) [2]?[]const u8 {
+    return .{
+        if (c.deleted) "deleted" else null,
+        if (c.suggestion() != null) "suggestion" else null,
+    };
+}
+
+fn draftStates(d: *const Draft) [2]?[]const u8 {
+    return .{
+        if (d.state == .outcome_unknown) "outcome unknown" else if (d.state == .posted) "posted" else null,
+        if (d.kind == .suggestion) "suggestion" else null,
+    };
+}
+
+/// The ReviewCard Title without the ancestry state, as in `Ada (deleted)` or
+/// `✎ draft (posted, suggestion)`.
+pub fn reviewCardAuthor(allocator: std.mem.Allocator, source: review_card.Source) ![]const u8 {
+    return switch (source) {
+        .comment => |c| cardTitle(allocator, null, c.author, &commentStates(c)),
+        .draft => |d| cardTitle(allocator, null, "✎ draft", &draftStates(d)),
+    };
+}
+
 fn cardContentWidth(width: usize, indent: usize) usize {
     return @max(width -| 4 -| indent, 1);
 }
@@ -2142,7 +2210,7 @@ fn draftScope(draft: *const Draft, opts: BuildOptions) review.CommentScope {
     };
 }
 
-fn draftResolution(draft: *const Draft, opts: BuildOptions) anchor_projection.ScopeResolution {
+pub fn draftResolution(draft: *const Draft, opts: BuildOptions) anchor_projection.ScopeResolution {
     if (anchor_projection.findScope(opts.scope_projections, draft.local_id)) |resolution| return resolution;
     if (anchor_projection.find(opts.anchor_projections, draft.local_id)) |legacy| return switch (legacy) {
         .unavailable => .unavailable,
@@ -2166,7 +2234,7 @@ fn draftCurrentOnSide(draft: *const Draft, opts: BuildOptions, file: model.File,
     };
 }
 
-fn scopeMatchesFile(scope: review.CommentScope, file: model.File) bool {
+pub fn scopeMatchesFile(scope: review.CommentScope, file: model.File) bool {
     return switch (scope) {
         .review => false,
         .file => |value| std.mem.eql(u8, value.path, file.old_path) or std.mem.eql(u8, value.path, file.new_path),

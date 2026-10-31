@@ -489,6 +489,94 @@ pub const ReviewBody = struct {
     }
 };
 
+const ExcerptSource = enum { prose, suggestion, code, none };
+
+fn excerptSource(kind: BlockKind) ExcerptSource {
+    return switch (kind) {
+        .paragraph, .heading, .table => .prose,
+        .suggestion => .suggestion,
+        .code, .literal => .code,
+        .spacer => .none,
+    };
+}
+
+/// One excerpt line. Each whitespace run becomes one space, and the ends
+/// carry no space.
+const ExcerptLine = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    space: bool = false,
+    max_bytes: usize,
+
+    /// True when a line with text ends inside `text` or reaches the limit.
+    fn append(self: *ExcerptLine, allocator: std.mem.Allocator, text: []const u8) !bool {
+        for (text) |byte| switch (byte) {
+            '\n' => if (self.end()) return true,
+            ' ', '\t', '\r', 0x0b, 0x0c => self.separate(),
+            else => {
+                if (self.bytes.items.len > self.max_bytes) return true;
+                if (self.space) try self.bytes.append(allocator, ' ');
+                self.space = false;
+                try self.bytes.append(allocator, byte);
+            },
+        };
+        return false;
+    }
+
+    fn separate(self: *ExcerptLine) void {
+        self.space = self.bytes.items.len > 0;
+    }
+
+    fn end(self: *ExcerptLine) bool {
+        self.space = false;
+        return self.bytes.items.len > 0;
+    }
+
+    fn finish(self: *ExcerptLine, allocator: std.mem.Allocator) ![]const u8 {
+        var len = self.bytes.items.len;
+        if (len > self.max_bytes) {
+            len = self.max_bytes;
+            while (len > 0 and self.bytes.items[len] & 0xc0 == 0x80) len -= 1;
+        }
+        while (len > 0 and self.bytes.items[len - 1] == ' ') len -= 1;
+        self.bytes.shrinkRetainingCapacity(len);
+        return self.bytes.toOwnedSlice(allocator);
+    }
+};
+
+/// The first non-blank line of visible prose, cut at `max_bytes` on a UTF-8
+/// scalar boundary. A body without prose gives "suggestion" for a Suggestion,
+/// else the first line of code. The caller owns the result.
+pub fn excerpt(allocator: std.mem.Allocator, body: ReviewBody, max_bytes: usize) ![]const u8 {
+    var line: ExcerptLine = .{ .max_bytes = max_bytes };
+    errdefer line.bytes.deinit(allocator);
+    var suggestion = false;
+    for (body.blocks) |block| switch (excerptSource(block.kind)) {
+        .prose => {
+            for (block.spans) |span| {
+                // A table cell ends with a hard break, but its row is one line.
+                if (span.hard_break and block.kind == .table) {
+                    line.separate();
+                } else if (span.join or span.hard_break) {
+                    if (line.end()) return line.finish(allocator);
+                } else if (!span.hidden and !span.generated) {
+                    if (try line.append(allocator, span.text)) return line.finish(allocator);
+                }
+            }
+            if (line.end()) return line.finish(allocator);
+        },
+        .suggestion => suggestion = true,
+        .code, .none => {},
+    };
+    if (suggestion) return allocator.dupe(u8, "suggestion");
+    for (body.blocks) |block| if (excerptSource(block.kind) == .code) {
+        for (block.spans) |span| {
+            if (!span.hidden and !span.generated and try line.append(allocator, span.text)) return line.finish(allocator);
+        }
+        if (line.end()) return line.finish(allocator);
+    };
+    return line.finish(allocator);
+}
+
 fn freeBlocks(allocator: std.mem.Allocator, blocks: []const Block) void {
     for (blocks) |block| freeBlock(allocator, block);
     allocator.free(blocks);
@@ -1864,4 +1952,37 @@ test "M23 inline unclosed Suggestion keeps earlier formatting and literal code c
     try testing.expectEqualStrings(source, body.source);
     try testing.expectEqual(source.len, body.blocks[1].fences.?[1].start);
     try testing.expectEqual(source.len, body.blocks[1].fences.?[1].end);
+}
+
+fn expectExcerpt(expected: []const u8, raw: []const u8, names: *const MentionNames, max_bytes: usize) !void {
+    const body = try ReviewBody.parseWithMentions(testing.allocator, raw, names);
+    defer freeBlocks(testing.allocator, body.blocks);
+    const text = try excerpt(testing.allocator, body, max_bytes);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(expected, text);
+}
+
+test "M29 overview the excerpt applies mention names and collapses whitespace" {
+    var names: MentionNames = .empty;
+    defer names.deinit(testing.allocator);
+    try names.put(testing.allocator, "id", "@Ada");
+    try expectExcerpt("Ask @Ada about this", "\n\n  Ask   @{id}\t about this  \nsecond line", &names, 200);
+    try expectExcerpt("Title", "# **Title**\n\nbody", &names, 200);
+    try expectExcerpt("Who Role", "| Who | Role |\n| --- | --- |\n| Ada | Lead |", &names, 200);
+    try expectExcerpt("alt", "![alt](<>)", &names, 200);
+}
+
+test "M29 overview the excerpt stops at the byte limit on a scalar boundary" {
+    const raw = "a" ** 199 ++ "é and more";
+    try expectExcerpt("a" ** 199, raw, &.empty, 200);
+    try expectExcerpt("a" ** 199 ++ "é", raw, &.empty, 201);
+    try expectExcerpt("ab", "ab cd", &.empty, 3);
+}
+
+test "M29 overview the excerpt names a Suggestion and falls back to code" {
+    try expectExcerpt("suggestion", "```suggestion\nconst a = 1;\n```", &.empty, 200);
+    try expectExcerpt("const a = 1;", "```zig\n\n   const   a = 1;\nnext\n```", &.empty, 200);
+    try expectExcerpt("prose", "```zig\ncode\n```\n\nprose", &.empty, 200);
+    try expectExcerpt("", "", &.empty, 200);
+    try expectExcerpt("", "  \n\n ", &.empty, 200);
 }

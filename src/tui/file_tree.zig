@@ -60,10 +60,7 @@ pub fn build(
     wanted_scroll: usize,
     metrics: CellMetrics,
 ) !Projection {
-    var nodes: std.ArrayList(Node) = .empty;
-    try nodes.append(allocator, .{ .kind = .root, .path = "", .parent = null });
-    for (diff.files, 0..) |file, file_index| try insertFile(allocator, &nodes, file.displayPath(), file_index);
-    sortChildren(&nodes, 0);
+    const nodes = try sortedNodes(allocator, diff);
 
     var entries: std.ArrayList(Entry) = .empty;
     for (nodes.items[0].children.items) |child| try emit(allocator, &nodes, child, null, 0, diff, tallies, collapsed, active_file, content_width, metrics, &entries);
@@ -77,6 +74,30 @@ pub fn build(
     if (cursor < scroll) scroll = cursor;
     if (viewport > 0 and cursor >= scroll + viewport) scroll = cursor + 1 - viewport;
     return .{ .entries = try entries.toOwnedSlice(allocator), .cursor = cursor, .scroll = scroll, .viewport = viewport };
+}
+
+fn sortedNodes(allocator: std.mem.Allocator, diff: bbr.diff.Diff) !std.ArrayList(Node) {
+    var nodes: std.ArrayList(Node) = .empty;
+    try nodes.append(allocator, .{ .kind = .root, .path = "", .parent = null });
+    for (diff.files, 0..) |file, file_index| try insertFile(allocator, &nodes, file.displayPath(), file_index);
+    sortChildren(&nodes, 0);
+    return nodes;
+}
+
+/// The File indices in File Tree order. Collapsed Directories do not change it.
+pub fn fileOrder(allocator: std.mem.Allocator, diff: bbr.diff.Diff) ![]usize {
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const nodes = try sortedNodes(scratch.allocator(), diff);
+    var order: std.ArrayList(usize) = try .initCapacity(allocator, diff.files.len);
+    appendFiles(nodes.items, 0, &order);
+    return order.toOwnedSlice(allocator);
+}
+
+fn appendFiles(nodes: []const Node, index: usize, order: *std.ArrayList(usize)) void {
+    const node = nodes[index];
+    if (node.kind == .file) return order.appendAssumeCapacity(node.file_index);
+    for (node.children.items) |child| appendFiles(nodes, child, order);
 }
 
 fn insertFile(allocator: std.mem.Allocator, nodes: *std.ArrayList(Node), path: []const u8, file_index: usize) !void {
@@ -277,4 +298,21 @@ test "File Tree truncation respects injected grapheme boundaries and fixed talli
     try testing.expect(std.mem.endsWith(u8, tree.entries[0].label, "…"));
     try testing.expect(std.unicode.utf8ValidateSlice(tree.entries[0].label));
     try testing.expectEqualStrings("ab🙂…", try truncate(a, "ab🙂xy", 5, metrics));
+}
+
+test "M29 overview fileOrder follows the File Tree entries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a, "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-a\n+b\n" ++
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n" ++
+        "diff --git a/a/b.txt b/a/b.txt\n--- a/a/b.txt\n+++ b/a/b.txt\n@@ -1 +1 @@\n-a\n+b\n" ++
+        "diff --git a/src/z/y.zig b/src/z/y.zig\n--- a/src/z/y.zig\n+++ b/src/z/y.zig\n@@ -1 +1 @@\n-a\n+b\n");
+    const tree = try build(a, diff, &.{ .{}, .{}, .{}, .{} }, &.{}, null, 40, 10, null, 0, .bytes);
+    var expected: std.ArrayList(usize) = .empty;
+    for (tree.entries) |entry| if (entry.identity == .file) try expected.append(a, entry.identity.file);
+    const order = try fileOrder(testing.allocator, diff);
+    defer testing.allocator.free(order);
+    try testing.expectEqualSlices(usize, &.{ 2, 1, 0, 3 }, expected.items);
+    try testing.expectEqualSlices(usize, expected.items, order);
 }

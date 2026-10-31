@@ -9,6 +9,7 @@ pub const file_tree = @import("file_tree.zig");
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 const view = @import("view.zig");
 const layouts = @import("layouts.zig");
+const comment_overview = @import("comment_overview.zig");
 
 pub const Revision = u64;
 
@@ -27,6 +28,32 @@ pub const PaneRects = struct {
 };
 
 pub const PaneFocus = enum { sidebar, diff };
+
+/// What the Main Pane, the Pane right of the Sidebar, shows.
+pub const MainPane = enum { diff_pane, comment_overview };
+
+/// The Comment Overview rects: border rects for the two Panes and content
+/// rects for the rest.
+pub const OverviewRects = struct {
+    sidebar: Rect,
+    overview: Rect,
+    sidebar_content: Rect,
+    overview_content: Rect,
+    filter: Rect,
+    entries: Rect,
+};
+
+pub fn overviewRects(geometry: Geometry) OverviewRects {
+    const rects = view.solve(layouts.OverviewPaneSlot, layouts.commentOverviewPanes, layouts.OverviewPanes{}, area(geometry));
+    return .{
+        .sidebar = rects.get(.sidebar).border,
+        .overview = rects.get(.overview).border,
+        .sidebar_content = rects.get(.sidebar).content,
+        .overview_content = rects.get(.overview).content,
+        .filter = rects.get(.filter).content,
+        .entries = rects.get(.entries).content,
+    };
+}
 
 pub const SelectedVersion = buffer_mod.SelectedVersion;
 
@@ -121,6 +148,7 @@ pub const HitTarget = union(enum) {
     diff,
     sidebar_entry: usize,
     diff_row: usize,
+    overview_entry: usize,
     list_entry: usize,
     review_search_entry: usize,
     review_search_list,
@@ -225,6 +253,8 @@ pub const Projection = struct {
     navigation: Nav,
     file_tree: file_tree.Projection = .{},
     focus: PaneFocus = .diff,
+    main_pane: MainPane = .diff_pane,
+    overview: comment_overview.Frame = .{},
     selected_version: SelectedVersion = .new,
     version_title_targets: VersionTitleTargets = .{},
     search_ranges: []const ProjectedSourceRange = &.{},
@@ -255,18 +285,34 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
         return .{ .list_entry = index };
     }
 
-    if (frame.version_title_targets.old) |rect| if (rect.contains(col, row)) return .select_old_version;
-    if (frame.version_title_targets.new) |rect| if (rect.contains(col, row)) return .select_new_version;
+    switch (frame.main_pane) {
+        .diff_pane => {
+            if (frame.version_title_targets.old) |rect| if (rect.contains(col, row)) return .select_old_version;
+            if (frame.version_title_targets.new) |rect| if (rect.contains(col, row)) return .select_new_version;
+        },
+        .comment_overview => {},
+    }
 
     if (frame.panes.sidebar_content.contains(col, row)) {
         const index = frame.file_tree.scroll + row - frame.panes.sidebar_content.y;
         if (index < frame.file_tree.entries.len) return .{ .sidebar_entry = index };
         return .sidebar;
     }
-    if (frame.panes.diff_content.contains(col, row)) {
-        const index = frame.navigation.scroll + row - frame.panes.diff_content.y;
-        if (index < frame.visual_rows.len) return .{ .diff_row = index };
-        return .diff;
+    switch (frame.main_pane) {
+        .diff_pane => if (frame.panes.diff_content.contains(col, row)) {
+            const index = frame.navigation.scroll + row - frame.panes.diff_content.y;
+            if (index < frame.visual_rows.len) return .{ .diff_row = index };
+            return .diff;
+        },
+        .comment_overview => {
+            const rects = overviewRects(frame.geometry);
+            if (rects.entries.contains(col, row)) {
+                const index = frame.overview.state.scroll + row - rects.entries.y;
+                if (index < frame.overview.listing.entries.len) return .{ .overview_entry = index };
+            }
+            // Any other Comment Overview cell, such as the filter row, focuses the Main Pane.
+            if (rects.overview.contains(col, row)) return .diff;
+        },
     }
     return null;
 }
@@ -1226,6 +1272,38 @@ test "published Frame hit testing gives Overlay rows precedence and clips blank 
     try testing.expectEqual(HitTarget{ .sidebar_entry = 0 }, hitTest(projection, 1, 1).?);
     try testing.expectEqual(HitTarget.sidebar, hitTest(projection, 1, 2).?);
     try testing.expect(hitTest(projection, 0, 1) == null); // Pane border.
+}
+
+test "M29 overview hit testing targets Overview Entries only while the Comment Overview shows" {
+    const geometry: Geometry = .{ .cols = 80, .rows = 12 };
+    const rects = overviewRects(geometry);
+    const tree_entries = [_]file_tree.Entry{.{ .identity = .{ .file = 0 }, .parent = null, .depth = 0, .label = "a.zig" }};
+    const listing_entries = [_]comment_overview.Entry{ .{ .record = 0, .context = false }, .{ .record = 1, .context = false }, .{ .record = 2, .context = false } };
+    const lines = [_]VisualRow{ .{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } } }, .{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } } } };
+    var projection: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = geometry,
+        .panes = paneRects(geometry),
+        .visual_rows = &lines,
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(lines.len, 10),
+        .file_tree = .{ .entries = &tree_entries, .viewport = 10 },
+        .version_title_targets = .{ .old = .{ .x = 60, .y = 0, .width = 6, .height = 1 } },
+        .overview = .{ .listing = .{ .entries = &listing_entries, .matches = 3, .records = 3 }, .state = .{ .scroll = 1 } },
+    };
+
+    try testing.expectEqual(HitTarget{ .diff_row = 0 }, hitTest(projection, rects.entries.x, rects.filter.y).?);
+    try testing.expectEqual(HitTarget.select_old_version, hitTest(projection, 60, 0).?);
+
+    projection.main_pane = .comment_overview;
+    try testing.expectEqual(HitTarget{ .overview_entry = 1 }, hitTest(projection, rects.entries.x, rects.entries.y).?);
+    try testing.expectEqual(HitTarget{ .overview_entry = 2 }, hitTest(projection, rects.entries.x + 4, rects.entries.y + 1).?);
+    try testing.expectEqual(HitTarget.diff, hitTest(projection, rects.entries.x, rects.entries.y + 2).?);
+    try testing.expectEqual(HitTarget.diff, hitTest(projection, rects.filter.x, rects.filter.y).?);
+    try testing.expectEqual(HitTarget.diff, hitTest(projection, 60, 0).?);
+    try testing.expectEqual(HitTarget{ .sidebar_entry = 0 }, hitTest(projection, 1, 1).?);
+    try testing.expect(hitTest(projection, 0, 1) == null);
 }
 
 test "Presentation Frame metadata exposes exact version title targets" {

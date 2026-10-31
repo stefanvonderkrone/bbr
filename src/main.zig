@@ -1416,6 +1416,7 @@ test {
     _ = @import("highlight/grammar_cli.zig");
     _ = @import("tui/app.zig");
     _ = @import("tui/config.zig");
+    _ = @import("tui/comment_overview.zig");
     _ = @import("tui/review_body.zig");
     _ = @import("tui/review_card.zig");
     _ = @import("tui/search.zig");

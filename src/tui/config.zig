@@ -537,6 +537,8 @@ test "unbinding a default can free its Leader for a shorter Action" {
         \\set_verdict_changes_requested = []
         \\set_verdict_none = []
         \\open_review_search = []
+        \\show_comment_overview = []
+        \\show_diff_pane = []
         \\to_top = ["g"]
     ;
     var result = try parse(testing.allocator, source);

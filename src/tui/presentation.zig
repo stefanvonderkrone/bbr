@@ -20,6 +20,36 @@ const buffer_mod = @import("buffer.zig");
 const search = @import("search.zig");
 const review_card = @import("review_card.zig");
 const code_highlighting = @import("code_highlighting.zig");
+const comment_overview = @import("comment_overview.zig");
+
+/// The Pane right of the Sidebar shows the DiffPane or the Comment Overview.
+pub const MainPane = frame_mod.MainPane;
+
+/// The selection after a listing rebuild: the same Owner when the listing
+/// still shows it, else the next shown entry in the old order, else the last
+/// entry. A selection that never existed starts on the first entry.
+fn keptOverviewSelection(
+    allocator: Allocator,
+    old_records: []const comment_overview.Record,
+    old_listing: comment_overview.Listing,
+    records: []const comment_overview.Record,
+    listing: comment_overview.Listing,
+    selected: ?review_card.Owner,
+) !?review_card.Owner {
+    if (listing.entries.len == 0) return null;
+    const wanted = selected orelse return records[listing.entries[0].record].owner;
+    var shown: std.AutoHashMapUnmanaged(review_card.Owner, void) = .empty;
+    try shown.ensureTotalCapacity(allocator, @intCast(listing.entries.len));
+    for (listing.entries) |entry| shown.putAssumeCapacity(records[entry.record].owner, {});
+    if (shown.contains(wanted)) return wanted;
+    var after_wanted = false;
+    for (old_listing.entries) |entry| {
+        const owner = old_records[entry.record].owner;
+        if (after_wanted and shown.contains(owner)) return owner;
+        if (std.meta.eql(owner, wanted)) after_wanted = true;
+    }
+    return records[listing.entries[listing.entries.len - 1].record].owner;
+}
 
 test "M23 highlighting Suggestions inherit authored inline context after LocalReview rename" {
     const Resolver = struct {
@@ -3977,6 +4007,15 @@ const Published = struct {
     search_corpus: ?*BufferSearchCorpus = null,
     review_search: ReviewSearchState,
     active_search: enum { none, buffer, review } = .none,
+    main_pane: MainPane,
+    overview: comment_overview.State,
+    overview_indexes: ArenaRing(2),
+    overview_listings: ArenaRing(2),
+    overview_index: comment_overview.Index,
+    overview_listing: comment_overview.Listing,
+    /// A Draft, Draft state, or ScopeProjection change marks the index stale.
+    /// The index rebuilds only while the Comment Overview shows.
+    overview_index_stale: bool,
 
     fn create(
         allocator: Allocator,
@@ -4058,6 +4097,15 @@ const Published = struct {
         published.buffers = ArenaRing(2).init(allocator);
         published.trees = ArenaRing(2).init(allocator);
         errdefer published.trees.deinit();
+        published.overview_indexes = ArenaRing(2).init(allocator);
+        errdefer published.overview_indexes.deinit();
+        published.overview_listings = ArenaRing(2).init(allocator);
+        errdefer published.overview_listings.deinit();
+        published.main_pane = .diff_pane;
+        published.overview = .{};
+        published.overview_index = .{};
+        published.overview_listing = .{};
+        published.overview_index_stale = true;
         published.worker_frame = null;
         published.code_highlighting = .{};
         errdefer published.buffers.deinit();
@@ -4102,6 +4150,8 @@ const Published = struct {
         self.collapsed_directories.deinit(allocator);
         self.buffers.deinit();
         self.trees.deinit();
+        self.overview_indexes.deinit();
+        self.overview_listings.deinit();
         self.review_arena.deinit();
         self.session.destroy();
         self.backing_allocator.destroy(self);
@@ -4189,6 +4239,8 @@ const Published = struct {
         self.collapsed_directories.deinit(allocator);
         self.buffers.deinit();
         self.trees.deinit();
+        self.overview_indexes.deinit();
+        self.overview_listings.deinit();
         if (self.worker_frame) |worker_frame| worker_frame.destroy();
         self.search_projection.release();
         self.disclosure_inputs.release();
@@ -4239,7 +4291,21 @@ const Published = struct {
             .file_tree = self.tree,
             .focus = self.focus,
             .selected_version = self.selected_version,
-            .version_title_targets = frame_mod.versionTitleTargets(frame_mod.paneRects(self.geometry).diff, self.selected_version),
+            .version_title_targets = switch (self.main_pane) {
+                .diff_pane => frame_mod.versionTitleTargets(frame_mod.paneRects(self.geometry).diff, self.selected_version),
+                .comment_overview => .{},
+            },
+            .main_pane = self.main_pane,
+            .overview = switch (self.main_pane) {
+                .diff_pane => .{},
+                .comment_overview => .{
+                    .records = self.overview_index.records,
+                    .listing = self.overview_listing,
+                    .state = self.overview,
+                    .selected = self.overviewSelectedEntry(),
+                    .cell_metrics = self.cell_metrics,
+                },
+            },
             .search_ranges = switch (self.active_search) {
                 .none => &.{},
                 .buffer => self.buffer_search.currentRanges(),
@@ -4264,6 +4330,7 @@ const Published = struct {
 
     fn setDraftState(self: *Published, temp_id: bbr.review.TempId, state: bbr.review.DraftState) void {
         self.review.setState(temp_id, state);
+        self.overview_index_stale = true;
         // Workers only release references. A sole Published owner can update
         // DraftState before the next handoff. Retained snapshots stay immutable.
         if (self.disclosure_inputs_current and self.disclosure_inputs.content_owner == null and self.disclosure_inputs.references.load(.acquire) == 1) {
@@ -4340,6 +4407,7 @@ const Published = struct {
             .temp_id = draft.local_id,
             .resolution = .{ .resolved = .{ .state = .current, .scope = draft.effectiveScope() } },
         });
+        self.overview_index_stale = true;
     }
 
     // Copy only changed authored data before the store write. The worker owns
@@ -4348,6 +4416,8 @@ const Published = struct {
         const mutation = job.mutation.?;
         const draft = self.review.get(mutation.temp_id) orelse return error.DraftEditConflict;
         const owned = try mutation.clone(self.review_arena.allocator());
+        // The store write can fail after a partial change, so mark first.
+        self.overview_index_stale = true;
         switch (owned.change) {
             .body => |body| {
                 store.editDraftBody(self.key.storeKey(), .{
@@ -4818,6 +4888,127 @@ const Published = struct {
 
     fn visualIndexForBufferIndex(self: *const Published, buffer_index: usize) ?usize {
         return frame_mod.visualIndexForBufferIndex(self.visual_rows, buffer_index);
+    }
+
+    fn overviewSelectedEntry(self: *const Published) ?usize {
+        const owner = self.overview.selected orelse return null;
+        for (self.overview_listing.entries, 0..) |entry, index| {
+            if (std.meta.eql(self.overview_index.records[entry.record].owner, owner)) return index;
+        }
+        return null;
+    }
+
+    fn overviewViewport(self: *const Published) usize {
+        return frame_mod.overviewRects(self.geometry).entries.height;
+    }
+
+    /// Builds the index when it is stale, then the listing, and publishes
+    /// both in one infallible step. A failure keeps the previous ones.
+    fn rebuildOverview(self: *Published, authenticated_account_uuid: ?[]const u8) !void {
+        var index = self.overview_index;
+        var index_staged = false;
+        errdefer if (index_staged) self.overview_indexes.abort();
+        if (self.overview_index_stale) {
+            const allocator = self.overview_indexes.begin();
+            index_staged = true;
+            index = try comment_overview.buildIndex(allocator, .{
+                .diff = self.session.diff,
+                .threads = self.session.threads,
+                .drafts = self.review.drafts.items,
+                .scope_projections = self.scope_projection.items,
+                .mention_names = &self.session.mention_names,
+                .authenticated_account_uuid = authenticated_account_uuid,
+                .emphasis_cache = &self.emphasis_cache,
+            });
+        }
+        const allocator = self.overview_listings.begin();
+        errdefer self.overview_listings.abort();
+        const listing = try comment_overview.buildListing(allocator, &index, &self.overview);
+        const selected = try keptOverviewSelection(allocator, self.overview_index.records, self.overview_listing, index.records, listing, self.overview.selected);
+        if (index_staged) self.overview_indexes.commit();
+        self.overview_listings.commit();
+        self.overview_index = index;
+        self.overview_listing = listing;
+        self.overview_index_stale = false;
+        self.overview.selected = selected;
+        self.followOverviewSelection();
+        self.frame_revision += 1;
+    }
+
+    /// The scroll keeps its top entry until the selection leaves the
+    /// viewport. Then it moves the minimum distance that shows the selection.
+    fn followOverviewSelection(self: *Published) void {
+        const viewport = self.overviewViewport();
+        var scroll = @min(self.overview.scroll, self.overview_listing.entries.len -| viewport);
+        if (self.overviewSelectedEntry()) |index| {
+            if (index < scroll) scroll = index;
+            if (viewport > 0 and index >= scroll + viewport) scroll = index + 1 - viewport;
+        }
+        self.overview.scroll = scroll;
+    }
+
+    fn selectOverviewEntry(self: *Published, index: usize) void {
+        const entries = self.overview_listing.entries;
+        if (index >= entries.len) return;
+        self.overview.selected = self.overview_index.records[entries[index].record].owner;
+        self.followOverviewSelection();
+        self.frame_revision += 1;
+    }
+
+    /// Moves the scroll by `delta` rows and keeps the selection in view.
+    fn scrollOverviewRows(self: *Published, delta: isize) void {
+        const len = self.overview_listing.entries.len;
+        if (len == 0) return;
+        const viewport = @max(self.overviewViewport(), 1);
+        const scroll = if (delta < 0) self.overview.scroll -| @abs(delta) else @min(self.overview.scroll +| @abs(delta), len -| viewport);
+        self.overview.scroll = scroll;
+        const current = self.overviewSelectedEntry() orelse scroll;
+        self.selectOverviewEntry(std.math.clamp(current, scroll, @min(scroll + viewport, len) - 1));
+    }
+
+    /// The Motions work on the listing as the DiffPane Motions work on the
+    /// Buffer. A Count applies to `down` and `up`.
+    fn moveOverview(self: *Published, action: Action) void {
+        const count: usize = @max(self.navigation.count, 1);
+        self.navigation.count = 0;
+        const len = self.overview_listing.entries.len;
+        if (len == 0) return;
+        const viewport = @max(self.overviewViewport(), 1);
+        const half = @max(viewport / 2, 1);
+        const current = self.overviewSelectedEntry() orelse 0;
+        const scroll = self.overview.scroll;
+        const last = len - 1;
+        switch (action) {
+            .scroll_row_up => return self.scrollOverviewRows(-1),
+            .scroll_row_down => return self.scrollOverviewRows(1),
+            .center => {
+                self.overview.scroll = @min(current -| (viewport - 1) / 2, len -| viewport);
+                return self.selectOverviewEntry(current);
+            },
+            else => {},
+        }
+        const target: usize = switch (action) {
+            .down => @min(current +| count, last),
+            .up => current -| count,
+            .half_page_down => @min(current +| half, last),
+            .half_page_up => current -| half,
+            .page_down => @min(current +| viewport, last),
+            .page_up => current -| viewport,
+            .to_top => 0,
+            .to_bottom => last,
+            .cursor_view_top => @min(scroll, last),
+            .cursor_view_middle => @min(scroll + (@min(viewport, len -| scroll) -| 1) / 2, last),
+            .cursor_view_bottom => @min(scroll + viewport - 1, last),
+            else => return,
+        };
+        switch (action) {
+            .half_page_down => self.overview.scroll = @min(scroll +| half, len -| viewport),
+            .half_page_up => self.overview.scroll = scroll -| half,
+            .page_down => self.overview.scroll = @min(scroll +| viewport, len -| viewport),
+            .page_up => self.overview.scroll = scroll -| viewport,
+            else => {},
+        }
+        self.selectOverviewEntry(target);
     }
 
     fn jumpToFileHeader(self: *Published, file_index: usize) void {
@@ -6058,6 +6249,7 @@ pub const Presentation = struct {
             .dismiss_submission_result => self.dismissSubmissionTree(),
             .request_shutdown => self.requestShutdown(),
         }
+        self.refreshOverview();
         if (self.code_work != null or (self.published != null and self.published.?.code_highlighting.bodies.items.len > 0)) self.refreshCodeVisibility();
     }
 
@@ -6386,6 +6578,11 @@ pub const Presentation = struct {
                     .file => .focus_file,
                 });
             },
+            .overview_entry => |index| {
+                const published = self.published orelse return;
+                self.focusPane(published, .diff);
+                published.selectOverviewEntry(index);
+            },
             .diff_row => |index| {
                 const published = self.published orelse return;
                 if (index >= published.visual_rows.len) return;
@@ -6454,7 +6651,12 @@ pub const Presentation = struct {
                 const published = self.published orelse return;
                 self.scrollPane(published, .diff, if (down) @as(isize, @intCast(rows)) else -@as(isize, @intCast(rows)));
             },
-            .sidebar, .diff => return,
+            .overview_entry, .diff => {
+                const published = self.published orelse return;
+                if (published.main_pane != .comment_overview) return;
+                published.scrollOverviewRows(if (down) @as(isize, @intCast(rows)) else -@as(isize, @intCast(rows)));
+            },
+            .sidebar => return,
         }
         self.interaction_revision +%= 1;
     }
@@ -6691,6 +6893,10 @@ pub const Presentation = struct {
         if (published.focus == .sidebar) {
             const entry = published.sidebarEntry() orelse return .sidebar;
             return if (entry.identity == .directory) .sidebar_directory else .sidebar_file;
+        }
+        switch (published.main_pane) {
+            .diff_pane => {},
+            .comment_overview => return .comment_overview,
         }
         return switch (published.cursorRow() orelse return .diff) {
             .line, .line_pair => .diff_source,
@@ -7438,6 +7644,12 @@ pub const Presentation = struct {
         if (self.replacement != null) return;
         const published = self.published orelse return;
         self.action_error = null;
+        if (published.main_pane == .comment_overview and published.focus == .diff and
+            (keymap_mod.isMotion(action) or action == .scroll_row_up or action == .scroll_row_down))
+        {
+            published.moveOverview(action);
+            return;
+        }
         const active_before = published.activeFile();
         const navigation_before = published.navigation;
         const selection_cursor_before = published.navigation.cursor;
@@ -7516,6 +7728,8 @@ pub const Presentation = struct {
             .toggle_review_card => self.toggleDisclosure(published),
             .toggle_directory, .focus_file => self.activateSidebarEntry(published),
             .focus_next_pane => self.togglePaneFocus(published),
+            .show_comment_overview => self.showCommentOverview(published),
+            .show_diff_pane => self.showDiffPane(published),
             .review_comment => self.openComposer(published, .{ .kind = .comment, .label = "New comment", .scope = .review }),
             .file_comment => self.openFileComposer(published),
             .reply => self.openReplyComposer(published),
@@ -9604,6 +9818,39 @@ pub const Presentation = struct {
         published.buffer_search.active = null;
     }
 
+    fn showCommentOverview(self: *Presentation, published: *Published) void {
+        if (published.main_pane == .comment_overview) return;
+        published.rebuildOverview(self.authenticatedAccountUuid()) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.main_pane = .comment_overview;
+        published.focus = .diff;
+        published.frame_revision += 1;
+    }
+
+    fn showDiffPane(self: *Presentation, published: *Published) void {
+        if (published.main_pane == .diff_pane) return;
+        published.main_pane = .diff_pane;
+        published.focus = .diff;
+        published.frame_revision += 1;
+        self.revealActiveFile(published);
+    }
+
+    /// Rebuilds a stale index after any input while the Comment Overview
+    /// shows, so every Draft change path reaches the listing.
+    fn refreshOverview(self: *Presentation) void {
+        const published = self.published orelse return;
+        if (published.main_pane != .comment_overview or !published.overview_index_stale) return;
+        published.rebuildOverview(self.authenticatedAccountUuid()) catch {
+            self.action_error = .out_of_memory;
+        };
+    }
+
+    fn authenticatedAccountUuid(self: *const Presentation) ?[]const u8 {
+        return if (self.authenticated_account_uuid) |*uuid| uuid.slice() else null;
+    }
+
     fn togglePaneFocus(self: *Presentation, published: *Published) void {
         self.focusPane(published, if (published.focus == .diff) .sidebar else .diff);
     }
@@ -9850,8 +10097,10 @@ pub const Presentation = struct {
                     self.action_error = .persistence_failed;
                     return;
                 };
-                if (self.published) |current| if (OwnedReviewIdentity.eql(current.key, editor.key))
+                if (self.published) |current| if (OwnedReviewIdentity.eql(current.key, editor.key)) {
                     current.review.setState(editor.temp_id, .{ .posted = comment_id });
+                    current.overview_index_stale = true;
+                };
                 const key = editor.key;
                 self.unknown_resolution = null;
                 if (self.published) |current| if (OwnedReviewIdentity.eql(current.key, key)) self.queueReconciliation(key);
@@ -29417,4 +29666,262 @@ test "Sidebar mouse click toggles a Directory and focuses a child File" {
     try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
     try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
+}
+
+/// A Review with `review_level` Review-level Comments and one resolved inline
+/// Thread with a Reply on `a.zig`.
+fn testOverviewSession(backing: std.mem.Allocator, id: u64, review_level: usize) !*session_mod.Session {
+    const s = try testSession(backing, id, 'a');
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    const comments = try a.alloc(bbr.review.Comment, review_level + 2);
+    for (comments[0..review_level], 0..) |*comment, index| comment.* = .{
+        .id = 10 + index,
+        .author = "Ada",
+        .author_uuid = "{ada}",
+        .body = try std.fmt.allocPrint(a, "review {d}", .{index}),
+        .scope = .review,
+    };
+    comments[review_level] = .{ .id = 500, .author = "Bo", .body = "inline root", .resolved = true, .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } } };
+    comments[review_level + 1] = .{ .id = 501, .parent_id = 500, .author = "Ada", .body = "inline reply" };
+    s.threads = try bbr.review.buildThreads(a, comments);
+    s.authenticated_account_uuid = "{ada}";
+    return s;
+}
+
+fn testOverviewPresentation(store: *bbr.review.InMemoryStore, review_level: usize) !Presentation {
+    return Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testOverviewSession(testing.allocator, 1, review_level) },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+}
+
+fn testOverviewSelectedOwner(presentation: *Presentation) ?review_card.Owner {
+    const overview = presentation.projection().review.?.frame.overview;
+    const index = overview.selected orelse return null;
+    return overview.records[overview.listing.entries[index].record].owner;
+}
+
+test "M29 overview g o shows the Comment Overview and g d restores the DiffPane" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 30);
+    defer presentation.deinit();
+
+    for (0..4) |_| try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .toggle_select });
+    const diff_before = presentation.projection().review.?.frame;
+    try testing.expect(diff_before.navigation.hasSelection());
+
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(MainPane.comment_overview, frame.main_pane);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try testing.expectEqual(keymap_mod.InteractionContext.comment_overview, presentation.interactionContext());
+    try testing.expectEqual(@as(usize, 32), frame.overview.listing.entries.len);
+    try testing.expectEqual(@as(?usize, 0), frame.overview.selected);
+    try testing.expect(frame.version_title_targets.old == null and frame.version_title_targets.new == null);
+
+    const revision = presentation.projection().revision.frame;
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try testing.expectEqual(revision, presentation.projection().revision.frame);
+    try testing.expect(presentation.projection().action_error == null);
+
+    try presentation.dispatch(.{ .push_count_digit = 3 });
+    try presentation.dispatch(.{ .action = .down });
+    try testing.expectEqual(@as(?usize, 3), presentation.projection().review.?.frame.overview.selected);
+    try presentation.dispatch(.{ .action = .up });
+    try testing.expectEqual(@as(?usize, 2), presentation.projection().review.?.frame.overview.selected);
+    try presentation.dispatch(.{ .action = .to_bottom });
+    frame = presentation.projection().review.?.frame;
+    const viewport = frame_mod.overviewRects(frame.geometry).entries.height;
+    try testing.expectEqual(@as(?usize, 31), frame.overview.selected);
+    try testing.expectEqual(32 - viewport, frame.overview.state.scroll);
+    try presentation.dispatch(.{ .action = .cursor_view_top });
+    try testing.expectEqual(@as(?usize, 32 - viewport), presentation.projection().review.?.frame.overview.selected);
+    try presentation.dispatch(.{ .action = .to_top });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.frame.overview.state.scroll);
+    try presentation.dispatch(.{ .action = .page_down });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(?usize, viewport), frame.overview.selected);
+    try testing.expect(frame.overview.selected.? >= frame.overview.state.scroll and frame.overview.selected.? < frame.overview.state.scroll + viewport);
+    const overview_before = frame.overview.state;
+
+    try presentation.dispatch(.{ .action = .show_diff_pane });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(MainPane.diff_pane, frame.main_pane);
+    try testing.expectEqual(diff_before.navigation.cursor, frame.navigation.cursor);
+    try testing.expectEqual(diff_before.navigation.scroll, frame.navigation.scroll);
+    try testing.expectEqual(diff_before.navigation.selection(), frame.navigation.selection());
+    const diff_revision = presentation.projection().revision.frame;
+    try presentation.dispatch(.{ .action = .show_diff_pane });
+    try testing.expectEqual(diff_revision, presentation.projection().revision.frame);
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try testing.expectEqual(overview_before.scroll, frame.overview.state.scroll);
+    try testing.expectEqual(overview_before.selected, frame.overview.state.selected);
+}
+
+test "M29 overview showing the Comment Overview changes no disclosure" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 2);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const rows = published.visual_rows;
+    const disclosures = published.expanded_disclosures.items.len;
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    const overview = presentation.projection().review.?.frame.overview;
+    try testing.expectEqual(@as(usize, 4), overview.listing.entries.len);
+    try testing.expect(overview.records[overview.listing.entries[2].record].resolved);
+    try testing.expectEqual(@as(usize, 1), overview.records[overview.listing.entries[3].record].depth);
+    try testing.expectEqual(disclosures, published.expanded_disclosures.items.len);
+    try testing.expectEqual(rows.ptr, published.visual_rows.ptr);
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .action = .show_diff_pane });
+    try testing.expectEqual(disclosures, published.expanded_disclosures.items.len);
+    try testing.expectEqual(rows.ptr, published.visual_rows.ptr);
+}
+
+test "M29 overview Tab moves focus between the Sidebar and the Comment Overview" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 2);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .key = .{ .codepoint = vaxis_tab } });
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
+    try presentation.dispatch(.{ .key = .{ .codepoint = vaxis_tab } });
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(keymap_mod.InteractionContext.comment_overview, presentation.interactionContext());
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'g' } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'd' } });
+    try testing.expectEqual(MainPane.diff_pane, presentation.projection().review.?.frame.main_pane);
+}
+
+const vaxis_tab = @import("vaxis").Key.tab;
+
+test "M29 overview a Review-level Draft saved from the Comment Overview appears and the selection keeps its Owner" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 3);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .down });
+    const owner = testOverviewSelectedOwner(&presentation).?;
+    try testing.expectEqual(review_card.Owner{ .comment = 12 }, owner);
+    try presentation.dispatch(.{ .action = .review_comment });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
+    try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.projection().composer == null);
+    const overview = presentation.projection().review.?.frame.overview;
+    try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
+    try testing.expectEqual(@as(usize, 6), overview.listing.entries.len);
+    try testing.expect(overview.records[overview.listing.entries[3].record].owner == .draft);
+    try testing.expectEqual(owner, testOverviewSelectedOwner(&presentation).?);
+}
+
+test "M29 overview an allocation failure in the index or listing build keeps the previous Frame" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 3);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    const indexes = published.overview_indexes;
+    published.overview_indexes = ArenaRing(2).init(failing.allocator());
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try testing.expectEqual(MainPane.diff_pane, presentation.projection().review.?.frame.main_pane);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    published.overview_indexes.deinit();
+    published.overview_indexes = indexes;
+
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    const before = presentation.projection().review.?.frame.overview;
+    published.overview_index_stale = true;
+    const listings = published.overview_listings;
+    published.overview_listings = ArenaRing(2).init(failing.allocator());
+    try presentation.dispatch(.{ .action = .down });
+    var after = presentation.projection().review.?.frame.overview;
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    try testing.expectEqual(before.records.ptr, after.records.ptr);
+    try testing.expectEqual(before.listing.entries.ptr, after.listing.entries.ptr);
+    try testing.expectEqual(@as(?usize, 1), after.selected);
+    published.overview_listings.deinit();
+    published.overview_listings = listings;
+
+    try presentation.dispatch(.{ .action = .down });
+    after = presentation.projection().review.?.frame.overview;
+    try testing.expect(!published.overview_index_stale);
+    try testing.expect(before.records.ptr != after.records.ptr);
+    try testing.expectEqual(@as(?usize, 2), after.selected);
+}
+
+test "M29 overview a Session replacement shows the DiffPane and resets the Overview State" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 3);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .down });
+
+    const key_two = try OwnedReviewIdentity.init("workspace", "repo", 2);
+    try presentation.dispatch(.{ .choose_pull_request = key_two });
+    const failed = presentation.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .intent = failed.intent, .outcome = .{ .failed = error.NotFound } } });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(MainPane.comment_overview, frame.main_pane);
+    try testing.expectEqual(@as(?usize, 1), frame.overview.selected);
+
+    try presentation.dispatch(.{ .choose_pull_request = key_two });
+    const load = presentation.takeCommand().?.load_session;
+    try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testOverviewSession(testing.allocator, 2, 3) },
+    } });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
+    try testing.expectEqual(MainPane.diff_pane, frame.main_pane);
+    const state = presentation.published.?.overview;
+    try testing.expectEqual(@as(?review_card.Owner, null), state.selected);
+    try testing.expectEqual(@as(usize, 0), state.scroll);
+    try testing.expectEqual(@as(usize, 0), state.query_len);
+    try testing.expect(!state.unresolved_only and !state.drafts_only and !state.mine_only);
+    try testing.expectEqual(comment_overview.Order.review, state.order);
+    try testing.expect(state.file_tree_filter == null);
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.frame.overview.selected);
+}
+
+test "M29 overview a click selects an entry and the wheel scrolls the listing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewPresentation(&store, 30);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    const rects = frame_mod.overviewRects(presentation.projection().review.?.frame.geometry);
+    const row = rects.entries.y + 2;
+    try presentation.dispatch(.{ .mouse = .{ .col = rects.entries.x + 1, .row = row, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = rects.entries.x + 1, .row = row, .button = .left, .type = .release } });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try testing.expectEqual(@as(?usize, 2), frame.overview.selected);
+
+    try presentation.dispatch(.{ .mouse = .{ .col = rects.entries.x + 1, .row = row, .button = .wheel_down, .type = .press } });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 3), frame.overview.state.scroll);
+    try testing.expectEqual(@as(?usize, 3), frame.overview.selected);
+    try presentation.dispatch(.{ .mouse = .{ .col = rects.entries.x + 1, .row = row, .button = .wheel_up, .type = .press } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.frame.overview.state.scroll);
 }

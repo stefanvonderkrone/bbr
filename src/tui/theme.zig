@@ -18,6 +18,9 @@ const ThemeId = @import("theme_id.zig").ThemeId;
 /// One kind of content on the status row. Each kind has its own Style.
 pub const StatusPart = enum { bar, separator, pull_request, title, ref, position, key, hint, drafts, verdict_approved, verdict_changes_requested, verdict_none, message, busy, no_match };
 
+/// One kind of content in the Comment Overview. Each kind has its own Style.
+pub const OverviewPart = enum { author, scope, excerpt, resolved, context, query, placeholder, chip, chip_active, message };
+
 /// The status row palette. Its polarity follows the Theme.
 pub const StatusBar = struct { bg: Color, fg: Color, muted: Color };
 
@@ -205,6 +208,32 @@ pub const Theme = struct {
 
     pub fn resolvedThreadStyle(self: Theme) Style {
         return self.resolveStyle(.{ .fg = self.status_added, .bg = self.context.bg, .bold = true });
+    }
+
+    /// Every Comment Overview part has the base background. Only the selected
+    /// entry gets its own background, from `cursorBg`.
+    pub fn overviewStyle(self: Theme, part: OverviewPart, role: review_card.CardRole) Style {
+        var style: Style = .{ .fg = self.context.fg, .bg = self.context.bg };
+        switch (part) {
+            .author => {
+                const header = self.reviewCardStyle(role, .header, .{});
+                style.fg = header.fg;
+                style.bold = header.bold;
+            },
+            .scope => style.fg = self.section.fg,
+            .excerpt, .query => {},
+            .resolved => {
+                style.fg = self.resolvedThreadStyle().fg;
+                style.bold = true;
+            },
+            .context => style.fg = self.card_border_dim.fg,
+            .placeholder, .chip, .message => style.fg = self.gutter.fg,
+            .chip_active => {
+                style.fg = self.accent;
+                style.bold = true;
+            },
+        }
+        return style;
     }
 
     /// Every status part keeps the bar background, so the whole row reads as one bar.
@@ -563,6 +592,10 @@ comptime {
             if (part.hasCodeBackground()) continue;
             if (!std.meta.eql(entry.value.reviewCardStyle(role, part, .{}).bg, entry.value.context.bg))
                 @compileError("Theme \"" ++ entry.name ++ "\" ReviewCard role " ++ @tagName(role) ++ " part " ++ @tagName(part) ++ " must have the context background, because a ReviewCard paints the Theme base background. Only code and Suggestion rows keep their own");
+        };
+        for (std.meta.tags(review_card.CardRole)) |role| for (std.meta.tags(OverviewPart)) |part| {
+            if (!std.meta.eql(entry.value.overviewStyle(part, role).bg, entry.value.context.bg))
+                @compileError("Theme \"" ++ entry.name ++ "\" Comment Overview part " ++ @tagName(part) ++ " role " ++ @tagName(role) ++ " must have the context background, because the Comment Overview paints the Theme base background. Only the selected entry has its own");
         };
     }
 }
