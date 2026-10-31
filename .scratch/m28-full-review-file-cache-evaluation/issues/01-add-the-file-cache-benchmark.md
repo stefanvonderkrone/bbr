@@ -142,3 +142,15 @@ The runner added `Options.requireDependencies`, its test, and its rule in `AGENT
 
 No run used live Bitbucket. Ticket 02 makes the first live run.
 The tests use the plain Highlighter and a fake clock, so their latencies are 0 ms.
+
+## Comments
+
+A follow-up changes the harness after this ticket resolved.
+The request window now persists in `<output-dir>/requests.log`, and a per-request gate applies it.
+The harness retries a failed `GET` with full jitter backoff.
+A rerun resumes at the first unfinished segment from a checkpoint file.
+The `remote` mode now needs `--output-dir` and a non-empty `--run-label`.
+The spec sections "Request budget", "Excluded time", "Retry", "Resume", and "Output" in the [M28 spec](../SPEC.md) describe the new rules.
+Some acceptance criteria above describe the old rules, such as "The request budget never waits inside a measured span".
+The spec replaces them.
+[Ticket 02](02-run-the-baseline-on-the-five-pullrequests.md) has the new run guide.

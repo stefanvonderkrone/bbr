@@ -99,6 +99,14 @@ The benchmark uses the five PullRequests in `pr-webapp` from the brief.
 Ticket 01 adds `src/benchmark/file_cache.zig` and the build step `zig build bench-file-cache`.
 The command is `zig build bench-file-cache -- remote <repository> <pull-request-id> [options]`.
 It resolves the Credential with `bbr.bitbucket.auth.resolve`, like `src/benchmark/file_acquisition.zig`.
+So it uses the default Profile, as `bbr` does without `--profile`.
+The `remote` mode needs two options:
+
+- `--output-dir DIR` names the directory for the request window, the lock, and the checkpoint files.
+  The harness creates the directory.
+- `--run-label LABEL` names the run.
+  It must not be empty.
+  It must not contain `/` or `\`, because it names the checkpoint file.
 
 The harness drives the real `Presentation` from `src/tui/presentation.zig`.
 It sends each Action through `Presentation.dispatch`, as the Presentation tests do.
@@ -119,8 +127,9 @@ Ticket 01 then lists the hook and the reason under `## Completion`.
 ### Instrumentation points
 
 - `MeasuringHttpClient` wraps `StdHttpClient.httpClient()` behind the `HttpClient` seam.
-  It counts requests, `/src/` requests, `429` responses, and other failures.
-  It records the latency of each request.
+  It gates each attempt on the request window and retries a failed attempt.
+  It counts attempts, `/src/` requests, `429` responses, retries, and final failures.
+  It records the latency of each attempt and the time in which the harness waits.
   It never stores a URL, a header, or a body.
 - The executor records the start and the end of each `enrich_file` command.
   It records the File index, the `speculative` flag, and the `search_acquisition` flag.
@@ -176,18 +185,140 @@ The output records only the query length.
 
 ### Request budget
 
-Bitbucket limits `/2.0/repositories/*` requests to between 1,000 and 10,000 an hour for each user.
+Bitbucket limits `/2.0/repositories/*` to 1,000 requests for each user in a rolling hour.
+This limit applies to a personal API token, which the Credential holds.
+The source is [API request limits](https://support.atlassian.com/bitbucket-cloud/docs/api-request-limits/).
+Bitbucket sends no `X-RateLimit` headers, so the harness cannot read the remaining requests.
 One full acquisition of a PullRequest with F Files needs about 2F requests.
 
-The harness keeps a log of its requests in the last hour.
-Before each scenario, it estimates the requests as two for each File that the scenario can fetch.
-It waits until the log and the estimate fit in `--hourly-request-budget`, which defaults to 900.
-If the estimate alone exceeds the budget, it waits for an empty hour and then starts.
-The harness never waits inside a measured span.
-A `429` response stays in the data, because a reviewer would wait for it too.
-The harness reports each `429` response.
+The harness keeps a rolling request window in `<output-dir>/requests.log`.
+The file holds one Unix timestamp in nanoseconds for each line, and nothing else.
+The window survives a crash, a kill, and a restart, so a new process sees the requests of the old one.
+At start, the harness drops entries older than one hour and rewrites the file atomically.
+It appends without a sync for each line, so a power loss can lose the last lines.
+
+The budget is `--hourly-request-budget`, and the default is 900.
+The default stays below 1,000, because other `bbr` use shares the same Bitbucket limit.
+
+The harness applies two gates:
+
+1. Before each attempt, the per-request gate checks the window.
+   If the window holds the budget, the attempt waits until the oldest entry leaves the hour.
+   One lock covers the check and the record, so concurrent requests never exceed the budget.
+2. Before each scenario, the harness estimates two requests for each File that the scenario can fetch.
+   If the estimate fits in the budget, the harness waits until the window has room for the whole estimate.
+   Then the scenario runs without waits from the window, if the estimate holds.
+   If the estimate exceeds the budget, the harness does not wait before the scenario.
+   The per-request gate then sets the pace inside the scenario.
+
+The harness no longer waits for an empty hour.
+A `429` response fills the window.
+The harness adds entries until the window holds the budget, and these entries persist like requests.
+
+The harness prints a note on stderr before each wait.
+A note holds `key=value` pairs and never a URL, a path, a header, a body, or a token.
+For example: `wait reason=window seconds=12.5 resume=2026-10-31T13:05:00Z`.
+The `reason` is `window` for the per-request gate, `scenario` before a scenario, and `retry` for a backoff.
+`resume` is the UTC time when the wait ends.
+
+### Excluded time
+
+A harness wait does not count as latency.
+The harness counts a stall when at least one request is in flight and every in-flight request waits.
+The latency of a span is its time minus the stall time inside the span.
+The S8 Candidate Session time and `probe_ms` use the same rule.
+A Visible Action with stall time in its span counts in `paced_samples`.
+
+This rule has two limits:
+
+- A backoff of one request while other requests progress stays in the latency.
+  The reviewer waits for that request too.
+- CPU work that overlaps a stall leaves the latency too.
+
+### Retry
+
+The harness retries a failed attempt below the `HttpClient` seam.
+It retries only a `GET` request.
+It retries after a `429` response, a `5xx` response, or a send error other than `OutOfMemory`.
+It does not retry another status, such as `401` or `404`.
+
+The policy uses full jitter backoff:
+
+- Retry k waits a random time from 0 to `min(15 min, 2 s * 2^(k-1))`.
+- With 8 attempts, the ceilings are 2, 4, 8, 16, 32, 64, and 128 s.
+- If the response has `Retry-After`, the wait is at least that time.
+- After 8 attempts, the harness gives up.
+  It prints `give_up attempts=8` with the status or the error, and every later request fails.
+  The run exits non-zero, and the checkpoint keeps the last finished segment.
+
+The counters follow the attempts:
+
+- `requests` counts attempts, so it matches the entries in the window.
+- `rate_limited` counts the attempts with a `429` response.
+- `retries` counts the attempts that the harness retries.
+- `failures` counts final failures only.
+  A `503` that succeeds on a retry is no failure.
+
+The round trip of each attempt stays in the latency.
+The backoff wait leaves the latency when it is stall time.
+This changes the old rule that a `429` response stays in the data.
+
+`RemoteBlobSource` in production retries once, above the harness retry.
+The harness retry handles a retryable response first.
+So the production retry runs only after the harness gives up, and then it fails at once.
+
+`StdHttpClient` has no request timeout.
+An OS timeout comes back as a send error, and the harness retries it.
+A request that hangs without an OS error never ends, and the harness does not retry it.
+
+### Resume
+
+A rerun with the same options resumes the run.
+The unit of resume is a segment.
+A segment is a sequence of selected scenarios that share state in memory.
+
+- The selected scenarios among S1 to S6 form one segment.
+  Each of them measures the LRU, the focus history, or the open Overlay that the scenario before it left.
+  A new process cannot rebuild that state, so a resumed S2 would measure something else.
+- S7 is one segment, and S8 is one segment.
+  Each starts with a Session replacement or a restart, which discards all File content.
+  They need only the admitted flags, and the checkpoint holds those flags.
+
+The checkpoint file is `<output-dir>/<run-label>-<pull-request>-<selection>.txt`.
+The selection is `all`, or the selected ids joined by `-`, for example `s1-s2-s3`.
+The file holds these lines:
+
+1. The `header` line.
+2. One `scenario=` line for each finished scenario.
+3. One `progress` line.
+   It holds the finished scenarios, the admitted and checked flags as bit strings, the largest sizes, and the check counters.
+   It holds no File path.
+4. The `check` line, only when every segment is done.
+
+The harness writes the file after the header and after each segment.
+Each write goes to a temporary file, syncs it, and replaces the checkpoint.
+So a crash leaves the file at the last finished segment.
+
+A rerun reads the checkpoint and acts on it:
+
+- With a `check` line, the rerun prints the stored lines and sends no request.
+- Without a `check` line, it prints the stored lines and restores the progress.
+  It prints `resume skip=` with the finished scenarios.
+  Then it runs the first unfinished segment from its first scenario.
+- A failed segment leaves no line in the checkpoint.
+  The rerun starts that segment again with the state of the last finished segment.
+- These header keys must match the current options: `network_label`, `bbr_version`, `cache_max_bytes`, `dwell_ms`, `seed`, `query_bytes`, `second_query_bytes`, and `hourly_request_budget`.
+  A difference prints `checkpoint mismatch key=<key>` and stops the run.
+- A different File count stops the run with `FileCountChanged`.
+
+Standard output repeats the checkpoint content without the `progress` line.
+
+The harness locks `<output-dir>/lock` for the whole run.
+A second harness on the same output directory prints `another harness uses this output directory` and stops.
+The OS releases the lock when the process ends, also after a crash or a kill.
 
 The option `--scenarios` selects a subset, so a human can split a long run across sessions.
+A subset has its own checkpoint file, because the selection is part of the file name.
 Every invocation prints the same header, so the results merge.
 
 ### Output
@@ -202,7 +333,10 @@ Each scenario line holds these keys:
 - `latency_median_ms` and `latency_p95_ms`.
 - `added_delay_p95_ms`, computed over the samples with a refetch.
 - `first_result_ms` and `complete_result_ms` for S4, S5, and S6.
-- `requests`, `src_requests`, `failures`, and `rate_limited`.
+- `requests`, `src_requests`, `failures`, and `rate_limited`, as the "Retry" section defines them.
+- `retries`, the attempts that the harness retried.
+- `paused_ms`, the stall time in the scenario, which the latencies exclude.
+- `paced_samples`, the Visible Actions with stall time in their span.
 - `peak_retained_bytes`, `retained_bytes`, `full_review_bytes`, and `peak_rss_bytes`.
 - `cache_hit_rate`, which is hits divided by hits plus refetches. Cold fetches do not count.
 - `low_samples=true` when the scenario has fewer than 20 samples with a refetch.
@@ -210,6 +344,8 @@ Each scenario line holds these keys:
 The p95 uses the nearest rank, like `harness.run`.
 With fewer than 20 samples, the p95 is the maximum, and `low_samples=true` marks it.
 The harness prints no File path, URL, source text, Comment text, or query text.
+The notes on stderr and the files in the output directory follow the same rule.
+They never hold the Credential token.
 
 ### Runs and network conditions
 
@@ -217,7 +353,8 @@ The baseline is two runs of all five PullRequests with the current default budge
 The two runs are on different days.
 They also use different network conditions, for example a wired office network and a home network over VPN.
 Each run records its network label and its `probe_ms`.
-A PullRequest result with a failure other than a `429` is invalid, and the human runs that PullRequest again.
+A PullRequest result with `failures` above 0 is invalid, and the human runs that PullRequest again.
+[Ticket 02](issues/02-run-the-baseline-on-the-five-pullrequests.md) has the run guide.
 
 ## Stop rule
 
@@ -355,6 +492,16 @@ Ticket 01 adds one rule to the table:
 | --- | --- |
 | The File cache benchmark prints only metadata and numbers, never source text, File paths, query text, Comment text, or URLs. | The test "M28 cache benchmark output holds no source, path, query, or Comment text" in `src/benchmark/file_cache.zig`. |
 
+The follow-up for the persistent window, the retry, and the resume adds these rules:
+
+| Rule | Enforcement |
+| --- | --- |
+| The File cache benchmark keeps its request window in `<output-dir>/requests.log`. No rolling hour in that file holds more requests than the budget. A `429` response fills the window. | The tests "M28 cache the request window survives a restart and never exceeds the budget in any hour" and "M28 cache a 429 marks the request window full" in `src/benchmark/file_cache.zig`. |
+| A harness wait never counts as File cache benchmark latency. | The test "M28 cache a harness wait inside a span is not latency" in `src/benchmark/file_cache.zig`. |
+| The File cache benchmark retries a `GET` with full jitter backoff and waits at least the `Retry-After` time. After 8 attempts, it exits non-zero and keeps the checkpoint. | The tests "M28 cache retries back off with full jitter up to the cap and honour Retry-After" and "M28 cache gives up after 8 attempts and a rerun resumes at the first unfinished segment" in `src/benchmark/file_cache.zig`. |
+| A File cache benchmark rerun resumes at the first unfinished segment. The selected scenarios among S1 to S6 form one segment. A rerun of a finished run sends no request. | The tests "M28 cache gives up after 8 attempts and a rerun resumes at the first unfinished segment", "M28 cache a rerun of a finished run sends no request", and "M28 cache a failure inside S1 to S6 restarts that segment from S1" in `src/benchmark/file_cache.zig`. |
+| The Credential token never reaches the File cache benchmark stdout, stderr, or a run file. | The test "M28 cache the Credential token never reaches the output, the notes, or the run files" in `src/benchmark/file_cache.zig`. |
+
 ## ADR conflicts
 
 [M17 ticket 09](../m17-diff-blob-highlighting-completeness/issues/09-decide-persistent-file-cache.md) says not to use an arbitrary latency threshold without workflow evidence.
@@ -378,7 +525,10 @@ The tests join the `zig build test` import chain.
 
 - `FakeHttpClient` from `src/http/fake_client.zig` is the network seam.
   The tests drive the harness against it with no network and no Credential.
-- An injected clock is the time seam for the request budget and the latency numbers.
+- An injected clock is the time seam for the request window, the latency numbers, and every wait.
+  It gives the awake time for latencies, the wall time for the window, and a sleep.
+  The fake clock records each sleep, so a test can assert the backoff sequence.
+- An injected random source is the seam for the retry jitter.
 - `CachePolicy.max_retained_bytes` is the eviction seam.
   A small budget forces eviction in a small fixture.
 
@@ -410,7 +560,7 @@ Scenarios on `FakeHttpClient`:
 
 - Each scenario runs to the end on a fixture with text, binary, added, and removed Files.
 - S5 and S6 report refetches with a small budget and none with an unlimited budget.
-- A fake `429` response counts in `rate_limited`, also when `RemoteBlobSource` retries it.
+- A fake `429` response counts in `rate_limited` once for each attempt that gets it.
 - The executor fails the run on an unsupported command kind.
 
 Merged PullRequest check:
@@ -420,14 +570,41 @@ Merged PullRequest check:
 
 Request budget:
 
-- The harness waits before a scenario when the hour log is full.
-  It never waits inside a measured span.
-- An estimate above the budget waits for an empty hour.
+- "M28 cache the request window survives a restart and never exceeds the budget in any hour".
+  Two runs share one output directory.
+  No hour in `requests.log` holds more entries than the budget, and the second run waits with `reason=window`.
+- "M28 cache a harness wait inside a span is not latency".
+  A budget below the scenario estimate makes the gate wait inside spans.
+  The latency stays 0, and `paused_ms` and `paced_samples` are above 0.
+- "M28 cache a 429 marks the request window full".
+  After one `429`, the window holds the budget, and the retry waits with `reason=window`.
+- The harness waits before a scenario when the window has no room for an estimate that fits in the budget.
+
+Retry:
+
+- "M28 cache retries back off with full jitter up to the cap and honour Retry-After".
+  Three `503` responses with the maximum jitter wait 2, 4, and 8 s.
+  A cap of 5 s gives 2, 4, 5, and 5 s.
+  A `429` with a `Retry-After` of 7 s waits 7 s.
+- "M28 cache gives up after 8 attempts and a rerun resumes at the first unfinished segment".
+  The run returns an error after exactly 8 attempts of one request.
+
+Resume:
+
+- "M28 cache gives up after 8 attempts and a rerun resumes at the first unfinished segment".
+  A failure inside S7 keeps the S1 to S6 lines.
+  The rerun prints S7 and S8, and its S7 has no cold fetch.
+- "M28 cache a rerun of a finished run sends no request".
+- "M28 cache a failure inside S1 to S6 restarts that segment from S1".
+- "M28 cache a second harness on the same output directory fails".
+- "M28 cache a rerun with other options fails on the checkpoint".
 
 Containment:
 
 - "M28 cache benchmark output holds no source, path, query, or Comment text".
   Sentinels in the fake blobs, paths, query, and Comment bodies never appear in the output.
+  They also never appear in the notes or in a file in the output directory.
+- "M28 cache the Credential token never reaches the output, the notes, or the run files".
 
 Stop rule:
 
@@ -465,8 +642,14 @@ The human can change a choice at ticket 03.
 2. The baseline for the added delay: the hit median of the same Action kind in the same run, PullRequest, and scenario.
 3. Refetch after Session replacement or a restart: it counts as a refetch under the 300 ms rule.
 4. Repeat Review Search: S5 query edits and S6 Overlay reopen. One refetch in either is a delay.
-5. A `429` response stays in the latency data, because a reviewer waits for it too.
+5. The round trip of each attempt stays in the latency, also for a `429`, because a reviewer waits for it.
+   A harness wait leaves the latency, because the reviewer never makes that wait.
 6. The sample floor: with fewer than 20 refetch samples, the p95 is the maximum, and the output marks it.
 7. The disk cache location: the state home, as the M28 request names, not a new cache home.
 8. The disk simulation uses random bytes of the same length, so no source content reaches the disk.
 9. Conditional tickets: the spec describes them, and ticket 03 writes them only for the outcome "Delay".
+10. The default budget is 900 requests an hour, below the Bitbucket limit of 1,000, because other `bbr` use shares that limit.
+11. The request window persists in the output directory, so a restart cannot exceed the budget.
+12. The retry policy is full jitter from 2 s, doubled for each retry. The cap is 15 min, and the limit is 8 attempts.
+13. The harness excludes a wait from latency only while every in-flight request waits.
+14. The unit of resume is a segment, and S1 to S6 form one segment because they share state in memory.
