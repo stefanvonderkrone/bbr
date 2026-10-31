@@ -128,18 +128,26 @@ pub fn drawCommentOverview(scratch: std.mem.Allocator, win: vaxis.Window, review
         .entries_scroll = .{ .total = overview.listing.entries.len, .offset = overview.state.scroll },
     }, win, theme);
     drawFileTree(childRect(win, rects.get(.sidebar).content), frame.file_tree, theme);
-    drawOverviewFilter(childRect(win, rects.get(.filter).content), &overview, theme);
+    drawOverviewFilter(scratch, childRect(win, rects.get(.filter).content), &overview, theme);
     drawOverviewEntries(scratch, childRect(win, rects.get(.entries).content), &overview, theme);
 }
 
 const OverviewPart = @import("theme.zig").OverviewPart;
 const OverviewText = struct { text: []const u8, part: OverviewPart };
 
-/// A filter chip. Ticket 04 adds the File Tree Filter chip to this table.
 const OverviewChip = struct { text: []const u8, active: bool };
 
-fn overviewChips(state: *const comment_overview.State) [4]OverviewChip {
+/// The File Tree Filter chip, then the toggle and order chips. Without a
+/// File Tree Filter, the first chip is empty and takes no cells.
+fn overviewChips(scratch: std.mem.Allocator, overview: *const comment_overview.Frame) [5]OverviewChip {
+    const state = overview.state;
+    const directory = if (state.file_tree_filter) |filter| filter == .directory else false;
+    const filter: []const u8 = if (overview.filter_path.len == 0)
+        ""
+    else
+        std.fmt.allocPrint(scratch, "in {s}{s}", .{ overview.filter_path, if (directory) "/" else "" }) catch "in …";
     return .{
+        .{ .text = filter, .active = true },
         .{ .text = "u unresolved", .active = state.unresolved_only },
         .{ .text = "d drafts", .active = state.drafts_only },
         .{ .text = "a mine", .active = state.mine_only },
@@ -154,7 +162,7 @@ const overview_chip_gap: usize = 2;
 
 /// The query on the left and the chips on the right. Chips that do not fit
 /// drop from the end, as a repel without wrap shrinks its last children.
-fn drawOverviewFilter(win: vaxis.Window, overview: *const comment_overview.Frame, theme: Theme) void {
+fn drawOverviewFilter(scratch: std.mem.Allocator, win: vaxis.Window, overview: *const comment_overview.Frame, theme: Theme) void {
     if (win.height == 0) return;
     const metrics = overview.cell_metrics;
     const query = overview.state.query();
@@ -168,7 +176,8 @@ fn drawOverviewFilter(win: vaxis.Window, overview: *const comment_overview.Frame
     var query_width: usize = 0;
     for (texts) |text| query_width += metrics.width(text.text);
 
-    const chips = overviewChips(overview.state);
+    const all_chips = overviewChips(scratch, overview);
+    const chips = if (all_chips[0].text.len == 0) all_chips[1..] else all_chips[0..];
     var shown: usize = chips.len;
     var chips_width: usize = 0;
     while (true) : (shown -= 1) {
@@ -5662,6 +5671,7 @@ const overview_test_records = [_]comment_overview.Record{
         .role = .comment,
         .author = "Ada",
         .scope = .{ .@"inline" = .{ .path = "src/tui/render.zig", .to = 12, .start_to = 10 } },
+        .file = null,
         .scope_state = .current,
         .resolved = true,
         .mine = false,
@@ -5677,6 +5687,7 @@ const overview_test_records = [_]comment_overview.Record{
         .role = .comment_reply,
         .author = "Grace",
         .scope = .{ .@"inline" = .{ .path = "src/tui/render.zig", .to = 12, .start_to = 10 } },
+        .file = null,
         .scope_state = .current,
         .resolved = true,
         .mine = false,
@@ -5692,6 +5703,7 @@ const overview_test_records = [_]comment_overview.Record{
         .role = .draft,
         .author = "You",
         .scope = .review,
+        .file = null,
         .scope_state = .current,
         .resolved = false,
         .mine = true,
@@ -5912,8 +5924,8 @@ test "M29 overview an entry row shows the indent, the resolved mark, the author,
     const geometry: @import("frame.zig").Geometry = .{ .cols = 100, .rows = 12 };
     const rects = @import("frame.zig").overviewRects(geometry);
     var records = overview_test_records ++ [_]comment_overview.Record{
-        .{ .owner = .{ .comment = 4 }, .parent = null, .depth = 0, .role = .comment, .author = "Lin", .scope = .{ .@"inline" = .{ .path = "lib.zig", .from = 7 } }, .scope_state = null, .resolved = false, .mine = false, .excerpt = "Why?", .haystack = "", .review_rank = 3, .recency_rank = 3 },
-        .{ .owner = .{ .comment = 5 }, .parent = null, .depth = 0, .role = .comment, .author = "Kim", .scope = .{ .file = .{ .path = "docs/a.md", .source_commit = "c" } }, .scope_state = .outdated, .resolved = false, .mine = false, .excerpt = "Typo", .haystack = "", .review_rank = 4, .recency_rank = 4 },
+        .{ .owner = .{ .comment = 4 }, .parent = null, .depth = 0, .role = .comment, .author = "Lin", .scope = .{ .@"inline" = .{ .path = "lib.zig", .from = 7 } }, .file = null, .scope_state = null, .resolved = false, .mine = false, .excerpt = "Why?", .haystack = "", .review_rank = 3, .recency_rank = 3 },
+        .{ .owner = .{ .comment = 5 }, .parent = null, .depth = 0, .role = .comment, .author = "Kim", .scope = .{ .file = .{ .path = "docs/a.md", .source_commit = "c" } }, .file = null, .scope_state = .outdated, .resolved = false, .mine = false, .excerpt = "Typo", .haystack = "", .review_rank = 4, .recency_rank = 4 },
     };
     records[0].scope_state = .moved;
     const entries = [_]comment_overview.Entry{ .{ .record = 0, .context = true }, .{ .record = 1, .context = false }, .{ .record = 2, .context = false }, .{ .record = 3, .context = false }, .{ .record = 4, .context = false } };
@@ -6007,4 +6019,44 @@ test "M29 overview an empty Review shows the empty message" {
     drawCommentOverview(a, win, try overviewTestReview(geometry, filtered), theme_dark);
     const none = "No entry matches the filters";
     try testing.expectEqualStrings(none, try overviewRowText(a, win, rects.entries.x, rects.entries.y, none.len));
+}
+
+test "M29 overview the File Tree paints the root entry and the filter row shows the File Tree Filter chip" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const geometry: @import("frame.zig").Geometry = .{ .cols = 120, .rows = 12 };
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const rects = @import("frame.zig").overviewRects(geometry);
+    const sidebar = rects.sidebar_content;
+    const diff = try bbr.diff.parse(a, "diff --git a/src/a.zig b/src/a.zig\n--- a/src/a.zig\n+++ b/src/a.zig\n@@ -1 +1 @@\n-a\n+b\n" ++
+        "diff --git a/top.zig b/top.zig\n--- a/top.zig\n+++ b/top.zig\n@@ -1 +1 @@\n-a\n+b\n");
+    const tree = try @import("file_tree.zig").build(a, diff, &.{ .{ .comments = 2 }, .{ .drafts = 1 } }, &.{}, null, sidebar.width, sidebar.height, .{ .directory = "src" }, 0, terminal_cell_metrics, true);
+
+    const cases = [_]struct { filter: @import("file_tree.zig").Identity, path: []const u8, chip: []const u8 }{
+        .{ .filter = .{ .directory = "src" }, .path = "src", .chip = "in src/" },
+        .{ .filter = .{ .file = 0 }, .path = "src/a.zig", .chip = "in src/a.zig" },
+    };
+    for (cases) |case| {
+        var overview = overview_test_frame;
+        const state: comment_overview.State = .{ .file_tree_filter = case.filter };
+        overview.state = &state;
+        overview.filter_path = case.path;
+        var review = try overviewTestReview(geometry, overview);
+        review.frame.file_tree = tree;
+        drawCommentOverview(a, win, review, theme_dark);
+
+        const chips = try std.fmt.allocPrint(a, "{s}  u unresolved  d drafts  a mine  o review order", .{case.chip});
+        const chips_x: u16 = @intCast(rects.filter.x + rects.filter.width - chips.len);
+        try testing.expectEqualStrings(chips, try overviewRowText(a, win, chips_x, rects.filter.y, @intCast(chips.len)));
+        const cell = win.readCell(chips_x, rects.filter.y).?.style;
+        try testing.expectEqual(theme_dark.overviewStyle(.chip_active, .comment).fg, cell.fg);
+        try testing.expectEqual(theme_dark.overviewStyle(.chip_active, .comment).bold, cell.bold);
+    }
+
+    try testing.expectEqualStrings("  All Files", try overviewRowText(a, win, sidebar.x, sidebar.y, 11));
+    try testing.expectEqualStrings("●2 ✎1", try overviewRowText(a, win, sidebar.x + sidebar.width - 5, sidebar.y, 5));
+    try testing.expectEqualStrings(" ▾ src/", try overviewRowText(a, win, sidebar.x, sidebar.y + 1, 7));
+    try testing.expectEqual(theme_dark.sidebar_selected.bg, win.readCell(sidebar.x, sidebar.y + 1).?.style.bg);
 }

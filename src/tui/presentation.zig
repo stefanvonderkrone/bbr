@@ -25,6 +25,15 @@ const comment_overview = @import("comment_overview.zig");
 /// The Pane right of the Sidebar shows the DiffPane or the Comment Overview.
 pub const MainPane = frame_mod.MainPane;
 
+/// The File Tree starts with the root entry only while the Comment Overview
+/// shows.
+fn hasRootEntry(main_pane: MainPane) bool {
+    return switch (main_pane) {
+        .diff_pane => false,
+        .comment_overview => true,
+    };
+}
+
 /// The selection after a listing rebuild: the same Owner when the listing
 /// still shows it, else the next shown entry in the old order, else the last
 /// entry. A selection that never existed starts on the first entry.
@@ -2573,6 +2582,8 @@ pub const DisclosureBuild = struct {
     collapsed_directories: []const []const u8 = &.{},
     wanted_cursor: ?file_tree.Identity = null,
     tree_scroll: usize = 0,
+    /// The Main Pane at create. A job publishes only while it still shows.
+    main_pane: MainPane,
     active_file: ?usize = null,
     source_active_file: ?usize = null,
     enrichment_file: ?usize = null,
@@ -2659,6 +2670,7 @@ pub const DisclosureBuild = struct {
             .request_id = request_id,
             .frame_revision = published.visual_rows_revision,
             .active = active,
+            .main_pane = published.main_pane,
             .cache_revision = published.session.enrichment.revision,
             .cache_policy = published.session.enrichment.cache,
             .cache_focused = published.session.enrichment.focused_file,
@@ -2678,6 +2690,7 @@ pub const DisclosureBuild = struct {
         job.source_active_file = job.active_file;
         if (published.tree.entries.len > 0) {
             job.wanted_cursor = switch (published.tree.entries[published.tree.cursor].identity) {
+                .root => .root,
                 .file => |index| .{ .file = index },
                 .directory => |path| .{ .directory = try a.dupe(u8, path) },
             };
@@ -2696,6 +2709,13 @@ pub const DisclosureBuild = struct {
             if (input.query) |query| job.input_query_text = try a.dupe(u8, query.text);
         }
         return job;
+    }
+
+    /// The File Tree inputs of the job still match `published`.
+    fn treeCurrent(self: *const DisclosureBuild, published: *const Published) bool {
+        if (self.main_pane != published.main_pane or self.tree_scroll != published.tree.scroll) return false;
+        const saved = self.wanted_cursor orelse return published.tree.entries.len == 0;
+        return published.tree.entries.len > 0 and saved.eql(published.tree.entries[published.tree.cursor].identity);
     }
 
     pub fn build(self: *DisclosureBuild) void {
@@ -2896,7 +2916,9 @@ pub const DisclosureBuild = struct {
         if (self.version_restoration) |target| self.version_destination = versionNavigationDestination(self.session, self.buffer, self.visual_rows, target, self.preferences.selected_version);
         if (self.deletion_origin) |origin| self.surviving_row = survivingRowAfterDeletion(origin.deletion_rows, self.deleted_ids);
         const panes = frame_mod.paneRects(self.geometry);
-        self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics);
+        // An Overview destination publishes the DiffPane.
+        const tree_pane: MainPane = if (self.kind == .overview_destination) .diff_pane else self.main_pane;
+        self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics, hasRootEntry(tree_pane));
         self.projection = try SearchProjection.create(self.buffer, self.visual_rows, .{
             .session = self.session,
             .drafts = self.drafts,
@@ -4259,6 +4281,7 @@ const Published = struct {
             if (session.diff.files.len == 0) null else .{ .file = 0 },
             0,
             cell_metrics,
+            hasRootEntry(published.main_pane),
         );
         published.search_corpus = published.bufferSearchCorpus(preferences, published.expanded_disclosures.items, published.isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BufferBuildFailed;
         errdefer published.search_corpus.?.release();
@@ -4349,6 +4372,11 @@ const Published = struct {
                     .state = &self.overview,
                     .selected = self.overviewSelectedEntry(),
                     .query_input = self.overview_query_input != null,
+                    .filter_path = if (self.overview.file_tree_filter) |filter| switch (filter) {
+                        .root => "",
+                        .directory => |path| path,
+                        .file => |index| self.session.diff.files[index].displayPath(),
+                    } else "",
                     .cell_metrics = self.cell_metrics,
                 },
             },
@@ -4600,6 +4628,7 @@ const Published = struct {
             wanted_cursor,
             self.tree.scroll,
             self.cell_metrics,
+            hasRootEntry(self.main_pane),
         );
         var accepted_batch: ?search.Batch = null;
         var accepted_ranges: ?[]frame_mod.ProjectedSourceRange = null;
@@ -4950,8 +4979,9 @@ const Published = struct {
 
     /// Builds the index when it is stale, then the listing for `state`, and
     /// publishes both and `state` in one infallible step. A failure keeps the
-    /// previous ones.
-    fn rebuildOverview(self: *Published, authenticated_account_uuid: ?[]const u8, state: comment_overview.State) !void {
+    /// previous ones. The listing arena owns the Directory path of the File
+    /// Tree Filter, so the path lives as long as the published listing.
+    fn rebuildOverview(self: *Published, authenticated_account_uuid: ?[]const u8, borrowed: comment_overview.State) !void {
         var index = self.overview_index;
         var index_staged = false;
         errdefer if (index_staged) self.overview_indexes.abort();
@@ -4970,6 +5000,10 @@ const Published = struct {
         }
         const allocator = self.overview_listings.begin();
         errdefer self.overview_listings.abort();
+        var state = borrowed;
+        if (state.file_tree_filter) |*filter| if (filter.* == .directory) {
+            filter.* = .{ .directory = try allocator.dupe(u8, filter.directory) };
+        };
         const listing = try comment_overview.buildListing(allocator, &index, &state);
         const selected = try keptOverviewSelection(allocator, self.overview_index.records, self.overview_listing, index.records, listing, state.selected);
         if (index_staged) self.overview_indexes.commit();
@@ -5076,11 +5110,18 @@ const Published = struct {
         return self.tree.entries[self.tree.cursor];
     }
 
-    fn rebuildFileTree(self: *Published) !void {
+    /// Builds the File Tree for `main_pane` into the next tree arena. The
+    /// caller commits or aborts `trees`.
+    fn stageFileTree(self: *Published, main_pane: MainPane, wanted_cursor: ?file_tree.Identity) !file_tree.Projection {
         const a = self.trees.begin();
         errdefer self.trees.abort();
         const panes = frame_mod.paneRects(self.geometry);
-        const tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories.items, self.activeFile(), panes.sidebar_content.width, panes.sidebar_content.height, if (self.sidebarEntry()) |entry| entry.identity else null, self.tree.scroll, self.cell_metrics);
+        return file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories.items, self.activeFile(), panes.sidebar_content.width, panes.sidebar_content.height, wanted_cursor, self.tree.scroll, self.cell_metrics, hasRootEntry(main_pane));
+    }
+
+    fn rebuildFileTree(self: *Published) !void {
+        const tree = try self.stageFileTree(self.main_pane, if (self.sidebarEntry()) |entry| entry.identity else null);
+        errdefer self.trees.abort();
         const inputs = try self.disclosure_inputs.withDirectories(self.collapsed_directories.items);
         self.trees.commit();
         self.tree = tree;
@@ -5136,6 +5177,7 @@ const Published = struct {
     }
 
     fn centerActiveFile(self: *Published) void {
+        if (self.main_pane != .diff_pane) return;
         const active = self.activeFile() orelse return;
         for (self.tree.entries, 0..) |entry, index| if (entry.identity == .file and entry.identity.file == active) {
             const half = self.tree.viewport / 2;
@@ -6627,10 +6669,11 @@ pub const Presentation = struct {
                 if (index >= published.tree.entries.len) return;
                 self.focusPane(published, .sidebar);
                 published.tree.cursor = index;
-                self.applyAction(switch (published.tree.entries[index].identity) {
-                    .directory => .toggle_directory,
-                    .file => .focus_file,
-                });
+                switch (published.tree.entries[index].identity) {
+                    .root => published.frame_revision += 1,
+                    .directory => self.applyAction(.toggle_directory),
+                    .file => self.applyAction(.focus_file),
+                }
             },
             .overview_entry => |index| {
                 const published = self.published orelse return;
@@ -6948,7 +6991,11 @@ pub const Presentation = struct {
         if (published.composer != null) return .composer;
         if (published.focus == .sidebar) {
             const entry = published.sidebarEntry() orelse return .sidebar;
-            return if (entry.identity == .directory) .sidebar_directory else .sidebar_file;
+            return switch (entry.identity) {
+                .root => .sidebar,
+                .directory => .sidebar_directory,
+                .file => .sidebar_file,
+            };
         }
         switch (published.main_pane) {
             .diff_pane => {},
@@ -9042,9 +9089,7 @@ pub const Presentation = struct {
         }
 
         const active_file = if (published.session.diff.files.len == 0) null else published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex());
-        const wanted_cursor: ?file_tree.Identity = if (published.tree.entries.len == 0) null else published.tree.entries[published.tree.cursor].identity;
-        const same_cursor = if (wanted_cursor) |cursor| if (job.wanted_cursor) |saved| cursor.eql(saved) else false else job.wanted_cursor == null;
-        if (job.active_file != active_file or job.tree_scroll != published.tree.scroll or !same_cursor) {
+        if (job.active_file != active_file or !job.treeCurrent(published)) {
             self.retryStaleBufferDisclosure(published);
             return;
         }
@@ -9185,13 +9230,7 @@ pub const Presentation = struct {
             self.retryContentBuild(published, job);
             return;
         }
-        if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or job.source_active_file != published.activeFile() or job.tree_scroll != published.tree.scroll) {
-            self.retryContentBuild(published, job);
-            return;
-        }
-        const wanted_cursor: ?file_tree.Identity = if (published.tree.entries.len == 0) null else published.tree.entries[published.tree.cursor].identity;
-        const same_cursor = if (wanted_cursor) |cursor| if (job.wanted_cursor) |saved| cursor.eql(saved) else false else job.wanted_cursor == null;
-        if (!same_cursor) {
+        if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or job.source_active_file != published.activeFile() or !job.treeCurrent(published)) {
             self.retryContentBuild(published, job);
             return;
         }
@@ -9672,9 +9711,7 @@ pub const Presentation = struct {
             return;
         }
         const active_file = if (published.session.diff.files.len == 0) null else published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex());
-        const wanted_cursor: ?file_tree.Identity = if (published.tree.entries.len == 0) null else published.tree.entries[published.tree.cursor].identity;
-        const same_cursor = if (wanted_cursor) |cursor| if (job.wanted_cursor) |saved| cursor.eql(saved) else false else job.wanted_cursor == null;
-        if (job.active_file != active_file or job.tree_scroll != published.tree.scroll or !same_cursor) {
+        if (job.active_file != active_file or !job.treeCurrent(published)) {
             self.retryAcceptedDisclosure(published, job);
             return;
         }
@@ -9950,12 +9987,23 @@ pub const Presentation = struct {
         published.buffer_search.active = null;
     }
 
+    /// The File Tree cursor goes to the stored File Tree Filter, or to the
+    /// root entry. The filter then names the entry under the cursor.
     fn showCommentOverview(self: *Presentation, published: *Published) void {
         if (published.main_pane == .comment_overview) return;
-        published.rebuildOverview(self.authenticatedAccountUuid(), published.overview) catch {
+        const tree = published.stageFileTree(.comment_overview, published.overview.file_tree_filter orelse .root) catch {
             self.action_error = .out_of_memory;
             return;
         };
+        var state = published.overview;
+        state.apply(.{ .file_tree_filter = tree.entries[tree.cursor].identity });
+        published.rebuildOverview(self.authenticatedAccountUuid(), state) catch {
+            published.trees.abort();
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.trees.commit();
+        published.tree = tree;
         published.main_pane = .comment_overview;
         published.focus = .diff;
         published.frame_revision += 1;
@@ -10006,6 +10054,12 @@ pub const Presentation = struct {
 
     fn showDiffPane(self: *Presentation, published: *Published) void {
         if (published.main_pane == .diff_pane) return;
+        const tree = published.stageFileTree(.diff_pane, if (published.sidebarEntry()) |entry| entry.identity else null) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.trees.commit();
+        published.tree = tree;
         published.main_pane = .diff_pane;
         published.focus = .diff;
         published.frame_revision += 1;
@@ -10014,13 +10068,24 @@ pub const Presentation = struct {
     }
 
     /// Rebuilds a stale index after any input while the Comment Overview
-    /// shows, so every Draft change path reaches the listing.
+    /// shows, so every Draft change path reaches the listing. The File Tree
+    /// Filter follows the File Tree cursor here, so every cursor move path,
+    /// such as a key, a click, the wheel, or a collapse, sets it.
     fn refreshOverview(self: *Presentation) void {
         const published = self.published orelse return;
-        if (published.main_pane != .comment_overview or !published.overview_index_stale) return;
-        published.rebuildOverview(self.authenticatedAccountUuid(), published.overview) catch {
+        if (published.main_pane != .comment_overview) return;
+        var state = published.overview;
+        state.apply(.{ .file_tree_filter = if (published.sidebarEntry()) |entry| entry.identity else null });
+        if (!published.overview_index_stale and sameFileTreeFilter(state.file_tree_filter, published.overview.file_tree_filter)) return;
+        published.rebuildOverview(self.authenticatedAccountUuid(), state) catch {
             self.action_error = .out_of_memory;
         };
+    }
+
+    fn sameFileTreeFilter(a: ?file_tree.Identity, b: ?file_tree.Identity) bool {
+        const left = a orelse return b == null;
+        const right = b orelse return false;
+        return left.eql(right);
     }
 
     /// Without a known Authenticated Account, no Comment is mine, so the
@@ -10042,7 +10107,8 @@ pub const Presentation = struct {
         _ = self;
         if (published.focus == focus) return;
         published.focus = focus;
-        if (focus == .sidebar) published.cursorToActiveFile();
+        // While the Comment Overview shows, the cursor stays on the File Tree Filter.
+        if (focus == .sidebar and published.main_pane == .diff_pane) published.cursorToActiveFile();
         published.frame_revision += 1;
     }
 
@@ -10098,10 +10164,15 @@ pub const Presentation = struct {
     fn activateSidebarEntry(self: *Presentation, published: *Published) void {
         const entry = published.sidebarEntry() orelse return;
         switch (entry.identity) {
+            .root => self.focusPane(published, .diff),
             .directory => if (entry.expanded) self.sidebarLeft(published) else self.sidebarRight(published),
+            // A File is a File Jump only while the DiffPane shows.
             .file => |file_index| {
                 self.focusPane(published, .diff);
-                self.focusFile(published, file_index);
+                switch (published.main_pane) {
+                    .diff_pane => self.focusFile(published, file_index),
+                    .comment_overview => {},
+                }
             },
         }
     }
@@ -10127,6 +10198,7 @@ pub const Presentation = struct {
     }
 
     fn revealActiveFile(self: *Presentation, published: *Published) void {
+        if (published.main_pane != .diff_pane) return;
         const active = published.activeFile() orelse return;
         const path = published.session.diff.files[active].displayPath();
         var hidden = false;
@@ -12198,7 +12270,10 @@ pub const Presentation = struct {
                 picked.repository.name(),
                 picked.id,
             )),
+            // A File Jump always shows the DiffPane.
             .file => |index| if (self.published) |published| {
+                self.showDiffPane(published);
+                if (published.main_pane != .diff_pane) return;
                 published.focus = .diff;
                 self.focusFile(published, index);
             },
@@ -30717,4 +30792,256 @@ test "M29 overview a lost Authenticated Account keeps no Comment in mine only" {
     } });
     try testing.expect(presentation.authenticated_account_uuid == null);
     try testOverviewOwners(&presentation, &.{});
+}
+
+/// `src/a.zig`, `src/b.zig`, and `top.zig` with a Review-level Comment (1)
+/// and one Comment on each File (2, 3, and 4). The Comment Overview File
+/// Tree is "All Files", `src/`, `a.zig`, `b.zig`, and `top.zig`.
+fn testOverviewTreeSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try testDisclosureSession(backing, id);
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    s.diff = try bbr.diff.parse(a,
+        \\diff --git a/src/a.zig b/src/a.zig
+        \\--- a/src/a.zig
+        \\+++ b/src/a.zig
+        \\@@ -1 +1 @@
+        \\-old a
+        \\+new a
+        \\diff --git a/src/b.zig b/src/b.zig
+        \\--- a/src/b.zig
+        \\+++ b/src/b.zig
+        \\@@ -1 +1 @@
+        \\-old b
+        \\+new b
+        \\diff --git a/top.zig b/top.zig
+        \\--- a/top.zig
+        \\+++ b/top.zig
+        \\@@ -1 +1 @@
+        \\-old top
+        \\+new top
+        \\
+    );
+    const comments = [_]bbr.review.Comment{
+        .{ .id = 1, .author = "Ada", .body = "review", .scope = .review },
+        .{ .id = 2, .author = "Ada", .body = "a", .scope = .{ .@"inline" = .{ .path = "src/a.zig", .to = 1 } } },
+        .{ .id = 3, .author = "Bo", .body = "b", .scope = .{ .file = .{ .path = "src/b.zig", .source_commit = "source" } } },
+        .{ .id = 4, .author = "Cy", .body = "top", .scope = .{ .@"inline" = .{ .path = "top.zig", .to = 1 } } },
+    };
+    s.threads = try bbr.review.buildThreads(a, try a.dupe(bbr.review.Comment, &comments));
+    try s.initializeEnrichment();
+    return s;
+}
+
+fn testOverviewTreePresentation(store: *bbr.review.InMemoryStore) !Presentation {
+    return Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testOverviewTreeSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 16 },
+    });
+}
+
+fn expectFileTreeCursor(presentation: *Presentation, identity: file_tree.Identity) !void {
+    const tree = presentation.projection().review.?.frame.file_tree;
+    try testing.expect(tree.entries[tree.cursor].identity.eql(identity));
+}
+
+const overview_all_comments = [_]review_card.Owner{ .{ .comment = 1 }, .{ .comment = 2 }, .{ .comment = 3 }, .{ .comment = 4 } };
+
+test "M29 overview a File Tree cursor move sets the File Tree Filter, and the root entry clears it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewTreePresentation(&store);
+    defer presentation.deinit();
+    for (presentation.projection().review.?.frame.file_tree.entries) |entry| try testing.expect(entry.identity != .root);
+
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    var frame = presentation.projection().review.?.frame;
+    const root = frame.file_tree.entries[0];
+    try testing.expect(root.identity == .root);
+    try testing.expectEqualStrings("All Files", root.label);
+    try testing.expectEqual(@as(usize, 3), root.comments);
+    try testing.expectEqualStrings("●3", root.tally);
+    try testing.expectEqual(@as(usize, 5), frame.file_tree.entries.len);
+    try expectFileTreeCursor(&presentation, .root);
+    try testOverviewOwners(&presentation, &overview_all_comments);
+    try testing.expectEqualStrings("", frame.overview.filter_path);
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try testing.expectEqual(keymap_mod.InteractionContext.sidebar, presentation.interactionContext());
+    try presentation.dispatch(.{ .action = .down });
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 2 }, .{ .comment = 3 } });
+    try testing.expectEqualStrings("src", presentation.projection().review.?.frame.overview.filter_path);
+    try presentation.dispatch(.{ .action = .down });
+    try testOverviewOwners(&presentation, &.{.{ .comment = 2 }});
+    try testing.expectEqualStrings("src/a.zig", presentation.projection().review.?.frame.overview.filter_path);
+    try presentation.dispatch(.{ .action = .down });
+    try testOverviewOwners(&presentation, &.{.{ .comment = 3 }});
+    try presentation.dispatch(.{ .action = .down });
+    try testOverviewOwners(&presentation, &.{.{ .comment = 4 }});
+
+    try presentation.dispatch(.{ .action = .up });
+    try presentation.dispatch(.{ .action = .left });
+    try expectFileTreeCursor(&presentation, .{ .directory = "src" });
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 2 }, .{ .comment = 3 } });
+    try presentation.dispatch(.{ .action = .left });
+    frame = presentation.projection().review.?.frame;
+    try testing.expect(!frame.file_tree.entries[1].expanded);
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 2 }, .{ .comment = 3 } });
+
+    try presentation.dispatch(.{ .action = .up });
+    try expectFileTreeCursor(&presentation, .root);
+    try testOverviewOwners(&presentation, &overview_all_comments);
+    try testing.expect(presentation.published.?.overview.file_tree_filter == null);
+}
+
+test "M29 overview the File Tree cursor stays on the File Tree Filter" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewTreePresentation(&store);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .next_file });
+    try testing.expectEqual(@as(?usize, 0), presentation.published.?.activeFile());
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    for (0..3) |_| try presentation.dispatch(.{ .action = .down });
+    try expectFileTreeCursor(&presentation, .{ .file = 1 });
+
+    for (0..2) |_| try presentation.dispatch(.{ .key = .{ .codepoint = vaxis_tab } });
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try expectFileTreeCursor(&presentation, .{ .file = 1 });
+    try testOverviewOwners(&presentation, &.{.{ .comment = 3 }});
+
+    try presentation.dispatch(.{ .resize = .{ .cols = 90, .rows = 16 } });
+    try completeDisclosureBuild(&presentation);
+    const frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(u16, 90), frame.geometry.cols);
+    try testing.expectEqual(MainPane.comment_overview, frame.main_pane);
+    try testing.expect(frame.file_tree.entries[0].identity == .root);
+    try expectFileTreeCursor(&presentation, .{ .file = 1 });
+    try testOverviewOwners(&presentation, &.{.{ .comment = 3 }});
+
+    // A view build that starts in the DiffPane and ends in the Comment
+    // Overview with the same File Tree cursor rebuilds with the root entry.
+    try presentation.dispatch(.{ .action = .up });
+    try presentation.dispatch(.{ .action = .show_diff_pane });
+    try expectFileTreeCursor(&presentation, .{ .file = 0 });
+    try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 16 } });
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try expectFileTreeCursor(&presentation, .{ .file = 0 });
+    while (presentation.commands.items.len > 0) try completeDisclosureBuild(&presentation);
+    try testing.expectEqual(@as(u16, 100), presentation.projection().review.?.frame.geometry.cols);
+    try testing.expect(presentation.projection().review.?.frame.file_tree.entries[0].identity == .root);
+    try expectFileTreeCursor(&presentation, .{ .file = 0 });
+}
+
+test "M29 overview g d hides the root entry and follows the active File, and g o restores the File Tree Filter" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewTreePresentation(&store);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .next_file });
+    const active = presentation.published.?.activeFile().?;
+    try testing.expect(active != 2);
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    for (0..4) |_| try presentation.dispatch(.{ .action = .down });
+    try expectFileTreeCursor(&presentation, .{ .file = 2 });
+
+    try presentation.dispatch(.{ .action = .show_diff_pane });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 4), frame.file_tree.entries.len);
+    for (frame.file_tree.entries) |entry| try testing.expect(entry.identity != .root);
+    try expectFileTreeCursor(&presentation, .{ .file = active });
+
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try expectFileTreeCursor(&presentation, .{ .file = 2 });
+    try testOverviewOwners(&presentation, &.{.{ .comment = 4 }});
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    for (0..3) |_| try presentation.dispatch(.{ .action = .up });
+    try expectFileTreeCursor(&presentation, .{ .directory = "src" });
+    try presentation.dispatch(.{ .action = .show_diff_pane });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .left });
+    try presentation.dispatch(.{ .action = .right });
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    frame = presentation.projection().review.?.frame;
+    try expectFileTreeCursor(&presentation, .{ .directory = "src" });
+    try testing.expectEqualStrings("src", frame.overview.filter_path);
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 2 }, .{ .comment = 3 } });
+}
+
+test "M29 overview Enter on a File Tree File while the Comment Overview shows moves focus to the Comment Overview" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewTreePresentation(&store);
+    defer presentation.deinit();
+    const navigation = presentation.projection().review.?.frame.navigation;
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    for (0..4) |_| try presentation.dispatch(.{ .action = .down });
+    try testing.expectEqual(keymap_mod.InteractionContext.sidebar_file, presentation.interactionContext());
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try testing.expectEqual(MainPane.comment_overview, frame.main_pane);
+    try testing.expectEqual(keymap_mod.InteractionContext.comment_overview, presentation.interactionContext());
+    try testing.expectEqual(navigation, frame.navigation);
+    try testing.expect(presentation.takeCommand() == null);
+    try expectFileTreeCursor(&presentation, .{ .file = 2 });
+    try testOverviewOwners(&presentation, &.{.{ .comment = 4 }});
+
+    const content = frame.panes.sidebar_content;
+    for ([_]struct { entry: usize, owners: []const review_card.Owner, focus: frame_mod.PaneFocus }{
+        .{ .entry = 3, .owners = &.{.{ .comment = 3 }}, .focus = .diff },
+        .{ .entry = 0, .owners = &overview_all_comments, .focus = .sidebar },
+    }) |case| {
+        const row = content.y + @as(u16, @intCast(case.entry));
+        try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = row, .button = .left, .type = .press } });
+        try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = row, .button = .left, .type = .release } });
+        frame = presentation.projection().review.?.frame;
+        try testing.expectEqual(case.focus, frame.focus);
+        try testing.expectEqual(case.entry, frame.file_tree.cursor);
+        try testing.expectEqual(MainPane.comment_overview, frame.main_pane);
+        try testOverviewOwners(&presentation, case.owners);
+    }
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .action = .show_diff_pane });
+    try testing.expectEqual(navigation, presentation.projection().review.?.frame.navigation);
+}
+
+test "M29 overview a File Jump shows the DiffPane" {
+    for ([_]bool{ false, true }) |issued| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try testOverviewJumpPresentation(&store, 1);
+        defer presentation.deinit();
+        try openOverviewOwner(&presentation, .{ .comment = 9 });
+        const job = if (issued) try takeOverviewDestination(&presentation) else null;
+
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'F', .text = "F" } });
+        try testing.expect(testListOverlay(&presentation, .file_finder) != null);
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'a', .text = "a" } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        var frame = presentation.projection().review.?.frame;
+        try testing.expectEqual(MainPane.diff_pane, frame.main_pane);
+        try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+        for (frame.file_tree.entries) |entry| try testing.expect(entry.identity != .root);
+        try expectFileHeaderOnTop(frame, 0);
+
+        if (job) |worker| {
+            worker.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+        } else while (presentation.takeCommand()) |command| {
+            var stale = command;
+            if (stale == .build_buffer_disclosure) {
+                stale.build_buffer_disclosure.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = stale.build_buffer_disclosure });
+            } else stale.deinit();
+        }
+        frame = presentation.projection().review.?.frame;
+        try testing.expectEqual(MainPane.diff_pane, frame.main_pane);
+        try expectFileHeaderOnTop(frame, 0);
+        try testing.expect(presentation.projection().action_error == null);
+    }
 }

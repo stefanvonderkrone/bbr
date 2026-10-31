@@ -114,6 +114,7 @@ pub fn fileTree(allocator: std.mem.Allocator, context: *const FileTreeContext) !
         null,
         0,
         .bytes,
+        false,
     );
 }
 

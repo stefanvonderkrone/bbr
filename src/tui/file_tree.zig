@@ -6,17 +6,23 @@ const buffer_mod = @import("buffer.zig");
 const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 
 pub const Identity = union(enum) {
+    /// The "All Files" entry that leads the File Tree while the Comment
+    /// Overview shows.
+    root,
     directory: []const u8,
     file: usize,
 
     pub fn eql(a: Identity, b: Identity) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
+            .root => true,
             .directory => |path| std.mem.eql(u8, path, b.directory),
             .file => |index| index == b.file,
         };
     }
 };
+
+pub const root_label = "All Files";
 
 pub const Entry = struct {
     identity: Identity,
@@ -59,10 +65,30 @@ pub fn build(
     wanted_cursor: ?Identity,
     wanted_scroll: usize,
     metrics: CellMetrics,
+    root_entry: bool,
 ) !Projection {
     const nodes = try sortedNodes(allocator, diff);
 
     var entries: std.ArrayList(Entry) = .empty;
+    if (root_entry) {
+        var comments: usize = 0;
+        var drafts: usize = 0;
+        for (tallies) |file_tally| {
+            comments += file_tally.comments;
+            drafts += file_tally.drafts;
+        }
+        const tally = try makeTally(allocator, comments, drafts);
+        try entries.append(allocator, .{
+            .identity = .root,
+            .parent = null,
+            .depth = 0,
+            .label = try truncate(allocator, root_label, content_width -| 3 -| metrics.width(tally), metrics),
+            .comments = comments,
+            .drafts = drafts,
+            .tally = tally,
+            .tally_width = metrics.width(tally),
+        });
+    }
     for (nodes.items[0].children.items) |child| try emit(allocator, &nodes, child, null, 0, diff, tallies, collapsed, active_file, content_width, metrics, &entries);
 
     var cursor: usize = 0;
@@ -189,7 +215,7 @@ fn emit(
     const expanded = !containsPath(collapsed, end.path);
     const parent_path = if (parent_identity) |parent| switch (parent) {
         .directory => |path| path,
-        .file => "",
+        .root, .file => "",
     } else "";
     const relative = if (parent_path.len == 0) end.path else end.path[@min(end.path.len, parent_path.len + 1)..];
     const prefix = @min(depth * 2 + 2, content_width);
@@ -260,7 +286,7 @@ test "empty File Tree is a valid stable projection" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const empty_diff: bbr.diff.Diff = .{ .files = &.{} };
-    const tree = try build(arena.allocator(), empty_diff, &.{}, &.{}, null, 0, 0, null, 0, .bytes);
+    const tree = try build(arena.allocator(), empty_diff, &.{}, &.{}, null, 0, 0, null, 0, .bytes, false);
     try testing.expectEqual(@as(usize, 0), tree.entries.len);
     try testing.expectEqual(@as(usize, 0), tree.cursor);
     try testing.expectEqual(@as(usize, 0), tree.scroll);
@@ -271,7 +297,7 @@ test "compacted File Tree is deterministic and keeps stable identities" {
     defer arena.deinit();
     const diff = try bbr.diff.parse(arena.allocator(), "diff --git a/docs/adr/a.md b/docs/adr/a.md\n--- a/docs/adr/a.md\n+++ b/docs/adr/a.md\n@@ -1 +1 @@\n-a\n+b\n" ++
         "diff --git a/src/z.zig b/src/z.zig\n--- a/src/z.zig\n+++ b/src/z.zig\n@@ -1 +1 @@\n-a\n+b\n");
-    const tree = try build(arena.allocator(), diff, &.{ .{}, .{} }, &.{}, 0, 28, 8, .{ .file = 0 }, 0, .bytes);
+    const tree = try build(arena.allocator(), diff, &.{ .{}, .{} }, &.{}, 0, 28, 8, .{ .file = 0 }, 0, .bytes, false);
     try testing.expectEqual(@as(usize, 4), tree.entries.len);
     try testing.expectEqualStrings("docs/adr/", tree.entries[0].label);
     try testing.expect(tree.entries[0].identity.eql(.{ .directory = "docs/adr" }));
@@ -293,7 +319,7 @@ test "File Tree truncation respects injected grapheme boundaries and fixed talli
     const metrics_vtable: CellMetrics.VTable = .{ .next = Metrics.next };
     const metrics_context: u8 = 0;
     const metrics: CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
-    const tree = try build(a, diff, &.{.{ .comments = 1 }}, &.{}, 0, 12, 4, .{ .file = 0 }, 0, metrics);
+    const tree = try build(a, diff, &.{.{ .comments = 1 }}, &.{}, 0, 12, 4, .{ .file = 0 }, 0, metrics, false);
     try testing.expectEqualStrings("●1", tree.entries[0].tally);
     try testing.expect(std.mem.endsWith(u8, tree.entries[0].label, "…"));
     try testing.expect(std.unicode.utf8ValidateSlice(tree.entries[0].label));
@@ -308,11 +334,42 @@ test "M29 overview fileOrder follows the File Tree entries" {
         "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n" ++
         "diff --git a/a/b.txt b/a/b.txt\n--- a/a/b.txt\n+++ b/a/b.txt\n@@ -1 +1 @@\n-a\n+b\n" ++
         "diff --git a/src/z/y.zig b/src/z/y.zig\n--- a/src/z/y.zig\n+++ b/src/z/y.zig\n@@ -1 +1 @@\n-a\n+b\n");
-    const tree = try build(a, diff, &.{ .{}, .{}, .{}, .{} }, &.{}, null, 40, 10, null, 0, .bytes);
+    const tree = try build(a, diff, &.{ .{}, .{}, .{}, .{} }, &.{}, null, 40, 10, null, 0, .bytes, false);
     var expected: std.ArrayList(usize) = .empty;
     for (tree.entries) |entry| if (entry.identity == .file) try expected.append(a, entry.identity.file);
     const order = try fileOrder(testing.allocator, diff);
     defer testing.allocator.free(order);
     try testing.expectEqualSlices(usize, &.{ 2, 1, 0, 3 }, expected.items);
     try testing.expectEqualSlices(usize, expected.items, order);
+}
+
+test "M29 overview the root entry leads the File Tree, sums every File tally, and keeps every other depth" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a, "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-a\n+b\n" ++
+        "diff --git a/src/z/y.zig b/src/z/y.zig\n--- a/src/z/y.zig\n+++ b/src/z/y.zig\n@@ -1 +1 @@\n-a\n+b\n" ++
+        "diff --git a/src/z/x.zig b/src/z/x.zig\n--- a/src/z/x.zig\n+++ b/src/z/x.zig\n@@ -1 +1 @@\n-a\n+b\n");
+    const tallies = [_]buffer_mod.FileTally{ .{ .comments = 2 }, .{ .comments = 1, .drafts = 3 }, .{} };
+    const plain = try build(a, diff, &tallies, &.{}, null, 40, 10, .{ .file = 2 }, 0, .bytes, false);
+    const rooted = try build(a, diff, &tallies, &.{}, null, 40, 10, .{ .file = 2 }, 0, .bytes, true);
+
+    for (plain.entries) |entry| try testing.expect(entry.identity != .root);
+    try testing.expectEqual(plain.entries.len + 1, rooted.entries.len);
+    const root = rooted.entries[0];
+    try testing.expect(root.identity == .root);
+    try testing.expectEqual(@as(usize, 0), root.depth);
+    try testing.expectEqual(@as(?Identity, null), root.parent);
+    try testing.expectEqualStrings("All Files", root.label);
+    try testing.expectEqual(@as(usize, 3), root.comments);
+    try testing.expectEqual(@as(usize, 3), root.drafts);
+    try testing.expectEqualStrings("●3 ✎3", root.tally);
+    for (plain.entries, rooted.entries[1..]) |expected, actual| {
+        try testing.expect(expected.identity.eql(actual.identity));
+        try testing.expectEqual(expected.depth, actual.depth);
+        try testing.expectEqualStrings(expected.label, actual.label);
+    }
+    try testing.expect(rooted.entries[rooted.cursor].identity.eql(.{ .file = 2 }));
+    const at_root = try build(a, diff, &tallies, &.{}, null, 40, 10, .root, 0, .bytes, true);
+    try testing.expectEqual(@as(usize, 0), at_root.cursor);
 }

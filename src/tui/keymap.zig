@@ -410,6 +410,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .open_command_palette,
             .open_theme_overlay,
             .open_pull_request_picker,
+            .open_file_finder,
             .refresh,
             .review_comment,
             .set_verdict_approved,
@@ -902,7 +903,7 @@ test "M29 overview g o and g d resolve in every Pane context and remain configur
     }
     var overview: Resolver = .{};
     try testing.expectEqual(Action.down, overview.feed(.default, .comment_overview, plain('j')).action);
-    try testing.expect(overview.feed(.default, .comment_overview, plain('F')) == .none);
+    try testing.expectEqual(Action.open_file_finder, overview.feed(.default, .comment_overview, plain('F')).action);
     try testing.expect(overview.feed(.default, .comment_overview, plain('g')) == .none);
     try testing.expect(overview.feed(.default, .comment_overview, plain('f')) == .none);
     try testing.expectEqualStrings("show Comment Overview", helpFor(.show_comment_overview));

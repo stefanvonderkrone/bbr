@@ -56,6 +56,10 @@ pub const State = struct {
                 .newest_first => .review,
             },
             .query => |text| self.setQuery(text),
+            .file_tree_filter => |identity| self.file_tree_filter = if (identity) |value| switch (value) {
+                .root => null,
+                .directory, .file => value,
+            } else null,
         }
     }
 };
@@ -68,6 +72,10 @@ pub const Change = union(enum) {
     order,
     /// The whole new query text. It can alias the current query.
     query: []const u8,
+    /// The File Tree entry under the cursor. The root entry clears the
+    /// filter. A Directory path can borrow from the File Tree, because
+    /// `Published.rebuildOverview` copies it into the listing arena.
+    file_tree_filter: ?file_tree.Identity,
 };
 
 /// The open query input. Escape restores the saved query.
@@ -106,6 +114,9 @@ pub const Record = struct {
     author: []const u8,
     /// The projected scope of the Thread root.
     scope: bbr.review.CommentScope,
+    /// The first File whose paths `scope` matches, as in the File tallies.
+    /// Null for a Review-level item and a path outside the Diff.
+    file: ?usize,
     /// Null for `unavailable`.
     scope_state: ?bbr.review.ScopeState,
     resolved: bool,
@@ -149,6 +160,8 @@ pub const Frame = struct {
     /// The listing entry of `state.selected`.
     selected: ?usize = null,
     query_input: bool = false,
+    /// The path of the File Tree Filter, or empty without one.
+    filter_path: []const u8 = "",
     cell_metrics: CellMetrics = .bytes,
 };
 
@@ -193,6 +206,9 @@ pub fn buildIndex(allocator: std.mem.Allocator, inputs: IndexInputs) !Index {
         tree.newest = 0;
         for (nodes[tree.start..tree.end]) |node| tree.newest = @max(tree.newest, recency(node.owner));
         const scope = try copyScope(allocator, root.scope);
+        const file: ?usize = for (inputs.diff.files, 0..) |diff_file, file_index| {
+            if (buffer_mod.scopeMatchesFile(root.scope, diff_file)) break file_index;
+        } else null;
         const scope_state: ?bbr.review.ScopeState, const resolved = switch (root.source) {
             .comment => |comment| .{ comment.state, threads_by_root.get(comment.id).?.resolved },
             .draft => |draft| .{ switch (buffer_mod.draftResolution(draft, options)) {
@@ -211,6 +227,7 @@ pub fn buildIndex(allocator: std.mem.Allocator, inputs: IndexInputs) !Index {
                 .role = node.role,
                 .author = author,
                 .scope = scope,
+                .file = file,
                 .scope_state = scope_state,
                 .resolved = resolved,
                 .mine = switch (node.source) {
@@ -301,6 +318,14 @@ fn keeps(record: Record, state: *const State, query: ?list_overlay.Query) bool {
     if (state.unresolved_only and record.resolved) return false;
     if (state.drafts_only and record.owner != .draft) return false;
     if (state.mine_only and !record.mine) return false;
+    if (state.file_tree_filter) |filter| switch (filter) {
+        .root => {},
+        .file => |file_index| if (record.file != file_index) return false,
+        .directory => |path| {
+            const scope_path = scopePath(record.scope);
+            if (record.scope == .review or !(scope_path.len > path.len and std.mem.startsWith(u8, scope_path, path) and scope_path[path.len] == '/')) return false;
+        },
+    };
     if (query) |value| if (value.rank(record.haystack) == null) return false;
     return true;
 }
@@ -894,4 +919,20 @@ test "M29 overview newest first puts Draft Threads first, sorts Comment Threads 
         .{ .owner = .{ .comment = 20 }, .context = true }, .{ .owner = .{ .comment = 21 } },
         .{ .owner = .{ .comment = 22 } },
     }, index, replies);
+}
+
+test "M29 overview the File Tree Filter keeps the items of its File or of every File under its Directory" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const index = try (Fixture{ .comments = &filter_comments, .drafts = &filter_drafts }).index(arena.allocator());
+    const nested = [_]Listed{ .{ .owner = .{ .comment = 4 } }, .{ .owner = .{ .draft = 2 } } };
+    try expectListing(&.{ .{ .owner = .{ .comment = 2 } }, .{ .owner = .{ .comment = 3 } } }, index, .{ .file_tree_filter = .{ .file = 0 } });
+    try expectListing(&nested, index, .{ .file_tree_filter = .{ .file = 1 } });
+    try expectListing(&nested, index, .{ .file_tree_filter = .{ .directory = "a" } });
+    try expectListing(&.{}, index, .{ .file_tree_filter = .{ .directory = "a/b" } });
+
+    var state: State = .{ .file_tree_filter = .{ .file = 0 } };
+    state.apply(.{ .file_tree_filter = .root });
+    try testing.expectEqual(@as(?file_tree.Identity, null), state.file_tree_filter);
+    try expectListing(&.{ .{ .owner = .{ .comment = 1 } }, .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 } }, .{ .owner = .{ .draft = 2 } }, .{ .owner = .{ .comment = 2 } }, .{ .owner = .{ .comment = 3 } } }, index, state);
 }
