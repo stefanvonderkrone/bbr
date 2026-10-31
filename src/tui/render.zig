@@ -2323,7 +2323,7 @@ pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km:
     const mouse = childRect(win, rects.get(.mouse).content);
     if (mouse.height == 3) {
         _ = mouse.printSegment(.{ .text = " Mouse", .style = theme.picker_query }, .{ .wrap = .none });
-        _ = mouse.printSegment(.{ .text = " click focus/select/toggle · wheel scroll", .style = theme.picker }, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
+        _ = mouse.printSegment(.{ .text = " click focus/select/toggle · wheel scroll · drag scroll bar", .style = theme.picker }, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
         _ = mouse.printSegment(.{ .text = " Shift/Option: native selection · [input.mouse] enabled=false", .style = theme.gutter }, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
     }
     _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .wrap = .none });
@@ -5473,29 +5473,46 @@ test "edit stays discoverable in the help Overlay when it is refused" {
     try testing.expect(helpRowAvailable(editable.commands, "edit local Draft").?);
 }
 
+test "M30 scrollbar the help Overlay mouse line names the scroll bar drag" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true });
+    const rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
+    const rects = @import("view.zig").solve(layouts.HelpSlot, layouts.help, @max(rows.motions.len, rows.commands.len), .{ .width = 80, .height = 24 });
+    const mouse = rects.get(.mouse).content;
+    var line: std.ArrayList(u8) = .empty;
+    for (mouse.x..mouse.x + mouse.width) |col| try line.appendSlice(a, win.readCell(@intCast(col), mouse.y + 1).?.char.grapheme);
+    try testing.expect(std.mem.indexOf(u8, line.items, "click focus/select/toggle · wheel scroll · drag scroll bar") != null);
+}
+
 fn helpRowAvailable(rows: []const HelpRow, help: []const u8) ?bool {
     for (rows) |row| if (std.mem.indexOf(u8, row.text, help) != null) return row.available;
     return null;
 }
 
-/// A Session of one File with `lines` added Lines.
-fn testScrollSession(lines: usize) !*@import("session.zig").Session {
+/// A Session of `files` Files with `lines` added Lines each.
+fn testScrollSession(files: usize, lines: usize) !*@import("session.zig").Session {
     const session = try @import("session.zig").create(testing.allocator);
     errdefer session.destroy();
     const a = session.arena.allocator();
     session.source = .{ .remote = .{ .id = 1, .title = "Scroll", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
     session.header = .{ .title = "Scroll", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
     var raw: std.ArrayList(u8) = .empty;
-    try raw.print(a, "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -0,0 +1,{d} @@\n", .{lines});
-    for (0..lines) |index| try raw.print(a, "+line {d}\n", .{index});
+    for (0..files) |file| {
+        try raw.print(a, "diff --git a/f{d}.zig b/f{d}.zig\n--- a/f{d}.zig\n+++ b/f{d}.zig\n@@ -0,0 +1,{d} @@\n", .{ file, file, file, file, lines });
+        for (0..lines) |index| try raw.print(a, "+line {d}\n", .{index});
+    }
     session.diff = try bbr.diff.parse(a, raw.items);
     try session.initializeEnrichment();
     return session;
 }
 
-fn testScrollPresentation(store: *bbr.review.InMemoryStore, lines: usize, geometry: frame_mod.Geometry) !presentation.Presentation {
+fn testScrollPresentation(store: *bbr.review.InMemoryStore, files: usize, lines: usize, geometry: frame_mod.Geometry) !presentation.Presentation {
     return presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .cell_metrics = terminal_cell_metrics }, .{
-        .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollSession(lines) },
+        .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollSession(files, lines) },
         .geometry = geometry,
     });
 }
@@ -5514,10 +5531,48 @@ fn expectPaneThumbs(win: vaxis.Window, frame: frame_mod.Projection) !void {
     }
 }
 
+test "M30 scrollbar every scroll bar hit target matches the painted thumb" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]frame_mod.Geometry{ .{ .cols = 80, .rows = 12 }, .{ .cols = 60, .rows = 7 }, .{ .cols = 100, .rows = 30 }, .{ .cols = 140, .rows = 45 } }) |geometry| {
+        var state = try testScrollPresentation(&store, 60, 2, geometry);
+        defer state.deinit();
+        var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+        const win = headlessWindow(&screen);
+        const review = state.projection().review.?;
+        const panes = review.frame.panes;
+        const diff_bottom = review.frame.visual_rows.len - panes.diff_track.height;
+        const tree_bottom = review.frame.file_tree.entries.len - panes.sidebar_track.height;
+        for ([_][2]usize{ .{ 0, 1 }, .{ 1, 3 }, .{ 1, 2 }, .{ 2, 3 }, .{ 1, 1 } }) |fraction| {
+            var shifted = review;
+            shifted.frame.navigation.scroll = diff_bottom * fraction[0] / fraction[1];
+            shifted.frame.navigation.cursor = shifted.frame.navigation.scroll;
+            shifted.frame.file_tree.scroll = tree_bottom * fraction[0] / fraction[1];
+            shifted.frame.file_tree.cursor = shifted.frame.file_tree.scroll;
+            drawReview(arena.allocator(), win, shifted, theme_dark, 0);
+            for ([_]frame_mod.ScrollBar{ .sidebar, .diff_pane }) |bar| {
+                const target = frame_mod.scrollTarget(shifted.frame, bar).?;
+                const thumb = target.thumb().?;
+                if (fraction[0] == 0) try testing.expectEqual(@as(u16, 0), thumb.first);
+                if (fraction[0] == fraction[1]) try testing.expectEqual(target.track.height, thumb.first + thumb.len);
+                for (0..target.track.height) |index| {
+                    const cell: u16 = @intCast(index);
+                    const row = target.track.y + cell;
+                    try testing.expectEqual(frame_mod.HitTarget{ .scroll_bar = .{ .bar = bar, .cell = cell } }, frame_mod.hitTest(shifted.frame, target.track.x, row).?);
+                    const painted = std.mem.eql(u8, win.readCell(target.track.x, row).?.char.grapheme, "┃");
+                    try testing.expectEqual(cell >= thumb.first and cell < thumb.first + thumb.len, painted);
+                }
+            }
+        }
+    }
+}
+
 test "M30 scrollbar a Pane whose rows fit paints no thumb and keeps its border" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var state = try testScrollPresentation(&store, 3, .{ .cols = 100, .rows = 30 });
+    var state = try testScrollPresentation(&store, 1, 3, .{ .cols = 100, .rows = 30 });
     defer state.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5535,7 +5590,7 @@ test "M30 scrollbar a Pane whose rows fit paints no thumb and keeps its border" 
 test "M30 scrollbar the DiffPane thumb paints at the top, the middle, the bottom, and past the bottom" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var state = try testScrollPresentation(&store, 80, .{ .cols = 80, .rows = 12 });
+    var state = try testScrollPresentation(&store, 1, 80, .{ .cols = 80, .rows = 12 });
     defer state.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5566,7 +5621,7 @@ test "M30 scrollbar a track of no cells paints nothing and a track of one cell p
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     for ([_]u16{ 2, 3 }) |rows| {
-        var state = try testScrollPresentation(&store, 40, .{ .cols = 80, .rows = rows });
+        var state = try testScrollPresentation(&store, 1, 40, .{ .cols = 80, .rows = rows });
         defer state.deinit();
         var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = rows, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
         const win = headlessWindow(&screen);

@@ -594,11 +594,16 @@ fn portableKey(key: vaxis.Key) keymap.KeyStroke {
     };
 }
 
+/// A drag or release above or left of the window clamps to 0, so a Scroll
+/// Drag reaches the first row and a release outside the window ends it.
 fn portableMouse(mouse: vaxis.Mouse, io: std.Io) ?presentation.MouseInput {
-    if (mouse.col < 0 or mouse.row < 0) return null;
+    if (mouse.col < 0 or mouse.row < 0) switch (mouse.type) {
+        .press, .motion => return null,
+        .drag, .release => {},
+    };
     return .{
-        .col = @intCast(mouse.col),
-        .row = @intCast(mouse.row),
+        .col = @intCast(@max(mouse.col, 0)),
+        .row = @intCast(@max(mouse.row, 0)),
         .time_ns = std.Io.Clock.awake.now(io).nanoseconds,
         .button = switch (mouse.button) {
             .left => .left,
@@ -1757,4 +1762,23 @@ fn expectTracksMatchViewports(frame: @import("frame.zig").Projection) !void {
     try std.testing.expectEqual(frame.panes.diff_content.height, diff.track.height);
     const sidebar = frame_mod.scrollState(frame, .sidebar).?;
     try std.testing.expectEqual(@as(usize, sidebar.track.height), frame.file_tree.viewport);
+}
+
+test "M30 scrollbar portableMouse clamps a negative drag or release coordinate and drops a negative press" {
+    const io = std.testing.io;
+    for ([_]vaxis.Mouse.Type{ .drag, .release }) |kind| {
+        const mouse = portableMouse(.{ .col = -3, .row = -1, .button = .left, .mods = .{}, .type = kind }, io).?;
+        try std.testing.expectEqual(@as(u16, 0), mouse.col);
+        try std.testing.expectEqual(@as(u16, 0), mouse.row);
+        const below = portableMouse(.{ .col = 7, .row = -2, .button = .left, .mods = .{}, .type = kind }, io).?;
+        try std.testing.expectEqual(@as(u16, 7), below.col);
+        try std.testing.expectEqual(@as(u16, 0), below.row);
+    }
+    for ([_]vaxis.Mouse.Type{ .press, .motion }) |kind| {
+        try std.testing.expect(portableMouse(.{ .col = -1, .row = 4, .button = .left, .mods = .{}, .type = kind }, io) == null);
+        try std.testing.expect(portableMouse(.{ .col = 4, .row = -1, .button = .left, .mods = .{}, .type = kind }, io) == null);
+    }
+    const inside = portableMouse(.{ .col = 5, .row = 6, .button = .left, .mods = .{}, .type = .press }, io).?;
+    try std.testing.expectEqual(@as(u16, 5), inside.col);
+    try std.testing.expectEqual(@as(u16, 6), inside.row);
 }
