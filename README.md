@@ -303,6 +303,18 @@ to restore ordinary terminal mouse handling, or configure `vertical_scroll_rows`
 count. Terminals commonly use Shift or Option as a terminal-dependent bypass for native selection
 while mouse reporting is enabled.
 
+The File Tree, the DiffPane, and the Review Search Results list show a scroll bar when their rows
+do not fit. A left press in a scroll bar track off the thumb jumps to that position. A press in the
+track also starts a Scroll Drag. While you hold the button, the thumb follows the pointer row, also
+outside the track. A drag past a track end stops at the first or the last row. The release, any
+other mouse event, and any key end the Scroll Drag. The wheel over a track does nothing. Use the
+wheel over the Pane or list content.
+
+The DiffPane scroll bar shows Scroll Marks. A Scroll Mark shows where an item sits in the Buffer:
+`◆` a Buffer Search hit, `✎` a Draft, `●` an unresolved Thread, `✓` a resolved Thread in a dim
+style, and `━` a File header. A track cell shows only its highest priority Scroll Mark, in that
+order. A Scroll Mark on the thumb keeps its glyph in the thumb style.
+
 Syntax highlighting is loaded lazily for the focused File. `max_file_bytes` limits each old/new
 file side independently; the 2 MiB default avoids expensive parsing of generated or minified
 files. Set it to `0` for no limit. Files above the limit remain readable as plain text.

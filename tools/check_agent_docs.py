@@ -14,6 +14,8 @@ TYPES = {"research", "prototype", "grilling", "task", "implementation"}
 FIELD = re.compile(r"^(?:\*\*)?([\w ]+):(?:\*\*)?\s*(.*?)\s*$")
 LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 REFERENCE = re.compile(r"^\s{0,3}\[(?!\^)[^\]\n]+\]:\s*(<[^>]+>|\S+)")
+QUOTED = re.compile(r'"([^"\n]+)"')
+ZIG_FILE = re.compile(r"in `([^`\n]+\.zig)`")
 
 
 def prose(text):
@@ -84,6 +86,25 @@ def check(root):
                     destination = path.parent / unquote(url.path)
                     if not destination.exists():
                         error(path, f"line {number}: broken link {target}")
+
+    agents = root / "AGENTS.md"
+    if agents.is_file():
+        for number, line in enumerate(agents.read_text().splitlines(), 1):
+            if not line.startswith("| "):
+                continue
+            enforcement = line.rstrip().rstrip("|").rsplit(" | ", 1)[-1]
+            for match in QUOTED.finditer(enforcement):
+                name = match[1]
+                file = ZIG_FILE.search(enforcement, match.end()) or (
+                    list(ZIG_FILE.finditer(enforcement, 0, match.start())) or [None])[-1]
+                if file is None:
+                    error(agents, f'line {number}: test "{name}" names no file. Add "in `<file>.zig`" to its Enforcement cell')
+                    continue
+                source = root / file[1]
+                if not source.is_file():
+                    error(agents, f'line {number}: test "{name}" names the missing file {file[1]}')
+                elif f'test "{name}"' not in source.read_text():
+                    error(agents, f'line {number}: {file[1]} has no test "{name}"; cite the exact test name')
 
     tickets = {}
     groups = {}

@@ -34,8 +34,16 @@ A View lays out each Pane, but a Pane is the role, not the View.
 _Avoid_: window (reserved for vaxis's surface), view, panel.
 
 **View**:
-One rectangular node of a layout tree. It has margin, an optional border, padding, and content, in that order from the outside. Its border always has rounded corners and can have a Title. Its scroll bar sits in its padding, border, or margin ring and never moves its content. One Composition places its child Views in its content. A View paints only decoration. A content painter fills its content.
+One rectangular node of a layout tree. It has margin, an optional border, padding, and content, in that order from the outside. Its border always has rounded corners and can have a Title. Its scroll bar sits in its padding, border, or margin ring and never moves its content. Its scroll bar shows a thumb over its track and takes a press and a Scroll Drag. One Composition places its child Views in its content. A View paints only decoration. A content painter fills its content.
 _Avoid_: widget, component, box, container.
+
+**Scroll Mark**:
+A sign in one cell of the DiffPane scroll bar track. It shows where one item sits in the Buffer. The item is a Buffer Search hit, a Draft, an unresolved Thread, a resolved Thread, or a File header. A cell shows only its highest priority Scroll Mark. A Scroll Mark on a thumb cell keeps its glyph in the thumb style.
+_Avoid_: marker, tick, annotation, overview ruler.
+
+**Scroll Drag**:
+The mouse interaction from a press on a scroll bar track to the release of that button. While it lasts, the pointer row sets the thumb position, also outside the track.
+_Avoid_: thumb drag, drag scroll, scrubbing.
 
 **Composition**:
 The rule by which a View places its child Views: flow, cluster, repel, sidebar, switcher, grid, reel, or center. A Composition places children and paints nothing. A rule is a View that draws a line across a flow and joins the lines at its ends.

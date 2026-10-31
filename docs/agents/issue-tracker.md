@@ -86,4 +86,5 @@ Leave the decision map as the historical record of the design phase.
 
 Run `python3 tools/check_agent_docs.py` after changes to agent documents or tracker metadata.
 The check validates local Markdown file links, status values, blocker references, dependency cycles, and spec completion consistency.
+It also checks that each quoted test name in the Enforcement column of the `AGENTS.md` rule table is a test in its named Zig file.
 It accepts historical metadata forms without rewriting their evidence.

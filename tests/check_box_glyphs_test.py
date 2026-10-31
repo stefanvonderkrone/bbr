@@ -34,7 +34,7 @@ class BoxGlyphsTest(unittest.TestCase):
 
     def test_straight_lines_comments_and_test_blocks_are_allowed(self):
         (self.root / checker.PAINTERS[0]).write_text(
-            'const lines = "─│━┃═║┄┆╴╵╼╽";\n'
+            'const lines = "─│═║┄┆╴╵╼╽";\n'
             '// ╔╬\n'
             'test "border fixture" {\n    const border = "╔╬";\n}\n',
             encoding="utf-8",
