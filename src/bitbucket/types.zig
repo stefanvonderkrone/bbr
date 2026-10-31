@@ -131,7 +131,8 @@ pub const PullRequestScope = union(enum) {
     /// The Workspace author endpoint. `reviewer` narrows its results.
     workspace_author: struct { author: []const u8, reviewer: ?[]const u8 = null },
     /// One PullRequest list for each Repository. `slugs` are distinct and not empty.
-    repositories: struct { slugs: []const []const u8, party: PullRequestParty },
+    /// `concurrency` is the positive bound on parallel Repository requests.
+    repositories: struct { slugs: []const []const u8, party: PullRequestParty, concurrency: usize = 1 },
 };
 
 /// The commit pair identifying a PR's current diff revision. A comment whose

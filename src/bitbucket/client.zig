@@ -994,15 +994,15 @@ pub const Client = struct {
 
     /// PullRequests in the Workspace that one account authored or reviews. The Workspace
     /// author scope keeps the order of the author endpoint and stops paging at `opts.limit`.
-    /// The Repositories scope lists each named Repository with at most `opts.concurrency`
+    /// The Repositories scope lists each named Repository with at most `concurrency`
     /// active requests. Its result is in the given Repository order, then in Bitbucket order.
     /// `opts.limit` caps the merged result.
     /// Only the coordinator uses `allocator`. Free the result with `deinitSummaries`.
     pub fn listWorkspacePullRequests(self: Client, io: std.Io, allocator: Allocator, filter: WorkspacePullRequestFilter, opts: WorkspacePullRequestOptions) ![]PullRequestSummary {
-        if (self.cred.workspace.len == 0 or filter.states.count() == 0 or opts.concurrency == 0) return error.BadRequest;
+        if (self.cred.workspace.len == 0 or filter.states.count() == 0) return error.BadRequest;
         const scope = switch (filter.scope) {
             .workspace_author => |scope| scope,
-            .repositories => |scope| return self.listRepositoryPullRequests(io, allocator, scope.slugs, scope.party, filter, opts),
+            .repositories => |scope| return self.listRepositoryPullRequests(io, allocator, scope, filter, opts),
         };
         if (scope.author.len == 0 or scope.reviewer != null and scope.reviewer.?.len == 0) return error.BadRequest;
         var endpoint: std.ArrayList(u8) = .empty;
@@ -1017,29 +1017,29 @@ pub const Client = struct {
         return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, list.url, list.page, null, false);
     }
 
-    fn listRepositoryPullRequests(self: Client, io: std.Io, allocator: Allocator, slugs: []const []const u8, party: types.PullRequestParty, filter: WorkspacePullRequestFilter, opts: WorkspacePullRequestOptions) ![]PullRequestSummary {
-        const author: ?[]const u8, const reviewer: ?[]const u8 = switch (party) {
+    fn listRepositoryPullRequests(self: Client, io: std.Io, allocator: Allocator, scope: @FieldType(types.PullRequestScope, "repositories"), filter: WorkspacePullRequestFilter, opts: WorkspacePullRequestOptions) ![]PullRequestSummary {
+        const author: ?[]const u8, const reviewer: ?[]const u8 = switch (scope.party) {
             .author => |uuid| .{ uuid, null },
             .reviewer => |uuid| .{ null, uuid },
             .author_and_reviewer => |both| .{ both.author, both.reviewer },
         };
-        if (slugs.len == 0) return error.BadRequest;
+        if (scope.slugs.len == 0 or scope.concurrency == 0) return error.BadRequest;
         for ([_]?[]const u8{ author, reviewer }) |value| if (value) |uuid| if (uuid.len == 0) return error.BadRequest;
         if (opts.limit == 0) return allocator.alloc(PullRequestSummary, 0);
-        const jobs = try allocator.alloc(RepositoryPullRequests, slugs.len);
+        const jobs = try allocator.alloc(RepositoryPullRequests, scope.slugs.len);
         for (jobs) |*job| job.* = .{};
         defer {
             for (jobs) |*job| job.deinit(allocator);
             allocator.free(jobs);
         }
-        for (slugs, jobs) |slug, *job| {
+        for (scope.slugs, jobs) |slug, *job| {
             const endpoint = try self.repositoryEndpoint(allocator, slug, "/pullrequests");
             defer allocator.free(endpoint);
             const list = try pullRequestListUrl(allocator, endpoint, .{ .states = filter.states, .author = author, .reviewer = reviewer }, .{ .pagelen = pull_request_pagelen, .query = filter.query });
             job.url = list.url;
         }
 
-        const completions = try allocator.alloc(RepositoryCompletion, opts.concurrency);
+        const completions = try allocator.alloc(RepositoryCompletion, scope.concurrency);
         defer allocator.free(completions);
         var select = std.Io.Select(RepositoryCompletion).init(io, completions);
         var protection: ?std.Io.CancelProtection = null;
@@ -1048,7 +1048,7 @@ pub const Client = struct {
         };
         // Join every worker before the jobs are freed, including on a coordinator error.
         defer select.group.await(io) catch {};
-        var concurrent = opts.concurrency > 1;
+        var concurrent = scope.concurrency > 1;
         var launched: usize = 0;
         var active: usize = 0;
         var stopped = false;
@@ -1057,7 +1057,7 @@ pub const Client = struct {
         while (true) {
             var ready: ?usize = null;
             if (!stopped and launched < jobs.len) {
-                if (concurrent and active < opts.concurrency) {
+                if (concurrent and active < scope.concurrency) {
                     if (select.concurrent(.repository, fetchRepositoryPullRequests, .{ self, &jobs[launched], launched, opts.limit })) |_| {
                         if (protection == null) protection = io.swapCancelProtection(.blocked);
                         launched += 1;
@@ -2250,8 +2250,6 @@ pub const WorkspacePullRequestFilter = struct {
 
 pub const WorkspacePullRequestOptions = struct {
     limit: ?usize = null,
-    /// The bound on parallel requests of the Repositories scope.
-    concurrency: usize = 1,
 };
 
 /// Bitbucket's largest PullRequest page.
@@ -4724,7 +4722,7 @@ test "Workspace author PullRequests keep Bitbucket order, stop paging at the lim
             .scope = .{ .workspace_author = .{ .author = "{author}", .reviewer = "{reviewer}" } },
             .states = .initMany(&.{ .MERGED, .OPEN }),
             .query = "title ~ \"x\"",
-        }, .{ .limit = case.limit, .concurrency = 8 });
+        }, .{ .limit = case.limit });
         defer deinitSummaries(testing.allocator, items);
         const url = try std.mem.concat(testing.allocator, u8, &.{
             base_url ++ "/workspaces/check24/pullrequests/%7Bauthor%7D?pagelen=",
@@ -4760,9 +4758,9 @@ fn repositoryResponses(beta: httpc_fixture.Canned, released: ?*std.atomic.Value(
 fn listRepositoryPullRequestsForTest(bb: Client, party: types.PullRequestParty, limit: ?usize, concurrency: usize, done: *std.atomic.Value(bool)) ![]PullRequestSummary {
     defer done.store(true, .release);
     return bb.listWorkspacePullRequests(testing.io, testing.allocator, .{
-        .scope = .{ .repositories = .{ .slugs = &.{ "gamma", "alpha", "beta" }, .party = party } },
+        .scope = .{ .repositories = .{ .slugs = &.{ "gamma", "alpha", "beta" }, .party = party, .concurrency = concurrency } },
         .states = .initMany(&.{ .OPEN, .DECLINED }),
-    }, .{ .limit = limit, .concurrency = concurrency });
+    }, .{ .limit = limit });
 }
 
 test "Repository PullRequests merge the named Repositories in the given order and honor the limit" {

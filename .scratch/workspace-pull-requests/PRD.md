@@ -17,8 +17,8 @@ bbr api list-workspace-pull-requests --author UUID [--reviewer UUID]
     [--state OPEN|MERGED|DECLINED|SUPERSEDED]... [--query Q] [--limit N] [--json]
 
 bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author UUID --reviewer UUID)
-    --repository SLUG... [--state OPEN|MERGED|DECLINED|SUPERSEDED]...
-    [--query Q] [--concurrency N] [--limit N] [--json]
+    --repository SLUG... [--concurrency N] [--state OPEN|MERGED|DECLINED|SUPERSEDED]...
+    [--query Q] [--limit N] [--json]
 ```
 
 - `--author` and `--reviewer` each take one account UUID. The command needs at least one of them.
@@ -26,7 +26,7 @@ bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author
 - `--state` repeats. The default is `OPEN`. Without a `q` filter, each value becomes one `state=` parameter. With a `q` filter, the states go into `q`, because Bitbucket then ignores `state=`.
 - `--query` is a Bitbucket `q` expression. The command joins it to its own filter with `AND (...)`.
 - `--limit` caps the total number of PullRequests in the output.
-- `--concurrency` sets the number of parallel Repository requests with `--repository`. The default and the CPU cap follow `search-workspace-members`.
+- `--concurrency` sets the number of parallel Repository requests. Only the `--repository` scan sends parallel requests, so `--concurrency` without `--repository` is an option error. The default and the CPU cap follow `search-workspace-members`.
 
 ## Behavior
 

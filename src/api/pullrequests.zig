@@ -18,8 +18,8 @@ pub const workspace_list_help =
     \\usage: bbr api list-workspace-pull-requests --author UUID [--reviewer UUID]
     \\      [--state OPEN|MERGED|DECLINED|SUPERSEDED ...] [--query Q] [--limit N] [--json]
     \\   or: bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author UUID --reviewer UUID)
-    \\      --repository SLUG ... [--state OPEN|MERGED|DECLINED|SUPERSEDED ...] [--query Q]
-    \\      [--concurrency N] [--limit N] [--json]
+    \\      --repository SLUG ... [--concurrency N] [--state OPEN|MERGED|DECLINED|SUPERSEDED ...]
+    \\      [--query Q] [--limit N] [--json]
     \\
     \\List PullRequests in the selected Workspace that one account authored or reviews.
     \\--author and --reviewer take account UUIDs.
@@ -31,8 +31,8 @@ pub const workspace_list_help =
     \\A repeated Repository is scanned once.
     \\Repeat --state to select several states. The default is OPEN.
     \\--query is a Bitbucket q expression. The command joins it to its own filter with AND.
-    \\Concurrency bounds the parallel Repository requests. It defaults to 8.
-    \\--concurrency accepts a positive integer, capped by logical CPUs.
+    \\--concurrency bounds the parallel Repository requests and needs --repository.
+    \\It defaults to 8 and accepts a positive integer, capped by logical CPUs.
     \\--limit caps the total. A failed request fails the complete list. HTTP 429 is not retried.
     \\
 ;
@@ -173,7 +173,6 @@ fn printSummaries(init: std.process.Init, items: []const bbr.bitbucket.PullReque
 const WorkspaceListArgs = struct {
     filter: bbr.bitbucket.WorkspacePullRequestFilter,
     limit: ?usize,
-    concurrency: usize,
 };
 
 /// The returned Repository slugs are owned by `allocator`.
@@ -210,6 +209,7 @@ fn parseWorkspaceList(allocator: std.mem.Allocator, args: []const []const u8) !W
         } else return error.UnknownFlag;
     }
     for ([_]?[]const u8{ author, reviewer, query }) |value| if (value) |text| if (text.len == 0) return error.BadRequest;
+    if (slugs.items.len == 0 and concurrency != null) return error.BadRequest;
     const scope: bbr.bitbucket.PullRequestScope = if (slugs.items.len == 0)
         .{ .workspace_author = .{ .author = author orelse return error.MissingRequired, .reviewer = reviewer } }
     else blk: {
@@ -217,22 +217,22 @@ fn parseWorkspaceList(allocator: std.mem.Allocator, args: []const []const u8) !W
             if (reviewer) |reviewer_uuid| .{ .author_and_reviewer = .{ .author = author_uuid, .reviewer = reviewer_uuid } } else .{ .author = author_uuid }
         else
             .{ .reviewer = reviewer orelse return error.MissingRequired };
-        break :blk .{ .repositories = .{ .slugs = try slugs.toOwnedSlice(allocator), .party = party } };
+        break :blk .{ .repositories = .{ .slugs = try slugs.toOwnedSlice(allocator), .party = party, .concurrency = concurrency orelse ws.default_concurrency } };
     };
     return .{
         .filter = .{ .scope = scope, .states = if (states.count() == 0) .initOne(.OPEN) else states, .query = query },
         .limit = limit,
-        .concurrency = concurrency orelse ws.default_concurrency,
     };
 }
 
 fn listWorkspacePullRequests(allocator: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client, args: []const []const u8) ![]bbr.bitbucket.PullRequestSummary {
-    const parsed = try parseWorkspaceList(allocator, args);
+    var parsed = try parseWorkspaceList(allocator, args);
+    switch (parsed.filter.scope) {
+        .workspace_author => {},
+        .repositories => |*scope| scope.concurrency = ws.effectiveConcurrency(scope.concurrency, std.Thread.getCpuCount()),
+    }
     defer if (parsed.filter.scope == .repositories) allocator.free(parsed.filter.scope.repositories.slugs);
-    return bb.listWorkspacePullRequests(io, allocator, parsed.filter, .{
-        .limit = parsed.limit,
-        .concurrency = ws.effectiveConcurrency(parsed.concurrency, std.Thread.getCpuCount()),
-    });
+    return bb.listWorkspacePullRequests(io, allocator, parsed.filter, .{ .limit = parsed.limit });
 }
 
 pub fn runListWorkspace(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
@@ -680,6 +680,7 @@ test "list-workspace-pull-requests rejects invalid options before HTTP" {
         .{ .args = &.{ "--author={a}", "--reviewer={a}", "--reviewer", "{b}" }, .err = error.BadRequest },
         .{ .args = &.{ "--author={a}", "--reviewer=" }, .err = error.BadRequest },
         .{ .args = &.{ "--reviewer={a}", "--repository=sample", "--concurrency=0" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--author={a}", "--concurrency=2" }, .err = error.BadRequest },
         .{ .args = &.{ "--author={a}", "--limit=bad" }, .err = error.InvalidNumber },
         .{ .args = &.{ "--reviewer={a}", "--repository=sample", "--page=2" }, .err = error.UnknownFlag },
         .{ .args = &.{ "--author={a}", "--no-follow" }, .err = error.UnknownFlag },
@@ -689,6 +690,14 @@ test "list-workspace-pull-requests rejects invalid options before HTTP" {
     const repeated = try listWorkspacePullRequests(std.testing.allocator, std.Io.failing, bb, &.{ "--author={a}", "--author={a}", "--state=MERGED", "--state=MERGED", "--state=OPEN" });
     defer bbr.bitbucket.deinitSummaries(std.testing.allocator, repeated);
     try std.testing.expect(std.mem.startsWith(u8, fake.lastUrl().?, bbr.bitbucket.base_url ++ "/workspaces/workspace/pullrequests/%7Ba%7D?pagelen=50&state=OPEN&state=MERGED&fields="));
+}
+
+test "list-workspace-pull-requests accepts --concurrency with --repository" {
+    var fake: bbr.http.FakeHttpClient = .{ .body = "{\"values\":[]}" };
+    const items = try listWorkspacePullRequests(std.testing.allocator, std.testing.io, testClient(&fake), &.{ "--author={a}", "--repository=sample", "--concurrency=2" });
+    defer bbr.bitbucket.deinitSummaries(std.testing.allocator, items);
+    try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+    try std.testing.expect(std.mem.startsWith(u8, fake.lastUrl().?, bbr.bitbucket.base_url ++ "/repositories/workspace/sample/pullrequests?"));
 }
 
 test "set-verdict rejects a spoofed uuid before HTTP" {
