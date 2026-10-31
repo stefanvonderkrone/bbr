@@ -2764,8 +2764,9 @@ test "M28 cache a failure inside S1 to S6 restarts that segment from S1" {
     defer testing.allocator.free(output);
     try testing.expect(std.mem.startsWith(u8, notes.written(), "resume skip=\n"));
     try testing.expectEqual(@as(usize, 8), scenarioLineCount(output));
-    // S1 starts again from the state after the header, so its fetches are cold.
-    try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s1 ", "refetches"));
+    // S1 starts again from the state after the header, so its first fetches are cold.
+    // A restored S1 state would make every S1 fetch a refetch. The budget of 1 can evict a
+    // prefetched File before its jump, so S1 can also hold a refetch.
     try testing.expect(try intField(output, "scenario=s1 ", "cold_fetches") > 0);
 }
 
