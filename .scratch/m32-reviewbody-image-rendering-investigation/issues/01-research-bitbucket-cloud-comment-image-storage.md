@@ -1,6 +1,6 @@
 # 01: Research Bitbucket Cloud Comment image storage
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 Spec: [M32 spec](../SPEC.md)
 
@@ -34,10 +34,26 @@ Ticket 04 confirms the findings on a real PullRequest.
 
 ## Acceptance criteria
 
-- [ ] `research/bitbucket-comment-images.md` answers Q1 to Q4, each with a source and a confidence mark.
-- [ ] The note gives a Bitbucket host list with exact hosts and no wildcard.
-- [ ] The note says, for each redirect host, whether Bitbucket controls it.
-- [ ] The note has a checklist for ticket 04 with one check for each open answer.
-- [ ] The note holds no real image URL, no Comment text, and no Credential value.
-- [ ] The note names every spec choice that its answers change, or states that none changes.
-- [ ] `python3 tools/check_agent_docs.py` passes.
+- [x] `research/bitbucket-comment-images.md` answers Q1 to Q4, each with a source and a confidence mark.
+- [x] The note gives a Bitbucket host list with exact hosts and no wildcard.
+- [x] The note says, for each redirect host, whether Bitbucket controls it.
+- [x] The note has a checklist for ticket 04 with one check for each open answer.
+- [x] The note holds no real image URL, no Comment text, and no Credential value.
+- [x] The note names every spec choice that its answers change, or states that none changes.
+- [x] `python3 tools/check_agent_docs.py` passes.
+
+## Completion
+
+The research note is [bitbucket-comment-images.md](../research/bitbucket-comment-images.md).
+
+- Q1 is `reported`. A pasted image becomes a `https://bitbucket.org/repo/<hash>/images/<n>-<file>` reference in `content.raw`.
+- Q2 is `reported`. Reports say that the Credential does not open an image in a private Repository. Only a browser session cookie works.
+- Q2 also finds a redirect to a signed Amazon S3 URL that expires. The authored URL does not expire.
+- Q3 is `unknown` for the relative base. A Comment has no attachment form (`reported`).
+- Q4 keeps exactly `api.bitbucket.org` and `bitbucket.org`.
+- Spec choice 5 changes. The prototype allows the storage host `bbuseruploads.s3.amazonaws.com` only directly after a `bitbucket.org` hop, and never sends it the Credential.
+- Spec choice 3 keeps its two hosts. Ticket 05 drops `bitbucket.org` if ticket 04 shows that the Credential has no effect there.
+- The note holds the checks C1 to C10 for ticket 04, with the exact requests for the human. No agent sent these requests.
+
+Checks: `python3 tools/check_agent_docs.py` passes.
+Review: the runner read the note and its prototype consequences.
