@@ -29,7 +29,8 @@ bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author
 - With `--author`, the command follows the pages of the author endpoint. A `--reviewer` value becomes `reviewers.uuid="..."` in `q`.
 - With only `--reviewer`, the command lists every Repository in the Workspace. Then it lists the PullRequests of each Repository with `q=reviewers.uuid="..."`.
 - The command scans all Repositories. The operator chose no recency filter.
-- The output order is Repository slug order, then the Bitbucket order inside each Repository.
+- With `--author`, the output keeps the Bitbucket order of the author endpoint, and paging stops at `--limit`. The page size is `--limit` up to 50. Sorting by Repository would need every page first. A live call with two states and `--limit 5` took 19 s with sorting and 1 to 2 s without it.
+- With only `--reviewer`, the output order is Repository slug order, then the Bitbucket order inside each Repository.
 - Each row names its Repository by `full_name`. The human row is `full_name#id [STATE draft] title (src -> dst)`.
 - The command prints nothing to stdout when any request fails. A 429 fails the command with the existing `RateLimited` error.
 - The command rejects bad options before any HTTP request.

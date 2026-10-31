@@ -26,7 +26,8 @@ pub const workspace_list_help =
     \\--query is a Bitbucket q expression. The command joins it to its own filter with AND.
     \\Concurrency bounds the parallel Repository requests with only --reviewer.
     \\It defaults to 8. --concurrency accepts a positive integer, capped by logical CPUs.
-    \\Rows follow Repository slug order, then the Bitbucket order in each Repository.
+    \\With --author, rows keep the Bitbucket order, and paging stops at --limit.
+    \\With only --reviewer, rows follow Repository slug order, then the Bitbucket order in each Repository.
     \\--limit caps the total. A failed request fails the complete list. HTTP 429 is not retried.
     \\
 ;
