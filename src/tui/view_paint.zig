@@ -334,3 +334,20 @@ test "M23 ancestry titled rules clip Unicode text and keep the Anchor Indicator 
         }
     }
 }
+
+fn barTree(scroll: view.Scrollbar, area: view.Rect, visitor: anytype) void {
+    const root: view.View(Pair) = .{ .slot = .left, .border = .{}, .scrollbar = scroll };
+    view.walk(Pair, &root, area, visitor);
+}
+
+test "M30 scrollbar the painted thumb covers the track cell of every visible row" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 9, .cols = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = headless(&screen);
+    var painter: Painter(Pair) = .{ .win = win, .theme = @import("theme.zig").dark };
+    barTree(.{ .ring = .border, .total = 20, .offset = 6 }, .{ .width = 3, .height = 9 }, &painter);
+    for (0..7) |cell| {
+        const expected = if (cell >= 2 and cell <= 4) "┃" else "│";
+        try testing.expectEqualStrings(expected, win.readCell(2, @intCast(cell + 1)).?.char.grapheme);
+    }
+}

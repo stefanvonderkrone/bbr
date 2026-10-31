@@ -1698,3 +1698,63 @@ test "stopping a Picker tick cancels and reaps its sleeping future" {
 
     try std.testing.expectEqual(@as(usize, 0), work.items.len);
 }
+
+test "M30 scrollbar a status height change keeps each track as tall as its viewport" {
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    const review = try session.create(std.testing.allocator);
+    const a = review.arena.allocator();
+    review.source = .{ .remote = .{ .id = 1, .title = "Status", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+    review.header = .{ .title = "Status", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.appendSlice(a, "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -0,0 +1,60 @@\n");
+    for (0..60) |index| try raw.print(a, "+line {d}\n", .{index});
+    review.diff = try bbr.diff.parse(a, raw.items);
+    try review.initializeEnrichment();
+    var state = try presentation.Presentation.init(std.testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = review },
+        .geometry = .{ .cols = 20, .rows = 20 },
+    });
+    defer state.deinit();
+    var frame_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer frame_arena.deinit();
+    var changed: usize = 0;
+    for (20..121) |cols| {
+        var screen = try vaxis.Screen.init(std.testing.allocator, .{ .cols = @intCast(cols), .rows = 20, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(std.testing.allocator);
+        const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = screen.width, .height = screen.height, .screen = &screen };
+        var sent: ?presentation.FrameGeometry = null;
+        _ = try syncContentGeometry(&state, &frame_arena, win, &sent);
+        try completeViewBuild(&state);
+        const before = state.projection().review.?.frame;
+        try expectTracksMatchViewports(before);
+        try state.dispatch(.{ .action = .open_buffer_search });
+        if (try syncContentGeometry(&state, &frame_arena, win, &sent)) try completeViewBuild(&state);
+        const after = state.projection().review.?.frame;
+        try expectTracksMatchViewports(after);
+        if (after.geometry.rows != before.geometry.rows) changed += 1;
+        try state.dispatch(.{ .key = .{ .codepoint = keymap.special.escape } });
+    }
+    try std.testing.expect(changed > 0);
+}
+
+fn completeViewBuild(state: *presentation.Presentation) !void {
+    while (state.takeCommand()) |command| {
+        var owned = command;
+        if (owned != .build_buffer_disclosure) {
+            owned.deinit();
+            continue;
+        }
+        owned.build_buffer_disclosure.build();
+        try state.dispatch(.{ .buffer_disclosure_built = owned.build_buffer_disclosure });
+    }
+}
+
+fn expectTracksMatchViewports(frame: @import("frame.zig").Projection) !void {
+    const frame_mod = @import("frame.zig");
+    const diff = frame_mod.scrollState(frame, .diff_pane).?;
+    try std.testing.expectEqual(@as(usize, diff.track.height), frame.navigation.viewport);
+    try std.testing.expectEqual(frame.panes.diff_content.height, diff.track.height);
+    const sidebar = frame_mod.scrollState(frame, .sidebar).?;
+    try std.testing.expectEqual(@as(usize, sidebar.track.height), frame.file_tree.viewport);
+}

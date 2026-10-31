@@ -424,3 +424,20 @@ test "the Help columns start at column 2 and one cell after the middle" {
     try testing.expectEqual(surface.x + surface.width / 2 + 1, rects.get(.commands).content.x);
     try testing.expectEqual(surface.y + 1, rects.get(.motions).content.y);
 }
+
+test "M30 scrollbar the layout rects do not depend on the scroll numbers or the Scroll Marks" {
+    const scrolls = [_]Scroll{ .{}, .{ .total = 3 }, .{ .total = 500, .offset = 0 }, .{ .total = 500, .offset = 250 }, .{ .total = 500, .offset = 9000 } };
+    const areas = [_]Rect{ .{}, .{ .width = 1, .height = 1 }, .{ .width = 80, .height = 24 }, .{ .width = 40, .height = 100 }, .{ .width = 320, .height = 3 } };
+    for (areas) |area| {
+        const panes_base = view.solve(PaneSlot, panes, Panes{}, area);
+        const search_base = view.solve(SearchSlot, reviewSearch, ReviewSearch{}, area);
+        for (scrolls) |sidebar_scroll| for (scrolls) |diff_scroll| {
+            const solved = view.solve(PaneSlot, panes, Panes{ .sidebar_scroll = sidebar_scroll, .diff_scroll = diff_scroll }, area);
+            for (std.enums.values(PaneSlot)) |slot| try testing.expectEqual(panes_base.get(slot), solved.get(slot));
+        };
+        for (scrolls) |list_scroll| {
+            const solved = view.solve(SearchSlot, reviewSearch, ReviewSearch{ .list_scroll = list_scroll }, area);
+            for (std.enums.values(SearchSlot)) |slot| try testing.expectEqual(search_base.get(slot), solved.get(slot));
+        }
+    }
+}

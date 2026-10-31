@@ -288,14 +288,25 @@ fn verticalTrack(placed: Placed, ring: Ring) Rect {
 
 pub const Thumb = struct { first: u16, len: u16 };
 
+/// The track cell of `row`. Requires total > extent > 0 and row < total.
+pub fn trackCell(extent: u16, total: usize, row: usize) u16 {
+    return @intCast(row * @as(usize, extent) / total);
+}
+
+/// The first row whose track cell is `cell`.
+pub fn cellFirstRow(extent: u16, total: usize, cell: u16) usize {
+    return (@as(usize, cell) * total + extent - 1) / extent;
+}
+
 /// The thumb of a scroll bar along a track of `extent` cells, or null when
-/// the content fits.
+/// the content fits. It runs from the track cell of the first visible row to
+/// the track cell of the last one, so it covers the cell of every visible row.
 pub fn thumb(extent: u16, total: usize, offset: usize) ?Thumb {
     if (extent == 0 or total <= extent) return null;
-    const len = @max(1, (@as(usize, extent) * extent + total - 1) / total);
-    const max_offset = total - extent;
-    const first = @min(offset, max_offset) * (extent - len) / max_offset;
-    return .{ .first = @intCast(first), .len = @intCast(len) };
+    const first_row = @min(offset, total - extent);
+    const first = trackCell(extent, total, first_row);
+    const last = trackCell(extent, total, first_row + extent - 1);
+    return .{ .first = first, .len = last - first + 1 };
 }
 
 /// Visit `node` and then each descendant, in tree order, with its placed
@@ -707,4 +718,51 @@ test "the scroll bar thumb covers the visible share of the content" {
     try testing.expectEqual(Thumb{ .first = 0, .len = 5 }, thumb(10, 20, 0).?);
     try testing.expectEqual(Thumb{ .first = 5, .len = 5 }, thumb(10, 20, 10).?);
     try testing.expectEqual(Thumb{ .first = 9, .len = 1 }, thumb(10, 1000, 990).?);
+}
+
+test "M30 scrollbar the thumb covers the track cell of every visible row" {
+    for (1..41) |extent_index| {
+        const extent: u16 = @intCast(extent_index);
+        for (extent + 1..201) |total| {
+            for (0..total - extent + 1) |offset| {
+                const range = thumb(extent, total, offset).?;
+                try testing.expect(range.len >= 1);
+                try testing.expect(range.first + range.len <= extent);
+                for (offset..offset + extent) |row| {
+                    const cell = trackCell(extent, total, row);
+                    try testing.expect(cell >= range.first and cell < range.first + range.len);
+                }
+            }
+            try testing.expectEqual(@as(u16, 0), thumb(extent, total, 0).?.first);
+            const bottom = thumb(extent, total, total - extent).?;
+            try testing.expectEqual(extent, bottom.first + bottom.len);
+            try testing.expectEqual(bottom, thumb(extent, total, total + 5).?);
+        }
+    }
+}
+
+test "M30 scrollbar the first row of a cell projects to that cell" {
+    for (1..41) |extent_index| {
+        const extent: u16 = @intCast(extent_index);
+        for (extent + 1..201) |total| {
+            for (0..extent) |cell_index| {
+                const cell: u16 = @intCast(cell_index);
+                const row = cellFirstRow(extent, total, cell);
+                try testing.expectEqual(cell, trackCell(extent, total, row));
+                if (row > 0) try testing.expect(trackCell(extent, total, row - 1) < cell);
+            }
+        }
+    }
+}
+
+test "M30 scrollbar the thumb covers the visible row that the old formula missed" {
+    try testing.expectEqual(Thumb{ .first = 2, .len = 3 }, thumb(7, 20, 6).?);
+    try testing.expectEqual(@as(u16, 4), trackCell(7, 20, 12));
+}
+
+test "M30 scrollbar a track of no cells has no thumb and a track of one cell has one thumb cell" {
+    try testing.expect(thumb(0, 50, 0) == null);
+    try testing.expectEqual(Thumb{ .first = 0, .len = 1 }, thumb(1, 50, 0).?);
+    try testing.expectEqual(Thumb{ .first = 0, .len = 1 }, thumb(1, 50, 49).?);
+    try testing.expect(thumb(1, 1, 0) == null);
 }

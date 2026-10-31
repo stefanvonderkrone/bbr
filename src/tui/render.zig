@@ -32,6 +32,7 @@ const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 const layouts = @import("layouts.zig");
 const view_paint = @import("view_paint.zig");
+const frame_mod = @import("frame.zig");
 
 pub const sidebar_width: u16 = 28;
 
@@ -56,6 +57,8 @@ pub fn draw(
         .diff = .{ .x = pane_x, .y = 0, .width = win.width - pane_x, .height = win.height },
         .sidebar_content = .{ .x = 0, .y = 0, .width = sb_w, .height = win.height },
         .diff_content = .{ .x = pane_x, .y = 0, .width = win.width - pane_x, .height = win.height },
+        .sidebar_track = .{},
+        .diff_track = .{},
     });
 }
 
@@ -92,8 +95,8 @@ pub fn drawReview(
     const frame = review.frame;
     const panes = view_paint.paint(layouts.PaneSlot, layouts.panes, layouts.Panes{
         .sidebar_focused = frame.focus == .sidebar,
-        .sidebar_scroll = .{ .total = frame.file_tree.entries.len, .offset = frame.file_tree.scroll },
-        .diff_scroll = .{ .total = frame.visual_rows.len, .offset = frame.navigation.scroll },
+        .sidebar_scroll = paneScroll(frame, .sidebar),
+        .diff_scroll = paneScroll(frame, .diff_pane),
     }, win, theme);
     const cursor = frame.navigation.cursor;
     const buffer_index = if (cursor < frame.visual_rows.len) frame.visual_rows[cursor].buffer_index else 0;
@@ -111,6 +114,11 @@ pub fn drawReview(
     drawCodeHighlights(diff_pane, review.frame, theme);
     drawSearchRanges(diff_pane, review.frame, theme);
     joinSectionRules(win, panes.get(.diff).border, panes.get(.diff).content, review.frame.visual_rows, review.frame.navigation);
+}
+
+fn paneScroll(frame: frame_mod.Projection, bar: frame_mod.ScrollBar) layouts.Scroll {
+    const state = frame_mod.scrollState(frame, bar).?;
+    return .{ .total = state.total, .offset = state.offset };
 }
 
 fn drawCodeHighlights(win: vaxis.Window, frame: @import("frame.zig").Projection, theme: Theme) void {
@@ -1073,11 +1081,10 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
     const box_width = geometry.rect.width;
     const status_label = if (searchCellWidth(full_status) + 6 <= box_width) full_status else if (searchCellWidth(short_status) + 6 <= box_width) short_status else if (searchCellWidth(tiny_status) + 6 <= box_width) tiny_status else "";
     const results_span = if (geometry.landscape) geometry.divider - geometry.body.x else geometry.body.width;
-    const list_total = if (projection.results.len > 0) projection.results.len else projection.files.len;
     const rects = view_paint.paint(layouts.SearchSlot, layouts.reviewSearch, layouts.ReviewSearch{
         .status = status_label,
         .results_title = if (results_span > searchCellWidth("Results · Position") + 4) "Results · Position" else "Position",
-        .list_scroll = .{ .total = list_total, .offset = projection.list_scroll },
+        .list_scroll = .{ .total = projection.list_total, .offset = projection.list_scroll },
     }, win, theme);
     const input = childRect(win, rects.get(.query).content);
     const query = std.fmt.allocPrint(scratch, "> {s}", .{projection.query}) catch "> ";
@@ -2452,6 +2459,7 @@ test "M21 authored Overlay renders ranked rows and matched Preview in landscape 
             .candidate_count = 3,
             .selected = 0,
             .list_scroll = 0,
+            .list_total = 1,
             .preview_scroll = 0,
             .pending = false,
             .geometry = geometry,
@@ -2505,6 +2513,7 @@ test "M23 acceptance Review Search waits for geometry that fits after a terminal
         .candidate_count = 1,
         .selected = 0,
         .list_scroll = 0,
+        .list_total = 1,
         .preview_scroll = 0,
         .pending = false,
         .geometry = @import("frame.zig").reviewSearchGeometry(.{ .cols = 150, .rows = 54 }).?,
@@ -2551,6 +2560,7 @@ test "M21 authored source Preview shows exact ranges, version states, horizontal
         .candidate_count = 2,
         .selected = 0,
         .list_scroll = 0,
+        .list_total = 1,
         .preview_scroll = 0,
         .pending = false,
         .geometry = geometry,
@@ -2677,6 +2687,7 @@ test "M21 authored Overlay exposes both File version states without a Query" {
         .candidate_count = 0,
         .selected = null,
         .list_scroll = 0,
+        .list_total = 1,
         .preview_scroll = 0,
         .pending = false,
         .geometry = geometry,
@@ -2718,29 +2729,23 @@ test "M21 authored Review Search list shows a scroll bar for long results" {
         .candidate_count = 60,
         .selected = 0,
         .list_scroll = 0,
+        .list_total = results.len,
         .preview_scroll = 0,
         .pending = false,
         .geometry = geometry,
     };
-    drawReviewSearch(a, win, projection, theme_dark);
     const list = childRect(win, .{ .x = geometry.list.x, .y = geometry.list.y, .width = geometry.list.width + 1, .height = geometry.list.height });
     const bar_col = list.width - 1;
-    const thumb = @max(@as(usize, 1), (@as(usize, list.height) * list.height + results.len - 1) / results.len);
-    try testing.expect(thumb < list.height);
-    try testing.expectEqualStrings("│", list.readCell(bar_col, 0).?.char.grapheme);
-    try testing.expectEqualStrings("│", list.readCell(bar_col, @intCast(thumb - 1)).?.char.grapheme);
-    try testing.expectEqualStrings(" ", list.readCell(bar_col, @intCast(thumb)).?.char.grapheme);
-    try testing.expectEqualStrings(" ", list.readCell(bar_col, list.height - 1).?.char.grapheme);
-    projection.list_scroll = (60 - list.height) / 2;
-    drawReviewSearch(a, win, projection, theme_dark);
-    try testing.expectEqualStrings(" ", list.readCell(bar_col, 0).?.char.grapheme);
-    try testing.expectEqualStrings("│", list.readCell(bar_col, list.height / 2).?.char.grapheme);
-    try testing.expectEqualStrings(" ", list.readCell(bar_col, list.height - 1).?.char.grapheme);
-    projection.list_scroll = 60 - list.height;
-    drawReviewSearch(a, win, projection, theme_dark);
-    try testing.expectEqualStrings(" ", list.readCell(bar_col, 0).?.char.grapheme);
-    try testing.expectEqualStrings(" ", list.readCell(bar_col, list.height - @as(u16, @intCast(thumb)) - 1).?.char.grapheme);
-    try testing.expectEqualStrings("│", list.readCell(bar_col, list.height - 1).?.char.grapheme);
+    for ([_]usize{ 0, (60 - list.height) / 2, 60 - list.height }) |scroll| {
+        projection.list_scroll = scroll;
+        drawReviewSearch(a, win, projection, theme_dark);
+        const range = @import("view.zig").thumb(list.height, results.len, scroll).?;
+        try testing.expect(range.len < list.height);
+        for (0..list.height) |cell| {
+            const on_thumb = cell >= range.first and cell < range.first + range.len;
+            try testing.expectEqualStrings(if (on_thumb) "│" else " ", list.readCell(bar_col, @intCast(cell)).?.char.grapheme);
+        }
+    }
 }
 
 test "M21 authored Preview paints every disjoint Markdown match range" {
@@ -2767,6 +2772,7 @@ test "M21 authored Preview paints every disjoint Markdown match range" {
         .candidate_count = 1,
         .selected = 0,
         .list_scroll = 0,
+        .list_total = 1,
         .preview_scroll = 0,
         .pending = false,
         .geometry = geometry,
@@ -2816,6 +2822,7 @@ test "Review Search draws titled borders, top query, Position, and separated Pre
         .candidate_count = 2,
         .selected = 0,
         .list_scroll = 0,
+        .list_total = 1,
         .preview_scroll = 0,
         .pending = false,
         .geometry = geometry,
@@ -3924,7 +3931,7 @@ test "every Overlay paints the Theme base background" {
         try Check.surface(win, target.rect, base, selected);
 
         win.fill(.{ .style = .{ .bg = backdrop } });
-        drawReviewSearch(a, win, .{ .query = "needle", .occurrences = &.{}, .results = &.{}, .candidate_count = 0, .selected = null, .list_scroll = 0, .preview_scroll = 0, .pending = false, .geometry = search }, theme);
+        drawReviewSearch(a, win, .{ .query = "needle", .occurrences = &.{}, .results = &.{}, .candidate_count = 0, .selected = null, .list_scroll = 0, .list_total = 0, .preview_scroll = 0, .pending = false, .geometry = search }, theme);
         try Check.surface(win, search.rect, base, .{});
 
         win.fill(.{ .style = .{ .bg = backdrop } });
@@ -5469,4 +5476,107 @@ test "edit stays discoverable in the help Overlay when it is refused" {
 fn helpRowAvailable(rows: []const HelpRow, help: []const u8) ?bool {
     for (rows) |row| if (std.mem.indexOf(u8, row.text, help) != null) return row.available;
     return null;
+}
+
+/// A Session of one File with `lines` added Lines.
+fn testScrollSession(lines: usize) !*@import("session.zig").Session {
+    const session = try @import("session.zig").create(testing.allocator);
+    errdefer session.destroy();
+    const a = session.arena.allocator();
+    session.source = .{ .remote = .{ .id = 1, .title = "Scroll", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+    session.header = .{ .title = "Scroll", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.print(a, "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -0,0 +1,{d} @@\n", .{lines});
+    for (0..lines) |index| try raw.print(a, "+line {d}\n", .{index});
+    session.diff = try bbr.diff.parse(a, raw.items);
+    try session.initializeEnrichment();
+    return session;
+}
+
+fn testScrollPresentation(store: *bbr.review.InMemoryStore, lines: usize, geometry: frame_mod.Geometry) !presentation.Presentation {
+    return presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .cell_metrics = terminal_cell_metrics }, .{
+        .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollSession(lines) },
+        .geometry = geometry,
+    });
+}
+
+/// Each Pane track paints the thumb of its `frame.scrollState` and no thumb
+/// glyph outside it.
+fn expectPaneThumbs(win: vaxis.Window, frame: frame_mod.Projection) !void {
+    for ([_]frame_mod.ScrollBar{ .sidebar, .diff_pane }) |bar| {
+        const state = frame_mod.scrollState(frame, bar).?;
+        const range = state.thumb();
+        for (0..state.track.height) |cell| {
+            const on_thumb = if (range) |thumb| cell >= thumb.first and cell < thumb.first + thumb.len else false;
+            const grapheme = win.readCell(state.track.x, @intCast(state.track.y + cell)).?.char.grapheme;
+            try testing.expectEqual(on_thumb, std.mem.eql(u8, grapheme, "┃"));
+        }
+    }
+}
+
+test "M30 scrollbar a Pane whose rows fit paints no thumb and keeps its border" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try testScrollPresentation(&store, 3, .{ .cols = 100, .rows = 30 });
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = 30, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const review = state.projection().review.?;
+    drawReview(arena.allocator(), win, review, theme_dark, 0);
+    try testing.expect(frame_mod.scrollState(review.frame, .diff_pane).?.thumb() == null);
+    try testing.expect(frame_mod.scrollState(review.frame, .sidebar).?.thumb() == null);
+    try expectPaneThumbs(win, review.frame);
+    const track = review.frame.panes.diff_track;
+    try testing.expectEqualStrings("│", win.readCell(track.x, track.y + track.height - 1).?.char.grapheme);
+}
+
+test "M30 scrollbar the DiffPane thumb paints at the top, the middle, the bottom, and past the bottom" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try testScrollPresentation(&store, 80, .{ .cols = 80, .rows = 12 });
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    const review = state.projection().review.?;
+    const track = review.frame.panes.diff_track;
+    const total = review.frame.visual_rows.len;
+    const bottom = total - track.height;
+    var painted: [4]@import("view.zig").Thumb = undefined;
+    for ([_]usize{ 0, bottom / 2, bottom, total + 40 }, &painted) |offset, *thumb| {
+        var shifted = review;
+        shifted.frame.navigation.scroll = offset;
+        shifted.frame.navigation.cursor = @min(offset, total - 1);
+        drawReview(arena.allocator(), win, shifted, theme_dark, 0);
+        try expectPaneThumbs(win, shifted.frame);
+        thumb.* = frame_mod.scrollState(shifted.frame, .diff_pane).?.thumb().?;
+    }
+    try testing.expectEqual(@as(u16, 0), painted[0].first);
+    try testing.expect(painted[1].first > 0 and painted[1].first + painted[1].len < track.height);
+    try testing.expectEqual(track.height, painted[2].first + painted[2].len);
+    try testing.expectEqual(painted[2], painted[3]);
+}
+
+test "M30 scrollbar a track of no cells paints nothing and a track of one cell paints one thumb cell" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]u16{ 2, 3 }) |rows| {
+        var state = try testScrollPresentation(&store, 40, .{ .cols = 80, .rows = rows });
+        defer state.deinit();
+        var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = rows, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+        const win = headlessWindow(&screen);
+        const review = state.projection().review.?;
+        drawReview(arena.allocator(), win, review, theme_dark, 0);
+        try testing.expectEqual(rows - 2, review.frame.panes.diff_track.height);
+        var thumbs: usize = 0;
+        for (0..rows) |row| {
+            if (std.mem.eql(u8, win.readCell(review.frame.panes.diff_track.x, @intCast(row)).?.char.grapheme, "┃")) thumbs += 1;
+        }
+        try testing.expectEqual(@as(usize, rows - 2), thumbs);
+    }
 }

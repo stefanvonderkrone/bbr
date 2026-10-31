@@ -24,6 +24,8 @@ pub const PaneRects = struct {
     diff: Rect,
     sidebar_content: Rect,
     diff_content: Rect,
+    sidebar_track: Rect,
+    diff_track: Rect,
 };
 
 pub const PaneFocus = enum { sidebar, diff };
@@ -79,6 +81,7 @@ pub const ReviewSearchGeometry = struct {
     list: Rect,
     preview: Rect,
     header: Rect,
+    list_track: Rect,
     divider: u16,
     landscape: bool,
 };
@@ -95,6 +98,7 @@ pub fn reviewSearchGeometry(geometry: Geometry) ?ReviewSearchGeometry {
         .list = rects.get(.list).content,
         .preview = rects.get(.preview).content,
         .header = rects.get(.header).content,
+        .list_track = rects.get(.list).track,
         .divider = if (landscape) divider.x else divider.y,
         .landscape = landscape,
     };
@@ -110,9 +114,40 @@ pub const OverlayTarget = struct {
     /// The rows of a List Overlay's entries, below its query row.
     entries: Rect = .{},
     row_count: usize = 0,
+    /// The rows of the Review Search list, from `Published.reviewSearchListTotal`.
+    list_total: usize = 0,
     scroll: usize = 0,
     review_search: ?ReviewSearchGeometry = null,
 };
+
+/// Every scroll bar on screen. A new scroll bar is one arm here, and
+/// `scrollState` gives it its numbers.
+pub const ScrollBar = enum { sidebar, diff_pane, review_search_list };
+
+/// The numbers that paint and hit testing share for one scroll bar.
+pub const ScrollState = struct {
+    track: Rect,
+    total: usize,
+    /// The first visible row.
+    offset: usize,
+
+    pub fn thumb(self: ScrollState) ?view.Thumb {
+        return view.thumb(self.track.height, self.total, self.offset);
+    }
+};
+
+/// The track, total, and offset of `bar`, or null when `bar` is not on screen.
+pub fn scrollState(projection: Projection, bar: ScrollBar) ?ScrollState {
+    return switch (bar) {
+        .sidebar => .{ .track = projection.panes.sidebar_track, .total = projection.file_tree.entries.len, .offset = projection.file_tree.scroll },
+        .diff_pane => .{ .track = projection.panes.diff_track, .total = projection.visual_rows.len, .offset = projection.navigation.scroll },
+        .review_search_list => {
+            const overlay = projection.overlay orelse return null;
+            const geometry = overlay.review_search orelse return null;
+            return .{ .track = geometry.list_track, .total = overlay.list_total, .offset = overlay.scroll };
+        },
+    };
+}
 
 pub const HitTarget = union(enum) {
     select_old_version,
@@ -278,6 +313,8 @@ pub fn paneRects(geometry: Geometry) PaneRects {
         .diff = rects.get(.diff).border,
         .sidebar_content = rects.get(.sidebar).content,
         .diff_content = rects.get(.diff).content,
+        .sidebar_track = rects.get(.sidebar).track,
+        .diff_track = rects.get(.diff).track,
     };
 }
 
@@ -1135,7 +1172,7 @@ test "View Pane geometry keeps the cells of the previous formulas" {
             const diff_x: u16 = @min(sidebar_width, geometry.cols);
             const sidebar: Rect = .{ .x = 0, .y = 0, .width = sidebar_width, .height = geometry.rows };
             const diff: Rect = .{ .x = diff_x, .y = 0, .width = geometry.cols - diff_x, .height = geometry.rows };
-            return .{ .sidebar = sidebar, .diff = diff, .sidebar_content = content(sidebar), .diff_content = content(diff) };
+            return .{ .sidebar = sidebar, .diff = diff, .sidebar_content = content(sidebar), .diff_content = content(diff), .sidebar_track = .{}, .diff_track = .{} };
         }
     };
     var cols: u16 = 5;
@@ -1398,4 +1435,48 @@ test "M21 kernel indexed navigation preserves Selection Count and viewport after
     try testing.expectEqual(@as(?usize, 0), visualIndexForBufferIndex(new_rows, 0));
     try testing.expectEqual(@as(?usize, null), visualIndexForBufferIndex(new_rows, 1));
     try testing.expectEqual(@as(?usize, null), visualIndexForBufferIndex(&.{}, 0));
+}
+
+test "M30 scrollbar every track is as tall as the content of its View at every size" {
+    var cols: u16 = 5;
+    while (cols <= 320) : (cols += 1) {
+        var rows: u16 = 3;
+        while (rows <= 120) : (rows += 1) {
+            const geometry: Geometry = .{ .cols = cols, .rows = rows };
+            const panes = paneRects(geometry);
+            try testing.expectEqual(panes.sidebar_content.height, panes.sidebar_track.height);
+            try testing.expectEqual(panes.diff_content.height, panes.diff_track.height);
+            try testing.expectEqual(panes.sidebar.x + panes.sidebar.width -| 1, panes.sidebar_track.x);
+            try testing.expectEqual(panes.diff.x + panes.diff.width -| 1, panes.diff_track.x);
+            const review_search = reviewSearchGeometry(geometry) orelse continue;
+            try testing.expectEqual(review_search.list.height, review_search.list_track.height);
+            if (review_search.list_track.height > 0) try testing.expectEqual(review_search.list.x + review_search.list.width, review_search.list_track.x);
+        }
+    }
+}
+
+test "M30 scrollbar the Sidebar track is the Sidebar border and the next column is the DiffPane border" {
+    const geometry: Geometry = .{ .cols = 80, .rows = 10 };
+    const panes = paneRects(geometry);
+    try testing.expectEqual(panes.sidebar.x + panes.sidebar.width - 1, panes.sidebar_track.x);
+    try testing.expectEqual(panes.sidebar_track.x + 1, panes.diff.x);
+    try testing.expectEqual(panes.sidebar_content.y, panes.sidebar_track.y);
+    const entries = [_]file_tree.Entry{.{ .identity = .{ .file = 0 }, .parent = null, .depth = 0, .label = "a.zig" }} ** 30;
+    const frame: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = geometry,
+        .panes = panes,
+        .visual_rows = &.{},
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(0, panes.diff_content.height),
+        .file_tree = .{ .entries = &entries, .viewport = panes.sidebar_content.height },
+    };
+    try testing.expect(scrollState(frame, .sidebar).?.thumb() != null);
+    try testing.expect(scrollState(frame, .diff_pane).?.thumb() == null);
+    try testing.expect(scrollState(frame, .review_search_list) == null);
+    for (panes.diff_track.y..panes.diff_track.y + panes.diff_track.height) |row| {
+        try testing.expect(hitTest(frame, panes.diff.x, @intCast(row)) == null);
+        try testing.expect(hitTest(frame, panes.diff_track.x, @intCast(row)) == null);
+    }
 }
