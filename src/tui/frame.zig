@@ -9,6 +9,7 @@ pub const file_tree = @import("file_tree.zig");
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 const view = @import("view.zig");
 const layouts = @import("layouts.zig");
+const scroll_marks = @import("scroll_marks.zig");
 
 pub const Revision = u64;
 
@@ -281,6 +282,8 @@ pub const Projection = struct {
     overlay: ?OverlayTarget = null,
     visual_rows: []const VisualRow,
     buffer: buffer_mod.Buffer,
+    /// The Scroll Marks of `visual_rows`, built with them.
+    row_marks: []const scroll_marks.RowMark = &.{},
     navigation: Nav,
     file_tree: file_tree.Projection = .{},
     focus: PaneFocus = .diff,

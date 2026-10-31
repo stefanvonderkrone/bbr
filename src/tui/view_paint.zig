@@ -29,7 +29,7 @@ fn Painter(comptime Slot: type) type {
             if (node.border) |border| drawBorder(self.win, placed.border, strokeStyle(self.theme, border.stroke));
             if (node.composition == .rule) drawRule(self.win, placed.border, strokeStyle(self.theme, node.composition.rule));
             if (node.title) |title| drawTitle(self.win, node, placed, title);
-            if (node.scrollbar) |bar| drawScrollbar(self.win, placed.track, bar, strokeStyle(self.theme, bar.stroke));
+            if (node.scrollbar) |bar| drawScrollbar(self.win, placed.track, bar, self.theme);
         }
     };
 }
@@ -195,17 +195,49 @@ pub fn anchorCorner(win: vaxis.Window, row: u16, style: vaxis.Style) void {
     join(win, 1, row, .{ .left = true });
 }
 
-fn drawScrollbar(win: vaxis.Window, track: view.Rect, bar: view.Scrollbar, style: vaxis.Style) void {
+fn drawScrollbar(win: vaxis.Window, track: view.Rect, bar: view.Scrollbar, theme: Theme) void {
     const extent = if (bar.axis == .vertical) track.height else track.width;
+    std.debug.assert(bar.marks.len == 0 or (bar.axis == .vertical and bar.marks.len == extent));
     const range = view.thumb(extent, bar.total, bar.offset) orelse return;
+    const style = strokeStyle(theme, bar.stroke);
     const grapheme: []const u8 = switch (bar.axis) {
-        .vertical => if (bar.ring == .border) "┃" else "│",
+        .vertical => if (bar.ring == .border) vertical_thumbs[0] else vertical_thumbs[1],
         .horizontal => if (bar.ring == .border) "━" else "─",
     };
-    for (range.first..range.first + range.len) |step| switch (bar.axis) {
-        .vertical => writeGlyph(win, track.x, track.y + step, grapheme, style),
-        .horizontal => writeGlyph(win, track.x + step, track.y, grapheme, style),
+    for (0..extent) |step| {
+        const mark = if (bar.marks.len == 0) null else bar.marks[step];
+        const on_thumb = step >= range.first and step < range.first + range.len;
+        if (!on_thumb and mark == null) continue;
+        const glyph = if (mark) |kind| scrollMarkGlyph(kind) else grapheme;
+        const cell_style = if (on_thumb) style else theme.scrollMarkStyle(mark.?);
+        switch (bar.axis) {
+            .vertical => writeGlyph(win, track.x, track.y + step, glyph, cell_style),
+            .horizontal => writeGlyph(win, track.x + step, track.y, glyph, cell_style),
+        }
+    }
+}
+
+/// The thumb glyphs of a vertical scroll bar in a border ring and in any other ring.
+pub const vertical_thumbs = [_][]const u8{ "┃", "│" };
+
+pub fn scrollMarkGlyph(mark: view.ScrollMark) []const u8 {
+    return switch (mark) {
+        .buffer_search_hit => "◆",
+        .draft => "✎",
+        .unresolved_thread => "●",
+        .resolved_thread => "✓",
+        .file_header => "━",
     };
+}
+
+comptime {
+    const marks = std.meta.tags(view.ScrollMark);
+    for (marks, 0..) |mark, index| {
+        for (marks[index + 1 ..]) |other| if (std.mem.eql(u8, scrollMarkGlyph(mark), scrollMarkGlyph(other)))
+            @compileError("Scroll Marks " ++ @tagName(mark) ++ " and " ++ @tagName(other) ++ " share a glyph in view_paint.scrollMarkGlyph");
+        for (vertical_thumbs) |thumb| if (std.mem.eql(u8, scrollMarkGlyph(mark), thumb))
+            @compileError("Scroll Mark " ++ @tagName(mark) ++ " has the thumb glyph " ++ thumb ++ " in view_paint.scrollMarkGlyph");
+    }
 }
 
 /// The line arms that leave one cell.
@@ -349,5 +381,69 @@ test "M30 scrollbar the painted thumb covers the track cell of every visible row
     for (0..7) |cell| {
         const expected = if (cell >= 2 and cell <= 4) "┃" else "│";
         try testing.expectEqualStrings(expected, win.readCell(2, @intCast(cell + 1)).?.char.grapheme);
+    }
+}
+
+const theme_mod = @import("theme.zig");
+
+/// Marks for the seven track cells of `barTree` at 9 rows. The thumb of
+/// total 20 at offset 6 covers cells 2 to 4.
+const test_marks = [_]?view.ScrollMark{ .file_header, null, .draft, null, .unresolved_thread, null, .resolved_thread };
+
+test "M30 scrollbar a Scroll Mark under the thumb keeps its glyph in the thumb style" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 9, .cols = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = headless(&screen);
+    for (theme_mod.builtins) |builtin| {
+        var painter: Painter(Pair) = .{ .win = win, .theme = builtin.value };
+        const bar: view.Scrollbar = .{ .ring = .border, .total = 20, .offset = 6, .stroke = .{ .focused = true }, .marks = &test_marks };
+        barTree(bar, .{ .width = 3, .height = 9 }, &painter);
+        const thumb = strokeStyle(builtin.value, bar.stroke);
+        for ([_]struct { u16, []const u8 }{ .{ 2, "✎" }, .{ 3, "┃" }, .{ 4, "●" } }) |expected| {
+            const cell = win.readCell(2, expected[0] + 1).?;
+            try testing.expectEqualStrings(expected[1], cell.char.grapheme);
+            try testing.expectEqual(thumb, cell.style);
+        }
+    }
+}
+
+test "M30 scrollbar a Scroll Mark off the thumb paints its glyph in its Theme style and a plain cell keeps the border" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 9, .cols = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = headless(&screen);
+    for (theme_mod.builtins) |builtin| {
+        var painter: Painter(Pair) = .{ .win = win, .theme = builtin.value };
+        barTree(.{ .ring = .border, .total = 20, .offset = 6, .marks = &test_marks }, .{ .width = 3, .height = 9 }, &painter);
+        for ([_]u16{ 0, 6 }) |track_cell| {
+            const mark = test_marks[track_cell].?;
+            const cell = win.readCell(2, track_cell + 1).?;
+            try testing.expectEqualStrings(scrollMarkGlyph(mark), cell.char.grapheme);
+            try testing.expectEqual(builtin.value.scrollMarkStyle(mark), cell.style);
+        }
+        for ([_]u16{ 1, 5 }) |track_cell| try testing.expectEqualStrings("│", win.readCell(2, track_cell + 1).?.char.grapheme);
+    }
+}
+
+test "M30 scrollbar a track without a thumb paints no Scroll Mark" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 9, .cols = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = headless(&screen);
+    var painter: Painter(Pair) = .{ .win = win, .theme = theme_mod.dark };
+    barTree(.{ .ring = .border, .total = 7, .marks = &test_marks }, .{ .width = 3, .height = 9 }, &painter);
+    for (1..8) |row| try testing.expectEqualStrings("│", win.readCell(2, @intCast(row)).?.char.grapheme);
+}
+
+test "M30 scrollbar each Scroll Mark glyph has a cell width of 1" {
+    for (std.meta.tags(view.ScrollMark)) |mark| try testing.expectEqual(@as(usize, 1), vaxis.gwidth.gwidth(scrollMarkGlyph(mark), .unicode));
+}
+
+test "M30 scrollbar a join leaves every Scroll Mark glyph alone" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 1, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = headless(&screen);
+    for (std.meta.tags(view.ScrollMark)) |mark| {
+        writeGlyph(win, 0, 0, scrollMarkGlyph(mark), .{});
+        join(win, 0, 0, .{ .left = true, .right = true });
+        try testing.expectEqualStrings(scrollMarkGlyph(mark), win.readCell(0, 0).?.char.grapheme);
     }
 }

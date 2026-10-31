@@ -18,6 +18,7 @@ const frame_mod = @import("frame.zig");
 const view_mod = @import("view.zig");
 const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
+const scroll_marks = @import("scroll_marks.zig");
 const search = @import("search.zig");
 const review_card = @import("review_card.zig");
 const code_highlighting = @import("code_highlighting.zig");
@@ -2567,6 +2568,7 @@ pub const DisclosureBuild = struct {
     destination_row: ?usize = null,
     buffer: buffer_mod.Buffer = undefined,
     visual_rows: []const frame_mod.VisualRow = &.{},
+    row_marks: []const scroll_marks.RowMark = &.{},
     projection: ?*SearchProjection = null,
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
     navigation_rows: ?[]SearchNavigationRow = null,
@@ -2831,6 +2833,7 @@ pub const DisclosureBuild = struct {
             .layout = self.preferences.layout,
             .width = frame_mod.paneRects(self.geometry).diff_content.width,
         });
+        self.row_marks = try scroll_marks.rowMarks(a, self.buffer, self.visual_rows);
         if (self.version_restoration) |target| self.version_destination = versionNavigationDestination(self.session, self.buffer, self.visual_rows, target, self.preferences.selected_version);
         if (self.deletion_origin) |origin| self.surviving_row = survivingRowAfterDeletion(origin.deletion_rows, self.deleted_ids);
         const panes = frame_mod.paneRects(self.geometry);
@@ -3832,6 +3835,7 @@ const Published = struct {
         published: *Published,
         buffer: buffer_mod.Buffer,
         visual_rows: []const frame_mod.VisualRow,
+        row_marks: []const scroll_marks.RowMark,
         search_projection: *SearchProjection,
         disclosure_inputs: *DisclosureInputs,
         disclosure_keys: *DisclosureKeys,
@@ -3875,6 +3879,7 @@ const Published = struct {
             self.published.buffers.commit();
             self.published.buffer = self.buffer;
             self.published.visual_rows = self.visual_rows;
+            self.published.row_marks = self.row_marks;
             self.published.search_projection.release();
             self.published.search_projection = self.search_projection;
             self.published.disclosure_inputs.release();
@@ -3951,6 +3956,7 @@ const Published = struct {
     buffer: buffer_mod.Buffer,
     visual_rows: []const frame_mod.VisualRow,
     search_projection: *SearchProjection,
+    row_marks: []const scroll_marks.RowMark = &.{},
     disclosure_inputs: *DisclosureInputs,
     disclosure_inputs_current: bool = true,
     disclosure_keys: *DisclosureKeys,
@@ -4149,6 +4155,7 @@ const Published = struct {
             .layout = preferences.layout,
             .width = frame_mod.paneRects(geometry).diff_content.width,
         });
+        published.row_marks = try scroll_marks.rowMarks(buffer_allocator, published.buffer, published.visual_rows);
         published.search_projection = try SearchProjection.create(published.buffer, published.visual_rows, .{
             .session = session,
             .drafts = published.review.drafts.items,
@@ -4246,6 +4253,7 @@ const Published = struct {
             .geometry = self.geometry,
             .panes = frame_mod.paneRects(self.geometry),
             .visual_rows = self.visual_rows,
+            .row_marks = self.row_marks,
             .buffer = self.buffer,
             .navigation = self.navigation,
             .file_tree = self.tree,
@@ -4475,6 +4483,7 @@ const Published = struct {
             .layout = preferences.layout,
             .width = frame_mod.paneRects(geometry).diff_content.width,
         });
+        const row_marks = try scroll_marks.rowMarks(allocator, candidate, visual_rows);
         const search_projection = try SearchProjection.create(candidate, visual_rows, .{
             .session = self.session,
             .drafts = self.review.drafts.items,
@@ -4588,6 +4597,7 @@ const Published = struct {
             .published = self,
             .buffer = candidate,
             .visual_rows = visual_rows,
+            .row_marks = row_marks,
             .search_projection = search_projection,
             .disclosure_inputs = disclosure_inputs,
             .disclosure_keys = disclosure_keys,
@@ -8852,6 +8862,7 @@ pub const Presentation = struct {
         published.search_projection = job.projection.?;
         published.buffer = job.buffer;
         published.visual_rows = job.visual_rows;
+        published.row_marks = job.row_marks;
         published.tree = job.tree;
         published.selected_version = job.preferences.selected_version;
         published.navigation = frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation);
@@ -9061,6 +9072,7 @@ pub const Presentation = struct {
         published.search_projection = job.projection.?;
         published.buffer = job.buffer;
         published.visual_rows = job.visual_rows;
+        published.row_marks = job.row_marks;
         published.tree = job.tree;
         published.navigation = switch (job.navigation_policy) {
             .restore, .file_header, .center, .version => frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation),
@@ -9436,6 +9448,7 @@ pub const Presentation = struct {
         published.search_projection = job.projection.?;
         published.buffer = job.buffer;
         published.visual_rows = job.visual_rows;
+        published.row_marks = job.row_marks;
         published.tree = job.tree;
         var navigation_origin = previous;
         if (job.clear_review_disclosures) {
@@ -30308,4 +30321,109 @@ test "M30 scrollbar a Review Search entry click and a double click behave as bef
     try presentation.dispatch(.{ .mouse = .{ .col = point.col, .row = point.row, .button = .left, .type = .release, .time_ns = again.time_ns } });
     try completeDisclosureBuild(&presentation);
     try testing.expect(presentation.projection().review_search == null);
+}
+
+/// The published row marks are the row marks of the published visual rows.
+fn expectPublishedRowMarks(frame: frame_mod.Projection) !void {
+    const expected = try scroll_marks.rowMarks(testing.allocator, frame.buffer, frame.visual_rows);
+    defer testing.allocator.free(expected);
+    try testing.expectEqualSlices(scroll_marks.RowMark, expected, frame.row_marks);
+}
+
+fn countRowMarks(frame: frame_mod.Projection, kind: view_mod.ScrollMark) usize {
+    var count: usize = 0;
+    for (frame.row_marks) |mark| count += @intFromBool(mark.kind == kind);
+    return count;
+}
+
+test "M30 scrollbar a saved Draft and a resolved Thread toggle change the Scroll Marks in the next Frame" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+
+    var disclosure = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer disclosure.deinit();
+    const collapsed = disclosure.projection().review.?.frame;
+    try expectPublishedRowMarks(collapsed);
+    const row = findDisclosureRow(collapsed.buffer.rows, .{ .resolved_thread = 1 }).?;
+    const disclosure_row = disclosure.published.?.visualIndexForBufferIndex(row).?;
+    try testing.expect(for (collapsed.row_marks) |mark| {
+        if (mark.kind == .resolved_thread and mark.first == disclosure_row and mark.end == disclosure_row + 1) break true;
+    } else false);
+    disclosure.published.?.navigation.jumpTo(disclosure_row);
+    try disclosure.dispatch(.{ .action = .toggle_disclosure });
+    try completeDisclosureBuild(&disclosure);
+    const expanded = disclosure.projection().review.?.frame;
+    try expectPublishedRowMarks(expanded);
+    try testing.expect(for (expanded.row_marks) |mark| {
+        if (mark.kind == .resolved_thread and mark.end - mark.first > 1) break true;
+    } else false);
+
+    try disclosure.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = disclosure.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&disclosure, .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testScrollBarSession(testing.allocator, 2, m30_scroll_diff) } } });
+    const replaced = disclosure.projection().review.?.frame;
+    try expectPublishedRowMarks(replaced);
+    try testing.expectEqual(@as(usize, 3), countRowMarks(replaced, .file_header));
+
+    var drafts = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 3), .session = try testScrollBarSession(testing.allocator, 3, m30_scroll_diff) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer drafts.deinit();
+    try testing.expectEqual(@as(usize, 0), countRowMarks(drafts.projection().review.?.frame, .draft));
+    try drafts.dispatch(.{ .action = .review_comment });
+    try drafts.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
+    try drafts.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&drafts);
+    const with = drafts.projection().review.?.frame;
+    try expectPublishedRowMarks(with);
+    try testing.expectEqual(@as(usize, 1), countRowMarks(with, .draft));
+}
+
+fn rowMarksFailureCase(allocator: Allocator, frame: frame_mod.Projection) !void {
+    const marks = try scroll_marks.rowMarks(allocator, frame.buffer, frame.visual_rows);
+    allocator.free(marks);
+}
+
+test "M30 scrollbar an allocation failure in rowMarks keeps the previous Frame" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer presentation.deinit();
+    const row = findDisclosureRow(presentation.projection().review.?.frame.buffer.rows, .{ .resolved_thread = 1 }).?;
+    presentation.published.?.navigation.jumpTo(presentation.published.?.visualIndexForBufferIndex(row).?);
+    const before = presentation.projection().review.?.frame;
+    try testing.expect(before.row_marks.len > 0);
+    try testing.checkAllAllocationFailures(testing.allocator, rowMarksFailureCase, .{before});
+
+    // The worker arena grows in chunks, so the sweep fails each chunk, and a
+    // rowMarks failure takes the same path as every other worker failure.
+    var failing: testing.FailingAllocator = undefined;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        try presentation.dispatch(.{ .action = .toggle_disclosure });
+        const worker = presentation.takeCommand().?.build_buffer_disclosure;
+        var page_arena = worker.arena;
+        defer page_arena.deinit();
+        failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        worker.arena = std.heap.ArenaAllocator.init(failing.allocator());
+        worker.build();
+        const failed = worker.failed;
+        try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+        if (!failed) break;
+        const after = presentation.projection().review.?.frame;
+        try testing.expectEqual(before.visual_rows.ptr, after.visual_rows.ptr);
+        try testing.expectEqual(before.row_marks.ptr, after.row_marks.ptr);
+        try testing.expectEqual(before.row_marks.len, after.row_marks.len);
+    }
+    try testing.expect(fail_index > 0);
+    const expanded = presentation.projection().review.?.frame;
+    try testing.expect(expanded.visual_rows.ptr != before.visual_rows.ptr);
+    try expectPublishedRowMarks(expanded);
 }

@@ -14,6 +14,7 @@ const Style = vaxis.Style;
 const Color = vaxis.Cell.Color;
 const review_card = @import("review_card.zig");
 const ThemeId = @import("theme_id.zig").ThemeId;
+const view = @import("view.zig");
 
 /// One kind of content on the status row. Each kind has its own Style.
 pub const StatusPart = enum { bar, separator, pull_request, title, ref, position, key, hint, drafts, verdict_approved, verdict_changes_requested, verdict_none, message, busy, no_match };
@@ -201,6 +202,32 @@ pub const Theme = struct {
             style.dim = true;
         }
         return self.resolveStyle(style);
+    }
+
+    /// A Scroll Mark off the thumb. Every mark keeps the Pane border
+    /// background, so it never paints a band in the border.
+    pub fn scrollMarkStyle(self: Theme, mark: view.ScrollMark) Style {
+        var style: Style = .{ .bg = self.pane_border.bg };
+        switch (mark) {
+            .buffer_search_hit => {
+                style.fg = self.accent;
+                style.bold = true;
+            },
+            .draft => {
+                style.fg = self.draft.fg;
+                style.bold = true;
+            },
+            .unresolved_thread => {
+                style.fg = self.status_renamed;
+                style.bold = true;
+            },
+            .resolved_thread => {
+                style.fg = self.status_added;
+                style.dim = true;
+            },
+            .file_header => style.fg = self.pane_border.fg,
+        }
+        return style;
     }
 
     pub fn resolvedThreadStyle(self: Theme) Style {
@@ -564,6 +591,28 @@ comptime {
             if (!std.meta.eql(entry.value.reviewCardStyle(role, part, .{}).bg, entry.value.context.bg))
                 @compileError("Theme \"" ++ entry.name ++ "\" ReviewCard role " ++ @tagName(role) ++ " part " ++ @tagName(part) ++ " must have the context background, because a ReviewCard paints the Theme base background. Only code and Suggestion rows keep their own");
         };
+        checkScrollMarks(entry);
+    }
+}
+
+fn checkScrollMarks(comptime entry: Builtin) void {
+    const theme = entry.value;
+    const marks = std.meta.tags(view.ScrollMark);
+    for (marks, 0..) |mark, index| {
+        const prefix = "Theme \"" ++ entry.name ++ "\" Scroll Mark " ++ @tagName(mark);
+        const style = theme.scrollMarkStyle(mark);
+        if (!std.meta.eql(style.bg, theme.pane_border.bg))
+            @compileError(prefix ++ " must have the pane_border background, because a Scroll Mark never paints a band in the border");
+        if (style.dim != (mark == .resolved_thread))
+            @compileError(prefix ++ " must be dim only for resolved_thread, so a resolved Thread does not compete with an open one");
+        if (mark == .file_header) continue;
+        if (std.meta.eql(style.fg, theme.pane_border.fg) or std.meta.eql(style.fg, theme.pane_border_focused.fg))
+            @compileError(prefix ++ " must have a foreground that differs from pane_border and pane_border_focused, so it stands out from the border");
+        for (marks[index + 1 ..]) |other| {
+            if (other == .file_header) continue;
+            if (std.meta.eql(style.fg, theme.scrollMarkStyle(other).fg))
+                @compileError(prefix ++ " must have a foreground that differs from Scroll Mark " ++ @tagName(other));
+        }
     }
 }
 
