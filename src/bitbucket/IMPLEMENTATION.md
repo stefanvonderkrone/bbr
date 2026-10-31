@@ -6,6 +6,23 @@ The [Bitbucket glossary](./GLOSSARY.md) defines the domain terms used here.
 
 These observations come from live PullRequest checks.
 
+### PullRequest states and q
+
+A PullRequest list ignores the `state` parameter when the request also has a `q` parameter.
+This applies to `/repositories/{ws}/{repo}/pullrequests` and to `/workspaces/{ws}/pullrequests/{user}`.
+Live checks on Repository `pr-reise-cockpit` showed this behavior:
+
+- `state=OPEN` with `q=reviewers.uuid="{uuid}"` returned MERGED PullRequests.
+- The same request with `q=reviewers.uuid="{uuid}" AND state="OPEN"` returned no PullRequests.
+- `state=OPEN` with `q=source.branch.name="PCO-89-fe-login-für-internen-cockpit-adm"` returned the MERGED PullRequest 146.
+  The TUI uses this request to find the AdjacentPullRequest.
+- The author endpoint without `q` returned only DECLINED PullRequests for `state=DECLINED`.
+
+`pullRequestListUrl` in `client.zig` builds every PullRequest list URL.
+Without a `q` filter, it sends one `state` parameter for each state.
+With a `q` filter, it puts the states into `q`, for example `(state="OPEN" OR state="MERGED") AND reviewers.uuid="{uuid}"`.
+A live check returned the same PullRequests for `state=DECLINED&state=OPEN` and for `q=(state="DECLINED" OR state="OPEN") AND (id > 0)`.
+
 ### Outdated Comments
 
 The Comments list endpoint, `/pullrequests/{id}/comments`, omits `inline.outdated`.

@@ -19,7 +19,7 @@ bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author
 ```
 
 - `--author` and `--reviewer` each take one account UUID. The command needs at least one of them.
-- `--state` repeats. The default is `OPEN`. Each value becomes one `state=` parameter.
+- `--state` repeats. The default is `OPEN`. Without a `q` filter, each value becomes one `state=` parameter. With a `q` filter, the states go into `q`, because Bitbucket then ignores `state=`.
 - `--query` is a Bitbucket `q` expression. The command joins it to its own filter with `AND (...)`.
 - `--limit` caps the total number of PullRequests in the output.
 - `--concurrency` sets the number of parallel Repository requests in reviewer mode. The default and the CPU cap follow `search-workspace-members`.

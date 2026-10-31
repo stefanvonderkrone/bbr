@@ -127,7 +127,7 @@ fn parseList(args: []const []const u8) !ListArgs {
             repository = try arg.takeValue(&cur, f);
         } else if (std.mem.eql(u8, f.name, "state")) {
             _ = cur.next();
-            filter.state = try arg.takeValue(&cur, f);
+            filter.state = std.meta.stringToEnum(bbr.bitbucket.PullRequestState, try arg.takeValue(&cur, f)) orelse return error.BadRequest;
         } else if (std.mem.eql(u8, f.name, "source-branch")) {
             _ = cur.next();
             filter.source_branch = try arg.takeValue(&cur, f);
@@ -550,7 +550,7 @@ test "list-pull-requests parses interleaved filters and page controls in both va
     for (cases) |args| {
         const parsed = try parseList(args);
         try std.testing.expectEqualStrings("repository", parsed.repository);
-        try std.testing.expectEqualStrings("MERGED", parsed.filter.state);
+        try std.testing.expectEqual(.MERGED, parsed.filter.state);
         try std.testing.expectEqualStrings("feature", parsed.filter.source_branch.?);
         try std.testing.expectEqual(@as(u32, 10), parsed.page.pagelen.?);
         try std.testing.expectEqual(@as(u32, 3), parsed.page.page.?);
@@ -560,7 +560,7 @@ test "list-pull-requests parses interleaved filters and page controls in both va
         try std.testing.expectEqual(@as(usize, 12), parsed.page.limit.?);
     }
     const defaults = try parseList(&.{ "--repository", "repository" });
-    try std.testing.expectEqualStrings("OPEN", defaults.filter.state);
+    try std.testing.expectEqual(.OPEN, defaults.filter.state);
     try std.testing.expect(defaults.filter.source_branch == null);
     try std.testing.expectEqual(bbr.bitbucket.PageOptions{}, defaults.page);
 }
@@ -575,6 +575,7 @@ test "list-pull-requests rejects invalid page controls before HTTP" {
     try std.testing.expectError(error.InvalidNumber, listPullRequests(a, bb, &.{ "--repository=repository", "--limit=bad" }));
     try std.testing.expectError(error.UnknownFlag, listPullRequests(a, bb, &.{ "--repository=repository", "--no-follow=false" }));
     try std.testing.expectError(error.UnknownFlag, listPullRequests(a, bb, &.{ "--repository=repository", "--unknown" }));
+    try std.testing.expectError(error.BadRequest, listPullRequests(a, bb, &.{ "--repository=repository", "--state=open" }));
     try std.testing.expectEqual(@as(usize, 0), fake.call_count);
 }
 
@@ -614,9 +615,10 @@ test "list-pull-requests sends filters and page controls and does not follow wit
     const url = fake.lastUrl().?;
     try std.testing.expect(std.mem.startsWith(u8, url, bbr.bitbucket.base_url ++ "/repositories/workspace/repository/pullrequests?"));
     for ([_][]const u8{
-        "pagelen=10",                                                              "page=3", "state=MERGED", "sort=-id",
-        "q=source.branch.name%3D%22feature%22%20AND%20%28title%3D%22Review%22%29",
+        "pagelen=10",                                                                                           "page=3", "sort=-id",
+        "q=state%3D%22MERGED%22%20AND%20source.branch.name%3D%22feature%22%20AND%20%28title%3D%22Review%22%29",
     }) |part| try std.testing.expect(std.mem.indexOf(u8, url, part) != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "state=") == null);
 }
 
 test "list-pull-requests limit stops HTTP paging and defaults still follow next" {

@@ -263,31 +263,11 @@ pub const Client = struct {
         filter: ListOptions,
         opts: PageOptions,
     ) ![]PullRequestSummary {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(allocator);
-        try buf.print(allocator, "{s}/repositories/{s}/{s}/pullrequests?", .{ base_url, self.cred.workspace, repo_slug });
-        // Keep the TUI's first-page URL and page size stable.
-        var page_opts = opts;
-        if (opts.pagelen) |n| {
-            try buf.print(allocator, "pagelen={d}&", .{n});
-            page_opts.pagelen = null;
-        }
-        try buf.appendSlice(allocator, "state=");
-        try percentEncodeInto(allocator, &buf, filter.state);
-        if (filter.source_branch) |branch| {
-            const quoted = try std.json.Stringify.valueAlloc(allocator, branch, .{});
-            defer allocator.free(quoted);
-            try buf.appendSlice(allocator, "&q=");
-            try percentEncodeInto(allocator, &buf, "source.branch.name=");
-            try percentEncodeInto(allocator, &buf, quoted);
-            if (opts.query) |query| {
-                try percentEncodeInto(allocator, &buf, " AND (");
-                try percentEncodeInto(allocator, &buf, query);
-                try percentEncodeInto(allocator, &buf, ")");
-            }
-            page_opts.query = null;
-        }
-        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, buf.items, page_opts, null, false);
+        const endpoint = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests");
+        defer allocator.free(endpoint);
+        const list = try pullRequestListUrl(allocator, endpoint, .{ .states = .initOne(filter.state), .source_branch = filter.source_branch }, opts);
+        defer allocator.free(list.url);
+        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, list.url, list.page, null, false);
     }
 
     /// GET /repositories/{workspace}/{repo}/pullrequests/{id}/diff.
@@ -1027,15 +1007,16 @@ pub const Client = struct {
         const reviewer: ?[]const u8 = if (filter.party == .author_and_reviewer) filter.party.author_and_reviewer.reviewer else null;
         if (author.len == 0 or reviewer != null and reviewer.?.len == 0) return error.BadRequest;
         if (opts.limit == 0) return allocator.alloc(PullRequestSummary, 0);
-        var url: std.ArrayList(u8) = .empty;
-        defer url.deinit(allocator);
-        try url.appendSlice(allocator, base_url ++ "/workspaces/");
-        try percentEncodeInto(allocator, &url, self.cred.workspace);
-        try url.appendSlice(allocator, "/pullrequests/");
-        try percentEncodeInto(allocator, &url, author);
-        try appendPullRequestFilter(allocator, &url, filter, reviewer);
+        var endpoint: std.ArrayList(u8) = .empty;
+        defer endpoint.deinit(allocator);
+        try endpoint.appendSlice(allocator, base_url ++ "/workspaces/");
+        try percentEncodeInto(allocator, &endpoint, self.cred.workspace);
+        try endpoint.appendSlice(allocator, "/pullrequests/");
+        try percentEncodeInto(allocator, &endpoint, author);
+        const list = try pullRequestListUrl(allocator, endpoint.items, .{ .states = filter.states, .reviewer = reviewer }, .{ .pagelen = pull_request_pagelen, .query = filter.query });
+        defer allocator.free(list.url);
         // The endpoint mixes Repositories, so the limit applies after the Repository order.
-        const items = try self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url.items, .{}, null, false);
+        const items = try self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, list.url, list.page, null, false);
         const Order = struct {
             fn less(_: void, lhs: PullRequestSummary, rhs: PullRequestSummary) bool {
                 return std.mem.lessThan(u8, lhs.destination_repository, rhs.destination_repository);
@@ -1070,13 +1051,10 @@ pub const Client = struct {
             allocator.free(jobs);
         }
         for (repositories, jobs) |repository, *job| {
-            var url: std.ArrayList(u8) = .empty;
-            errdefer url.deinit(allocator);
             const endpoint = try self.repositoryEndpoint(allocator, repository.slug, "/pullrequests");
             defer allocator.free(endpoint);
-            try url.appendSlice(allocator, endpoint);
-            try appendPullRequestFilter(allocator, &url, filter, reviewer);
-            job.url = try url.toOwnedSlice(allocator);
+            const list = try pullRequestListUrl(allocator, endpoint, .{ .states = filter.states, .reviewer = reviewer }, .{ .pagelen = pull_request_pagelen, .query = filter.query });
+            job.url = list.url;
         }
 
         const completions = try allocator.alloc(RepositoryCompletion, opts.concurrency);
@@ -2253,11 +2231,10 @@ fn asApiError(err: anyerror) ?ApiError {
     };
 }
 
-/// Filter for `listPullRequests`. `state` is a Bitbucket PR state string
-/// (OPEN, MERGED, DECLINED, SUPERSEDED); `source_branch` restricts to PRs
+/// Filter for `listPullRequests`. `source_branch` restricts to PRs
 /// opened from that branch (the AdjacentPullRequest lookup).
 pub const ListOptions = struct {
-    state: []const u8 = "OPEN",
+    state: types.PullRequestState = .OPEN,
     source_branch: ?[]const u8 = null,
 };
 
@@ -2278,22 +2255,54 @@ pub const WorkspacePullRequestOptions = struct {
 /// Bitbucket's largest PullRequest page.
 const pull_request_pagelen = 50;
 
-fn appendPullRequestFilter(allocator: Allocator, url: *std.ArrayList(u8), filter: WorkspacePullRequestFilter, reviewer: ?[]const u8) !void {
-    try url.print(allocator, "?pagelen={d}", .{pull_request_pagelen});
+/// The filter of one PullRequest list request. `states` must not be empty.
+const PullRequestListFilter = struct {
+    states: std.EnumSet(types.PullRequestState),
+    source_branch: ?[]const u8 = null,
+    reviewer: ?[]const u8 = null,
+};
+
+/// A PullRequest list URL and the page options that `listPages` still applies.
+const PullRequestListUrl = struct { url: []u8, page: PageOptions };
+
+/// The only builder of PullRequest list URLs. `endpoint` has no query string.
+/// The URL takes `opts.pagelen` and `opts.query`, so the returned options omit both.
+fn pullRequestListUrl(allocator: Allocator, endpoint: []const u8, filter: PullRequestListFilter, opts: PageOptions) !PullRequestListUrl {
+    std.debug.assert(filter.states.count() != 0);
+    var url: std.ArrayList(u8) = .empty;
+    errdefer url.deinit(allocator);
+    try url.appendSlice(allocator, endpoint);
+    try url.append(allocator, '?');
+    if (opts.pagelen) |n| try url.print(allocator, "pagelen={d}&", .{n});
+    var page = opts;
+    page.pagelen = null;
+    page.query = null;
     var states = filter.states.iterator();
-    while (states.next()) |state| try url.print(allocator, "&state={s}", .{@tagName(state)});
-    if (reviewer == null and filter.query == null) return;
-    try url.appendSlice(allocator, "&q=");
-    if (reviewer) |uuid| {
-        const quoted = try std.json.Stringify.valueAlloc(allocator, uuid, .{});
-        defer allocator.free(quoted);
-        try percentEncodeInto(allocator, url, "reviewers.uuid=");
-        try percentEncodeInto(allocator, url, quoted);
-        if (filter.query == null) return;
-        try percentEncodeInto(allocator, url, " AND (");
+    if (filter.source_branch == null and filter.reviewer == null and opts.query == null) {
+        var separator: []const u8 = "";
+        while (states.next()) |state| : (separator = "&") try url.print(allocator, "{s}state={s}", .{ separator, @tagName(state) });
+        return .{ .url = try url.toOwnedSlice(allocator), .page = page };
     }
-    try percentEncodeInto(allocator, url, filter.query.?);
-    if (reviewer != null) try percentEncodeInto(allocator, url, ")");
+    // Bitbucket ignores the state parameter when q is present, so q must hold the states.
+    var q: std.ArrayList(u8) = .empty;
+    defer q.deinit(allocator);
+    const grouped = filter.states.count() > 1;
+    if (grouped) try q.append(allocator, '(');
+    var separator: []const u8 = "";
+    while (states.next()) |state| : (separator = " OR ") try q.print(allocator, "{s}state=\"{s}\"", .{ separator, @tagName(state) });
+    if (grouped) try q.append(allocator, ')');
+    for ([_]struct { []const u8, ?[]const u8 }{
+        .{ "source.branch.name", filter.source_branch },
+        .{ "reviewers.uuid", filter.reviewer },
+    }) |condition| if (condition[1]) |value| {
+        const quoted = try std.json.Stringify.valueAlloc(allocator, value, .{});
+        defer allocator.free(quoted);
+        try q.print(allocator, " AND {s}={s}", .{ condition[0], quoted });
+    };
+    if (opts.query) |query| try q.print(allocator, " AND ({s})", .{query});
+    try url.appendSlice(allocator, "q=");
+    try percentEncodeInto(allocator, &url, q.items);
+    return .{ .url = try url.toOwnedSlice(allocator), .page = page };
 }
 
 /// One Repository's reviewer-filtered PullRequests. Its worker owns the arena until it completes.
@@ -3424,13 +3433,26 @@ test "listPullRequests builds a filtered, percent-encoded URL" {
     const prs = try bb.listPullRequests(a, "myrepo", .{ .source_branch = "feature/x y" });
     defer deinitSummaries(a, prs);
 
-    // state is a plain param; the branch filter is `source.branch.name="..."`
-    // percent-encoded as a single q value (space→%20, quote→%22, slash→%2F).
     try testing.expectEqualStrings(
         "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests" ++
-            "?pagelen=50&state=OPEN&q=source.branch.name%3D%22feature%2Fx%20y%22",
+            "?pagelen=50&q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22feature%2Fx%20y%22",
         fake.lastUrl().?,
     );
+}
+
+test "PullRequest lists send the states as parameters without q and inside q with q" {
+    const repo = "https://api.bitbucket.org/2.0/repositories/check24/repo/pullrequests";
+    for ([_]struct { filter: ListOptions, opts: PageOptions, url: []const u8 }{
+        .{ .filter = .{}, .opts = .{ .pagelen = 50 }, .url = repo ++ "?pagelen=50&state=OPEN" },
+        .{ .filter = .{ .state = .MERGED }, .opts = .{}, .url = repo ++ "?state=MERGED" },
+        .{ .filter = .{ .state = .MERGED }, .opts = .{ .query = "id=1" }, .url = repo ++ "?q=state%3D%22MERGED%22%20AND%20%28id%3D1%29" },
+        .{ .filter = .{ .source_branch = "x" }, .opts = .{ .pagelen = 50 }, .url = repo ++ "?pagelen=50&q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22x%22" },
+    }) |case| {
+        var fake: FakeHttpClient = .{ .body = "{\"values\":[]}" };
+        const items = try Client.init(fake.httpClient(), testCredential()).listPullRequestsPage(testing.allocator, "repo", case.filter, case.opts);
+        defer deinitSummaries(testing.allocator, items);
+        try testing.expectEqualStrings(case.url, fake.lastUrl().?);
+    }
 }
 
 test "listPullRequests follows next links across pages" {
@@ -4693,8 +4715,8 @@ test "Workspace author PullRequests encode the author path, repeat states, and j
         }, .{ .limit = limit, .concurrency = 8 });
         defer deinitSummaries(testing.allocator, items);
         try testing.expectEqualStrings(
-            base_url ++ "/workspaces/check24/pullrequests/%7Bauthor%7D?pagelen=50&state=OPEN&state=MERGED" ++
-                "&q=reviewers.uuid%3D%22%7Breviewer%7D%22%20AND%20%28title%20~%20%22x%22%29",
+            base_url ++ "/workspaces/check24/pullrequests/%7Bauthor%7D?pagelen=50" ++
+                "&q=%28state%3D%22OPEN%22%20OR%20state%3D%22MERGED%22%29%20AND%20reviewers.uuid%3D%22%7Breviewer%7D%22%20AND%20%28title%20~%20%22x%22%29",
             fake.urlAt(0).?,
         );
         try testing.expectEqual(@as(usize, 2), fake.call_count);
@@ -4748,7 +4770,7 @@ test "Workspace reviewer PullRequests merge every Repository in slug order and h
     const items = try listReviewerPullRequestsForTest(Client.init(fake.httpClient(), testCredential()), null, 1, &done);
     defer deinitSummaries(testing.allocator, items);
     try testing.expectEqualStrings(base_url ++ "/repositories/check24?pagelen=100", fake.urlAt(0).?);
-    try testing.expectEqualStrings(base_url ++ "/repositories/check24/alpha/pullrequests?pagelen=50&state=OPEN&state=DECLINED&q=reviewers.uuid%3D%22%7Breviewer%7D%22", fake.urlAt(1).?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/alpha/pullrequests?pagelen=50&q=%28state%3D%22OPEN%22%20OR%20state%3D%22DECLINED%22%29%20AND%20reviewers.uuid%3D%22%7Breviewer%7D%22", fake.urlAt(1).?);
     try testing.expectEqual(@as(usize, 5), fake.call_count);
 }
 
@@ -5156,7 +5178,7 @@ test "review fixes PullRequest source branch and query combine in one encoded fi
     const items = try Client.init(fake.httpClient(), testCredential()).listPullRequestsPage(testing.allocator, "repo", .{ .source_branch = "feature/\"x\\y" }, .{ .query = "id=1 OR id=2", .sort = "-id", .follow = false });
     defer deinitSummaries(testing.allocator, items);
     try testing.expectEqualStrings(
-        "https://api.bitbucket.org/2.0/repositories/check24/repo/pullrequests?state=OPEN&q=source.branch.name%3D%22feature%2F%5C%22x%5C%5Cy%22%20AND%20%28id%3D1%20OR%20id%3D2%29&sort=-id",
+        "https://api.bitbucket.org/2.0/repositories/check24/repo/pullrequests?q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22feature%2F%5C%22x%5C%5Cy%22%20AND%20%28id%3D1%20OR%20id%3D2%29&sort=-id",
         fake.lastUrl().?,
     );
 }
