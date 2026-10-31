@@ -14,11 +14,11 @@ Today `bbr api` can only run that filter on one Repository.
 
 ```sh
 bbr api list-workspace-pull-requests --author UUID [--reviewer UUID]
-    [--state OPEN|MERGED|DECLINED|SUPERSEDED]... [--query Q] [--limit N] [--json]
+    [--state OPEN|MERGED|DECLINED|SUPERSEDED]... [--query Q] [--concurrency N] [--limit N] [--json]
 
 bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author UUID --reviewer UUID)
-    --repository SLUG... [--concurrency N] [--state OPEN|MERGED|DECLINED|SUPERSEDED]...
-    [--query Q] [--limit N] [--json]
+    --repository SLUG... [--state OPEN|MERGED|DECLINED|SUPERSEDED]...
+    [--query Q] [--concurrency N] [--limit N] [--json]
 ```
 
 - `--author` and `--reviewer` each take one account UUID. The command needs at least one of them.
@@ -26,7 +26,7 @@ bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author
 - `--state` repeats and ignores letter case, so `open` selects `OPEN`. The default is `OPEN`. Without a `q` filter, each value becomes one `state=` parameter. With a `q` filter, the states go into `q`, because Bitbucket then ignores `state=`.
 - `--query` is a Bitbucket `q` expression. The command joins it to its own filter with `AND (...)`.
 - `--limit` caps the total number of PullRequests in the output.
-- `--concurrency` sets the number of parallel Repository requests. Only the `--repository` scan sends parallel requests, so `--concurrency` without `--repository` is an option error. The default and the CPU cap follow `search-workspace-members`.
+- `--concurrency` bounds the active page requests of the whole command, across all Repositories and pages. It applies with and without `--repository`. The default and the CPU cap follow `search-workspace-members`.
 
 ## Behavior
 
@@ -34,6 +34,8 @@ bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author
 - Without `--repository`, the output keeps the Bitbucket order of the author endpoint, and paging stops at `--limit`. The page size is `--limit` up to 50. Sorting by Repository would need every page first. A live call with two states and `--limit 5` took 19 s with sorting and 1 to 2 s without it.
 - With `--repository`, the command lists the PullRequests of each named Repository. Its `q` holds the states, `author.uuid="..."` for `--author`, `reviewers.uuid="..."` for `--reviewer`, and the `--query` expression, joined with AND.
 - With `--repository`, the output order is the order of the `--repository` values, then the Bitbucket order inside each Repository. A repeated slug is scanned once, at its first position.
+- Each PullRequest list is paged by number. The command requests page 1 of every list first. Page 1 reports `size` and `pagelen`, so the command then requests the remaining pages of all lists in one pool. It requests only the pages that `--limit` needs, `ceil(limit / pagelen)` for each list, and it stops when the merged prefix holds `--limit` rows. A list whose page 1 has no `size` or no numbered `next` link follows its `next` links one page at a time.
+- The order does not depend on the completion order of the pages.
 - `--reviewer` without `--repository` fails before any HTTP request, and the help says that the reviewer scan needs `--repository`.
 - Each row names its Repository by `full_name`. The human row is `full_name#id [STATE draft] title (src -> dst)`.
 - The command prints nothing to stdout when any request fails. A 429 fails the command with the existing `RateLimited` error.

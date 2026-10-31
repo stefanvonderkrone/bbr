@@ -35,6 +35,22 @@ Live checks on Workspace `check24` measured these wall times:
 
 The JSON output of both commands did not change.
 
+### Numbered pages
+
+A PullRequest list page reports `size`, `page`, and `pagelen` when `fields` selects them.
+Its `next` link is the same URL with `page=N+1`, and it keeps `q` and `fields`.
+`listPagesConcurrent` in `client.zig` reads page 1, then requests the remaining pages as `page=N` in parallel.
+A list without `size` or without a numbered `next` link follows `next` one page at a time.
+The Workspace members endpoint behaves the same way. It reported `size` 4278 for `check24`.
+
+Live checks on 31 October 2026 compared `page=N` with following `next`:
+
+- Repository `pr-webapp`, `q=(state="OPEN" OR state="MERGED") AND reviewers.uuid="{uuid}"`: 38 pages, the same 1888 PullRequests in the same order.
+- The author endpoint with all four states in `q`: 5 pages, the same 249 PullRequests in the same order.
+
+With parallel pages, `list-workspace-pull-requests --reviewer` over 10 Repositories with OPEN and MERGED took 4.9 s at `--concurrency 8`, from 30.2 s.
+The author endpoint with all four states took 1.9 s, from 3.3 s.
+
 ### Outdated Comments
 
 The Comments list endpoint, `/pullrequests/{id}/comments`, omits `inline.outdated`.
