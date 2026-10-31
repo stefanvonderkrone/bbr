@@ -2,9 +2,6 @@
 //! the `bbr api` verb table, plus a `--list-profiles` helper for dynamic
 //! `--profile` values. Never starts the TUI and never touches the network:
 //! scripts print to stdout for `eval` or file install; errors go to stderr.
-//!
-//! Keep the per-verb flag rows in `api/cli.zig` (`verb_flags`) as the single
-//! source of truth — these scripts embed them at comptime.
 
 const std = @import("std");
 const bbr = @import("bbr");
@@ -126,7 +123,7 @@ const top_space = blk: {
 
 const value_flags_space = blk: {
     var text: []const u8 = "";
-    for (cli.completion_value_flags) |name| text = text ++ name ++ " ";
+    for (cli.value_flags) |name| text = text ++ name ++ " ";
     break :blk text;
 };
 
@@ -150,39 +147,25 @@ const zsh_lists =
     "_bbr_value_flags=(" ++ value_flags_space ++ ")\n" ++
     "_bbr_globals=(" ++ global_flags_space ++ ")\n";
 
-fn verbHasFlag(name: []const u8, flag: []const u8) bool {
-    if (cli.flagsForVerb(name)) |flags| {
-        for (flags) |f| if (std.mem.eql(u8, f, flag)) return true;
-    }
-    return false;
-}
-
-fn verbFlagWords(name: []const u8) []const u8 {
-    // Comptime-built `--flag` words for one verb (globals included).
-    return blk: {
-        @setEvalBranchQuota(100_000);
-        var text: []const u8 = "";
-        if (cli.flagsForVerb(name)) |flags| {
-            for (flags) |flag| text = text ++ "--" ++ flag ++ " ";
-        }
-        for (cli.global_flags) |flag| {
-            if (!verbHasFlag(name, flag)) text = text ++ "--" ++ flag ++ " ";
-        }
-        break :blk text;
-    };
+fn verbFlagWords(comptime verb: cli.Verb) []const u8 {
+    var text: []const u8 = "";
+    for (verb.value_flags) |flag| text = text ++ "--" ++ flag ++ " ";
+    for (verb.switch_flags) |flag| text = text ++ "--" ++ flag ++ " ";
+    for (cli.global_flags) |flag| text = text ++ "--" ++ flag ++ " ";
+    return text;
 }
 
 const bash_verb_cases = blk: {
     @setEvalBranchQuota(100_000);
     var text: []const u8 = "";
-    for (cli.verbs) |verb| text = text ++ "            " ++ verb.name ++ ") _bbr_words=\"" ++ verbFlagWords(verb.name) ++ "\";;\n";
+    for (cli.verbs) |verb| text = text ++ "            " ++ verb.name ++ ") _bbr_words=\"" ++ verbFlagWords(verb) ++ "\";;\n";
     break :blk text;
 };
 
 const zsh_verb_cases = blk: {
     @setEvalBranchQuota(100_000);
     var text: []const u8 = "";
-    for (cli.verbs) |verb| text = text ++ "        " ++ verb.name ++ ") _bbr_words=(" ++ verbFlagWords(verb.name) ++ ");;\n";
+    for (cli.verbs) |verb| text = text ++ "        " ++ verb.name ++ ") _bbr_words=(" ++ verbFlagWords(verb) ++ ");;\n";
     break :blk text;
 };
 
@@ -424,20 +407,9 @@ const fish_verb_lines = blk: {
     var text: []const u8 = "";
     for (cli.verbs) |verb| {
         text = text ++ fishVerbLine(verb.name, verb.summary);
-        if (cli.flagsForVerb(verb.name)) |flags| {
-            for (flags) |flag| {
-                const cond = "'__fish_seen_subcommand_from " ++ verb.name ++ "; and __fish_seen_subcommand_from api'";
-                if (cli.completionTakesValue(flag)) {
-                    if (std.mem.eql(u8, flag, "profile")) {
-                        text = text ++ "complete -c bbr -n " ++ cond ++ " -l " ++ flag ++ " -r -f -a '(bbr completion --list-profiles)'\n";
-                    } else {
-                        text = text ++ "complete -c bbr -n " ++ cond ++ " -l " ++ flag ++ " -r\n";
-                    }
-                } else {
-                    text = text ++ "complete -c bbr -n " ++ cond ++ " -l " ++ flag ++ " -f\n";
-                }
-            }
-        }
+        const cond = "'__fish_seen_subcommand_from " ++ verb.name ++ "; and __fish_seen_subcommand_from api'";
+        for (verb.value_flags) |flag| text = text ++ "complete -c bbr -n " ++ cond ++ " -l " ++ flag ++ " -r\n";
+        for (verb.switch_flags) |flag| text = text ++ "complete -c bbr -n " ++ cond ++ " -l " ++ flag ++ " -f\n";
     }
     break :blk text;
 };
@@ -476,22 +448,11 @@ pub const fish_script =
     \\
 ++ fish_verb_lines;
 
-test "completion metadata covers every verb" {
-    try std.testing.expectEqual(cli.verbs.len, cli.verb_flags.len);
-    for (cli.verbs) |verb| try std.testing.expect(cli.flagsForVerb(verb.name) != null);
-}
-
 test "Workspace Member completion exposes complete-search options without partial-page flags" {
-    const search_flags = cli.flagsForVerb("search-workspace-members").?;
-    const list_flags = cli.flagsForVerb("list-workspace-members").?;
-    try std.testing.expectEqual(@as(usize, 5), search_flags.len);
-    try std.testing.expectEqual(@as(usize, 5), list_flags.len);
-    for (search_flags, [_][]const u8{ "name", "pagelen", "concurrency", "limit", "json" }) |actual, expected|
-        try std.testing.expectEqualStrings(expected, actual);
-    for (list_flags, [_][]const u8{ "pagelen", "page", "no-follow", "limit", "json" }) |actual, expected|
-        try std.testing.expectEqualStrings(expected, actual);
-    try std.testing.expect(cli.completionTakesValue("name"));
-    try std.testing.expect(cli.completionTakesValue("concurrency"));
+    try std.testing.expect(std.mem.indexOf(u8, bash_script, "search-workspace-members) _bbr_words=\"--name --pagelen --concurrency --limit --profile --workspace --json --help \";;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_script, "list-workspace-members) _bbr_words=\"--pagelen --page --limit --no-follow --profile --workspace --json --help \";;") != null);
+    try std.testing.expect(cli.takesValue("name"));
+    try std.testing.expect(cli.takesValue("concurrency"));
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "__fish_seen_subcommand_from search-workspace-members; and __fish_seen_subcommand_from api' -l concurrency -r") != null);
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "__fish_seen_subcommand_from search-workspace-members; and __fish_seen_subcommand_from api' -l name -r") != null);
 }

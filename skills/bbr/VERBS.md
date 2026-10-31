@@ -1,6 +1,6 @@
 # bbr api verbs
 
-38 verbs. Run `bbr api VERB --help` for flags. No flag tables here.
+Run `bbr api VERB --help` for flags. No flag tables here.
 
 ## Workspaces
 

@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     exe_mod.addOptions("build_options", build_options);
+    exe_mod.addAnonymousImport("bbr_verbs_md", .{ .root_source_file = b.path("skills/bbr/VERBS.md") });
     addSqlite(b, exe_mod);
     addTreeSitter(b, exe_mod);
     addRe2(b, exe_mod, target, macos_sdk);
