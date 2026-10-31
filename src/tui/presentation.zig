@@ -15,6 +15,7 @@ const list_overlay_mod = @import("list_overlay.zig");
 const ListOverlay = list_overlay_mod.ListOverlay;
 const ThemeId = @import("theme_id.zig").ThemeId;
 const frame_mod = @import("frame.zig");
+const view_mod = @import("view.zig");
 const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
 const search = @import("search.zig");
@@ -5933,10 +5934,18 @@ pub const Presentation = struct {
     mouse_press: ?MousePress = null,
     last_review_click: ?struct { index: usize, time_ns: ?i96 } = null,
     version_restoration: ?VersionRestoration = null,
+    scroll_drag: ?ScrollDrag = null,
 
     const MousePress = struct {
         revision: frame_mod.Revision,
         target: frame_mod.HitTarget,
+    };
+
+    /// A Scroll Drag. `grab` is the pressed track cell minus `thumb.first`.
+    const ScrollDrag = struct {
+        bar: frame_mod.ScrollBar,
+        grab: u16,
+        epoch: SessionEpoch,
     };
 
     pub fn init(allocator: Allocator, dependencies: Dependencies, boot: Boot) !Presentation {
@@ -6026,6 +6035,7 @@ pub const Presentation = struct {
             self.last_review_click = null;
             self.interaction_revision +%= 1;
         }
+        if (input == .key or input == .action) self.scroll_drag = null;
         switch (input) {
             .choose_pull_request => |key| if (!self.shutdown_requested) try self.choosePullRequest(key),
             .key => |key| try self.applyKey(key),
@@ -6310,18 +6320,25 @@ pub const Presentation = struct {
     fn applyMouse(self: *Presentation, mouse: MouseInput) void {
         if (self.published) |published| if (published.buffer_search.input != null) {
             self.mouse_press = null;
+            self.scroll_drag = null;
             return;
         };
         if (!self.dependencies.mouse_enabled) {
             self.mouse_press = null;
+            self.scroll_drag = null;
             return;
+        }
+        const active_before = if (self.published) |published| published.activeFile() else null;
+        defer if (self.published) |published| if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
+        if (self.scroll_drag) |drag| {
+            self.scroll_drag = null;
+            if (mouse.button == .left and mouse.type == .drag) return self.dragScrollBar(drag, mouse.row);
+            if (mouse.button == .left and mouse.type == .release) return;
         }
         if (mouse.modified or mouse.type == .motion or mouse.type == .drag) {
             self.mouse_press = null;
             return;
         }
-        const active_before = if (self.published) |published| published.activeFile() else null;
-        defer if (self.published) |published| if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
         switch (mouse.button) {
             .wheel_up, .wheel_down => {
                 self.mouse_press = null;
@@ -6335,6 +6352,10 @@ pub const Presentation = struct {
                         self.mouse_press = null;
                         return;
                     };
+                    if (target == .scroll_bar) {
+                        self.mouse_press = null;
+                        return self.pressScrollBar(frame, target.scroll_bar);
+                    }
                     self.mouse_press = .{ .revision = frame.revision, .target = target };
                 },
                 .release => {
@@ -6361,6 +6382,49 @@ pub const Presentation = struct {
         }
     }
 
+    /// A press on the thumb grabs it. A press off the thumb first centers the
+    /// visible rows on the pressed cell, so the thumb then covers that cell.
+    fn pressScrollBar(self: *Presentation, frame: frame_mod.Projection, hit: frame_mod.ScrollBarHit) void {
+        const published = self.published orelse return;
+        const state = frame_mod.scrollTarget(frame, hit.bar) orelse return;
+        self.last_review_click = null;
+        self.version_restoration = null;
+        var thumb = state.thumb().?;
+        if (hit.cell < thumb.first or hit.cell >= thumb.first + thumb.len) {
+            const extent = state.track.height;
+            const row = view_mod.cellFirstRow(extent, state.total, hit.cell);
+            self.scrollBarTo(published, hit.bar, state, @min(row -| extent / 2, state.total - extent));
+            thumb = (frame_mod.scrollTarget(self.frameProjection(), hit.bar) orelse return).thumb().?;
+        }
+        self.scroll_drag = .{ .bar = hit.bar, .grab = hit.cell - thumb.first, .epoch = published.epoch };
+    }
+
+    /// The pointer row sets the thumb position, whatever the column and also
+    /// past the track ends. Each event reads the current Frame, so a content
+    /// change or a resize applies at once.
+    fn dragScrollBar(self: *Presentation, drag: ScrollDrag, pointer_row: u16) void {
+        const published = self.published orelse return;
+        if (published.epoch != drag.epoch) return;
+        const state = frame_mod.scrollTarget(self.frameProjection(), drag.bar) orelse return;
+        self.scroll_drag = drag;
+        const extent = state.track.height;
+        const first = @as(i32, pointer_row) - state.track.y - drag.grab;
+        const offset = if (first <= 0) 0 else @min(view_mod.cellFirstRow(extent, state.total, @intCast(first)), state.total - extent);
+        self.scrollBarTo(published, drag.bar, state, offset);
+    }
+
+    fn scrollBarTo(self: *Presentation, published: *Published, bar: frame_mod.ScrollBar, state: frame_mod.ScrollState, offset: usize) void {
+        if (offset == state.offset) return;
+        const delta = @as(isize, @intCast(offset)) - @as(isize, @intCast(state.offset));
+        self.version_restoration = null;
+        switch (bar) {
+            .sidebar => self.scrollPane(published, .sidebar, delta),
+            .diff_pane => self.scrollPane(published, .diff, delta),
+            .review_search_list => published.review_search.list_scroll = offset,
+        }
+        self.interaction_revision +%= 1;
+    }
+
     fn activateMouseTarget(self: *Presentation, target: frame_mod.HitTarget, time_ns: ?i96) void {
         if (target != .select_old_version and target != .select_new_version) {
             self.prefetch_arm = null;
@@ -6385,7 +6449,7 @@ pub const Presentation = struct {
                     self.last_review_click = .{ .index = index, .time_ns = time_ns };
                 }
             },
-            .review_search_list, .review_search_preview => return,
+            .review_search_list, .review_search_preview, .scroll_bar => return,
             .sidebar => {
                 const published = self.published orelse return;
                 self.focusPane(published, .sidebar);
@@ -6470,7 +6534,7 @@ pub const Presentation = struct {
                 const published = self.published orelse return;
                 self.scrollPane(published, .diff, if (down) @as(isize, @intCast(rows)) else -@as(isize, @intCast(rows)));
             },
-            .sidebar, .diff => return,
+            .sidebar, .diff, .scroll_bar => return,
         }
         self.interaction_revision +%= 1;
     }
@@ -29507,7 +29571,7 @@ fn expectScrollBarNumbers(frame: frame_mod.Projection) !void {
     const thumb = diff.thumb() orelse return;
     const cursor = frame.navigation.cursor;
     if (cursor < diff.offset or cursor >= diff.offset + diff.track.height) return;
-    const cell = @import("view.zig").trackCell(diff.track.height, diff.total, cursor);
+    const cell = view_mod.trackCell(diff.track.height, diff.total, cursor);
     try testing.expect(cell >= thumb.first and cell < thumb.first + thumb.len);
 }
 
@@ -29801,4 +29865,260 @@ fn expectReviewSearchListTotal(presentation: *const Presentation, total: usize) 
     try testing.expectEqual(total, state.total);
     try testing.expectEqual(projection.review_search.?.list_scroll, state.offset);
     try testing.expectEqual(projection.review_search.?.geometry.list.height, state.track.height);
+}
+
+fn m30ManyFilesSession(id: u64) !*session_mod.Session {
+    const s = try testSession(testing.allocator, id, 's');
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    var raw: std.ArrayList(u8) = .empty;
+    for (0..30) |file| try raw.print(a, "diff --git a/f{d}.zig b/f{d}.zig\n--- a/f{d}.zig\n+++ b/f{d}.zig\n@@ -0,0 +1,3 @@\n+one\n+two\n+three\n", .{ file, file, file, file });
+    s.diff = try bbr.diff.parse(a, raw.items);
+    try s.initializeEnrichment();
+    return s;
+}
+
+fn m30DragState(store: *bbr.review.InMemoryStore, mouse_enabled: bool) !Presentation {
+    return Presentation.init(testing.allocator, .{ .reviews = store.store(), .mouse_enabled = mouse_enabled }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try m30ManyFilesSession(1) },
+        .geometry = .{ .cols = 100, .rows = 12 },
+    });
+}
+
+fn m30Left(presentation: *Presentation, col: u16, row: u16, kind: MouseType) !void {
+    try presentation.dispatch(.{ .mouse = .{ .col = col, .row = row, .button = .left, .type = kind } });
+}
+
+fn m30Scroll(presentation: *const Presentation, bar: frame_mod.ScrollBar) frame_mod.ScrollState {
+    return frame_mod.scrollState(presentation.frameProjection(), bar).?;
+}
+
+const m30_pane_bars = [_]frame_mod.ScrollBar{ .sidebar, .diff_pane };
+
+test "M30 scrollbar a press on the thumb keeps the scroll and a press off the thumb jumps under the pointer" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    for (m30_pane_bars) |bar| {
+        var presentation = try m30DragState(&store, true);
+        defer presentation.deinit();
+        const before = m30Scroll(&presentation, bar);
+        const track = before.track;
+        const thumb = before.thumb().?;
+        try testing.expectEqual(@as(u16, 0), thumb.first);
+        try m30Left(&presentation, track.x, track.y + thumb.len - 1, .press);
+        try testing.expectEqual(before.offset, m30Scroll(&presentation, bar).offset);
+        try testing.expectEqual(thumb.len - 1, presentation.scroll_drag.?.grab);
+        try m30Left(&presentation, track.x, track.y + thumb.len - 1, .release);
+        try testing.expect(presentation.scroll_drag == null);
+
+        for ([_]u16{ track.height - 1, track.height / 2 + 1, thumb.len }) |cell| {
+            try m30Left(&presentation, track.x, track.y + cell, .press);
+            const jumped = m30Scroll(&presentation, bar);
+            const covering = jumped.thumb().?;
+            try testing.expect(cell >= covering.first and cell < covering.first + covering.len);
+            try testing.expectEqual(cell - covering.first, presentation.scroll_drag.?.grab);
+            try m30Left(&presentation, track.x, track.y + cell, .release);
+        }
+        try testing.expect(m30Scroll(&presentation, bar).offset != before.offset);
+        try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);
+    }
+}
+
+test "M30 scrollbar a Scroll Drag follows the pointer outside the track and past its ends" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    for (m30_pane_bars) |bar| {
+        var presentation = try m30DragState(&store, true);
+        defer presentation.deinit();
+        const start = m30Scroll(&presentation, bar);
+        const track = start.track;
+        const panes = presentation.frameProjection().panes;
+        const other_col = if (bar == .sidebar) panes.diff_content.x + 5 else panes.sidebar_content.x + 2;
+        const status_row = presentation.geometry.rows - 1;
+        const grab = start.thumb().?.len - 1;
+        try m30Left(&presentation, track.x, track.y + grab, .press);
+        try testing.expectEqual(start.offset, m30Scroll(&presentation, bar).offset);
+
+        const bottom_first = view_mod.thumb(track.height, start.total, start.total - track.height).?.first;
+        for (0..bottom_first + 1) |index| {
+            const cell: u16 = @intCast(index);
+            try m30Left(&presentation, other_col, track.y + grab + cell, .drag);
+            try testing.expectEqual(cell, m30Scroll(&presentation, bar).thumb().?.first);
+        }
+
+        try m30Left(&presentation, 0, status_row, .drag);
+        try testing.expectEqual(start.total - track.height, m30Scroll(&presentation, bar).offset);
+        try m30Left(&presentation, track.x, track.y + grab + 1, .drag);
+        try testing.expectEqual(@as(u16, 1), m30Scroll(&presentation, bar).thumb().?.first);
+        try m30Left(&presentation, other_col, 0, .drag);
+        try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, bar).offset);
+        try presentation.dispatch(.{ .mouse = .{ .col = track.x, .row = status_row, .button = .left, .type = .drag, .modified = true } });
+        try testing.expectEqual(start.total - track.height, m30Scroll(&presentation, bar).offset);
+
+        try m30Left(&presentation, other_col, track.y + 3, .release);
+        try testing.expect(presentation.scroll_drag == null);
+        try m30Left(&presentation, track.x, track.y, .drag);
+        try testing.expectEqual(start.total - track.height, m30Scroll(&presentation, bar).offset);
+        if (bar == .sidebar) try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .diff_pane).offset);
+    }
+}
+
+test "M30 scrollbar key input and a Session replacement end a Scroll Drag" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try m30DragState(&store, true);
+    defer presentation.deinit();
+    const track = m30Scroll(&presentation, .diff_pane).track;
+    const bottom = presentation.geometry.rows - 1;
+
+    try m30Left(&presentation, track.x, track.y, .press);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expect(presentation.scroll_drag == null);
+    try testing.expectEqual(@as(usize, 1), presentation.projection().review.?.navigation.cursor);
+    try m30Left(&presentation, track.x, bottom, .drag);
+    try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .diff_pane).offset);
+
+    try m30Left(&presentation, track.x, track.y, .press);
+    try presentation.dispatch(.{ .action = .down });
+    try m30Left(&presentation, track.x, bottom, .drag);
+    try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .diff_pane).offset);
+
+    try m30Left(&presentation, track.x, track.y, .press);
+    try testing.expect(presentation.scroll_drag != null);
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try m30ManyFilesSession(2) } } });
+    try testing.expect(m30Scroll(&presentation, .diff_pane).thumb() != null);
+    try m30Left(&presentation, track.x, bottom, .drag);
+    try testing.expect(presentation.scroll_drag == null);
+    try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .diff_pane).offset);
+}
+
+test "M30 scrollbar a release activates nothing and a motion, a wheel, or another press ends a Scroll Drag" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try m30DragState(&store, true);
+    defer presentation.deinit();
+    const frame = presentation.frameProjection();
+    const track = frame.panes.diff_track;
+    const content = frame.panes.diff_content;
+    const bottom = presentation.geometry.rows - 1;
+
+    try m30Left(&presentation, track.x, track.y, .press);
+    try m30Left(&presentation, content.x, content.y + 3, .release);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
+    try testing.expect(presentation.scroll_drag == null);
+
+    try m30Left(&presentation, track.x, track.y, .press);
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .unsupported, .type = .motion } });
+    try m30Left(&presentation, track.x, bottom, .drag);
+    try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .diff_pane).offset);
+
+    try m30Left(&presentation, track.x, track.y, .press);
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .wheel_down, .type = .press } });
+    try testing.expectEqual(@as(usize, 3), m30Scroll(&presentation, .diff_pane).offset);
+    try m30Left(&presentation, track.x, bottom, .drag);
+    try testing.expectEqual(@as(usize, 3), m30Scroll(&presentation, .diff_pane).offset);
+
+    try m30Left(&presentation, track.x, m30Scroll(&presentation, .diff_pane).thumb().?.first + track.y, .press);
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 1, .button = .right, .type = .press } });
+    try testing.expect(presentation.scroll_drag == null);
+    try m30Left(&presentation, content.x, content.y + 2, .press);
+    try m30Left(&presentation, content.x, content.y + 2, .release);
+    try testing.expectEqual(@as(usize, 5), presentation.projection().review.?.navigation.cursor);
+}
+
+test "M30 scrollbar a Scroll Drag uses the new total after a content change" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const raw = "diff --git a/w.zig b/w.zig\n--- a/w.zig\n+++ b/w.zig\n@@ -0,0 +1,30 @@\n" ++
+        ("+alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron\n" ** 30);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollBarSession(testing.allocator, 1, raw) },
+        .geometry = .{ .cols = 160, .rows = 12 },
+    });
+    defer presentation.deinit();
+    const wide = m30Scroll(&presentation, .diff_pane);
+    try m30Left(&presentation, wide.track.x, wide.track.y, .press);
+    try presentation.dispatch(.{ .resize = .{ .cols = 70, .rows = 10 } });
+    try completeDisclosureBuild(&presentation);
+    const narrow = m30Scroll(&presentation, .diff_pane);
+    try testing.expect(narrow.total > wide.total);
+    try testing.expect(narrow.track.height < wide.track.height);
+    try m30Left(&presentation, narrow.track.x, narrow.track.y + 2, .drag);
+    try testing.expectEqual(@as(u16, 2), m30Scroll(&presentation, .diff_pane).thumb().?.first);
+    try testing.expectEqual(view_mod.cellFirstRow(narrow.track.height, narrow.total, 2), m30Scroll(&presentation, .diff_pane).offset);
+    try m30Left(&presentation, narrow.track.x, presentation.geometry.rows - 1, .drag);
+    try testing.expectEqual(narrow.total - narrow.track.height, m30Scroll(&presentation, .diff_pane).offset);
+}
+
+test "M30 scrollbar a DiffPane drag moves the cursor with the edge and the File Tree cursor to the active File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try m30DragState(&store, true);
+    defer presentation.deinit();
+    const track = m30Scroll(&presentation, .diff_pane).track;
+    try m30Left(&presentation, track.x, track.y, .press);
+    for ([_]u16{ 3, presentation.geometry.rows - 1 }) |row| {
+        try m30Left(&presentation, track.x, row, .drag);
+        const review = presentation.projection().review.?;
+        const frame = review.frame;
+        try testing.expect(frame.navigation.scroll > 0);
+        try testing.expectEqual(frame.navigation.scroll, frame.navigation.cursor);
+        const file = frame.buffer.fileIndexForRow(frame.visual_rows[frame.navigation.cursor].buffer_index).?;
+        try testing.expect(file > 0);
+        try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = file }));
+        try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    }
+    try m30Left(&presentation, track.x, 0, .drag);
+    try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .diff_pane).offset);
+    try testing.expect(presentation.projection().review.?.navigation.cursor < track.height);
+}
+
+test "M30 scrollbar a Pane track takes no press under an Overlay, on the DiffPane border, or with mouse input off" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try m30DragState(&store, true);
+    defer presentation.deinit();
+    const panes = presentation.frameProjection().panes;
+    const bottom = panes.diff_track.y + panes.diff_track.height - 1;
+
+    try m30Left(&presentation, panes.diff.x, bottom, .press);
+    try testing.expect(presentation.scroll_drag == null);
+    try m30Left(&presentation, panes.diff.x, bottom, .release);
+    for (m30_pane_bars) |bar| try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, bar).offset);
+
+    try presentation.dispatch(.{ .action = .open_file_finder });
+    for ([_]u16{ panes.sidebar_track.x, panes.diff_track.x }) |col| {
+        try m30Left(&presentation, col, bottom, .press);
+        try testing.expect(presentation.scroll_drag == null);
+        try m30Left(&presentation, col, bottom, .release);
+    }
+    for (m30_pane_bars) |bar| try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, bar).offset);
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null);
+
+    var disabled = try m30DragState(&store, false);
+    defer disabled.deinit();
+    for ([_]u16{ panes.sidebar_track.x, panes.diff_track.x }) |col| {
+        try m30Left(&disabled, col, bottom, .press);
+        try m30Left(&disabled, col, bottom + 1, .drag);
+        try testing.expect(disabled.scroll_drag == null);
+    }
+    for (m30_pane_bars) |bar| try testing.expectEqual(@as(usize, 0), m30Scroll(&disabled, bar).offset);
+}
+
+test "M30 scrollbar a Scroll Drag ends when its thumb goes away" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try m30DragState(&store, true);
+    defer presentation.deinit();
+    const track = m30Scroll(&presentation, .sidebar).track;
+    try m30Left(&presentation, track.x, track.y, .press);
+    try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 60 } });
+    try testing.expect(m30Scroll(&presentation, .sidebar).thumb() == null);
+    try m30Left(&presentation, track.x, track.y + 3, .drag);
+    try testing.expect(presentation.scroll_drag == null);
+    try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 12 } });
+    try m30Left(&presentation, track.x, track.y + 5, .drag);
+    try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .sidebar).offset);
 }

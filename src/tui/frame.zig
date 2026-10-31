@@ -149,9 +149,32 @@ pub fn scrollState(projection: Projection, bar: ScrollBar) ?ScrollState {
     };
 }
 
+/// The numbers of `bar` while it takes a press and a Scroll Drag: no Overlay
+/// covers it and it shows a thumb. Hit testing and the Scroll Drag share it.
+pub fn scrollTarget(projection: Projection, bar: ScrollBar) ?ScrollState {
+    const covered = switch (bar) {
+        .sidebar, .diff_pane => projection.overlay != null,
+        .review_search_list => false,
+    };
+    if (covered) return null;
+    const state = scrollState(projection, bar) orelse return null;
+    _ = state.thumb() orelse return null;
+    return state;
+}
+
+/// A track cell, counted from the top of the track.
+pub const ScrollBarHit = struct { bar: ScrollBar, cell: u16 };
+
+fn scrollBarHit(projection: Projection, bar: ScrollBar, col: u16, row: u16) ?ScrollBarHit {
+    const state = scrollTarget(projection, bar) orelse return null;
+    if (!state.track.contains(col, row)) return null;
+    return .{ .bar = bar, .cell = row - state.track.y };
+}
+
 pub const HitTarget = union(enum) {
     select_old_version,
     select_new_version,
+    scroll_bar: ScrollBarHit,
     sidebar,
     diff,
     sidebar_entry: usize,
@@ -292,6 +315,7 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
 
     if (frame.version_title_targets.old) |rect| if (rect.contains(col, row)) return .select_old_version;
     if (frame.version_title_targets.new) |rect| if (rect.contains(col, row)) return .select_new_version;
+    for ([_]ScrollBar{ .sidebar, .diff_pane }) |bar| if (scrollBarHit(frame, bar, col, row)) |hit| return .{ .scroll_bar = hit };
 
     if (frame.panes.sidebar_content.contains(col, row)) {
         const index = frame.file_tree.scroll + row - frame.panes.sidebar_content.y;
@@ -1476,7 +1500,47 @@ test "M30 scrollbar the Sidebar track is the Sidebar border and the next column 
     try testing.expect(scrollState(frame, .diff_pane).?.thumb() == null);
     try testing.expect(scrollState(frame, .review_search_list) == null);
     for (panes.diff_track.y..panes.diff_track.y + panes.diff_track.height) |row| {
+        const cell: u16 = @intCast(row - panes.sidebar_track.y);
+        try testing.expectEqual(HitTarget{ .scroll_bar = .{ .bar = .sidebar, .cell = cell } }, hitTest(frame, panes.sidebar_track.x, @intCast(row)).?);
         try testing.expect(hitTest(frame, panes.diff.x, @intCast(row)) == null);
         try testing.expect(hitTest(frame, panes.diff_track.x, @intCast(row)) == null);
     }
+}
+
+test "M30 scrollbar a track without a thumb or under an Overlay has no scroll bar target" {
+    const geometry: Geometry = .{ .cols = 80, .rows = 10 };
+    const panes = paneRects(geometry);
+    const entries = [_]file_tree.Entry{.{ .identity = .{ .file = 0 }, .parent = null, .depth = 0, .label = "a.zig" }} ** 30;
+    const rows = [_]VisualRow{.{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } } }} ** 30;
+    var frame: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = geometry,
+        .panes = panes,
+        .visual_rows = &rows,
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(rows.len, panes.diff_content.height),
+        .file_tree = .{ .entries = &entries, .viewport = panes.sidebar_content.height },
+    };
+    for (0..panes.diff_track.height) |cell| {
+        const row: u16 = @intCast(panes.diff_track.y + cell);
+        try testing.expectEqual(HitTarget{ .scroll_bar = .{ .bar = .diff_pane, .cell = @intCast(cell) } }, hitTest(frame, panes.diff_track.x, row).?);
+    }
+
+    var fits = frame;
+    fits.file_tree.entries = entries[0..panes.sidebar_track.height];
+    fits.visual_rows = rows[0..panes.diff_track.height];
+    for ([_]ScrollBar{ .sidebar, .diff_pane }) |bar| try testing.expect(scrollTarget(fits, bar) == null);
+    for (0..panes.diff_track.height) |cell| {
+        try testing.expect(hitTest(fits, panes.sidebar_track.x, @intCast(panes.sidebar_track.y + cell)) == null);
+        try testing.expect(hitTest(fits, panes.diff_track.x, @intCast(panes.diff_track.y + cell)) == null);
+    }
+
+    frame.overlay = screenOverlayTarget(geometry);
+    for ([_]ScrollBar{ .sidebar, .diff_pane }) |bar| {
+        try testing.expect(scrollState(frame, bar).?.thumb() != null);
+        try testing.expect(scrollTarget(frame, bar) == null);
+    }
+    try testing.expect(hitTest(frame, panes.sidebar_track.x, panes.sidebar_track.y) == null);
+    try testing.expect(hitTest(frame, panes.diff_track.x, panes.diff_track.y) == null);
 }
