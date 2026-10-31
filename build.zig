@@ -210,6 +210,8 @@ pub fn build(b: *std.Build) void {
     const box_glyphs = b.addSystemCommand(&.{"python3"});
     box_glyphs.addFileArg(b.path("tools/check_box_glyphs.py"));
     box_glyphs.addDirectoryArg(b.path("."));
+    const box_glyphs_self_test = b.addSystemCommand(&.{"python3"});
+    box_glyphs_self_test.addFileArg(b.path("tests/check_box_glyphs_test.py"));
 
     const cli_test_step = b.step("test-cli", "Run hermetic Python CLI checks (requires python3)");
     for ([_][]const u8{
@@ -394,6 +396,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&release_validation.step);
     test_step.dependOn(&xdg_reads.step);
     test_step.dependOn(&box_glyphs.step);
+    test_step.dependOn(&box_glyphs_self_test.step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
 }
