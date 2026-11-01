@@ -1,6 +1,6 @@
 //! The Summary Cache: the local file of Repository Summaries and PullRequest
-//! Summaries for one Workspace. This module is pure. It encodes and decodes
-//! the file, and the adapter reads and writes it.
+//! Summaries for one account and one Workspace. This module is pure. It
+//! encodes and decodes the file, and the adapter reads and writes it.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -9,9 +9,22 @@ const Allocator = std.mem.Allocator;
 pub const RepositorySummary = types.RepositorySummary;
 pub const PullRequestSummary = types.PullRequestSummary;
 
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 /// `decode` refuses a larger file.
 pub const max_bytes: usize = 16 * 1024 * 1024;
+
+/// The SHA-256 digest of the Credential email, in lowercase hex. Another
+/// account can lack access to the cached Repositories, so the file names its
+/// account without the email itself.
+pub const Account = struct {
+    hex: [64]u8,
+
+    pub fn of(email: []const u8) Account {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(email, &digest, .{});
+        return .{ .hex = std.fmt.bytesToHex(digest, .lower) };
+    }
+};
 
 pub const Repository = struct {
     summary: RepositorySummary,
@@ -26,6 +39,7 @@ pub const Snapshot = struct {
 
 const FileRecord = struct {
     version: u32,
+    account: []const u8,
     workspace: []const u8,
     repositories: []const RepositoryRecord,
 };
@@ -51,7 +65,7 @@ const PullRequestRecord = struct {
 /// Every JSON key that the file can hold. A record field outside this list is
 /// a compile error, so no Credential, description, Comment, or URL gets in.
 const allowlist = .{
-    .{ FileRecord, .{ "version", "workspace", "repositories" } },
+    .{ FileRecord, .{ "version", "account", "workspace", "repositories" } },
     .{ RepositoryRecord, .{ "slug", "name", "updated_on", "pull_requests" } },
     .{ PullRequestRecord, .{ "id", "title", "author", "updated_on", "source", "destination", "approvals", "changes_requested" } },
 };
@@ -70,8 +84,8 @@ fn allowed(comptime names: anytype, name: []const u8) bool {
     return false;
 }
 
-/// Writes the Snapshot as JSON. The caller owns the bytes.
-pub fn encode(allocator: Allocator, snapshot: Snapshot) Allocator.Error![]u8 {
+/// Writes the Snapshot of `account` as JSON. The caller owns the bytes.
+pub fn encode(allocator: Allocator, account: Account, snapshot: Snapshot) Allocator.Error![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -99,17 +113,19 @@ pub fn encode(allocator: Allocator, snapshot: Snapshot) Allocator.Error![]u8 {
     }
     return std.json.Stringify.valueAlloc(allocator, FileRecord{
         .version = version,
+        .account = &account.hex,
         .workspace = snapshot.workspace,
         .repositories = repositories,
     }, .{});
 }
 
-/// Reads a Snapshot into `arena`. Returns null for every parse error, a wrong
-/// version, and input larger than `max_bytes`. The Snapshot does not borrow
-/// `bytes`.
-pub fn decode(arena: Allocator, bytes: []const u8) ?Snapshot {
+/// Reads the Snapshot of `account` into `arena`. Returns null for every parse
+/// error, a wrong version, another account, and input larger than
+/// `max_bytes`. The Snapshot does not borrow `bytes`.
+pub fn decode(arena: Allocator, bytes: []const u8, account: Account) ?Snapshot {
     if (bytes.len > max_bytes) return null;
     const file = std.json.parseFromSliceLeaky(FileRecord, arena, bytes, .{ .allocate = .alloc_always }) catch return null;
+    _ = account;
     if (file.version != version) return null;
     const repositories = arena.alloc(Repository, file.repositories.len) catch return null;
     for (file.repositories, repositories) |record, *repository| {
@@ -152,33 +168,39 @@ const test_snapshot: Snapshot = .{
     },
 };
 
+const test_email = "ada@example.com";
+
 test "M24 cache encode then decode returns an equal Snapshot" {
-    const bytes = try encode(testing.allocator, test_snapshot);
+    const account: Account = .of(test_email);
+    const bytes = try encode(testing.allocator, account, test_snapshot);
     defer testing.allocator.free(bytes);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const decoded = decode(arena.allocator(), bytes).?;
+    const decoded = decode(arena.allocator(), bytes, account).?;
     try testing.expectEqualDeep(test_snapshot, decoded);
 }
 
-test "M24 cache decode returns null for truncated JSON, a wrong version, and an oversized file" {
-    const bytes = try encode(testing.allocator, test_snapshot);
+test "M24 cache decode returns null for truncated JSON, a wrong version, another account, and an oversized file" {
+    const account: Account = .of(test_email);
+    const bytes = try encode(testing.allocator, account, test_snapshot);
     defer testing.allocator.free(bytes);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expect(decode(a, bytes[0 .. bytes.len - 1]) == null);
-    try testing.expect(decode(a, "") == null);
-    try testing.expect(decode(a, "{\"version\":2,\"workspace\":\"check24\",\"repositories\":[]}") == null);
-    try testing.expect(decode(a, "{\"version\":1,\"workspace\":\"check24\",\"repositories\":[],\"token\":\"x\"}") == null);
-    try testing.expect(decode(a, "{\"version\":1,\"workspace\":\"check24\",\"repositories\":[]}") != null);
+    try testing.expect(decode(a, bytes[0 .. bytes.len - 1], account) == null);
+    try testing.expect(decode(a, "", account) == null);
+    try testing.expect(decode(a, bytes, .of("bo@example.com")) == null);
+    try testing.expect(decode(a, "{\"version\":1,\"workspace\":\"check24\",\"repositories\":[]}", account) == null);
+    const valid = try std.fmt.allocPrint(a, "{{\"version\":2,\"account\":\"{s}\",\"workspace\":\"check24\",\"repositories\":[]}}", .{&account.hex});
+    try testing.expect(decode(a, valid, account) != null);
+    const with_token = try std.fmt.allocPrint(a, "{s},\"token\":\"x\"}}", .{valid[0 .. valid.len - 1]});
+    try testing.expect(decode(a, with_token, account) == null);
 
     const oversized = try testing.allocator.alloc(u8, max_bytes + 1);
     defer testing.allocator.free(oversized);
     @memset(oversized, ' ');
-    const valid = "{\"version\":1,\"workspace\":\"check24\",\"repositories\":[]}";
     @memcpy(oversized[0..valid.len], valid);
-    try testing.expect(decode(a, oversized) == null);
+    try testing.expect(decode(a, oversized, account) == null);
 }
 
 fn expectAllowedKeys(value: std.json.Value) !void {
@@ -201,12 +223,12 @@ fn expectAllowedKeys(value: std.json.Value) !void {
 }
 
 test "M24 cache a saved Summary Cache holds no Credential or description" {
-    const bytes = try encode(testing.allocator, test_snapshot);
+    const bytes = try encode(testing.allocator, .of(test_email), test_snapshot);
     defer testing.allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bytes, .{});
     defer parsed.deinit();
     try expectAllowedKeys(parsed.value);
-    inline for (.{ "token", "password", "username", "description", "http", "comment" }) |word| {
+    inline for (.{ "token", "password", "username", "description", "http", "comment", test_email }) |word| {
         try testing.expect(std.ascii.indexOfIgnoreCase(bytes, word) == null);
     }
 }

@@ -57,6 +57,13 @@ pub const RunCtx = struct {
     summary_cache_path: ?[]const u8 = null,
 };
 
+/// The Summary Cache account of a remote run with a Summary Cache path.
+fn summaryCacheAccount(ctx: RunCtx) ?bbr.bitbucket.summary_cache.Account {
+    if (ctx.summary_cache_path == null) return null;
+    const bb = ctx.bitbucket orelse return null;
+    return .of(bb.cred.username);
+}
+
 /// What the TUI opens first.
 pub const Start = union(enum) {
     /// A LocalReview or the demo. The demo passes its Session to `run`.
@@ -129,7 +136,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session) !void {
         .cell_metrics = vaxis_cell_metrics,
         .configured_theme = ctx.theme,
         .persist_theme = ctx.persist_theme,
-        .summary_cache = ctx.summary_cache_path != null,
+        .summary_cache = summaryCacheAccount(ctx),
     }, .{
         .initial = if (initial) |loaded| .{
             .key = ctx.start.review,

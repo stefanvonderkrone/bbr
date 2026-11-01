@@ -943,8 +943,9 @@ pub const Dependencies = struct {
     configured_theme: ThemeId = .system,
     /// False for the demo: choosing a Theme applies it to this process only.
     persist_theme: bool = true,
-    /// True when a Summary Cache path exists. The adapter owns the path.
-    summary_cache: bool = false,
+    /// The account of the Summary Cache, or null when no Summary Cache path
+    /// exists. The adapter owns the path.
+    summary_cache: ?bbr.bitbucket.summary_cache.Account = null,
 };
 
 pub const InitialReview = struct {
@@ -1215,14 +1216,15 @@ pub const BrowserPullRequestsLoaded = struct {
 pub const LoadSummaryCache = struct {
     command_id: CommandId = 0,
     workspace: browser_mod.Name,
+    account: bbr.bitbucket.summary_cache.Account,
 
     pub fn workspaceName(self: *const LoadSummaryCache) []const u8 {
         return self.workspace.slice();
     }
 };
 
-/// A null cache is an empty Summary Cache: a missing file, a parse error, or
-/// another Workspace.
+/// A null cache is an empty Summary Cache: a missing file, a parse error,
+/// another account, or another Workspace.
 pub const SummaryCacheLoaded = struct {
     command_id: CommandId = 0,
     cache: ?*browser_mod.CachedSummaries,
@@ -1892,7 +1894,7 @@ const LaunchFailureFixture = struct {
             } } },
             .list_browser_repositories => .{ .list_browser_repositories = .{ .work_id = work_id } },
             .list_browser_pull_requests => .{ .list_browser_pull_requests = .{ .work_id = work_id, .repository = try browser_mod.Name.init("repo") } },
-            .load_summary_cache => .{ .load_summary_cache = .{ .workspace = try browser_mod.Name.init("workspace") } },
+            .load_summary_cache => .{ .load_summary_cache = .{ .workspace = try browser_mod.Name.init("workspace"), .account = test_summary_cache_account } },
             .save_summary_cache => .{ .save_summary_cache = try SaveSummaryCache.create(a, try a.dupe(u8, "{}")) },
             .copy_clipboard => blk: {
                 const copy = try a.create(ClipboardCopy);
@@ -12584,7 +12586,7 @@ pub const Presentation = struct {
                 return;
             };
             self.browser = state;
-            if (self.dependencies.summary_cache) self.commands.appendAssumeCapacity(.{ .load_summary_cache = .{ .workspace = start.workspace } });
+            if (self.dependencies.summary_cache) |account| self.commands.appendAssumeCapacity(.{ .load_summary_cache = .{ .workspace = start.workspace, .account = account } });
             self.next_work_id += 1;
             state.repositories.work = self.next_work_id;
             self.commands.appendAssumeCapacity(.{ .list_browser_repositories = .{ .work_id = self.next_work_id } });
@@ -12820,7 +12822,7 @@ pub const Presentation = struct {
     /// a Repository list filled is saved, so a save never drops the
     /// Repositories that the Summary Cache still holds.
     fn saveSummaryCache(self: *Presentation, state: *const browser_mod.Browser) void {
-        if (!self.dependencies.summary_cache or self.shutdown_requested or state.repositories.loaded == null) return;
+        if (self.dependencies.summary_cache == null or self.shutdown_requested or state.repositories.loaded == null) return;
         for (self.issued_commands.items) |issued| if (issued.target == .save_summary_cache) {
             self.summary_cache_save_waiting = true;
             return;
@@ -12837,7 +12839,7 @@ pub const Presentation = struct {
     fn encodeSummaryCache(self: *Presentation, state: *const browser_mod.Browser) Allocator.Error!*SaveSummaryCache {
         const snapshot = try state.snapshot(self.allocator);
         defer self.allocator.free(snapshot.repositories);
-        const bytes = try bbr.bitbucket.summary_cache.encode(self.allocator, snapshot);
+        const bytes = try bbr.bitbucket.summary_cache.encode(self.allocator, self.dependencies.summary_cache.?, snapshot);
         errdefer self.allocator.free(bytes);
         return SaveSummaryCache.create(self.allocator, bytes);
     }
@@ -31322,6 +31324,8 @@ fn summaryCacheFixture(workspace: []const u8, repositories: []const CachedReposi
     return cache;
 }
 
+const test_summary_cache_account: bbr.bitbucket.summary_cache.Account = .{ .hex = @splat('a') };
+
 fn takeLoadSummaryCacheCommand(presentation: *Presentation) !LoadSummaryCache {
     const command = presentation.takeCommand() orelse return error.MissingCommand;
     if (command != .load_summary_cache) {
@@ -31338,7 +31342,7 @@ fn takeSaveSummaryCacheCommand(presentation: *Presentation, arena: Allocator) !s
     defer command.deinit();
     if (command != .save_summary_cache) return error.UnexpectedCommand;
     const save = command.save_summary_cache;
-    return .{ .command_id = save.command_id, .snapshot = bbr.bitbucket.summary_cache.decode(arena, save.bytes) orelse return error.InvalidSnapshot };
+    return .{ .command_id = save.command_id, .snapshot = bbr.bitbucket.summary_cache.decode(arena, save.bytes, test_summary_cache_account) orelse return error.InvalidSnapshot };
 }
 
 fn queuedSummaryCacheSaves(presentation: *const Presentation) usize {
@@ -31364,12 +31368,13 @@ fn snapshotPullRequestIds(snapshot: bbr.bitbucket.summary_cache.Snapshot, slug: 
 test "M24 cache the Browser shows cached rows before any network completion, and a Repository list success replaces them" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = test_summary_cache_account });
     defer presentation.deinit();
 
     try browserKey(&presentation, 'b');
     const load = try takeLoadSummaryCacheCommand(&presentation);
     try testing.expectEqualStrings("check24", load.workspaceName());
+    try testing.expectEqual(test_summary_cache_account, load.account);
     const repositories = try takeBrowserRepositoriesCommand(&presentation);
     const pull_requests = try takeBrowserPullRequestsCommand(&presentation, "repo");
     try expectNoCommand(&presentation);
@@ -31412,7 +31417,7 @@ test "M24 cache the Browser shows cached rows before any network completion, and
 test "M24 cache a Summary Cache completion after a Repository list success changes nothing" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = test_summary_cache_account });
     defer presentation.deinit();
 
     try browserKey(&presentation, 'b');
@@ -31436,7 +31441,7 @@ test "M24 cache a Summary Cache completion after a Repository list success chang
 test "M24 cache a cached PullRequest list shows as a cached load, and its first expansion queues a refresh" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = test_summary_cache_account });
     defer presentation.deinit();
 
     try browserKey(&presentation, 'b');
@@ -31469,7 +31474,7 @@ test "M24 cache a cached PullRequest list shows as a cached load, and its first 
 test "M24 cache a newer Snapshot replaces a waiting save, and only one save runs at a time" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = test_summary_cache_account });
     defer presentation.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -31506,7 +31511,7 @@ test "M24 cache a newer Snapshot replaces a waiting save, and only one save runs
 test "M24 cache a failed save leaves the Browser unchanged" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = test_summary_cache_account });
     defer presentation.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

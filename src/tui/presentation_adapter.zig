@@ -385,20 +385,20 @@ fn loadPullRequests(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, 
 const summary_cache = bbr.bitbucket.summary_cache;
 const summary_cache_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
 
-/// Reads the Summary Cache. A missing file, a parse error, or another
-/// Workspace gives an empty result. The completion owns the cache.
+/// Reads the Summary Cache. A missing file, a parse error, another account,
+/// or another Workspace gives an empty result. The completion owns the cache.
 pub fn loadSummaryCache(allocator: std.mem.Allocator, io: std.Io, path: []const u8, command: presentation.LoadSummaryCache) presentation.OwnedInput {
     return .{ .summary_cache_loaded = .{
         .command_id = command.command_id,
-        .cache = readSummaryCache(allocator, io, path, command.workspaceName()),
+        .cache = readSummaryCache(allocator, io, path, command.account, command.workspaceName()),
     } };
 }
 
-fn readSummaryCache(allocator: std.mem.Allocator, io: std.Io, path: []const u8, workspace: []const u8) ?*browser.CachedSummaries {
+fn readSummaryCache(allocator: std.mem.Allocator, io: std.Io, path: []const u8, account: summary_cache.Account, workspace: []const u8) ?*browser.CachedSummaries {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(summary_cache.max_bytes + 1)) catch return null;
     defer allocator.free(bytes);
     const cache = browser.CachedSummaries.create(allocator) catch return null;
-    const snapshot = summary_cache.decode(cache.arena.allocator(), bytes) orelse {
+    const snapshot = summary_cache.decode(cache.arena.allocator(), bytes, account) orelse {
         cache.destroy();
         return null;
     };
@@ -673,8 +673,10 @@ fn testCachePath(tmp: *const std.testing.TmpDir, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/{s}", .{ &tmp.sub_path, name });
 }
 
-fn testSaveCommand(snapshot: summary_cache.Snapshot) !*presentation.SaveSummaryCache {
-    const bytes = try summary_cache.encode(testing.allocator, snapshot);
+const test_account: summary_cache.Account = .{ .hex = @splat('a') };
+
+fn testSaveCommand(account: summary_cache.Account, snapshot: summary_cache.Snapshot) !*presentation.SaveSummaryCache {
+    const bytes = try summary_cache.encode(testing.allocator, account, snapshot);
     errdefer testing.allocator.free(bytes);
     const command = try presentation.SaveSummaryCache.create(testing.allocator, bytes);
     command.command_id = 6;
@@ -694,7 +696,7 @@ test "M24 cache the save worker creates the directory and writes mode 0600, and 
     const path = try testCachePath(&tmp, "state/bbr/browser-cache.json");
     defer testing.allocator.free(path);
 
-    var saved = saveSummaryCache(testing.io, path, try testSaveCommand(test_cache_snapshot));
+    var saved = saveSummaryCache(testing.io, path, try testSaveCommand(test_account, test_cache_snapshot));
     defer saved.deinit();
     try testing.expectEqual(@as(presentation.CommandId, 6), saved.summary_cache_saved.command_id);
     try testing.expect(saved.summary_cache_saved.saved);
@@ -705,7 +707,7 @@ test "M24 cache the save worker creates the directory and writes mode 0600, and 
     for ([_][]const u8{ "token", "description", "http", "://" }) |word| try testing.expect(std.mem.indexOf(u8, bytes, word) == null);
 
     try std.Io.Dir.cwd().setFilePermissions(testing.io, path, @enumFromInt(0o644), .{});
-    var second = saveSummaryCache(testing.io, path, try testSaveCommand(.{ .workspace = "check24", .repositories = &.{} }));
+    var second = saveSummaryCache(testing.io, path, try testSaveCommand(test_account, .{ .workspace = "check24", .repositories = &.{} }));
     defer second.deinit();
     try testing.expect(second.summary_cache_saved.saved);
     const replaced = try std.Io.Dir.cwd().statFile(testing.io, path, .{});
@@ -720,9 +722,9 @@ test "M24 cache the save worker creates the directory and writes mode 0600, and 
     }
     try testing.expectEqual(@as(usize, 1), names);
 
-    var third = saveSummaryCache(testing.io, path, try testSaveCommand(test_cache_snapshot));
+    var third = saveSummaryCache(testing.io, path, try testSaveCommand(test_account, test_cache_snapshot));
     defer third.deinit();
-    var loaded = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 8, .workspace = try browser.Name.init("check24") });
+    var loaded = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 8, .workspace = try browser.Name.init("check24"), .account = test_account });
     defer loaded.deinit();
     try testing.expectEqual(@as(presentation.CommandId, 8), loaded.summary_cache_loaded.command_id);
     try testing.expectEqualDeep(test_cache_snapshot, loaded.summary_cache_loaded.cache.?.snapshot);
@@ -735,21 +737,39 @@ test "M24 cache a missing, broken, or foreign Summary Cache gives an empty resul
     defer testing.allocator.free(path);
     const workspace = try browser.Name.init("check24");
 
-    var missing = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 1, .workspace = workspace });
+    var missing = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 1, .workspace = workspace, .account = test_account });
     defer missing.deinit();
     try testing.expect(missing.summary_cache_loaded.cache == null);
 
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "browser-cache.json", .data = "{\"version\":1,\"workspace\":" });
-    var broken = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 2, .workspace = workspace });
+    var broken = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 2, .workspace = workspace, .account = test_account });
     defer broken.deinit();
     try testing.expect(broken.summary_cache_loaded.cache == null);
 
-    var saved = saveSummaryCache(testing.io, path, try testSaveCommand(.{ .workspace = "other", .repositories = test_cache_snapshot.repositories }));
+    var saved = saveSummaryCache(testing.io, path, try testSaveCommand(test_account, .{ .workspace = "other", .repositories = test_cache_snapshot.repositories }));
     defer saved.deinit();
     try testing.expect(saved.summary_cache_saved.saved);
-    var foreign = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 3, .workspace = workspace });
+    var foreign = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 3, .workspace = workspace, .account = test_account });
     defer foreign.deinit();
     try testing.expect(foreign.summary_cache_loaded.cache == null);
+}
+
+test "M24 cache a Summary Cache saved for one account is empty for another account in the same Workspace" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testCachePath(&tmp, "browser-cache.json");
+    defer testing.allocator.free(path);
+    const workspace = try browser.Name.init("check24");
+
+    var saved = saveSummaryCache(testing.io, path, try testSaveCommand(test_account, test_cache_snapshot));
+    defer saved.deinit();
+    try testing.expect(saved.summary_cache_saved.saved);
+    var other = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 1, .workspace = workspace, .account = .of("bo@example.com") });
+    defer other.deinit();
+    try testing.expect(other.summary_cache_loaded.cache == null);
+    var same = loadSummaryCache(testing.allocator, testing.io, path, .{ .command_id = 2, .workspace = workspace, .account = test_account });
+    defer same.deinit();
+    try testing.expectEqualDeep(test_cache_snapshot, same.summary_cache_loaded.cache.?.snapshot);
 }
 
 test "M24 cache a failed save reports the failure and consumes the command" {
@@ -758,7 +778,7 @@ test "M24 cache a failed save reports the failure and consumes the command" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "file", .data = "" });
     const path = try testCachePath(&tmp, "file/browser-cache.json");
     defer testing.allocator.free(path);
-    var failed = saveSummaryCache(testing.io, path, try testSaveCommand(test_cache_snapshot));
+    var failed = saveSummaryCache(testing.io, path, try testSaveCommand(test_account, test_cache_snapshot));
     defer failed.deinit();
     try testing.expectEqual(@as(presentation.CommandId, 6), failed.summary_cache_saved.command_id);
     try testing.expect(!failed.summary_cache_saved.saved);
