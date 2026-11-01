@@ -226,6 +226,9 @@ pub fn build(b: *std.Build) void {
         cli_test.addFileArg(b.path(script));
         cli_test.addArtifactArg(exe);
         cli_test.setCwd(b.path("."));
+        // A developer's saved Profile or Credential variables would let a check pass only on that machine.
+        cli_test.clearEnvironment();
+        if (b.graph.environ_map.get("PATH")) |path| cli_test.setEnvironmentVariable("PATH", path);
         cli_test_step.dependOn(&cli_test.step);
     }
 
