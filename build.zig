@@ -424,6 +424,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
+    test_step.dependOn(&bench_exe.step);
+    test_step.dependOn(&file_acquisition_bench.step);
+    test_step.dependOn(&buffer_search_bench.step);
+    test_step.dependOn(&file_cache_bench.step);
 }
 
 fn resolveVersion(b: *std.Build) []const u8 {
