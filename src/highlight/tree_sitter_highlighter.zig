@@ -221,10 +221,9 @@ fn collectLayerIntervals(allocator: Allocator, intervals: *std.ArrayList(Capture
                 try intervals.append(allocator, interval);
                 continue;
             }
-            for (layer.ranges) |included| {
+            for (overlappingRanges(layer.ranges, interval.start, interval.end)) |included| {
                 const start = @max(interval.start, included.start_byte);
                 const end = @min(interval.end, included.end_byte);
-                if (start >= end) continue;
                 var clipped = interval;
                 clipped.start = start;
                 clipped.end = end;
@@ -356,11 +355,24 @@ fn appendContentRanges(
 
 fn appendClipped(allocator: Allocator, ranges: *std.ArrayList(c.TSRange), start: u32, end: u32, parent: Layer, lines: LineStarts) !void {
     if (parent.ranges.len == 0) return ranges.append(allocator, lines.range(start, end));
-    for (parent.ranges) |included| {
-        const clipped_start = @max(start, included.start_byte);
-        const clipped_end = @min(end, included.end_byte);
-        if (clipped_start < clipped_end) try ranges.append(allocator, lines.range(clipped_start, clipped_end));
+    for (overlappingRanges(parent.ranges, start, end)) |included| {
+        try ranges.append(allocator, lines.range(@max(start, included.start_byte), @min(end, included.end_byte)));
     }
+}
+
+/// The ranges that overlap `start..end`, from ranges that are sorted and disjoint.
+fn overlappingRanges(ranges: []const c.TSRange, start: u32, end: u32) []const c.TSRange {
+    const first = std.sort.partitionPoint(c.TSRange, ranges, start, rangeEndsAtOrBefore);
+    const limit = first + std.sort.partitionPoint(c.TSRange, ranges[first..], end, rangeStartsBefore);
+    return ranges[first..limit];
+}
+
+fn rangeEndsAtOrBefore(byte: u32, range: c.TSRange) bool {
+    return range.end_byte <= byte;
+}
+
+fn rangeStartsBefore(byte: u32, range: c.TSRange) bool {
+    return range.start_byte < byte;
 }
 
 /// The byte offset of each line start, for the row and column points of a range.
@@ -1395,6 +1407,21 @@ test "M27 injection a large fenced Zig block costs about as much as the same Zig
     if (markdown_ns > 10 * zig_ns) {
         std.debug.print("Markdown took {d} ms, the Zig File took {d} ms\n", .{ markdown_ns / std.time.ns_per_ms, zig_ns / std.time.ns_per_ms });
         return error.FencedBlockTooSlow;
+    }
+}
+
+test "M27 injection a combined PHP text layer costs about as much as the same HTML File" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(testing.allocator);
+    for (0..12000) |_| try source.appendSlice(testing.allocator, "<b>x</b><?php $a; ?>\n");
+
+    const html_ns = try highlightNanoseconds(&highlighter, "src/a.html", source.items);
+    const php_ns = try highlightNanoseconds(&highlighter, "src/a.php", source.items);
+    if (php_ns > 5 * html_ns) {
+        std.debug.print("PHP took {d} ms, the HTML File took {d} ms\n", .{ php_ns / std.time.ns_per_ms, html_ns / std.time.ns_per_ms });
+        return error.CombinedLayerTooSlow;
     }
 }
 
