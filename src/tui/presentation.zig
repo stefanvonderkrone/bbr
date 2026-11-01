@@ -31059,13 +31059,14 @@ test "M24 browser one failed Repository keeps the others, and only forbidden and
     defer store.deinit();
     var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
     defer presentation.deinit();
-    try openLoadedBrowser(&presentation, &.{ "repo", "a", "b" }, &.{1});
-    for ([_][]const u8{ "a", "b" }) |slug| {
+    try openLoadedBrowser(&presentation, &.{ "repo", "a", "b", "c" }, &.{1});
+    for ([_][]const u8{ "a", "b", "c" }) |slug| {
         try browserCursorTo(&presentation, slug);
         try browserKey(&presentation, 'l');
     }
     try completeBrowserPullRequests(&presentation, try takeBrowserPullRequestsCommand(&presentation, "a"), &.{ 3, 4 });
     try completeBrowserPullRequests(&presentation, try takeBrowserPullRequestsCommand(&presentation, "b"), &.{5});
+    try completeBrowserPullRequests(&presentation, try takeBrowserPullRequestsCommand(&presentation, "c"), &.{6});
 
     try browserKey(&presentation, 'R');
     const repositories = try takeBrowserRepositoriesCommand(&presentation);
@@ -31074,24 +31075,27 @@ test "M24 browser one failed Repository keeps the others, and only forbidden and
     try failBrowserPullRequests(&presentation, a, error.ServerError);
     const b = try takeBrowserPullRequestsCommand(&presentation, "b");
     try failBrowserPullRequests(&presentation, b, error.Forbidden);
+    const c = try takeBrowserPullRequestsCommand(&presentation, "c");
+    try failBrowserPullRequests(&presentation, c, error.NotFound);
     try completeBrowserPullRequests(&presentation, repo, &.{});
-    try completeBrowserRepositories(&presentation, repositories, &.{ "repo", "a", "b" });
+    try completeBrowserRepositories(&presentation, repositories, &.{ "repo", "a", "b", "c" });
 
     try expectBrowserPullRequests(&presentation, "a", &.{ 3, 4 });
     try expectBrowserPullRequests(&presentation, "b", &.{});
+    try expectBrowserPullRequests(&presentation, "c", &.{});
     try expectBrowserPullRequests(&presentation, "repo", &.{});
     var messages: usize = 0;
     for (browserRows(&presentation)) |entry| if (entry == .message) switch (entry.message) {
         .pull_requests_failed => |failed| {
             messages += 1;
-            try testing.expect(failed.reason == error.ServerError or failed.reason == error.Forbidden);
+            try testing.expect(failed.reason == error.ServerError or failed.reason == error.Forbidden or failed.reason == error.NotFound);
         },
         .no_pull_requests => messages += 1,
         else => return error.UnexpectedMessage,
     };
-    try testing.expectEqual(@as(usize, 3), messages);
+    try testing.expectEqual(@as(usize, 4), messages);
 
-    for (0..3) |_| try browserKey(&presentation, 'h');
+    for (0..4) |_| try browserKey(&presentation, 'h');
     try browserCursorTo(&presentation, "a");
     try browserKey(&presentation, 'l');
     try expectNoCommand(&presentation);
