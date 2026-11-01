@@ -12371,6 +12371,8 @@ pub const Presentation = struct {
     }
 
     fn queueRefresh(self: *Presentation, key: OwnedReviewIdentity) void {
+        // The PullRequest the reviewer chose replaces this Session anyway.
+        if (self.replacement) |replacement| if (replacement.cause == .picker or replacement.cause == .browser) return;
         const intent = self.next_intent + 1;
         self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1) catch {
             self.action_error = .out_of_memory;
