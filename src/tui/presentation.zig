@@ -30947,8 +30947,12 @@ test "M29 overview showing the Comment Overview changes no disclosure" {
     var presentation = try testOverviewPresentation(&store, 2);
     defer presentation.deinit();
     const published = presentation.published.?;
+    while (published.cursorRow().? != .disclosure) try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    while (presentation.commands.items.len > 0) try completeDisclosureBuild(&presentation);
     const rows = published.visual_rows;
     const disclosures = published.expanded_disclosures.items.len;
+    try testing.expectEqual(@as(usize, 1), disclosures);
     try presentation.dispatch(.{ .action = .show_comment_overview });
     const overview = presentation.projection().review.?.frame.overview;
     try testing.expectEqual(@as(usize, 4), overview.listing.entries.len);
@@ -32009,6 +32013,54 @@ test "M29 overview the File Tree cursor stays on the File Tree Filter" {
     try testing.expectEqual(@as(u16, 100), presentation.projection().review.?.frame.geometry.cols);
     try testing.expect(presentation.projection().review.?.frame.file_tree.entries[0].identity == .root);
     try expectFileTreeCursor(&presentation, .{ .file = 0 });
+}
+
+test "M29 overview a File build or a height change in the Comment Overview keeps the File Tree cursor and scroll" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 30) },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+    for (0..20) |_| try presentation.dispatch(.{ .action = .next_file });
+    try dispatchView(&presentation, .{ .action = .isolate });
+    try presentation.dispatch(.{ .action = .next_file });
+    try testing.expect(presentation.published.?.pending_view != null);
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    while (presentation.commands.items.len > 0) try completeDisclosureBuild(&presentation);
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(MainPane.comment_overview, frame.main_pane);
+    try testing.expectEqual(@as(?usize, 21), presentation.published.?.activeFile());
+    try expectFileTreeCursor(&presentation, .root);
+    try testing.expectEqual(@as(usize, 0), frame.file_tree.scroll);
+
+    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 11 } });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(MainPane.comment_overview, frame.main_pane);
+    try expectFileTreeCursor(&presentation, .root);
+    try testing.expectEqual(@as(usize, 0), frame.file_tree.scroll);
+}
+
+test "M29 overview the excerpt cuts on the graphemes of the Presentation CellMetrics" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const s = try testSession(testing.allocator, 1, 'a');
+    const a = s.arena.allocator();
+    s.threads = bbr.review.buildThreads(a, try a.dupe(bbr.review.Comment, &.{
+        .{ .id = 1, .author = "Ada", .body = "a" ** 194 ++ "👩‍💻 more", .scope = .review },
+    })) catch |err| {
+        s.destroy();
+        return err;
+    };
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .cell_metrics = MatrixGraphemeMetrics.value }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = s },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    const overview = presentation.projection().review.?.frame.overview;
+    try testing.expectEqualStrings("a" ** 194 ++ "…", overview.records[overview.listing.entries[0].record].excerpt);
 }
 
 test "M29 overview g d hides the root entry and follows the active File, and g o restores the File Tree Filter" {
