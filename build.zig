@@ -2,6 +2,7 @@ const std = @import("std");
 const version_identity = @import("build/version.zig");
 
 pub fn build(b: *std.Build) void {
+    const test_step = b.step("test", "Run tests");
     var target = b.standardTargetOptions(.{});
     if (target.query.os_tag == null and
         target.query.os_version_min == null and
@@ -92,7 +93,7 @@ pub fn build(b: *std.Build) void {
     addTreeSitter(b, bench_highlight_mod);
     addRe2(b, bench_highlight_mod, target, macos_sdk);
     bench_mod.addImport("benchmark_highlight", bench_highlight_mod);
-    const bench_exe = b.addExecutable(.{ .name = "bbr-bench", .root_module = bench_mod });
+    const bench_exe = addBenchmark(b, test_step, "bbr-bench", bench_mod);
     const install_bench = b.addInstallArtifact(bench_exe, .{});
     b.getInstallStep().dependOn(&install_bench.step);
     const run_bench = b.addRunArtifact(bench_exe);
@@ -116,7 +117,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "file_enrichment", .module = file_enrichment_bench_mod },
         },
     });
-    const file_acquisition_bench = b.addExecutable(.{ .name = "bbr-file-acquisition-bench", .root_module = file_acquisition_bench_mod });
+    const file_acquisition_bench = addBenchmark(b, test_step, "bbr-file-acquisition-bench", file_acquisition_bench_mod);
     const run_file_acquisition_bench = b.addRunArtifact(file_acquisition_bench);
     if (b.args) |args| run_file_acquisition_bench.addArgs(args);
     const file_acquisition_bench_step = b.step("bench-file-acquisition", "Run the opt-in File Enrichment concurrency benchmark");
@@ -132,7 +133,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vaxis", .module = vaxis.module("vaxis") },
         },
     });
-    const buffer_search_bench = b.addExecutable(.{ .name = "bbr-buffer-search-bench", .root_module = buffer_search_bench_mod });
+    const buffer_search_bench = addBenchmark(b, test_step, "bbr-buffer-search-bench", buffer_search_bench_mod);
     const buffer_search_bench_step = b.step("bench-buffer-search", "Run the deterministic large Buffer Search benchmark");
     const run_buffer_search_bench = b.addRunArtifact(buffer_search_bench);
     if (b.args) |args| run_buffer_search_bench.addArgs(args);
@@ -152,7 +153,7 @@ pub fn build(b: *std.Build) void {
     file_cache_bench_mod.addOptions("build_options", build_options);
     addTreeSitter(b, file_cache_bench_mod);
     addRe2(b, file_cache_bench_mod, target, macos_sdk);
-    const file_cache_bench = b.addExecutable(.{ .name = "bbr-file-cache-bench", .root_module = file_cache_bench_mod });
+    const file_cache_bench = addBenchmark(b, test_step, "bbr-file-cache-bench", file_cache_bench_mod);
     const run_file_cache_bench = b.addRunArtifact(file_cache_bench);
     if (b.args) |args| run_file_cache_bench.addArgs(args);
     const file_cache_bench_step = b.step("bench-file-cache", "Run the opt-in M28 File cache benchmark");
@@ -419,7 +420,6 @@ pub fn build(b: *std.Build) void {
     const user_grammar_test_step = b.step("test-user-grammar", "Run the native UserGrammar load and CLI lifecycle fixture");
     user_grammar_test_step.dependOn(&run_lifecycle_test.step);
 
-    const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_version_tests.step);
@@ -430,11 +430,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
-    test_step.dependOn(&bench_exe.step);
-    test_step.dependOn(&file_acquisition_bench.step);
-    test_step.dependOn(&buffer_search_bench.step);
-    test_step.dependOn(&file_cache_bench.step);
     test_step.dependOn(&file_cache_bench_exit.step);
+}
+
+/// `zig build test` compiles every benchmark, so CI catches a benchmark that no test reaches.
+fn addBenchmark(b: *std.Build, test_step: *std.Build.Step, name: []const u8, root_module: *std.Build.Module) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{ .name = name, .root_module = root_module });
+    test_step.dependOn(&exe.step);
+    return exe;
 }
 
 fn resolveVersion(b: *std.Build) []const u8 {

@@ -306,3 +306,12 @@ Nobody ran `tools/m28-baseline-run.sh`. `sh -n tools/m28-baseline-run.sh` parsed
 
 X-4 (2026-11-01): the branch contains `origin/main` `497c86f` through merge `36627c6`, so the harness measures the Enrichment Range.
 `git merge-base --is-ancestor 497c86f HEAD` exited with 0.
+
+### One way to add a benchmark (2026-11-01)
+
+The audit row "`zig build test` compiles every benchmark" survived a removed `test_step.dependOn` line.
+All four benchmarks had missed that line before M28-10, so the mistake happened more than once.
+`addBenchmark` in `build.zig` now creates each benchmark executable and adds its compile step to `zig build test`.
+A removed line can no longer drop one benchmark from the test step.
+A probe `@compileError` in `src/benchmark/buffer_projection.zig` made `zig build test` fail. The probe was then reverted.
+A new benchmark that calls `b.addExecutable` directly stays a convention (no check).
