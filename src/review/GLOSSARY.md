@@ -15,7 +15,7 @@ A deterministic digest of one File's review-visible change. It covers the old an
 _Avoid_: commit hash (too broad), blob hash (does not describe both sides of the reviewed change), Session identity.
 
 **File Read Receipt**:
-The reviewer-local durable fact that a File Review Fingerprint was explicitly marked read within one ReviewIdentity. It is current only while the loaded File has the same fingerprint; missing, mismatched, or unverifiable receipts project as unread. Receipts live in local persistence for both RemoteReview and LocalReview and never synchronize to Bitbucket. The store holds one receipt for each ReviewIdentity and canonical path. The canonical path is the new path when present, otherwise the old path. A mark replaces the receipt. Candidate Session preparation only reads receipts and never deletes a stale receipt.
+The reviewer-local durable fact that a File Review Fingerprint was explicitly marked read within one ReviewIdentity. It is current only while the loaded File has the same fingerprint; missing, mismatched, or unverifiable receipts project as unread. Receipts live in local persistence for both RemoteReview and LocalReview and never synchronize to Bitbucket. The store holds one receipt for each ReviewIdentity and canonical path. The canonical path is the new path when present, otherwise the old path. A mark replaces the receipt. Two Files of one Diff can share a canonical path, for example after a type change. Then that path is unverifiable, so both Files stay unread. Candidate Session preparation only reads receipts and never deletes a stale receipt.
 _Avoid_: read File (conflates the File with the decision), viewed state (does not imply explicit completion), Session state (the receipt survives replacement).
 
 **Anchor**:

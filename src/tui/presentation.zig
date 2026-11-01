@@ -3917,7 +3917,8 @@ const FileReadState = struct {
 };
 
 /// Reads File Read Receipts and never writes them. A File is read only when a
-/// receipt has its canonical path and its current fingerprint.
+/// receipt has its canonical path and its current fingerprint. The store holds
+/// one receipt per path, so a path that two Files share has no fingerprint.
 fn loadFileReads(
     allocator: Allocator,
     scratch_backing: Allocator,
@@ -3925,11 +3926,19 @@ fn loadFileReads(
     identity: bbr.review.ReviewIdentity,
     diff: bbr.diff.Diff,
 ) error{OutOfMemory}!FileReadState {
-    const entries = try allocator.alloc(FileReadEntry, diff.files.len);
-    for (entries, diff.files) |*entry, file| entry.* = .{ .fingerprint = bbr.review.file_read.fingerprint(file) };
-    const reads = store orelse return .{ .entries = entries };
     var scratch = std.heap.ArenaAllocator.init(scratch_backing);
     defer scratch.deinit();
+    var shared: std.StringHashMapUnmanaged(bool) = .empty;
+    try shared.ensureTotalCapacity(scratch.allocator(), @intCast(diff.files.len));
+    for (diff.files) |file| {
+        const slot = shared.getOrPutAssumeCapacity(file.displayPath());
+        slot.value_ptr.* = slot.found_existing;
+    }
+    const entries = try allocator.alloc(FileReadEntry, diff.files.len);
+    for (entries, diff.files) |*entry, file| entry.* = .{
+        .fingerprint = if (shared.get(file.displayPath()).?) null else bbr.review.file_read.fingerprint(file),
+    };
+    const reads = store orelse return .{ .entries = entries };
     const receipts = reads.load(scratch.allocator(), identity) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .entries = entries, .load_failed = true };
