@@ -92,3 +92,7 @@ All checks ran with HOME, the XDG directories, and the proxies set to paths unde
 - `zig build test-browser --summary all`: 9/9 steps succeeded, 77/77 tests passed.
 - `zig fmt --check build.zig src tests`: exit 0.
 - `python3 tools/check_agent_docs.py`: "Agent documents and tracker metadata pass."
+
+## Comments
+
+[Ticket 09](09-fix-the-minor-review-findings.md) fixes the findings under "Not fixed", except M24-3.
