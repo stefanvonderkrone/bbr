@@ -1597,6 +1597,32 @@ test "M27 injection Spans stay ordered and inside their layer ranges" {
     }
 }
 
+test "M27 injection a nested Injection stays out of the gaps between its parent layer ranges" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query,
+        \\((template_string (string_fragment) @injection.content) (#set! injection.language "javascript") (#set! injection.combined))
+        \\((arguments) @injection.content (#set! injection.language "javascript") (#set! injection.include-children))
+    );
+    const source = "[`f(1,`, `2)`];\n";
+    const gap_start = std.mem.indexOf(u8, source, "`, `").?;
+    const gap_end = gap_start + "`, `".len;
+    const package = &highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.javascript)];
+    const intervals = try collectCaptureIntervals(testing.allocator, package, &highlighter.packages, source, null);
+    defer testing.allocator.free(intervals);
+    var nested: usize = 0;
+    for (intervals) |interval| {
+        if (interval.depth < 2) continue;
+        nested += 1;
+        try testing.expect(interval.end <= gap_start or interval.start >= gap_end);
+    }
+    try testing.expect(nested > 0);
+
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(result);
+    try testing.expectEqual(@as(?bbr.highlight.Capture, null), captureOver(result, source, std.mem.indexOf(u8, source, " `").?));
+}
+
 fn useJavaScriptQueries(highlighter: *TreeSitterHighlighter, highlight_query: []const u8, locals_query: []const u8, injections_query: []const u8) !void {
     var diagnostic: predicate_mod.Diagnostic = undefined;
     const replacement = try RuntimePackage.init(testing.allocator, language(.javascript).?, highlight_query, locals_query, injections_query, &diagnostic);
