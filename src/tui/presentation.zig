@@ -7750,7 +7750,7 @@ pub const Presentation = struct {
 
     fn landOnDraftCard(self: *Presentation, published: *Published, row: usize) void {
         self.showDiffPane(published);
-        if (published.main_pane != .diff_pane) return;
+        if (published.main_pane != .diff_pane) return self.failDraftDestination(published, .out_of_memory);
         // The cursor leaves the Buffer Search match. A restore of the saved
         // disclosures could hide the Draft again, so the current ones stay.
         if (published.buffer_search.active != null) {
@@ -31276,6 +31276,37 @@ test "M29 overview a Submission Overlay jump to a shown Draft card shows the Dif
     try testing.expect(presentation.projection().submission_tree == null);
     try testing.expect(presentation.takeCommand() == null);
     try expectCursorOnHeader(&presentation, .{ .draft = 1 });
+}
+
+test "M29 overview a failed DiffPane change during a Draft jump shows the Submission Overlay again" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "failed root" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 100, .rows = 16 },
+    });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testSession(testing.allocator, 1, 'a'));
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .submit });
+    const published = presentation.published.?;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const trees = published.trees;
+    published.trees = ArenaRing(2).init(failing.allocator());
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    published.trees.deinit();
+    published.trees = trees;
+    try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().submission_tree != null);
 }
 
 fn takeOverviewDestination(presentation: *Presentation) !*DisclosureBuild {
