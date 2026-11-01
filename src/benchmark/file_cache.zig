@@ -1731,7 +1731,9 @@ fn nonSequentialNavigation(driver: *Driver, recorder: *Recorder) !void {
     for (0..200) |_| try driver.finderJump(recorder, prng.random().uintLessThan(usize, driver.file_count));
 }
 
+/// The restart discards the content that S1 to S3 left, so rule 3 compares a cold Review Search with the warm S6 reopen.
 fn firstReviewSearch(driver: *Driver, recorder: *Recorder) !void {
+    _ = try driver.restart();
     const span = try driver.beginSpan();
     try driver.openReviewSearch();
     try driver.recordSearch(recorder, span, true);
@@ -2047,7 +2049,8 @@ fn firstGap(lines: []const ScenarioLine, checks: []const RunKey, key: RunKey) ?G
 fn runCauses(lines: []const ScenarioLine, run_label: []const u8) std.EnumSet(Cause) {
     var causes: std.EnumSet(Cause) = .initEmpty();
     for (lines) |line| if (std.mem.eql(u8, line.run_label, run_label)) {
-        if (line.added_delay_p95_ms > delay_threshold_ms) causes.insert(causeOf(line.scenario));
+        // The S4 sample has no hit baseline. Rule 3 gives its added delay.
+        if (line.scenario != .s4 and line.added_delay_p95_ms > delay_threshold_ms) causes.insert(causeOf(line.scenario));
         if ((line.scenario == .s5 or line.scenario == .s6) and line.refetches > 0) causes.insert(causeOf(line.scenario));
         if (line.scenario != .s6 or line.refetches > 0) continue;
         const reopen = line.complete_result_ms orelse continue;
@@ -2440,6 +2443,23 @@ test "M28 cache every scenario runs to the end with text, binary, added, and rem
         try testing.expect(try intField(output, prefix, "refetches") > 0);
         try testing.expectEqual(@as(usize, 0), try intField(output, prefix, "cold_fetches"));
     }
+}
+
+test "M28 cache S4 is a cold Review Search after a restart, also when every File fits the budget" {
+    const responses = fixtureResponses(matching_b);
+    var clock: FakeClock = .{};
+    var options = fixture_options;
+    options.scenarios = .initMany(&.{ .s1, .s2, .s3, .s4, .s5, .s6 });
+    const output = try runFixture(&responses, options, &clock);
+    defer testing.allocator.free(output);
+    // S1 admits every File, and the default budget keeps them. Only the restart makes S4 cold.
+    try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s3 ", "requests"));
+    try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s4 ", "hits"));
+    try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s4 ", "refetches"));
+    try testing.expect(try intField(output, "scenario=s4 ", "src_requests") > 0);
+    // S6 reopens the Overlay on content that S4 acquired, so rule 3 compares a cold and a warm Review Search.
+    try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s6 ", "requests"));
+    try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s6 ", "hits"));
 }
 
 test "M28 cache an unlimited budget refetches nothing in S2, S3, S5, and S6" {
@@ -3071,6 +3091,25 @@ test "M28 cache summarize reports the restart Review Search delay only when S6 h
     const text = try summaryText(fullRun("a", restart) ++ fullRun("b", restart));
     defer testing.allocator.free(text);
     try testing.expect(std.mem.endsWith(u8, text, "outcome=Delay scenarios=restart_review_search\n"));
+}
+
+test "M28 cache summarize applies rule 3, not rule 1, to the S4 restart Review Search" {
+    // The S4 sample refetches every File after a restart and has no hit baseline, so its added
+    // delay is its full latency. Rule 3 subtracts the warm S6 reopen instead.
+    const slow_scan: RunFixture = .{ .lines = &.{
+        "scenario=s4 run_label={s} pull_request=12 refetches=1 failures=0 added_delay_p95_ms=900.0 complete_result_ms=900.0\n",
+        "scenario=s6 run_label={s} pull_request=12 refetches=0 failures=0 added_delay_p95_ms=0.0 complete_result_ms=700.0\n",
+    } };
+    const quiet = try summaryText(fullRun("a", slow_scan) ++ fullRun("b", slow_scan));
+    defer testing.allocator.free(quiet);
+    try testing.expect(std.mem.endsWith(u8, quiet, "outcome=No delay scenarios=none\n"));
+    const slow_restart: RunFixture = .{ .lines = &.{
+        "scenario=s4 run_label={s} pull_request=12 refetches=1 failures=0 added_delay_p95_ms=1200.0 complete_result_ms=1200.0\n",
+        "scenario=s6 run_label={s} pull_request=12 refetches=0 failures=0 added_delay_p95_ms=0.0 complete_result_ms=700.0\n",
+    } };
+    const delayed = try summaryText(fullRun("a", slow_restart) ++ fullRun("b", slow_restart));
+    defer testing.allocator.free(delayed);
+    try testing.expect(std.mem.endsWith(u8, delayed, "outcome=Delay scenarios=restart_review_search\n"));
 }
 
 /// Delays each `/src/` request in real time, so a File fetch is still in flight

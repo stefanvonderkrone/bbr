@@ -180,7 +180,7 @@ The random sequences use the seed 28, so each run uses the same Files.
 | S1 | Sequential review | From the first File, `next_file` through every File in File Tree order. | One File Jump for each File. |
 | S2 | Revisit after eviction | File Jump through the File Finder to the 50 least recently focused Files, oldest first. | 50 File Jumps. |
 | S3 | Non-sequential navigation | 200 File Jumps through the File Finder to seeded random Files. | 200 File Jumps. |
-| S4 | First Review Search | Open Review Search with the configured query. | First-result and complete-result latency. |
+| S4 | First Review Search after a restart | Restart as S8 does, then open Review Search with the configured query. | First-result and complete-result latency. |
 | S5 | Query edits | In the open Overlay, add one character, remove it, then replace the query with a second query. | Three complete-result latencies. |
 | S6 | Overlay reopen | Close Review Search, do 10 seeded File Jumps, and open Review Search with the same query. | One complete-result latency. |
 | S7 | Session replacement | Run `refresh`, then do 20 seeded File Jumps to Files that the run admitted. Repeat three times. | 60 File Jumps. |
@@ -190,6 +190,14 @@ A File with only binary or unavailable sides takes part in File Jumps, but it ne
 S4 complete-result latency also stands for the first Review Search after S7 or S8.
 The restart Review Search added delay is the S4 complete-result latency minus the S6 complete-result latency.
 This estimate is valid only when S6 had no refetch.
+
+S4 starts with a process restart, so its Review Search acquires every File again.
+The restart loads the Session and waits until the first File is shown, as a reviewer does after a start.
+Then the S4 span starts.
+S5 and S6 continue on the content that S4 acquired.
+So S6 is a warm Review Search, and rule 3 compares a cold and a warm Review Search on the same PullRequest.
+The S4 sample has no hit baseline, so its `added_delay_p95_ms` is its full latency.
+Rule 1 does not apply to S4, because rule 3 gives the added delay of S4.
 
 The default query is `return`, and the second query is `const`.
 The options `--query` and `--second-query` replace them.
@@ -380,7 +388,7 @@ A PullRequest result with `failures` above 0 is invalid, and the human runs that
 
 A run shows a delay when one of these conditions is true for one PullRequest:
 
-1. One scenario has `added_delay_p95_ms` above 300.
+1. One scenario other than S4 has `added_delay_p95_ms` above 300.
 2. S5 or S6 has `refetches` above zero.
 3. The restart Review Search added delay is above 300 ms.
 
@@ -642,6 +650,8 @@ Stop rule:
 - Two runs with a delay give "Delay".
 - One run with a delay gives "Inconclusive".
 - One refetch in S5 or S6 is a delay, even with a low latency.
+- "M28 cache summarize applies rule 3, not rule 1, to the S4 restart Review Search".
+- "M28 cache S4 is a cold Review Search after a restart, also when every File fits the budget".
 - A run with a missing or failed result gives "Inconclusive".
 
 ## Out of Scope
@@ -684,3 +694,7 @@ The human can change a choice at ticket 03.
 12. The retry policy is full jitter from 2 s, doubled for each retry. The cap is 15 min, and the limit is 8 attempts.
 13. The harness excludes a wait from latency only while every in-flight request waits.
 14. The unit of resume is a segment, and S1 to S6 form one segment because they share state in memory.
+15. S4 starts with a process restart.
+    Before this change, S4 ran after S1 had admitted every File, so S4 sent no request and rule 3 could not fire.
+    A restart before S4 costs one Session load and adds no Review Search, so it is the smallest change that makes S4 cold.
+    The alternative, a Review Search after each S7 refresh and each S8 restart, costs six full acquisitions and changes the S7 and S8 File Jumps.

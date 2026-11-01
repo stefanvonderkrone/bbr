@@ -34,6 +34,12 @@ After both runs:
 3. If the outcome is `Inconclusive`, do a third run on a third day under a third network condition.
    Then run `summarize` on all three runs.
 
+## Method changes
+
+- S4 starts with a process restart, so its Review Search is cold.
+  Before, S4 ran after S1 had admitted every File, so it sent no request, and stop rule 3 could not fire.
+  The SPEC records this change as choice 15.
+
 ## Run guide
 
 Use this guide with the steps above.
@@ -143,7 +149,7 @@ zig build bench-file-cache -- remote pr-webapp <pull-request> --run-label run1 -
 Each part has its own checkpoint file, such as `run1-<pull-request>-s1-s2-s3.txt`.
 Add these files to the `summarize` command.
 S2 needs S1, and S7 and S8 need S1 or S4, so the harness refuses other splits.
-In the second part, S4 starts in a new process, so most of its fetches are cold fetches.
+In the second part, S4 starts in a new process, so its fetches are cold fetches, not refetches.
 Record each split under `## Completion`.
 
 ### Expected duration
@@ -192,7 +198,10 @@ Look for these values:
 - `enrichments` counts every File Enrichment of the scenario, also the speculative ones outside a span.
   `enrichment_refetches` counts those for an admitted File, and `speculative_enrichments` counts the speculative ones.
   A File that the prefetch refetched before the File Jump counts as a hit, so `cache_hit_rate` can be high while `enrichment_refetches` is high too.
-- `added_delay_p95_ms` above `300` on any scenario line is a delay.
+- `added_delay_p95_ms` above `300` on any scenario line other than S4 is a delay.
+- S4 starts with a restart, so its Review Search acquires every File again.
+  Its `added_delay_p95_ms` is its full latency, and the stop rule ignores it.
+  `summarize` compares the S4 `complete_result_ms` with the S6 `complete_result_ms` instead.
 - `low_samples=true` means fewer than 20 refetch samples. The p95 is then the maximum.
 - For a merged PullRequest, `not_found_sides` and `hunk_mismatch_files` must be `0`. If not, record the PullRequest. Ticket 03 decides how to use it.
 - A line `error=unsupported_command` or an error such as `ScenarioStalled` stops the run.
