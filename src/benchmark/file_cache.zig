@@ -2801,6 +2801,35 @@ test "M28 cache the request estimate bounds the requests of each scenario" {
 }
 
 test "M28 cache a harness wait inside a span is not latency" {
+    {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &.{.{ .status = 200 }} };
+        var zero_jitter: FixedRandom = .{ .value = 1 };
+        var probe_client: RetryProbe = undefined;
+        try probe_client.init(fake.httpClient(), zero_jitter.random(), .{}, 1);
+        defer probe_client.deinit();
+        const clock = &probe_client.clock;
+        const step_ns = std.time.ns_per_ms;
+        const work_ns = 5 * std.time.ns_per_ms;
+        // A late start time makes an exclusion that starts at time 0 visible.
+        clock.time.store(10 * hour_ns, .monotonic);
+        clock.step_ns = step_ns;
+        try probe_client.window.fill();
+        const start = probe_client.measuring.mark();
+        const span: Span = .begin(clock.clock(), &probe_client.measuring);
+        clock.clock().sleep(work_ns);
+        try testing.expectEqual(@as(u16, 200), try probe_client.get());
+        const ended = span.end(clock.clock(), &probe_client.measuring);
+        const span_ns = clock.time.load(.monotonic) - step_ns - span.begin_ns;
+        const paused_ns = (try probe_client.measuring.since(testing.allocator, start)).paused_ns;
+        const sleeps = clock.recordedSleeps();
+        try testing.expectEqual(@as(usize, 2), sleeps.len);
+        try testing.expect(ended.paced);
+        // The pause holds the window wait and no time outside the stall.
+        try testing.expect(paused_ns >= sleeps[1]);
+        try testing.expect(paused_ns < sleeps[1] + work_ns);
+        try testing.expect(ended.latency_ns >= work_ns);
+        try testing.expectEqual(span_ns - paused_ns, ended.latency_ns);
+    }
     const responses = fixtureResponses(matching_b);
     var clock: FakeClock = .{};
     var options = fixture_options;
