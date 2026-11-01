@@ -5933,6 +5933,7 @@ const overview_test_records = [_]comment_overview.Record{
         .author = "Ada",
         .scope = .{ .@"inline" = .{ .path = "src/tui/render.zig", .to = 12, .start_to = 10 } },
         .file = null,
+        .tree_path = "src/tui/render.zig",
         .scope_state = .current,
         .resolved = true,
         .mine = false,
@@ -5949,6 +5950,7 @@ const overview_test_records = [_]comment_overview.Record{
         .author = "Grace",
         .scope = .{ .@"inline" = .{ .path = "src/tui/render.zig", .to = 12, .start_to = 10 } },
         .file = null,
+        .tree_path = "src/tui/render.zig",
         .scope_state = .current,
         .resolved = true,
         .mine = false,
@@ -5965,6 +5967,7 @@ const overview_test_records = [_]comment_overview.Record{
         .author = "You",
         .scope = .review,
         .file = null,
+        .tree_path = "",
         .scope_state = .current,
         .resolved = false,
         .mine = true,
@@ -6185,8 +6188,8 @@ test "M29 overview an entry row shows the indent, the resolved mark, the author,
     const geometry: @import("frame.zig").Geometry = .{ .cols = 100, .rows = 12 };
     const rects = @import("frame.zig").overviewRects(geometry);
     var records = overview_test_records ++ [_]comment_overview.Record{
-        .{ .owner = .{ .comment = 4 }, .parent = null, .depth = 0, .role = .comment, .author = "Lin", .scope = .{ .@"inline" = .{ .path = "lib.zig", .from = 7 } }, .file = null, .scope_state = null, .resolved = false, .mine = false, .excerpt = "Why?", .haystack = "", .review_rank = 3, .recency_rank = 3 },
-        .{ .owner = .{ .comment = 5 }, .parent = null, .depth = 0, .role = .comment, .author = "Kim", .scope = .{ .file = .{ .path = "docs/a.md", .source_commit = "c" } }, .file = null, .scope_state = .outdated, .resolved = false, .mine = false, .excerpt = "Typo", .haystack = "", .review_rank = 4, .recency_rank = 4 },
+        .{ .owner = .{ .comment = 4 }, .parent = null, .depth = 0, .role = .comment, .author = "Lin", .scope = .{ .@"inline" = .{ .path = "lib.zig", .from = 7 } }, .file = null, .tree_path = "lib.zig", .scope_state = null, .resolved = false, .mine = false, .excerpt = "Why?", .haystack = "", .review_rank = 3, .recency_rank = 3 },
+        .{ .owner = .{ .comment = 5 }, .parent = null, .depth = 0, .role = .comment, .author = "Kim", .scope = .{ .file = .{ .path = "docs/a.md", .source_commit = "c" } }, .file = null, .tree_path = "docs/a.md", .scope_state = .outdated, .resolved = false, .mine = false, .excerpt = "Typo", .haystack = "", .review_rank = 4, .recency_rank = 4 },
     };
     records[0].scope_state = .moved;
     const entries = [_]comment_overview.Entry{ .{ .record = 0, .context = true }, .{ .record = 1, .context = false }, .{ .record = 2, .context = false }, .{ .record = 3, .context = false }, .{ .record = 4, .context = false } };

@@ -132,6 +132,11 @@ pub const Record = struct {
     /// The first File whose paths `scope` matches, as in the File tallies.
     /// Null for a Review-level item and a path outside the Diff.
     file: ?usize,
+    /// The path that places the item in the File Tree: the display path of
+    /// `file`, or the scope path outside the Diff. Empty for a Review-level
+    /// item. A renamed File shows under its new path, so its old-path
+    /// Comments must match that Directory too.
+    tree_path: []const u8,
     /// Null for `unavailable`.
     scope_state: ?bbr.review.ScopeState,
     resolved: bool,
@@ -249,6 +254,7 @@ pub fn buildIndex(allocator: std.mem.Allocator, inputs: IndexInputs) !Index {
         const file: ?usize = for (inputs.diff.files, 0..) |diff_file, file_index| {
             if (buffer_mod.scopeMatchesFile(root.scope, diff_file)) break file_index;
         } else null;
+        const tree_path = if (file) |index| try allocator.dupe(u8, inputs.diff.files[index].displayPath()) else scopePath(scope);
         const scope_state: ?bbr.review.ScopeState, const resolved = switch (root.source) {
             .comment => |comment| .{ comment.state, threads_by_root.get(comment.id).?.resolved },
             .draft => |draft| .{ switch (buffer_mod.draftResolution(draft, options)) {
@@ -268,6 +274,7 @@ pub fn buildIndex(allocator: std.mem.Allocator, inputs: IndexInputs) !Index {
                 .author = author,
                 .scope = scope,
                 .file = file,
+                .tree_path = tree_path,
                 .scope_state = scope_state,
                 .resolved = resolved,
                 .mine = switch (node.source) {
@@ -382,7 +389,7 @@ fn passes(filter: Filter, record: Record, state: *const State, query: ?list_over
         .file_tree_filter => if (state.file_tree_filter) |value| switch (value) {
             .root => true,
             .file => |file_index| record.file == file_index,
-            .directory => |path| record.scope != .review and underDirectory(scopePath(record.scope), path),
+            .directory => |path| underDirectory(record.tree_path, path),
         } else true,
     };
 }
@@ -518,9 +525,10 @@ const Fixture = struct {
     drafts: []const Draft = &.{},
     scope_projections: []const bbr.review.ScopeProjectionEntry = &.{},
     account: ?[]const u8 = null,
+    diff: []const u8 = fixture_diff,
 
     fn index(self: Fixture, a: std.mem.Allocator) !Index {
-        const diff = try bbr.diff.parse(a, fixture_diff);
+        const diff = try bbr.diff.parse(a, self.diff);
         const threads = try bbr.review.buildThreads(a, self.comments);
         return buildIndex(a, .{
             .diff = diff,
@@ -996,4 +1004,30 @@ test "M29 overview the File Tree Filter keeps the items of its File or of every 
     state.apply(.{ .file_tree_filter = .root });
     try testing.expectEqual(@as(?file_tree.Identity, null), state.file_tree_filter);
     try expectListing(&.{ .{ .owner = .{ .comment = 1 } }, .{ .owner = .{ .draft = 1 } }, .{ .owner = .{ .comment = 4 } }, .{ .owner = .{ .draft = 2 } }, .{ .owner = .{ .comment = 2 } }, .{ .owner = .{ .comment = 3 } } }, index, state);
+}
+
+test "M29 overview the Directory File Tree Filter places a renamed File by its display path like the File Tree" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const renamed_diff =
+        \\diff --git a/old/x.zig b/new/x.zig
+        \\similarity index 90%
+        \\rename from old/x.zig
+        \\rename to new/x.zig
+        \\--- a/old/x.zig
+        \\+++ b/new/x.zig
+        \\@@ -1 +1 @@
+        \\-x
+        \\+y
+        \\
+    ;
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "old path", .scope = .{ .file = .{ .path = "old/x.zig", .source_commit = "abc" } } },
+        .{ .id = 2, .author = "Bob", .body = "outside", .scope = .{ .@"inline" = .{ .path = "old/gone.zig", .to = 1 } }, .state = .outdated },
+    };
+    const index = try (Fixture{ .comments = &comments, .diff = renamed_diff }).index(arena.allocator());
+    const renamed = [_]Listed{.{ .owner = .{ .comment = 1 } }};
+    try expectListing(&renamed, index, .{ .file_tree_filter = .{ .file = 0 } });
+    try expectListing(&renamed, index, .{ .file_tree_filter = .{ .directory = "new" } });
+    try expectListing(&.{.{ .owner = .{ .comment = 2 } }}, index, .{ .file_tree_filter = .{ .directory = "old" } });
 }
