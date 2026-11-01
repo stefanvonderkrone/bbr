@@ -978,6 +978,10 @@ test "M24 browser dates format as UTC days" {
     try testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0).?);
     try testing.expect(formatDate(&buf, null) == null);
     try testing.expect(formatDate(&buf, -1) == null);
+    try testing.expectEqualStrings("9999-12-31", formatDate(&buf, 253402300799).?);
+    try testing.expect(formatDate(&buf, 253402300800) == null);
+    try testing.expect(formatDate(&buf, 1 << 50) == null);
+    try testing.expect(formatDate(&buf, std.math.maxInt(i64)) == null);
 }
 
 test "M24 browser failure keeps ApiError names and maps other errors" {
