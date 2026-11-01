@@ -125,8 +125,7 @@ pub fn encode(allocator: Allocator, account: Account, snapshot: Snapshot) Alloca
 pub fn decode(arena: Allocator, bytes: []const u8, account: Account) ?Snapshot {
     if (bytes.len > max_bytes) return null;
     const file = std.json.parseFromSliceLeaky(FileRecord, arena, bytes, .{ .allocate = .alloc_always }) catch return null;
-    _ = account;
-    if (file.version != version) return null;
+    if (file.version != version or !std.mem.eql(u8, file.account, &account.hex)) return null;
     const repositories = arena.alloc(Repository, file.repositories.len) catch return null;
     for (file.repositories, repositories) |record, *repository| {
         repository.* = .{

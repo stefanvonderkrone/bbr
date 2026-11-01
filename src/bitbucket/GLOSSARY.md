@@ -54,8 +54,9 @@ It holds no description and no Comment.
 _Avoid_: PullRequest (the aggregate root), PR row.
 
 **Summary Cache**:
-The local file of Repository Summaries and PullRequest Summaries for one Workspace.
+The local file of Repository Summaries and PullRequest Summaries for one account and one Workspace.
 bbr shows it at Browser start and replaces it after each refresh.
+It names its account with the SHA-256 digest of the Credential email.
 It holds no Credential and no PullRequest description.
 bbr rebuilds it after any parse error.
 _Avoid_: cache (alone), offline copy, database.
