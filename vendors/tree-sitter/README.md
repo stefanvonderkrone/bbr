@@ -74,6 +74,11 @@ The nvim-treesitter queries are Apache-2.0.
 Each adapted query starts with a comment that names the source path and the commit, and states that bbr changed the query.
 This comment meets the Apache-2.0 notice rule for changed files.
 
+Each release archive has a `THIRD_PARTY_NOTICES` file next to `bbr`.
+`tools/third_party_notices.py` writes it from the manifests and the `LICENSE` files.
+The file holds every Grammar `LICENSE`, `nvim-treesitter/LICENSE`, `runtime/LICENSE`, and the RE2 and Abseil licences.
+A Grammar without exactly one `LICENSE` entry in `.files` stops the release.
+
 ## Generated parser.c
 
 Swift is the only BuiltInGrammar with a generated `parser.c`.

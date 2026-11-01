@@ -220,6 +220,7 @@ pub fn build(b: *std.Build) void {
         "tests/check_agent_docs_test.py",
         "tests/check_box_glyphs_test.py",
         "tests/check_vendored_grammars_test.py",
+        "tests/third_party_notices_test.py",
         "tests/verify_bbr_control_test.py",
     }) |script| {
         const python_test = b.addSystemCommand(&.{"python3"});

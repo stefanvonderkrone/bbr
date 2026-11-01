@@ -77,7 +77,10 @@ build without `.git`. Git metadata and explicit metadata must produce the same v
 
 After validation, four native jobs run `zig build test --summary all` and build with `-Doptimize=ReleaseSafe`.
 The jobs use the same macOS and Linux runners as CI for x86_64 and aarch64.
-Each job checks the binary's release identity and packages only `bbr` in a `.tar.gz` archive.
+Each job checks the binary's release identity and packages `bbr` and `THIRD_PARTY_NOTICES` in a `.tar.gz` archive.
+`tools/third_party_notices.py` writes `THIRD_PARTY_NOTICES` from the vendored manifests.
+The file holds the licence text of each vendored component that `bbr` links.
+A missing licence stops the job. The archive check accepts exactly these two files.
 The archive retains the binary's execute permission.
 
 After all four builds pass, the publish job creates a GitHub release for the existing tag.
@@ -124,6 +127,7 @@ To make a manual release instead:
 To check a downloaded archive on Linux, run `sha256sum --ignore-missing --check SHA256SUMS`.
 On macOS, run `shasum -a 256 --ignore-missing --check SHA256SUMS`.
 Extract the matching archive with `tar -xzf <archive>` and put `bbr` on your `PATH`.
+Keep `THIRD_PARTY_NOTICES` with each copy of `bbr` that you distribute.
 
 ## Credential handling
 

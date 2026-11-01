@@ -120,10 +120,11 @@ jobs:
           commit=$(git rev-parse HEAD)
           expected="bbr ${RELEASE_TAG#v}+g${commit:0:12}"
           test "$(./zig-out/bin/bbr --version)" = "$expected"
-          mkdir -p "$RUNNER_TEMP/release"
+          mkdir -p "$RUNNER_TEMP/release" "$RUNNER_TEMP/notices"
+          python3 tools/third_party_notices.py . "$RUNNER_TEMP/notices/THIRD_PARTY_NOTICES"
           archive="$RUNNER_TEMP/release/bbr-$RELEASE_TAG-$TARGET.tar.gz"
-          COPYFILE_DISABLE=1 tar -czf "$archive" -C zig-out/bin bbr
-          test "$(tar -tzf "$archive")" = bbr
+          COPYFILE_DISABLE=1 tar -czf "$archive" -C zig-out/bin bbr -C "$RUNNER_TEMP/notices" THIRD_PARTY_NOTICES
+          test "$(tar -tzf "$archive")" = "$(printf 'bbr\nTHIRD_PARTY_NOTICES')"
       - name: Upload release archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
