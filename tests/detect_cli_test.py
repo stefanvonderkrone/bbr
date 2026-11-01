@@ -46,6 +46,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-detect-test-") as root:
     # A named Repository outside Git stays expanded.
     output = detect(env, work, ["pr-webapp"])
     assert output.endswith(b"resolved: browser pr-webapp expanded\n"), output
+    assert b"reason:" not in output, output
 
     # `bbr detect` never reads or writes the Summary Cache.
     assert not (Path(root) / "state").exists()
