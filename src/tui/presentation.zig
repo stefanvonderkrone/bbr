@@ -30903,6 +30903,78 @@ test "M29 overview a Review-level Draft saved from the Comment Overview appears 
     try testing.expectEqual(owner, testOverviewSelectedOwner(&presentation).?);
 }
 
+test "M29 overview a Draft deleted in the DiffPane leaves the listing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var presentation = try testDraftMutationPresentation(testing.allocator, store.store(), key, .delete);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try testOverviewOwners(&presentation, &.{ .{ .draft = 1 }, .{ .draft = 2 }, .{ .draft = 3 }, .{ .draft = 4 } });
+    try presentation.dispatch(.{ .action = .show_diff_pane });
+    try startTestDraftMutation(&presentation, .delete);
+    try completeDisclosureBuild(&presentation);
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try testOverviewOwners(&presentation, &.{.{ .draft = 4 }});
+}
+
+test "M29 overview a submitting Draft leaves the listing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "first" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .scope = .review, .body = "second" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try testOverviewOwners(&presentation, &.{ .{ .draft = 1 }, .{ .draft = 2 } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    var post = presentation.takeCommand().?;
+    defer post.deinit();
+    try testing.expectEqual(@as(bbr.review.TempId, 1), post.post_draft.draft.local_id);
+    try testOverviewOwners(&presentation, &.{.{ .draft = 2 }});
+}
+
+test "M29 overview a Draft linked to its fetched Comment leaves the listing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } },
+        .snapshot = .{ .text = "new", .selection_start = 0, .selection_len = 1 },
+        .body = "unknown",
+        .state = .outcome_unknown,
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .key = .{ .codepoint = vaxis_tab } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try expectFileTreeCursor(&presentation, .{ .file = 0 });
+    try testOverviewOwners(&presentation, &.{ .{ .comment = 99 }, .{ .draft = 1 } });
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'C', .text = "C" } });
+    try presentation.dispatch(.{ .unknown_resolution = .{ .digit = 9 } });
+    try presentation.dispatch(.{ .unknown_resolution = .{ .digit = 9 } });
+    try presentation.dispatch(.{ .unknown_resolution = .confirm });
+    try testing.expect(presentation.projection().unknown_resolution == null);
+    try testOverviewOwners(&presentation, &.{.{ .comment = 99 }});
+    var reconciliation = presentation.takeCommand().?;
+    reconciliation.deinit();
+}
+
 test "M29 overview an allocation failure in the index or listing build keeps the previous Frame" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
