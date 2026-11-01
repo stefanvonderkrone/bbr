@@ -1636,6 +1636,22 @@ const Driver = struct {
         try self.finishJump(recorder, span, file);
     }
 
+    /// Jumps to a random File of `files`, or of every File when `files` is null.
+    /// The target is never the active File, because that jump would be a hit with no work.
+    /// One draw per jump keeps the S7 and S8 targets on the same random sequence.
+    fn randomJump(self: *Driver, recorder: ?*Recorder, random: std.Random, files: ?[]const usize) !void {
+        const count = if (files) |subset| subset.len else self.file_count;
+        const active: ?usize = if (self.activeFile()) |file|
+            if (files) |subset| std.mem.indexOfScalar(usize, subset, file) else file
+        else
+            null;
+        const choices = count - @intFromBool(active != null);
+        if (choices == 0) return;
+        var index = random.uintLessThan(usize, choices);
+        if (active) |skipped| index += @intFromBool(index >= skipped);
+        try self.finderJump(recorder, if (files) |subset| subset[index] else index);
+    }
+
     /// Returns false when `next_file` finds no next File.
     fn nextFileJump(self: *Driver, recorder: *Recorder) !bool {
         const before = self.activeFile();
@@ -1761,7 +1777,7 @@ fn revisitAfterEviction(driver: *Driver, recorder: *Recorder) !void {
 
 fn nonSequentialNavigation(driver: *Driver, recorder: *Recorder) !void {
     var prng = std.Random.DefaultPrng.init(driver.options.seed);
-    for (0..200) |_| try driver.finderJump(recorder, prng.random().uintLessThan(usize, driver.file_count));
+    for (0..200) |_| try driver.randomJump(recorder, prng.random(), null);
 }
 
 /// The restart discards the content that S1 to S3 left, so rule 3 compares a cold Review Search with the warm S6 reopen.
@@ -1793,7 +1809,7 @@ fn overlayReopen(driver: *Driver, recorder: *Recorder) !void {
     try driver.ensureReviewSearch();
     try driver.closeReviewSearch();
     var prng = std.Random.DefaultPrng.init(driver.options.seed);
-    for (0..10) |_| try driver.finderJump(null, prng.random().uintLessThan(usize, driver.file_count));
+    for (0..10) |_| try driver.randomJump(null, prng.random(), null);
     const span = try driver.beginSpan();
     try driver.openReviewSearch();
     try driver.recordSearch(recorder, span, false);
@@ -1825,7 +1841,7 @@ fn replacementJumps(driver: *Driver, recorder: *Recorder, comptime replace: fn (
     for (0..replacement_repeats) |_| {
         try replace(driver, recorder);
         if (files.len == 0) continue;
-        for (0..replacement_jumps) |_| try driver.finderJump(recorder, files[prng.random().uintLessThan(usize, files.len)]);
+        for (0..replacement_jumps) |_| try driver.randomJump(recorder, prng.random(), files);
     }
 }
 
@@ -2923,6 +2939,58 @@ test "M28 cache an unsupported command kind fails the run and names the kind" {
     defer command.deinit();
     try testing.expectError(error.UnsupportedCommand, driver.executor().execute(driver.sink(), &command));
     try testing.expectEqual(std.meta.Tag(OwnedCommand).copy_clipboard, driver.unsupported.?);
+}
+
+test "M28 cache a random File Jump never targets the active File" {
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var clock: FakeClock = .{};
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var notes_text: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes_text.deinit();
+    var notes: Notes = .{ .writer = &notes_text.writer };
+    var window: RequestWindow = try .open(testing.io, tmp.dir, clock.clock(), &notes, 900);
+    defer window.deinit();
+    var prng: std.Random.DefaultPrng = .init(28);
+    var measuring: MeasuringHttpClient = .{ .inner = try transport.transport().open(), .clock = clock.clock(), .window = &window, .notes = &notes, .random = prng.random() };
+    defer measuring.deinit();
+    const env: Environment = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .clock = clock.clock(),
+        .transport = transport.transport(),
+        .credential = .{ .username = "u", .token = "t", .workspace = "ws" },
+        .highlighter = plain.highlighter(),
+        .bbr_version = "test",
+        .out = undefined,
+        .notes = undefined,
+        .random = prng.random(),
+    };
+    var driver: Driver = undefined;
+    try driver.init(env, fixture_options, &measuring, "repo", 7);
+    defer driver.deinit();
+    _ = try driver.start();
+    var recorder: Recorder = .{};
+    defer recorder.deinit(testing.allocator);
+    var jumps: std.Random.DefaultPrng = .init(28);
+    for (0..30) |_| {
+        const before = driver.activeFile();
+        try driver.randomJump(&recorder, jumps.random(), null);
+        try testing.expect(driver.activeFile() != before);
+    }
+    for (0..10) |_| {
+        const before = driver.activeFile().?;
+        const other = (before + 1) % driver.file_count;
+        try driver.randomJump(&recorder, jumps.random(), &.{ @min(before, other), @max(before, other) });
+        try testing.expectEqual(other, driver.activeFile().?);
+    }
+    try testing.expectEqual(@as(usize, 40), recorder.samples.items.len);
+    // A subset with only the active File has no target, so it records no sample.
+    try driver.randomJump(&recorder, jumps.random(), &.{driver.activeFile().?});
+    try testing.expectEqual(@as(usize, 40), recorder.samples.items.len);
 }
 
 /// Fails when a forbidden text is in `text`.
