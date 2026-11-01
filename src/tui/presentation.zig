@@ -30863,6 +30863,70 @@ test "M24 browser a replacement that the Browser did not start keeps the Browser
     try testing.expect(presentation.projection().browser != null);
 }
 
+test "M24 browser a stale repair reload keeps the PullRequest the reviewer chose" {
+    for ([_]bool{ false, true }) |in_flight| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+        defer locks.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "review", .scope = .review });
+        var presentation = try Presentation.init(testing.allocator, .{
+            .reviews = store.store(),
+            .submission_locks = locks.locks(),
+            .require_source_check = true,
+        }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .submit });
+        const check = presentation.takeCommand().?.check_recovery;
+        try presentation.dispatch(recoveryCheckSucceeded(check.command_id, check.operation_id, null, "new-head"));
+        try testing.expect(presentation.projection().submission_tree.?.stale_repair != null);
+
+        const chosen = try OwnedReviewIdentity.init("workspace", "repo", 2);
+        try presentation.dispatch(.{ .choose_pull_request = chosen });
+        const taken = if (in_flight) presentation.takeCommand().?.load_session else null;
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'R', .text = "R" } });
+        const load = taken orelse presentation.takeCommand().?.load_session;
+        try testing.expect(OwnedReviewIdentity.eql(chosen, load.key));
+        try expectNoCommand(&presentation);
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') } } });
+        try testing.expect(OwnedReviewIdentity.eql(chosen, presentation.projection().review.?.key));
+    }
+}
+
+test "M24 browser a settled Reviewer Verdict keeps the PullRequest the reviewer chose" {
+    for ([_]bool{ false, true }) |in_flight| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+        defer presentation.deinit();
+        presentation.authenticated_account_uuid = try BoundedText(256).init("{me}");
+        presentation.published.?.session.source.remote.author_uuid = "{author}";
+        presentation.published.?.session.source.remote.reviewer_verdicts = &.{};
+        try presentation.dispatch(.{ .action = .set_verdict_approved });
+        const verdict = presentation.takeCommand().?.change_reviewer_verdict;
+        try openLoadedBrowser(&presentation, &.{"repo"}, &.{ 1, 2 });
+        try browserKey(&presentation, 'j');
+        try browserKey(&presentation, keymap_mod.special.enter);
+        const taken = if (in_flight) presentation.takeCommand().?.load_session else null;
+
+        try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+            .command_id = verdict.command_id,
+            .identity = verdict.identity,
+            .target = verdict.target,
+            .outcome = .{ .completed = .success },
+        } });
+        try testing.expect(!presentation.remoteWriteBusy());
+        const load = taken orelse presentation.takeCommand().?.load_session;
+        try testing.expectEqual(SessionLoadCause.browser, load.cause);
+        try testing.expectEqual(@as(u64, 2), load.key.pull_request_id);
+        try expectNoCommand(&presentation);
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') } } });
+        try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
+        try testing.expect(presentation.projection().browser == null);
+    }
+}
+
 test "M24 browser a stale completion changes nothing and frees its payload" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
