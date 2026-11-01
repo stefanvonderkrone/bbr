@@ -7565,8 +7565,8 @@ pub const Presentation = struct {
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.closeOverviewQuery(published, .{ .query = input.saved() });
             if (key.matches(keymap_mod.special.enter, .{})) return self.closeOverviewQuery(published, null);
             const query = published.overview.query();
-            if (key.matches(keymap_mod.special.backspace, .{})) return self.changeOverview(published, .{ .query = query[0..lastScalarStart(query)] });
-            if (key.matches('w', .{ .ctrl = true })) return self.changeOverview(published, .{ .query = query[0..searchWordStart(query)] });
+            if (key.matches(keymap_mod.special.backspace, .{})) return self.changeOverview(published, .{ .query = query[0..search.lastScalarStart(query)] });
+            if (key.matches('w', .{ .ctrl = true })) return self.changeOverview(published, .{ .query = query[0..search.wordStart(query)] });
             if (key.matches('u', .{ .ctrl = true })) return self.changeOverview(published, .{ .query = "" });
             if (key.text) |text| return self.insertOverviewQuery(published, text);
             return;
