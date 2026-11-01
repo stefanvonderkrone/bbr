@@ -185,3 +185,35 @@ The review findings M28-1 and M28-4 in the adversarial branch review describe th
   A missing `check` line, a missing scenario, or `failures` above 0 gives "Inconclusive".
   The test "M28 cache summarize gives Inconclusive for a partial or failed run" proves it.
   On the old code, the test failed with `outcome=No delay`.
+
+### Harness fixes from the review (2026-11-01)
+
+- M28-8: a random File Jump in S3, S6, S7, and S8 could target the active File.
+  That sample was a hit with no work, so it lowered the hit median.
+  `Driver.randomJump` now draws only from the Files other than the active File.
+  It uses one draw per jump, so S7 and S8 keep the same random sequence.
+  A subset that holds only the active File gives no jump and no sample.
+  The test "M28 cache a random File Jump never targets the active File" proves it.
+  On the old draw, the test failed on the first loop, where the active File did not change.
+  Commit `138ad1f`.
+- M28-9: the test "M28 cache a harness wait inside a span is not latency" used a clock with no step.
+  Every latency was 0, so the test passed when the harness excluded all time.
+  The test now starts with a stepped probe at a late clock time.
+  It checks that the latency equals the span time minus `paused_ns`, and that the pause holds only the window wait.
+  The mutation that never sets `stalled_since` now fails the test on the pause bound.
+  Commit `9a87655`.
+- M28-11: `lock` was a spin lock held across the `requests.log` write and the notes flush.
+  Waiting workers used CPU inside measured spans.
+  Every M28 lock is now a `std.Io.Mutex`, and `lockUncancelable` waits on a futex.
+  `Notes` and `MeasuringHttpClient` now hold the `Io`.
+  One lock still holds the window check and the record, so no rolling hour exceeds the budget.
+  No test proves the CPU use, because thread CPU time needs a timing test that is platform specific.
+  The request window tests still pass.
+  Commit `b56cb4c`.
+- M28-15: the Credential test asserted the s1 `retries` count before the token checks.
+  A traffic change then failed the test before the containment check ran.
+  The token checks now run first, and the notes prove the retry with `wait reason=retry status=503`.
+  The test no longer asserts the span-bound `retries` count.
+  A mutation that prints the token into the notes fails the test with `ForbiddenText`.
+  With that leak and no retry count, the old order failed on `retries` and hid the leak.
+  Commit `bbfccaf`.
