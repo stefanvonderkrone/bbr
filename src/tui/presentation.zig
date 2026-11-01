@@ -30929,6 +30929,29 @@ test "M24 browser a settled Reviewer Verdict keeps the PullRequest the reviewer 
     }
 }
 
+test "M24 browser b after a failed first load starts the Browser on the failed PullRequest" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .geometry = browser_test_geometry });
+    defer presentation.deinit();
+    try browserKey(&presentation, 'b');
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+    try testing.expect(presentation.projection().browser == null);
+    try expectNoCommand(&presentation);
+
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("check24", "repo", 7) });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .failed = error.ConnectionResetByPeer } } });
+    try browserKey(&presentation, 'b');
+    try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+    try testing.expectEqualStrings("check24", presentation.projection().browser.?.workspace);
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const pull_requests = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try completeBrowserRepositories(&presentation, repositories, &.{ "other", "repo" });
+    try completeBrowserPullRequests(&presentation, pull_requests, &.{ 8, 7 });
+    try testing.expectEqual(@as(u64, 7), browserCursor(&presentation).?.pull_request.id);
+}
+
 test "M24 browser a stale completion changes nothing and frees its payload" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
