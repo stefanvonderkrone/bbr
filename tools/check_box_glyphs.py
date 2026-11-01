@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import sys
 
-from source_lines import zig_code
+from source_lines import zig_files
 
 PAINTERS = (Path("src/tui/render.zig"), Path("src/tui/app.zig"))
 GLYPHS = re.compile("[\u250c-\u254b\u2552-\u2570]")
@@ -17,9 +17,9 @@ FIX = (
 
 
 def violations(root):
-    for relative in PAINTERS:
+    for relative, lines in zig_files(root, PAINTERS, literals=True):
         in_test = False
-        for number, line in enumerate(zig_code((root / relative).read_text(encoding="utf-8")), 1):
+        for number, line in enumerate(lines, 1):
             if in_test:
                 in_test = line != "}"
                 continue

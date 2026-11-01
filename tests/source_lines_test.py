@@ -54,17 +54,34 @@ class ZigCodeWithoutLiteralsTest(unittest.TestCase):
                 self.assertEqual(zig_code_without_literals(line), [code])
 
 
+NO_ZIG_SOURCE = {
+    "check_agent_docs.py": "reads the Markdown agent documents, not Zig source",
+}
+RAW_READS = ("read_text(", "read_bytes(", "open(", ".splitlines()")
+
+
+def checker_problems(path):
+    """Each way the checker at `path` reads source text itself instead of through source_lines.zig_files."""
+    text = path.read_text(encoding="utf-8")
+    fix = (
+        f"tools/{path.name}: read Zig source only with source_lines.zig_files, which drops comments outside literals. "
+        f"A checker that reads no Zig source goes in NO_ZIG_SOURCE in tests/source_lines_test.py with its reason."
+    )
+    problems = [f"{fix} It calls {raw}" for raw in RAW_READS if raw in text]
+    if "from source_lines import zig_files" not in text:
+        problems.append(f"{fix} It does not import zig_files.")
+    return problems
+
+
 class CheckersTest(unittest.TestCase):
     def test_every_zig_checker_reads_lines_through_source_lines(self):
+        for name in NO_ZIG_SOURCE:
+            self.assertTrue((TOOLS / name).is_file(), f"NO_ZIG_SOURCE names tools/{name}, which does not exist.")
         for path in sorted(TOOLS.glob("check_*.py")):
-            text = path.read_text(encoding="utf-8")
-            if ".zig" not in text:
+            if path.name in NO_ZIG_SOURCE:
                 continue
             with self.subTest(checker=path.name):
-                fix = f"tools/{path.name}: read each line with source_lines.zig_code or source_lines.zig_code_without_literals, which drop comments outside literals."
-                self.assertTrue("from source_lines import" in text, fix)
-                for raw in (".splitlines()", 'startswith("//")', 'startswith("#")'):
-                    self.assertFalse(raw in text, fix)
+                self.assertEqual(checker_problems(path), [])
 
 
 if __name__ == "__main__":

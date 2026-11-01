@@ -1,9 +1,23 @@
 """The code text of each Zig source line, without its comment.
 
-Every line checker in tools/ reads source through this module, so a comment
-that quotes a forbidden pattern never fails a check, and a comment marker
-inside a string literal never hides code.
+Every line checker in tools/ reads Zig source only through `zig_files`, so a
+comment that quotes a forbidden pattern never fails a check, and a comment
+marker inside a string literal never hides code.
 """
+
+
+def zig_files(root, sources, *, literals):
+    """Yield `(relative_path, code_lines)` for each Zig file in `sources`.
+
+    Each source is a path relative to `root`. A directory stands for each
+    `*.zig` file below it, in sorted order. `code_lines` comes from `zig_code`
+    when `literals` is true, and from `zig_code_without_literals` otherwise.
+    """
+    code = zig_code if literals else zig_code_without_literals
+    for source in sources:
+        path = root / source
+        for file in sorted(path.rglob("*.zig")) if path.is_dir() else (path,):
+            yield file.relative_to(root), code(file.read_text(encoding="utf-8"))
 
 
 def zig_code(text):

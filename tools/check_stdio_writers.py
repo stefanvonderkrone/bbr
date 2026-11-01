@@ -5,15 +5,14 @@ from pathlib import Path
 import re
 import sys
 
-from source_lines import zig_code_without_literals
+from source_lines import zig_files
 
 POSITIONAL = re.compile(r"\b(stdout|stderr)\(\)\.writer\(")
 
 
 def violations(root):
-    for path in sorted((root / "src").rglob("*.zig")):
-        relative = path.relative_to(root)
-        for number, line in enumerate(zig_code_without_literals(path.read_text(encoding="utf-8")), 1):
+    for relative, lines in zig_files(root, ("src",), literals=False):
+        for number, line in enumerate(lines, 1):
             match = POSITIONAL.search(line)
             if match:
                 stream = match.group(1)
