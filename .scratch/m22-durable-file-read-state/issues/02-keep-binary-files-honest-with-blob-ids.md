@@ -127,3 +127,20 @@ That change touches main's parser, so it stays open as a follow-up.
 Proof: the test "M22 read a binary File with a space in its path is unverifiable" in `src/review/file_read.zig`.
 It failed on commit `518e6a7` with "expected null, found .{ .bytes = ... }".
 It passes after the fix.
+
+### Review fix M22-1 follow-up: binary paths from the `Binary files` line
+
+The parser now reads both paths from the `Binary files <old> and <new> differ` line.
+It uses the same path rules as the `---` and `+++` lines.
+So a binary File with a space in its path has binary sides and a fingerprint.
+A changed blob id now makes such a File unread.
+An added binary File now has the old path `/dev/null`, as an added text File has.
+A line with more than one possible ` and ` split keeps the unavailable sides.
+That outcome is conservative, because such a File stays unverifiable.
+
+Proof:
+
+- The test "M22 read a Binary files line names binary File sides whose paths have a space" in `src/diff/parser.zig` failed on commit `c581171`. It expected `my logo.png` and found `a/my logo.png b/my logo.png`.
+- The test "M22 read a binary File with a space in its path follows each blob id" in `src/review/file_read.zig` replaces the earlier "is unverifiable" test. It failed on `c581171` with `error.Unverifiable`.
+- The test "M22 read an ambiguous Binary files line leaves the File sides unavailable" guards the split rule.
+- The fix is commit `4d8c485`. A removed split or a removed ambiguity guard fails a named test.

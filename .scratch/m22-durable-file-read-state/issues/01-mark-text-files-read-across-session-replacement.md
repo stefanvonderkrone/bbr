@@ -119,3 +119,41 @@ Mutation checks prove that the new tests fail when the behavior breaks:
 - A store write during Candidate Session preparation fails seven Presentation tests, including "M22 read Candidate Session preparation never writes File Read Receipts".
 - A File Tree weight that keeps the `Theme.sidebar_selected` bold fails "M22 read the File Tree weight follows File Read State on every row".
 - Staged Frame inputs without the new File Read State fail "M22 read a worker Frame started before a toggle publishes the new File Read State".
+
+## Comments
+
+### Review fix M22-3: two Files with one display path
+
+A type change gives a removed File and an added File with one display path.
+The store holds one receipt for each path, so the two Files shared one receipt.
+`loadFileReads` now gives no fingerprint to a File whose display path occurs twice in the Diff.
+Both Files stay unread, and `m` on either File reports `file_read_unverifiable` and writes nothing.
+We chose this conservative option over a new store key, because it needs no schema change.
+
+Proof: the test "M22 read two Files with one display path ignore a matching receipt and m on each is file_read_unverifiable" in `src/tui/presentation.zig`.
+It failed on commit `372ef40` and passes after commit `1f19168`.
+A removed guard fails the same test.
+
+### Review fix M22-7: a change to only the end-of-file newline
+
+The parser dropped the `\ No newline at end of file` marker.
+`Line.no_newline_at_eof` in `src/diff/model.zig` now records the marker.
+`fingerprint` hashes one extra tag after each flagged Line.
+A Line without the flag hashes as before, so stored receipts stay valid.
+
+Proof: the tests "M22 read a no newline marker flags the Line before it" in `src/diff/parser.zig` and "M22 read a change to only the end-of-file newline gives a different fingerprint" in `src/review/file_read.zig`.
+Both failed on commit `21b800c` and pass after commit `148ab30`.
+
+### Review fix M22-4: busy timeout and migration race
+
+`SqliteStore.open` now sets a busy timeout of 2000 ms before it migrates.
+Writes run on the TUI thread, so the wait stays short.
+Each migration is one entry in `SqliteStore.migrations`.
+`migrateStep` runs the entry in `BEGIN IMMEDIATE` and reads `user_version` again inside the transaction.
+A step that another process applied is skipped.
+The fix covers every step, not only v10, because the race was the same for each step.
+
+Proof: the tests "M22 read SqliteStore.open sets a busy timeout so a write waits for another bbr process" and "M22 read a migration step that another process already applied is skipped" in `src/persist/sqlite_store.zig`.
+Both failed on commit `3e1d146` and pass after commit `a445646`.
+The tests use one thread, because the build compiles SQLite with `SQLITE_THREADSAFE=0`.
+A first version used two threads, and we removed it because it was a data race.

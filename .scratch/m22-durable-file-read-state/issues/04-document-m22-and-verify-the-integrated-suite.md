@@ -100,3 +100,16 @@ The single receipt writer `Published.toggleFileRead` is also a convention.
 Both rows now say "convention (no check)" for those parts.
 
 After the fixes, `zig build test --summary all` passed with 24 of 24 steps and 1465 of 1465 tests.
+
+### Review fixes M22-1 follow-up, M22-3, M22-4, M22-7, X-5, and X-6
+
+Tickets 01 and 02 record each fix and its proving test.
+For X-6, each new guard got one mutation run, and each mutation failed a named test.
+For X-5, the new migration row in AGENTS.md names its checks.
+Its sentence about `PRAGMA user_version` in an entry is a convention (no check).
+X-2 and X-3 are out of scope for this branch.
+X-2 is the Credential transport on main, and X-3 is the decoders.
+Each gets its own ticket later.
+
+Checks after the fixes: `zig build test`, `zig fmt --check build.zig src tests`, and `python3 tools/check_agent_docs.py` all exit 0.
+The Zig commands ran with HOME and XDG directories under `$TMPDIR`, no `BITBUCKET_*` variables, and proxies at 127.0.0.1:9.
