@@ -952,8 +952,8 @@ fn chain(env: Environment, options: Options, files: RunFiles, repository: []cons
         try checkpoint.header.print(gpa, "header run_label={s} network_label={s} bbr_version={s} cache_max_bytes={d} pull_request={d} state={s} files={d} probe_ms={d:.1}", .{
             options.run_label, options.network_label, env.bbr_version, options.cache_max_bytes, pull_request_id, driver.stateText(), driver.file_count, ms(probe_ns),
         });
-        try checkpoint.header.print(gpa, " dwell_ms={d} seed={d} query_bytes={d} second_query_bytes={d} hourly_request_budget={d}\n", .{
-            options.dwell_ms, options.seed, options.query.len, options.second_query.len, options.hourly_request_budget,
+        try checkpoint.header.print(gpa, " dwell_ms={d} seed={d} query_bytes={d} second_query_bytes={d} hourly_request_budget={d} cols={d} rows={d}\n", .{
+            options.dwell_ms, options.seed, options.query.len, options.second_query.len, options.hourly_request_budget, frame_geometry.cols, frame_geometry.rows,
         });
         try checkpoint.write(gpa, env.io, files.dir, &driver);
     }
@@ -1055,7 +1055,7 @@ const Checkpoint = struct {
     progress: ?[]const u8 = null,
 
     /// The settings that a resumed run must share with the stored header.
-    const settings = [_][]const u8{ "network_label", "bbr_version", "cache_max_bytes", "dwell_ms", "seed", "query_bytes", "second_query_bytes", "hourly_request_budget" };
+    const settings = [_][]const u8{ "network_label", "bbr_version", "cache_max_bytes", "dwell_ms", "seed", "query_bytes", "second_query_bytes", "hourly_request_budget", "cols", "rows" };
 
     /// `<run-label>-<pull-request>-<selection>.txt`, with selection `all` or the scenario ids joined by `-`.
     fn name(buffer: []u8, options: Options, pull_request_id: u64) ![]const u8 {
@@ -1100,8 +1100,8 @@ const Checkpoint = struct {
     /// The first setting whose stored value differs from the current options.
     fn mismatch(self: *const Checkpoint, env: Environment, options: Options) ?[]const u8 {
         var buffer: [512]u8 = undefined;
-        const current = std.fmt.bufPrint(&buffer, "network_label={s} bbr_version={s} cache_max_bytes={d} dwell_ms={d} seed={d} query_bytes={d} second_query_bytes={d} hourly_request_budget={d}", .{
-            options.network_label, env.bbr_version, options.cache_max_bytes, options.dwell_ms, options.seed, options.query.len, options.second_query.len, options.hourly_request_budget,
+        const current = std.fmt.bufPrint(&buffer, "network_label={s} bbr_version={s} cache_max_bytes={d} dwell_ms={d} seed={d} query_bytes={d} second_query_bytes={d} hourly_request_budget={d} cols={d} rows={d}", .{
+            options.network_label, env.bbr_version, options.cache_max_bytes, options.dwell_ms, options.seed, options.query.len, options.second_query.len, options.hourly_request_budget, frame_geometry.cols, frame_geometry.rows,
         }) catch return "bbr_version";
         for (settings) |key| {
             const stored = lineValue(self.header.items, key) orelse return key;
@@ -2356,6 +2356,9 @@ test "M28 cache every scenario runs to the end with text, binary, added, and rem
     }
     try testing.expectEqualStrings("6", try field(output, "header", "files"));
     try testing.expectEqualStrings("MERGED", try field(output, "header", "state"));
+    // The Frame size sets the Enrichment Range, so the header names it.
+    try testing.expectEqualStrings("200", try field(output, "header", "cols"));
+    try testing.expectEqualStrings("50", try field(output, "header", "rows"));
     // The first fetch of a File is cold.
     try testing.expect(try intField(output, "scenario=s1 ", "cold_fetches") > 0);
     // S2 revisits the Files that S1 left, and the budget evicted them. The overscan refetches the

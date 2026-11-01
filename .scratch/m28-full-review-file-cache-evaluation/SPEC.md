@@ -121,6 +121,10 @@ For every other command kind that a scenario produces, it calls the production f
 It fails the run on a command kind that it does not support.
 It uses the production Highlighter and `Configuration.default_highlight_max_file_bytes`.
 It builds each Presentation Frame at a fixed geometry of 200 columns and 50 rows.
+The Frame size sets the Enrichment Range, and the range sets which Files stay outside the budget.
+So a run at another size measures another policy.
+The fixed size keeps all runs comparable, and it is a common full-screen terminal size.
+The header prints `cols` and `rows`.
 It paints no terminal.
 
 The harness must not copy the prefetch, eviction, or Review Search acquisition policy.
@@ -316,7 +320,7 @@ A rerun reads the checkpoint and acts on it:
   Then it runs the first unfinished segment from its first scenario.
 - A failed segment leaves no line in the checkpoint.
   The rerun starts that segment again with the state of the last finished segment.
-- These header keys must match the current options: `network_label`, `bbr_version`, `cache_max_bytes`, `dwell_ms`, `seed`, `query_bytes`, `second_query_bytes`, and `hourly_request_budget`.
+- These header keys must match the current options: `network_label`, `bbr_version`, `cache_max_bytes`, `dwell_ms`, `seed`, `query_bytes`, `second_query_bytes`, `hourly_request_budget`, `cols`, and `rows`.
   A difference prints `checkpoint mismatch key=<key>` and stops the run.
 - A different File count stops the run with `FileCountChanged`.
 
@@ -336,6 +340,7 @@ The harness prints one header line and one line for each scenario as `key=value`
 The header holds the run label, the network label, the bbr commit, and the cache budget.
 It also holds the PullRequest id, its state, and its File count.
 The header also holds `probe_ms`, the median of five `getPullRequest` latencies before the chain.
+It also holds the Frame size as `cols` and `rows`.
 Each scenario line holds these keys:
 
 - `samples`, `hits`, `cold_fetches`, and `refetches`.

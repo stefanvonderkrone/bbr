@@ -166,7 +166,7 @@ So a crash late in S1 to S6 of the largest PullRequest can add most of its time.
 
 Each PullRequest prints these lines:
 
-- One `header` line with `bbr_version`, `state`, `files`, and `probe_ms`.
+- One `header` line with `bbr_version`, `state`, `files`, `probe_ms`, and the Frame size `cols` and `rows`.
 - One `scenario=sN` line for each scenario.
 - One `check` line with `not_found_sides` and `hunk_mismatch_files`.
 

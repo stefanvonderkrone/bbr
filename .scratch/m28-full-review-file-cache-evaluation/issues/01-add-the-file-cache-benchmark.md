@@ -175,3 +175,6 @@ The review findings M28-1 and M28-4 in the adversarial branch review describe th
   `TimedHttpClient` now ends each live attempt after 120 s with `error.Timeout`, and the harness retries it.
   The test "M28 cache a request that hangs times out and the harness retries it" proves it.
   Its loopback server never answers.
+- M28-6: the Frame size sets the Enrichment Range, so it sets the cache policy that a run measures.
+  The header now prints `cols` and `rows`, and the checkpoint check compares them.
+  The test "M28 cache every scenario runs to the end with text, binary, added, and removed Files" checks the header.
