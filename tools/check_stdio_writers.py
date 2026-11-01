@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Fail when Zig source makes a positional writer for stdout or stderr."""
+"""Fail when Zig source uses stdout() or stderr() other than for a streaming writer or a handle.
+
+An alias such as `const out = stdout();` could make a positional writer out of sight of this check,
+so every use must be `.writerStreaming(` or `.handle`. `zig fmt`, run by `zig build test`, removes
+spaces inside the call chain.
+"""
 
 from pathlib import Path
 import re
@@ -7,18 +12,18 @@ import sys
 
 from source_lines import zig_files
 
-POSITIONAL = re.compile(r"\b(stdout|stderr)\(\)\.writer\(")
+OTHER_USE = re.compile(r"\b(stdout|stderr)\(\)(?!\.writerStreaming\(|\.handle\b)")
 
 
 def violations(root):
     for relative, lines in zig_files(root, ("src",), literals=False):
         for number, line in enumerate(lines, 1):
-            match = POSITIONAL.search(line)
-            if match:
+            for match in OTHER_USE.finditer(line):
                 stream = match.group(1)
                 yield (
-                    f"{relative}:{number}: {stream}().writer writes at absolute file offsets and overwrites a redirected file. "
-                    f"Use {stream}().writerStreaming."
+                    f"{relative}:{number}: use {stream}() only as {stream}().writerStreaming( or {stream}().handle. "
+                    f"File.writer writes at absolute file offsets and overwrites a redirected file, "
+                    f"and an alias of {stream}() hides such a writer from this check."
                 )
 
 
@@ -29,7 +34,7 @@ def main():
         print(message, file=sys.stderr)
     if found:
         return 1
-    print("Every stdout and stderr writer streams.")
+    print("Every stdout() and stderr() use is a streaming writer or a handle.")
     return 0
 
 

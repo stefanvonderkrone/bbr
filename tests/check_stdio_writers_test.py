@@ -28,6 +28,20 @@ class StdioWritersTest(unittest.TestCase):
                 self.source.write_text(f"var w = std.Io.File.{stream}().writer(io, &buf);\n", encoding="utf-8")
                 self.assertEqual(len(list(checker.violations(self.root))), 1)
 
+    def test_an_alias_of_stdout_or_stderr_is_rejected(self):
+        for line in (
+            "const out = std.Io.File.stdout();",
+            "var w = std.Io.File.stderr().writer(io, &buf);",
+            "const f: std.Io.File = std.Io.File.stdout(); var w = f.writer(io, &buf);",
+        ):
+            with self.subTest(line=line):
+                self.source.write_text(line + "\n", encoding="utf-8")
+                self.assertEqual(len(list(checker.violations(self.root))), 1)
+
+    def test_a_handle_comparison_is_allowed(self):
+        self.source.write_text("const same = file.handle == std.Io.File.stdout().handle;\n", encoding="utf-8")
+        self.assertEqual(list(checker.violations(self.root)), [])
+
     def test_streaming_writers_and_comments_are_allowed(self):
         self.source.write_text(
             "var w = std.Io.File.stdout().writerStreaming(io, &buf);\n"

@@ -382,6 +382,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&xdg_reads.step);
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&stdio_writers.step);
+    test_step.dependOn(&b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true }).step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
 }
