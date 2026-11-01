@@ -150,6 +150,12 @@ Record each split under `## Completion`.
 
 These numbers are estimates. Nobody measured them.
 
+The table predates the Enrichment Range that main added in PR #16.
+The Enrichment Range fetches every visible File and one File above and below each File Jump.
+A 20-File fixture probe in the branch review sent about 3 times more requests in S3 and S7 after the merge.
+So the requests and the times below can be up to about 3 times higher.
+The per-scenario request estimate in the harness has the same gap, so the per-request gate sets the pace.
+
 F is the File count of a PullRequest.
 One PullRequest needs at least 2F + 240 requests, when every File stays in the LRU.
 It needs at most 12F + 780 requests, when no File stays in the LRU.
