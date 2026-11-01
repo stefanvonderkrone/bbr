@@ -72,6 +72,7 @@ A stale jump never moves a later view.
 - `DisclosureBuild.Kind.rebuildsContent` replaces two copies of the content-build kind list with one exhaustive switch.
 - The failed-build criterion is proved by the `overview_destination` arm of "M21 kernel Frame worker allocation failures preserve the graph and complete Frame". That test is outside `zig build test-comment-overview`, but `zig build test` runs it.
 - The missing-row test replaces `overview_owner` on the issued job. No fixture puts an index record outside the DiffPane Buffer, because the index comes from the same Buffer build.
+- After the merge with PR #16, review findings M29-3 and M29-4 touched this ticket's Enter behavior. Ticket 06 records the fixes.
 
 ## Completion
 

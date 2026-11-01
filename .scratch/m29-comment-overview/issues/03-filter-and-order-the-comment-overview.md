@@ -76,6 +76,7 @@ The filters, the query, and the order survive `g d` and `g o`.
 - `comment_overview.Frame.state` is a `*const State` that borrows the Overview State from `Published`. vaxis cells borrow their text until render. A by-value copy of the query buffer on a stack left dangling cells. Now the type rejects a by-value copy at compile time.
 - The order chip stays muted in both orders, because it is not a filter. Its text names the order.
 - At 80 columns, the filter row is 50 cells wide. The chips then drop from the end, so the order chip shows only from about 85 columns. This follows the spec rule for a narrow row.
+- After the merge with PR #16, review findings M29-2 and M29-5 touched the query input. Ticket 06 records the fixes.
 
 ## Completion
 

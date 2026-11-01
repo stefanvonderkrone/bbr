@@ -50,6 +50,15 @@ The integrated hermetic suite passes with every M29 test.
 - The spec keeps `Status: ready-for-agent`. Ticket 07 is `ready-for-human`, so `python3 tools/check_agent_docs.py` does not require the spec to be `claimed` or `resolved`. The runner sets the spec status after ticket 07.
 - `README.md` does not list M27 to M29 in its milestone line, because that line stops at M26. This ticket does not change it.
 - The `TODO.md` M29 heading stays without "done", because ticket 07 is open.
+- Merge with `origin/main` (`497c86f`, PR #16) on 2026-11-01. The merge commit resolves the textual conflicts in `frame.zig`, `layouts.zig`, `presentation.zig`, and `render.zig`. It follows the single-branch trial recipe `5fe9422`. Later commits fix the review findings below.
+- X-1 and M29-1. The merged tree did not compile. Main made `keymap.helpSection` exhaustive and moved the query erase helpers to `search.zig`. The fix commit adds the help sections and calls `search.lastScalarStart` and `search.wordStart`.
+- Help sections. `show_comment_overview`, `show_diff_pane`, and `open_overview_entry` go to Panes and Files, because they change the Main Pane. `edit_overview_query` and the four `toggle_overview_*` Actions go to Comments and Drafts, because they filter Comments. M29 adds no new help section.
+- M29-5. `help.fixed_sections` has a "Comment Overview Filter Input" section with the keys of the query input. The Mouse section names the second click that opens an Overview Entry.
+- M29-2. A destination build that shows the DiffPane now closes the query input and keeps the query.
+- M29-3. An armed re-anchor claims Enter and Escape only while the DiffPane shows. Enter in the Comment Overview opens the entry again.
+- M29-4. A Submission Overlay jump to a Draft card shows the DiffPane on the fast path too. A failed DiffPane change shows the Submission Overlay again.
+- Ticket 08 records the Overview scroll bar defect that exists after the M30 merge. The operator chose a follow-up ticket.
+- After the fixes: `zig build test --summary all` passes, 24/24 steps and 1499/1499 tests. `python3 tools/check_agent_docs.py` passes.
 
 ## Completion
 
