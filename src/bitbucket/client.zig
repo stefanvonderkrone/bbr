@@ -1767,7 +1767,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             known: u32 = 1,
             /// The `next` link that addresses page `known` when that page is not numbered.
             link: ?[]u8 = null,
-            /// The last page the result needs: the first page without `next`, or the last page within the limit.
+            /// The last page of the list: the first page without `next`.
             last: ?u32 = null,
             /// One state for each launched page, in page order.
             pages: std.ArrayList(PageState) = .empty,
@@ -1850,12 +1850,24 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                 for (self.lists, 0..) |list, index| {
                     const launched: u32 = @intCast(list.pages.items.len);
                     if (first_pages != (launched == 0)) continue;
-                    if (launched >= list.known or launched >= list.last orelse std.math.maxInt(u32)) continue;
+                    if (launched >= list.known or launched >= list.last orelse std.math.maxInt(u32) or !self.withinLimit(list, launched + 1)) continue;
                     const position: PagePosition = .{ .list = index, .number = launched + 1 };
                     if (failure == null or position.before(failure.?)) return position;
                 }
             }
             return null;
+        }
+
+        /// Whether page `number` of `list` can hold a row within the limit. A page that is not
+        /// done counts as full, so a short page brings later pages into the limit.
+        fn withinLimit(self: *const Self, list: List, number: u32) bool {
+            const limit = self.options.limit orelse return true;
+            var rows: usize = 0;
+            for (list.pages.items[0 .. number - 1]) |page| rows += switch (page) {
+                .done => |items| items.len,
+                .pending, .failed => list.pagelen,
+            };
+            return rows < limit;
         }
 
         /// The Bitbucket page number of `number`, which counts the pages of a list from 1.
@@ -1895,7 +1907,6 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             if (number == 1) {
                 list.pagelen = page.pagelen orelse self.options.pagelen;
                 if (list.pagelen == 0 or list.pagelen > self.options.pagelen) return error.MalformedResponse;
-                if (self.options.limit) |limit| list.last = std.math.cast(u32, std.math.divCeil(usize, limit, list.pagelen) catch unreachable) orelse std.math.maxInt(u32);
                 if (page.next) |next| if (page.size) |size| if (numberedNext(next, list.first, page_number + 1)) {
                     const total = std.math.cast(u32, std.math.divCeil(usize, size, list.pagelen) catch unreachable) orelse return error.MalformedResponse;
                     list.known = @max(1, total -| (self.options.first_page - 1));
@@ -1914,11 +1925,11 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             if (page.next) |next| {
                 if (number < list.known) {
                     if (!numberedNext(next, list.first, page_number + 1)) return error.MalformedResponse;
-                } else if (number < list.last orelse std.math.maxInt(u32)) {
+                } else {
                     list.link = try self.allocator.dupe(u8, next);
                     list.known = number + 1;
                 }
-            } else list.last = @min(list.last orelse number, number);
+            } else list.last = number;
             return items;
         }
 
@@ -4975,6 +4986,29 @@ test "a PullRequest limit requests only the pages that hold it" {
         try testing.expectEqual(calls, fake.callCount());
         try testing.expectEqual(@min(limit, 8), items.len);
         for (items, 1..) |item, id| try testing.expectEqual(@as(u64, id), item.id);
+    }
+}
+
+test "a PullRequest limit follows a short page that has a next link" {
+    const short_first = "{\"values\":[" ++ comptime workspacePr("zeta", "9") ++ "],\"page\":1,\"pagelen\":2";
+    const second = "{\"values\":[" ++ comptime workspacePr("alpha", "2") ++ "," ++ workspacePr("alpha", "1") ++ "],\"page\":2,\"pagelen\":2}";
+    for ([_][2]httpc_fixture.Canned{
+        .{
+            .{ .body = short_first ++ ",\"next\":\"https://api.bitbucket.org/2.0/next?cursor=opaque\"}" },
+            .{ .request_key = "cursor=opaque", .body = second },
+        },
+        .{
+            .{ .body = short_first ++ ",\"size\":4,\"next\":\"" ++ author_endpoint ++ "?pagelen=2&page=2\"}" },
+            .{ .request_key = "&page=2", .body = second },
+        },
+    }) |responses| {
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        var done: std.atomic.Value(bool) = .init(false);
+        const items = try listPagedPullRequestsForTest(Client.init(fake.httpClient(), testCredential()), author_scope, 2, 8, &done);
+        defer deinitSummaries(testing.allocator, items);
+        try testing.expectEqual(@as(usize, 2), fake.callCount());
+        try testing.expectEqual(@as(usize, 2), items.len);
+        for ([_]u64{ 9, 2 }, items) |id, item| try testing.expectEqual(id, item.id);
     }
 }
 
