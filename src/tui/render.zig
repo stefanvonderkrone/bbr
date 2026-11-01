@@ -6349,3 +6349,43 @@ test "M29 overview the File Tree selects only the cursor and marks no active Fil
         try testing.expectEqualStrings(" ", cell.char.grapheme);
     }
 }
+
+test "M29 overview a cut excerpt keeps whole graphemes and ends with … on a wide row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const combining = "a" ** 199 ++ "e\u{301} more";
+    const family = "a" ** 190 ++ "👨\u{200d}👩\u{200d}👧 more";
+    const comments = [_]bbr.review.Comment{
+        .{ .id = 1, .author = "Ada", .body = combining },
+        .{ .id = 2, .author = "Bob", .body = family },
+    };
+    const index = try comment_overview.buildIndex(a, .{
+        .diff = overview_test_diff,
+        .threads = try bbr.review.buildThreads(a, &comments),
+        .drafts = &.{},
+        .scope_projections = &.{},
+        .mention_names = &.empty,
+        .authenticated_account_uuid = null,
+        .cell_metrics = terminal_cell_metrics,
+    });
+    const state: comment_overview.State = .{};
+    var overview = overview_test_frame;
+    overview.records = index.records;
+    overview.listing = try comment_overview.buildListing(a, &index, &state);
+    overview.selected = null;
+
+    const geometry: @import("frame.zig").Geometry = .{ .cols = 300, .rows = 8 };
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    drawCommentOverview(a, win, try overviewTestReview(geometry, overview), theme_dark);
+    const rects = @import("frame.zig").overviewRects(geometry);
+    const expected = [_][]const u8{
+        "Ada  Review  " ++ "a" ** 199 ++ "…",
+        "Bob  Review  " ++ "a" ** 190 ++ "…",
+    };
+    for (expected, 0..) |line, row| {
+        const painted = try overviewRowText(a, win, rects.entries.x, rects.entries.y + @as(u16, @intCast(row)), rects.entries.width);
+        try testing.expectEqualStrings(line, std.mem.trimEnd(u8, painted, " "));
+    }
+}

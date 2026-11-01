@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const emoji = @import("emoji.zig");
+const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 
 /// Session-owned account IDs and their display labels, including the leading @.
 pub const MentionNames = std.StringHashMapUnmanaged([]const u8);
@@ -503,6 +504,8 @@ fn excerptSource(kind: BlockKind) ExcerptSource {
 /// One excerpt line. Each whitespace run becomes one space, and the ends
 /// carry no space.
 const ExcerptLine = struct {
+    const max_scalar_bytes = 4;
+
     bytes: std.ArrayList(u8) = .empty,
     space: bool = false,
     max_bytes: usize,
@@ -513,7 +516,8 @@ const ExcerptLine = struct {
             '\n' => if (self.end()) return true,
             ' ', '\t', '\r', 0x0b, 0x0c => self.separate(),
             else => {
-                if (self.bytes.items.len > self.max_bytes) return true;
+                // One whole scalar past the limit settles the grapheme boundary at the limit.
+                if (self.bytes.items.len > self.max_bytes + max_scalar_bytes) return true;
                 if (self.space) try self.bytes.append(allocator, ' ');
                 self.space = false;
                 try self.bytes.append(allocator, byte);
@@ -531,22 +535,27 @@ const ExcerptLine = struct {
         return self.bytes.items.len > 0;
     }
 
-    fn finish(self: *ExcerptLine, allocator: std.mem.Allocator) ![]const u8 {
-        var len = self.bytes.items.len;
-        if (len > self.max_bytes) {
-            len = self.max_bytes;
-            while (len > 0 and self.bytes.items[len] & 0xc0 == 0x80) len -= 1;
+    fn finish(self: *ExcerptLine, allocator: std.mem.Allocator, metrics: CellMetrics) ![]const u8 {
+        const text = self.bytes.items;
+        if (text.len <= self.max_bytes) return self.bytes.toOwnedSlice(allocator);
+        var len: usize = 0;
+        while (len < text.len) {
+            const grapheme = metrics.next(text[len..]).byte_len;
+            if (len + grapheme > self.max_bytes) break;
+            len += grapheme;
         }
-        while (len > 0 and self.bytes.items[len - 1] == ' ') len -= 1;
+        while (len > 0 and text[len - 1] == ' ') len -= 1;
         self.bytes.shrinkRetainingCapacity(len);
+        try self.bytes.appendSlice(allocator, "…");
         return self.bytes.toOwnedSlice(allocator);
     }
 };
 
-/// The first non-blank line of visible prose, cut at `max_bytes` on a UTF-8
-/// scalar boundary. A body without prose gives "suggestion" for a Suggestion,
-/// else the first line of code. The caller owns the result.
-pub fn excerpt(allocator: std.mem.Allocator, body: ReviewBody, max_bytes: usize) ![]const u8 {
+/// The first non-blank line of visible prose. A longer line keeps the whole
+/// graphemes of `metrics` within `max_bytes`, then `…`. A body without prose
+/// gives "suggestion" for a Suggestion, else the first line of code. The
+/// caller owns the result.
+pub fn excerpt(allocator: std.mem.Allocator, body: ReviewBody, max_bytes: usize, metrics: CellMetrics) ![]const u8 {
     var line: ExcerptLine = .{ .max_bytes = max_bytes };
     errdefer line.bytes.deinit(allocator);
     var suggestion = false;
@@ -557,12 +566,12 @@ pub fn excerpt(allocator: std.mem.Allocator, body: ReviewBody, max_bytes: usize)
                 if (span.hard_break and block.kind == .table) {
                     line.separate();
                 } else if (span.join or span.hard_break) {
-                    if (line.end()) return line.finish(allocator);
+                    if (line.end()) return line.finish(allocator, metrics);
                 } else if (!span.hidden and !span.generated) {
-                    if (try line.append(allocator, span.text)) return line.finish(allocator);
+                    if (try line.append(allocator, span.text)) return line.finish(allocator, metrics);
                 }
             }
-            if (line.end()) return line.finish(allocator);
+            if (line.end()) return line.finish(allocator, metrics);
         },
         .suggestion => suggestion = true,
         .code, .none => {},
@@ -570,11 +579,11 @@ pub fn excerpt(allocator: std.mem.Allocator, body: ReviewBody, max_bytes: usize)
     if (suggestion) return allocator.dupe(u8, "suggestion");
     for (body.blocks) |block| if (excerptSource(block.kind) == .code) {
         for (block.spans) |span| {
-            if (!span.hidden and !span.generated and try line.append(allocator, span.text)) return line.finish(allocator);
+            if (!span.hidden and !span.generated and try line.append(allocator, span.text)) return line.finish(allocator, metrics);
         }
-        if (line.end()) return line.finish(allocator);
+        if (line.end()) return line.finish(allocator, metrics);
     };
-    return line.finish(allocator);
+    return line.finish(allocator, metrics);
 }
 
 fn freeBlocks(allocator: std.mem.Allocator, blocks: []const Block) void {
@@ -1954,10 +1963,17 @@ test "M23 inline unclosed Suggestion keeps earlier formatting and literal code c
     try testing.expectEqual(source.len, body.blocks[1].fences.?[1].end);
 }
 
+/// One grapheme for each UTF-8 scalar.
+const scalar_metrics: CellMetrics = .{ .ptr = &scalar_context, .vtable = &.{ .next = scalarNext } };
+const scalar_context: u8 = 0;
+fn scalarNext(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+    return .{ .byte_len = std.unicode.utf8ByteSequenceLength(text[0]) catch 1, .cell_width = 1 };
+}
+
 fn expectExcerpt(expected: []const u8, raw: []const u8, names: *const MentionNames, max_bytes: usize) !void {
     const body = try ReviewBody.parseWithMentions(testing.allocator, raw, names);
     defer freeBlocks(testing.allocator, body.blocks);
-    const text = try excerpt(testing.allocator, body, max_bytes);
+    const text = try excerpt(testing.allocator, body, max_bytes, scalar_metrics);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(expected, text);
 }
@@ -1972,11 +1988,12 @@ test "M29 overview the excerpt applies mention names and collapses whitespace" {
     try expectExcerpt("alt", "![alt](<>)", &names, 200);
 }
 
-test "M29 overview the excerpt stops at the byte limit on a scalar boundary" {
+test "M29 overview the excerpt stops at the byte limit on a grapheme boundary and ends with …" {
     const raw = "a" ** 199 ++ "é and more";
-    try expectExcerpt("a" ** 199, raw, &.empty, 200);
-    try expectExcerpt("a" ** 199 ++ "é", raw, &.empty, 201);
-    try expectExcerpt("ab", "ab cd", &.empty, 3);
+    try expectExcerpt("a" ** 199 ++ "…", raw, &.empty, 200);
+    try expectExcerpt("a" ** 199 ++ "é…", raw, &.empty, 201);
+    try expectExcerpt("ab…", "ab cd", &.empty, 3);
+    try expectExcerpt("ab cd", "ab cd", &.empty, 5);
 }
 
 test "M29 overview the excerpt names a Suggestion and falls back to code" {

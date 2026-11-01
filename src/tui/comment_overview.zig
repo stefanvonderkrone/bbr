@@ -117,6 +117,8 @@ pub const IndexInputs = struct {
     mention_names: *const review_body.MentionNames,
     authenticated_account_uuid: ?[]const u8,
     emphasis_cache: ?*const buffer_mod.EmphasisCache = null,
+    /// Cuts a long excerpt on a grapheme boundary.
+    cell_metrics: CellMetrics,
 };
 
 pub const Record = struct {
@@ -210,7 +212,7 @@ pub const Frame = struct {
     }
 };
 
-/// The longest excerpt in bytes. The cut keeps whole UTF-8 scalars.
+/// The longest excerpt in bytes before its `…`. The cut keeps whole graphemes.
 const excerpt_bytes = 200;
 
 pub fn buildIndex(allocator: std.mem.Allocator, inputs: IndexInputs) !Index {
@@ -284,7 +286,7 @@ pub fn buildIndex(allocator: std.mem.Allocator, inputs: IndexInputs) !Index {
                         false,
                     .draft => true,
                 },
-                .excerpt = try allocator.dupe(u8, try review_body.excerpt(scratch, parsed, excerpt_bytes)),
+                .excerpt = try allocator.dupe(u8, try review_body.excerpt(scratch, parsed, excerpt_bytes, inputs.cell_metrics)),
                 .haystack = try std.mem.join(allocator, "\n", &.{ author, scopePath(scope), body }),
                 .review_rank = rank,
                 .recency_rank = undefined,
@@ -537,6 +539,7 @@ const Fixture = struct {
             .scope_projections = self.scope_projections,
             .mention_names = &.empty,
             .authenticated_account_uuid = self.account,
+            .cell_metrics = .bytes,
         });
     }
 };
@@ -724,6 +727,7 @@ test "M29 overview the index lists the DiffPane ReviewCards with every disclosur
         .scope_projections = &projections,
         .mention_names = &.empty,
         .authenticated_account_uuid = null,
+        .cell_metrics = .bytes,
     });
 
     var keys: std.ArrayList(buffer_mod.DisclosureKey) = .empty;

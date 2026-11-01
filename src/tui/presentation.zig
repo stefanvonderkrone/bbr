@@ -5093,6 +5093,7 @@ const Published = struct {
             .mention_names = &self.session.mention_names,
             .authenticated_account_uuid = authenticated_account_uuid,
             .emphasis_cache = &self.emphasis_cache,
+            .cell_metrics = self.cell_metrics,
         });
     }
 
