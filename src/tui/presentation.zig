@@ -7584,11 +7584,12 @@ pub const Presentation = struct {
             return;
         };
         // Stage two of re-anchor keeps the DiffPane's whole motion and Selection
-        // vocabulary; only accept and cancel are claimed from it.
-        if (self.reanchor != null) {
+        // vocabulary; only accept and cancel are claimed from it. The Comment
+        // Overview hides the candidate, so its keys keep their own meaning.
+        if (self.reanchor != null) if (self.published) |published| if (published.main_pane == .diff_pane) {
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyReanchorInput(.cancel);
             if (key.matches(keymap_mod.special.enter, .{})) return self.applyReanchorInput(.accept);
-        }
+        };
         switch (self.resolver.feed(self.dependencies.keymap, self.interactionContext(), key)) {
             .none => {},
             .digit => |digit| self.pushCountDigit(digit),
@@ -31215,6 +31216,36 @@ test "M29 overview a destination that lands closes the query input and keeps the
     const cursor = presentation.projection().review.?.frame.navigation.cursor;
     try typeOverviewKey(&presentation, "j");
     try testing.expect(presentation.projection().review.?.frame.navigation.cursor > cursor);
+}
+
+test "M29 overview Enter opens the entry and leaves an armed re-anchor alone" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "keep me here",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try selectSource(&presentation, .new, 5, 7);
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const job = try takeOverviewDestination(&presentation);
+    try testing.expect(presentation.takeCommand() == null);
+    job.build();
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    try testing.expectEqual(MainPane.diff_pane, presentation.projection().review.?.frame.main_pane);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), presentation.projection().reanchor.?.temp_id);
+    try testing.expectEqual(@as(?u32, 1), draftAnchor(&presentation, 1).to);
+    try testing.expect(presentation.takeCommand() == null);
 }
 
 fn takeOverviewDestination(presentation: *Presentation) !*DisclosureBuild {
