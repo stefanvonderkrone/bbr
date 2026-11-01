@@ -1575,11 +1575,21 @@ const Driver = struct {
 
     /// A File that was ready at the span start is a hit, even when the span refetches it later.
     /// Else a refetch wins over a cold fetch. `file` limits the span to one File.
+    /// A fetch that the Presentation still queues counts too. A command ahead of it in the
+    /// queue, such as a running disclosure build, can hold it back until after the span.
     fn classify(self: *const Driver, file: ?usize) FetchClass {
         if (file) |index| if (self.ready_at_span[index]) return .hit;
         var class: FetchClass = .hit;
         for (self.span_fetches.items) |fetch| if (file == null or fetch.file_index == file.?) {
             if (fetch.admitted_before) return .refetch;
+            class = .cold;
+        };
+        const state = &self.state.?;
+        const epoch = state.published.?.epoch;
+        for (state.commands.items) |command| if (command == .enrich_file) {
+            const queued = command.enrich_file;
+            if (queued.session_epoch != epoch or file != null and queued.file_index != file.?) continue;
+            if (self.admitted[queued.file_index]) return .refetch;
             class = .cold;
         };
         return class;

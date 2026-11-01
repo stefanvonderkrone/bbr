@@ -145,6 +145,9 @@ Ticket 01 then lists the hook and the reason under `## Completion`.
 - At the start of each span, the harness records which Files have terminal File Enrichment.
   It also keeps the fetches that are in flight at the start.
   A span can wait for these fetches, so they count for the span.
+- At the end of each span, the harness also counts the `enrich_file` commands that the Presentation still queues for the current Session.
+  A command ahead of them in the queue, such as a running disclosure build, can hold them back until after the span.
+  The span caused these fetches or can wait for them, so they count for the span.
 - The harness keeps one admitted flag for each File in each run.
   The flag survives Session replacement and the simulated restart.
   An `enrich_file` command for a File with the flag set is a refetch.
