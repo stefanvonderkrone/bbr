@@ -3069,6 +3069,25 @@ test "API lifecycle HTTP headers and transport errors follow the existing creden
     try testing.expectEqual(@as(usize, 9), checked.fake.call_count);
 }
 
+test "Repository paths percent-encode the Workspace and the Repository slug and refuse dot segments" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 404, .body = "{}" };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws/x" });
+    const slug = "a/../b?x%y#z";
+    const repository = base_url ++ "/repositories/ws%2Fx/a%2F..%2Fb%3Fx%25y%23z";
+
+    try testing.expectError(error.NotFound, bb.listPullRequests(a, slug, .{ .source_branch = "main" }));
+    try testing.expect(std.mem.startsWith(u8, fake.lastUrl().?, repository ++ "/pullrequests?pagelen=50&state=OPEN&q="));
+    try testing.expectError(error.NotFound, bb.getPullRequest(a, slug, 7));
+    try testing.expectEqualStrings(repository ++ "/pullrequests/7", fake.lastUrl().?);
+    try testing.expectError(error.NotFound, bb.getCommentsRaw(a, slug, 7));
+    try testing.expectEqualStrings(repository ++ "/pullrequests/7/comments?pagelen=100", fake.lastUrl().?);
+
+    const sent = fake.call_count;
+    for ([_][]const u8{ "", ".", ".." }) |dots| try testing.expectError(error.BadRequest, bb.listPullRequests(a, dots, .{}));
+    try testing.expectEqual(sent, fake.call_count);
+}
+
 test "getPullRequest parses a well-formed fixture" {
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .status = 200, .body = fixture_pr };
