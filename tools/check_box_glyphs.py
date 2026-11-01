@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 import sys
 
+from source_lines import zig_code
+
 PAINTERS = (Path("src/tui/render.zig"), Path("src/tui/app.zig"))
 GLYPHS = re.compile("[\u250c-\u254b\u2552-\u2570]")
 TEST_START = re.compile(r"^test\b.*\{\s*$")
@@ -17,14 +19,12 @@ FIX = (
 def violations(root):
     for relative in PAINTERS:
         in_test = False
-        for number, line in enumerate((root / relative).read_text(encoding="utf-8").splitlines(), 1):
+        for number, line in enumerate(zig_code((root / relative).read_text(encoding="utf-8")), 1):
             if in_test:
                 in_test = line != "}"
                 continue
             if TEST_START.match(line):
                 in_test = True
-                continue
-            if line.lstrip().startswith("//"):
                 continue
             match = GLYPHS.search(line)
             if match:

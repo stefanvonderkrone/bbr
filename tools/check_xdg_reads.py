@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 import sys
 
+from source_lines import zig_code
+
 OWNER = Path("src/xdg.zig")
 VARIABLES = ('"XDG_CONFIG_HOME"', '"XDG_DATA_HOME"', '"XDG_STATE_HOME"')
 FIX = {
@@ -21,7 +23,7 @@ def violations(root):
         if relative == OWNER:
             continue
         in_test = False
-        for number, line in enumerate(path.read_text().splitlines(), 1):
+        for number, line in enumerate(zig_code(path.read_text(encoding="utf-8")), 1):
             if in_test:
                 in_test = line != "}"
                 continue

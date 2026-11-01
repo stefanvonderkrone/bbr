@@ -5,14 +5,16 @@ from pathlib import Path
 import re
 import sys
 
+from source_lines import zig_code
+
 POSITIONAL = re.compile(r"\b(stdout|stderr)\(\)\.writer\(")
 
 
 def violations(root):
     for path in sorted((root / "src").rglob("*.zig")):
         relative = path.relative_to(root)
-        for number, line in enumerate(path.read_text().splitlines(), 1):
-            match = None if line.lstrip().startswith("//") else POSITIONAL.search(line)
+        for number, line in enumerate(zig_code(path.read_text(encoding="utf-8")), 1):
+            match = POSITIONAL.search(line)
             if match:
                 stream = match.group(1)
                 yield (

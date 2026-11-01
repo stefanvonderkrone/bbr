@@ -2,12 +2,14 @@
 
 import importlib.util
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "tools/check_stdio_writers.py"
-spec = importlib.util.spec_from_file_location("check_stdio_writers", SCRIPT)
+TOOLS = Path(__file__).resolve().parents[1] / "tools"
+sys.path.insert(0, str(TOOLS))
+spec = importlib.util.spec_from_file_location("check_stdio_writers", TOOLS / "check_stdio_writers.py")
 checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
 
@@ -31,10 +33,22 @@ class StdioWritersTest(unittest.TestCase):
             "var w = std.Io.File.stdout().writerStreaming(io, &buf);\n"
             "// stdout().writer( writes at offset 0.\n"
             "    /// stderr().writer( is positional.\n"
-            "//! stdout().writer( overwrites a redirected file.\n",
+            "//! stdout().writer( overwrites a redirected file.\n"
+            "var e = std.Io.File.stderr().writerStreaming(io, &buf); // not stderr().writer(\n",
             encoding="utf-8",
         )
         self.assertEqual(list(checker.violations(self.root)), [])
+
+    def test_a_comment_marker_inside_a_literal_hides_no_code(self):
+        for line in (
+            'const url = "https://example.test"; var w = std.Io.File.stdout().writer(io, &buf);',
+            "const quote = '\"'; const url = \"https://example.test\"; var w = std.Io.File.stderr().writer(io, &buf);",
+            "const lines = \\\\ // a multiline string, not a comment: stdout().writer(",
+            'const s = "\\"//"; var w = std.Io.File.stdout().writer(io, &buf);',
+        ):
+            with self.subTest(line=line):
+                self.source.write_text(line + "\n", encoding="utf-8")
+                self.assertEqual(len(list(checker.violations(self.root))), 1)
 
 
 if __name__ == "__main__":

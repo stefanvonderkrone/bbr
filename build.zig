@@ -409,8 +409,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&stdio_writers.step);
     test_step.dependOn(&tests_wired.step);
     for ([_][]const u8{
+        "tests/source_lines_test.py",
         "tests/check_stdio_writers_test.py",
         "tests/check_box_glyphs_test.py",
+        "tests/check_xdg_reads_test.py",
+        "tests/check_tests_wired_test.py",
         "tests/verify_bbr_control_test.py",
     }) |script| {
         const python_test = b.addSystemCommand(&.{"python3"});
