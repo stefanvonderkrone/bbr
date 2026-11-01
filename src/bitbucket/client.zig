@@ -930,12 +930,7 @@ pub const Client = struct {
 
     fn workspaceMembersEndpoint(self: Client, allocator: Allocator) ![]u8 {
         if (self.cred.workspace.len == 0) return error.BadRequest;
-        var url: std.ArrayList(u8) = .empty;
-        errdefer url.deinit(allocator);
-        try url.appendSlice(allocator, base_url ++ "/workspaces/");
-        try percentEncodeInto(allocator, &url, self.cred.workspace);
-        try url.appendSlice(allocator, "/members");
-        return url.toOwnedSlice(allocator);
+        return pathUrl(allocator, "/workspaces", &.{self.cred.workspace}, "/members", .{});
     }
 
     /// Complete member acquisition with a caller-selected active-request bound.
