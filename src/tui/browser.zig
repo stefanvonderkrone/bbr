@@ -977,6 +977,34 @@ test "M24 browser a failed rebuild after a data change leaves no Entry past the 
     try testing.expectEqual(@as(usize, 2), browser.entries.len);
 }
 
+test "M24 browser a lost Selection after a failed rebuild lands on the row at the same index" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var browser = try Browser.create(failing.allocator(), try testStart(null, null), 10);
+    defer browser.destroy();
+    try browser.replaceRepositories(try testRepositories(&.{
+        .{ .slug = "r0", .name = "R0", .updated_on = 4 },
+        .{ .slug = "r1", .name = "R1", .updated_on = 3 },
+        .{ .slug = "r2", .name = "R2", .updated_on = 2 },
+        .{ .slug = "r3", .name = "R3", .updated_on = 1 },
+    }));
+    try browser.rebuild();
+    browser.select(2);
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, browser.rebuild());
+    try expectEntriesInBounds(browser);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try browser.replaceRepositories(try testRepositories(&.{
+        .{ .slug = "r0", .name = "R0", .updated_on = 4 },
+        .{ .slug = "r1", .name = "R1", .updated_on = 3 },
+        .{ .slug = "r3", .name = "R3", .updated_on = 1 },
+    }));
+    try browser.rebuild();
+    try testing.expectEqual(@as(?usize, 2), browser.cursor_index);
+    try testing.expect(browser.cursor.?.repository.eql("r3"));
+}
+
 test "M24 browser a Sort change keeps the selected Repository and moves the scroll only when its row leaves the viewport" {
     var browser = try Browser.create(testing.allocator, try testStart(null, null), 4);
     defer browser.destroy();
