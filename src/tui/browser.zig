@@ -922,6 +922,53 @@ test "M24 browser a Repository list keeps the expansion and load of a known node
     try testing.expect(browser.findNode("lost") == null);
 }
 
+fn expectEntriesInBounds(browser: *const Browser) !void {
+    for (browser.entries) |entry| switch (entry) {
+        .repository => |node| try testing.expect(node < browser.nodes.items.len),
+        .pull_request => |pr| {
+            try testing.expect(pr.repository < browser.nodes.items.len);
+            const prs = browser.nodes.items[pr.repository].pull_requests.settled.list() orelse return error.TestUnexpectedResult;
+            try testing.expect(pr.index < prs.len);
+        },
+        .message => {},
+    };
+    if (browser.cursor_index) |index| try testing.expect(index < browser.entries.len);
+    try testing.expect(browser.scroll <= browser.entries.len);
+}
+
+test "M24 browser a failed rebuild after a data change leaves no Entry past the data" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var browser = try Browser.create(failing.allocator(), try testStart("repo", null), 10);
+    defer browser.destroy();
+    browser.nodes.items[0].pull_requests.request = .{ .issued = 1 };
+    browser.storePullRequests(0, .{ .loaded = try testPullRequests(&.{ testPr(1, 1), testPr(2, 2), testPr(3, 3) }) });
+    try browser.replaceRepositories(try testRepositories(&.{
+        .{ .slug = "repo", .name = "Repo", .updated_on = 3 },
+        .{ .slug = "b", .name = "B", .updated_on = 2 },
+        .{ .slug = "c", .name = "C", .updated_on = 1 },
+    }));
+    try browser.rebuild();
+    browser.move(.to_bottom);
+
+    browser.nodes.items[0].pull_requests.request = .{ .issued = 2 };
+    browser.storePullRequests(0, .{ .loaded = try testPullRequests(&.{testPr(1, 1)}) });
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, browser.rebuild());
+    try expectEntriesInBounds(browser);
+
+    failing.fail_index = std.math.maxInt(usize);
+    const list = try testRepositories(&.{.{ .slug = "repo", .name = "Repo", .updated_on = 3 }});
+    try browser.replaceRepositories(list);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, browser.rebuild());
+    try expectEntriesInBounds(browser);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try browser.rebuild();
+    try expectEntriesInBounds(browser);
+    try testing.expectEqual(@as(usize, 2), browser.entries.len);
+}
+
 test "M24 browser a Sort change keeps the selected Repository and moves the scroll only when its row leaves the viewport" {
     var browser = try Browser.create(testing.allocator, try testStart(null, null), 4);
     defer browser.destroy();
