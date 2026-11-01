@@ -280,12 +280,13 @@ pub const IoClock = struct {
 
 /// The `key=value` lines on stderr. They never hold a URL, a path, a header, a body, or the token.
 const Notes = struct {
+    io: std.Io,
     writer: *std.Io.Writer,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
 
     fn print(self: *Notes, comptime format: []const u8, args: anytype) void {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.writer.print(format ++ "\n", args) catch {};
         self.writer.flush() catch {};
     }
@@ -328,7 +329,7 @@ pub const RequestWindow = struct {
     file: std.Io.File,
     offset: u64,
     entries: std.ArrayList(u64) = .empty,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
 
     const file_name = "requests.log";
 
@@ -403,8 +404,8 @@ pub const RequestWindow = struct {
     /// Records one request now and returns null, or returns the deadline and records nothing.
     /// One check and one record under one lock, so threads never overshoot the budget.
     fn tryAcquire(self: *RequestWindow) !?u64 {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.deadline(1)) |until| return until;
         try self.append(self.clock.wall());
         return null;
@@ -412,8 +413,8 @@ pub const RequestWindow = struct {
 
     /// A 429 response means the server counts more requests than the window. The marks fill it.
     fn fill(self: *RequestWindow) !void {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         _ = self.deadline(0);
         const wall_now = self.clock.wall();
         while (self.entries.items.len < self.hourly) try self.append(wall_now);
@@ -423,8 +424,8 @@ pub const RequestWindow = struct {
     fn reserve(self: *RequestWindow, scenario: Scenario, estimate: usize) void {
         while (true) {
             const until = blk: {
-                lock(&self.mutex);
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
                 break :blk self.deadline(estimate) orelse return;
             };
             const ns = @max(until -| self.clock.wall(), 1);
@@ -452,6 +453,7 @@ pub const RetryPolicy = struct {
 /// failed GET, and counts its traffic. It never stores a URL, a header, or a
 /// body. File Enrichments send from many threads at once.
 pub const MeasuringHttpClient = struct {
+    io: std.Io,
     inner: bbr.http.HttpClient,
     clock: Clock,
     window: *RequestWindow,
@@ -466,7 +468,7 @@ pub const MeasuringHttpClient = struct {
     sleeping: usize = 0,
     stalled_since: u64 = 0,
     excluded_ns: u64 = 0,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
 
     const Mark = struct { traffic: Traffic, latency_count: usize, excluded_ns: u64 };
     const Counter = enum { in_flight, sleeping };
@@ -526,8 +528,8 @@ pub const MeasuringHttpClient = struct {
 
     /// Counts one attempt. `requests` counts attempts like the window, and `failures` counts final failures.
     fn count(self: *MeasuringHttpClient, request: bbr.http.client.Request, result: anyerror!bbr.http.client.Response, elapsed: u64, retryable: bool, give_up: bool) void {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.traffic.requests += 1;
         if (std.mem.indexOf(u8, request.url, "/src/") != null) self.traffic.src_requests += 1;
         if (result) |response| {
@@ -550,15 +552,15 @@ pub const MeasuringHttpClient = struct {
 
     /// Full jitter is a uniform wait up to the ceiling of the retry.
     fn jitter(self: *MeasuringHttpClient, attempt: usize) u64 {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.random.uintAtMost(u64, self.policy.ceiling(attempt));
     }
 
     /// True after one request used every attempt. Later requests then fail without a send.
     fn gaveUp(self: *MeasuringHttpClient) bool {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.gave_up;
     }
 
@@ -575,8 +577,8 @@ pub const MeasuringHttpClient = struct {
     }
 
     fn change(self: *MeasuringHttpClient, counter: Counter, up: bool) void {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const was = self.stalled();
         const value = switch (counter) {
             .in_flight => &self.in_flight,
@@ -590,8 +592,8 @@ pub const MeasuringHttpClient = struct {
 
     /// The stalled time so far. CPU work that overlaps a stall is also excluded.
     fn excludedNs(self: *MeasuringHttpClient) u64 {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.excludedLocked();
     }
 
@@ -601,14 +603,14 @@ pub const MeasuringHttpClient = struct {
     }
 
     fn mark(self: *MeasuringHttpClient) Mark {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return .{ .traffic = self.traffic, .latency_count = self.latencies.items.len, .excluded_ns = self.excludedLocked() };
     }
 
     fn since(self: *MeasuringHttpClient, allocator: Allocator, start: Mark) !Traffic {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.out_of_memory) return error.OutOfMemory;
         const latencies = try allocator.dupe(u64, self.latencies.items[start.latency_count..]);
         defer allocator.free(latencies);
@@ -624,10 +626,6 @@ pub const MeasuringHttpClient = struct {
         };
     }
 };
-
-fn lock(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
-}
 
 /// Opens and closes the network client. S8 closes it and opens a new one.
 pub const Transport = struct {
@@ -887,7 +885,7 @@ fn usage() error{InvalidArguments} {
 /// for each scenario, and the merged PullRequest check. A rerun with the same
 /// options resumes at the first unfinished segment.
 pub fn run(env: Environment, options: Options, repository: []const u8, pull_request_id: u64) !void {
-    var notes: Notes = .{ .writer = env.notes };
+    var notes: Notes = .{ .io = env.io, .writer = env.notes };
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(env.io, options.output_dir);
     const dir = try cwd.openDir(env.io, options.output_dir, .{});
@@ -902,7 +900,7 @@ pub fn run(env: Environment, options: Options, repository: []const u8, pull_requ
     defer lock_file.close(env.io);
     var window: RequestWindow = try .open(env.io, dir, env.clock, &notes, options.hourly_request_budget);
     defer window.deinit();
-    var measuring: MeasuringHttpClient = .{ .inner = try env.transport.open(), .clock = env.clock, .window = &window, .notes = &notes, .random = env.random };
+    var measuring: MeasuringHttpClient = .{ .io = env.io, .inner = try env.transport.open(), .clock = env.clock, .window = &window, .notes = &notes, .random = env.random };
     defer measuring.deinit();
     defer env.transport.close();
     env.clock.watch(&measuring);
@@ -2135,7 +2133,7 @@ const FakeClock = struct {
     measuring: std.atomic.Value(?*MeasuringHttpClient) = .init(null),
     sleeps: [64]u64 = undefined,
     sleep_count: usize = 0,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
 
     fn clock(self: *FakeClock) Clock {
         return .{ .ptr = self, .vtable = &.{ .now = now, .wall = wall, .sleep = sleep, .watch = watch } };
@@ -2161,8 +2159,8 @@ const FakeClock = struct {
     fn sleep(ptr: *anyopaque, ns: u64) void {
         const self: *FakeClock = @ptrCast(@alignCast(ptr));
         {
-            lock(&self.mutex);
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(testing.io);
+            defer self.mutex.unlock(testing.io);
             if (self.sleep_count < self.sleeps.len) self.sleeps[self.sleep_count] = ns;
             self.sleep_count += 1;
         }
@@ -2171,8 +2169,8 @@ const FakeClock = struct {
             return;
         };
         while (true) {
-            lock(&measuring.mutex);
-            defer measuring.mutex.unlock();
+            measuring.mutex.lockUncancelable(measuring.io);
+            defer measuring.mutex.unlock(measuring.io);
             if (measuring.in_flight == measuring.sleeping) {
                 _ = self.time.fetchAdd(ns, .monotonic);
                 return;
@@ -2210,7 +2208,7 @@ const FlakyHttpClient = struct {
     calls: usize = 0,
     scripted: usize = 0,
     failed_urls: std.ArrayList([]u8) = .empty,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
 
     fn deinit(self: *FlakyHttpClient) void {
         for (self.failed_urls.items) |url| testing.allocator.free(url);
@@ -2235,8 +2233,8 @@ const FlakyHttpClient = struct {
     fn send(ptr: *anyopaque, allocator: Allocator, request: bbr.http.client.Request) anyerror!bbr.http.client.Response {
         const self: *FlakyHttpClient = @ptrCast(@alignCast(ptr));
         const canned = blk: {
-            lock(&self.mutex);
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(testing.io);
+            defer self.mutex.unlock(testing.io);
             self.calls += 1;
             if (self.healthy_calls) |healthy| if (self.calls > healthy) {
                 try self.failed_urls.append(testing.allocator, try testing.allocator.dupe(u8, request.url));
@@ -2606,9 +2604,9 @@ const RetryProbe = struct {
         self.tmp = testing.tmpDir(.{});
         self.clock = .{};
         self.notes_text = .init(testing.allocator);
-        self.notes = .{ .writer = &self.notes_text.writer };
+        self.notes = .{ .io = testing.io, .writer = &self.notes_text.writer };
         self.window = try .open(testing.io, self.tmp.dir, self.clock.clock(), &self.notes, hourly);
-        self.measuring = .{ .inner = inner, .clock = self.clock.clock(), .window = &self.window, .notes = &self.notes, .random = random, .policy = policy };
+        self.measuring = .{ .io = testing.io, .inner = inner, .clock = self.clock.clock(), .window = &self.window, .notes = &self.notes, .random = random, .policy = policy };
     }
 
     fn deinit(self: *RetryProbe) void {
@@ -2940,11 +2938,11 @@ test "M28 cache an unsupported command kind fails the run and names the kind" {
     defer tmp.cleanup();
     var notes_text: std.Io.Writer.Allocating = .init(testing.allocator);
     defer notes_text.deinit();
-    var notes: Notes = .{ .writer = &notes_text.writer };
+    var notes: Notes = .{ .io = testing.io, .writer = &notes_text.writer };
     var window: RequestWindow = try .open(testing.io, tmp.dir, clock.clock(), &notes, 900);
     defer window.deinit();
     var prng: std.Random.DefaultPrng = .init(28);
-    var measuring: MeasuringHttpClient = .{ .inner = try transport.transport().open(), .clock = clock.clock(), .window = &window, .notes = &notes, .random = prng.random() };
+    var measuring: MeasuringHttpClient = .{ .io = testing.io, .inner = try transport.transport().open(), .clock = clock.clock(), .window = &window, .notes = &notes, .random = prng.random() };
     defer measuring.deinit();
     const env: Environment = .{
         .gpa = testing.allocator,
@@ -2980,11 +2978,11 @@ test "M28 cache a random File Jump never targets the active File" {
     defer tmp.cleanup();
     var notes_text: std.Io.Writer.Allocating = .init(testing.allocator);
     defer notes_text.deinit();
-    var notes: Notes = .{ .writer = &notes_text.writer };
+    var notes: Notes = .{ .io = testing.io, .writer = &notes_text.writer };
     var window: RequestWindow = try .open(testing.io, tmp.dir, clock.clock(), &notes, 900);
     defer window.deinit();
     var prng: std.Random.DefaultPrng = .init(28);
-    var measuring: MeasuringHttpClient = .{ .inner = try transport.transport().open(), .clock = clock.clock(), .window = &window, .notes = &notes, .random = prng.random() };
+    var measuring: MeasuringHttpClient = .{ .io = testing.io, .inner = try transport.transport().open(), .clock = clock.clock(), .window = &window, .notes = &notes, .random = prng.random() };
     defer measuring.deinit();
     const env: Environment = .{
         .gpa = testing.allocator,
