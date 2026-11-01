@@ -899,6 +899,7 @@ It does not gate the hermetic suite.
 5. [Route Review-level Review Search results through the Comment Overview](issues/05-route-review-level-review-search-results-through-the-comment-overview.md)
 6. [Document M29 and verify the integrated suite](issues/06-document-m29-and-verify-the-integrated-suite.md)
 7. [Run the live M29 outside check](issues/07-run-the-live-m29-outside-check.md)
+8. [Give the Overview entries scroll bar a mouse target](issues/08-give-the-overview-entries-scroll-bar-a-mouse-target.md)
 
 ## Out of Scope
 
