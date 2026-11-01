@@ -406,35 +406,26 @@ fn mergeCaptureIntervals(allocator: Allocator, content: []const u8, intervals: [
     var spans: std.ArrayList(bbr.highlight.Span) = .empty;
     errdefer spans.deinit(allocator);
     var line_state: LineState = .{};
-    var cluster_start: usize = 0;
-    // ponytail: Grammar overlap is shallow; use a priority heap if profiles show deep overlap.
-    while (cluster_start < intervals.len) {
-        var cluster_end = intervals[cluster_start].end;
-        var cluster_limit = cluster_start + 1;
-        while (cluster_limit < intervals.len and intervals[cluster_limit].start < cluster_end) : (cluster_limit += 1) {
-            cluster_end = @max(cluster_end, intervals[cluster_limit].end);
+    var open: std.PriorityQueue(CaptureInterval, void, higherPrecedence) = .empty;
+    defer open.deinit(allocator);
+    var next: usize = 0;
+    var position: u32 = 0;
+    while (true) {
+        while (next < intervals.len and intervals[next].start <= position) : (next += 1) {
+            try open.push(allocator, intervals[next]);
         }
-        const cluster = intervals[cluster_start..cluster_limit];
-        var position = cluster[0].start;
-        while (position < cluster_end) {
-            var winner: ?CaptureInterval = null;
-            var next_start = cluster_end;
-            for (cluster) |interval| {
-                if (interval.start > position) {
-                    next_start = @min(next_start, interval.start);
-                } else if (interval.end > position and (winner == null or higherPrecedence({}, interval, winner.?) == .lt)) {
-                    winner = interval;
-                }
-            }
-            if (winner) |selected| {
-                const end = @min(selected.end, next_start);
-                try appendIntervalSpans(allocator, &spans, content, &line_state, position, end, selected.capture);
-                position = end;
-            } else {
-                position = next_start;
-            }
+        while (open.peek()) |top| {
+            if (top.end > position) break;
+            _ = open.pop();
         }
-        cluster_start = cluster_limit;
+        const next_start = if (next < intervals.len) intervals[next].start else null;
+        const winner = open.peek() orelse {
+            position = next_start orelse break;
+            continue;
+        };
+        const end = if (next_start) |start| @min(winner.end, start) else winner.end;
+        try appendIntervalSpans(allocator, &spans, content, &line_state, position, end, winner.capture);
+        position = end;
     }
     return spans.toOwnedSlice(allocator);
 }
@@ -1375,6 +1366,62 @@ test "M27 injection a higher host priority wins over a deeper layer" {
         .{ .line = 1, .start = 5, .end = 6, .capture = injected },
         .{ .line = 1, .start = 6, .end = 7, .capture = host },
     }, actual);
+}
+
+/// The fastest of three runs, so one slow run on a busy host does not count.
+fn highlightNanoseconds(highlighter: *TreeSitterHighlighter, path: []const u8, source: []const u8) !u64 {
+    var fastest: u64 = std.math.maxInt(u64);
+    for (0..3) |_| {
+        const start = std.Io.Timestamp.now(testing.io, .awake);
+        const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
+        fastest = @min(fastest, @as(u64, @intCast(start.untilNow(testing.io, .awake).toNanoseconds())));
+        freeResult(result);
+    }
+    return fastest;
+}
+
+test "M27 injection a large fenced Zig block costs about as much as the same Zig File" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    var markdown: std.ArrayList(u8) = .empty;
+    defer markdown.deinit(testing.allocator);
+    try markdown.appendSlice(testing.allocator, "```zig\n");
+    for (0..4000) |_| try markdown.appendSlice(testing.allocator, "const a = b + c;\n");
+    try markdown.appendSlice(testing.allocator, "```\n");
+    const zig_source = markdown.items["```zig\n".len .. markdown.items.len - "```\n".len];
+
+    const zig_ns = try highlightNanoseconds(&highlighter, "src/a.zig", zig_source);
+    const markdown_ns = try highlightNanoseconds(&highlighter, "doc/a.md", markdown.items);
+    if (markdown_ns > 10 * zig_ns) {
+        std.debug.print("Markdown took {d} ms, the Zig File took {d} ms\n", .{ markdown_ns / std.time.ns_per_ms, zig_ns / std.time.ns_per_ms });
+        return error.FencedBlockTooSlow;
+    }
+}
+
+test "M27 injection merged Spans match the byte planes for random overlapping intervals" {
+    var prng: std.Random.DefaultPrng = .init(27);
+    const random = prng.random();
+    const content = "abcdefghij\nklmnopqrst\nuvwxyzabcd\n";
+    var intervals: [24]CaptureInterval = undefined;
+    for (0..200) |_| {
+        for (&intervals, 0..) |*interval, order| {
+            const start = random.uintLessThan(u32, content.len);
+            interval.* = .{
+                .start = start,
+                .end = random.intRangeAtMost(u32, start + 1, content.len),
+                .capture = .init(random.uintLessThan(u16, 3), "keyword"),
+                .priority = default_priority + random.uintLessThan(u16, 2),
+                .depth = random.uintLessThan(u8, 3),
+                .pattern_index = random.uintLessThan(u32, 3),
+                .order = order,
+            };
+        }
+        const expected = try spansFromBytePlanes(testing.allocator, content, &intervals);
+        defer testing.allocator.free(expected);
+        const actual = try mergeCaptureIntervals(testing.allocator, content, &intervals);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualDeep(expected, actual);
+    }
 }
 
 test "M27 injection resolves a captured Grammar name" {
