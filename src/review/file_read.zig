@@ -53,6 +53,8 @@ pub fn fingerprint(file: diff.File) ?FileReviewFingerprint {
                 .removed => 3,
             }});
             putText(&hash, line.text);
+            // A tag only for a flagged Line keeps every stored receipt without the marker valid.
+            if (line.no_newline_at_eof) hash.update(&.{4});
         }
     }
     return .{ .bytes = hash.finalResult() };

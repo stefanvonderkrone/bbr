@@ -232,6 +232,7 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
             },
             '\\' => {
                 // "\ No newline at end of file" — a marker, not a real line.
+                if (lines.items.len > 0) lines.items[lines.items.len - 1].no_newline_at_eof = true;
             },
             else => return ParseError.UnexpectedLine,
         }
