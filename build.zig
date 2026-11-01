@@ -229,6 +229,7 @@ pub fn build(b: *std.Build) void {
         // A developer's saved Profile or Credential variables would let a check pass only on that machine.
         cli_test.clearEnvironment();
         if (b.graph.environ_map.get("PATH")) |path| cli_test.setEnvironmentVariable("PATH", path);
+        cli_test.setEnvironmentVariable("BBR_TEST_CLI", "1");
         cli_test_step.dependOn(&cli_test.step);
     }
 

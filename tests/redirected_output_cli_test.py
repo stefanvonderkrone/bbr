@@ -1,17 +1,16 @@
-"""Run with python3 tests/redirected_output_cli_test.py zig-out/bin/bbr. No network access."""
+"""Run with zig build test-cli. No network access."""
 
-import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 
+from cli_env import cli_env
+
 
 binary = str(Path(sys.argv[1]).resolve())
 data_home = tempfile.TemporaryDirectory()
-env = {key: value for key, value in os.environ.items()
-       if not key.startswith("BITBUCKET_") and key != "BBR_PROFILE" and not key.lower().endswith("_proxy")}
-env.update(XDG_DATA_HOME=data_home.name, BITBUCKET_USERNAME="user", BITBUCKET_TOKEN="token", BITBUCKET_WORKSPACE="workspace")
+env = cli_env(XDG_DATA_HOME=data_home.name, BITBUCKET_USERNAME="user", BITBUCKET_TOKEN="token", BITBUCKET_WORKSPACE="workspace")
 prefix = b"written before bbr\n"
 
 
