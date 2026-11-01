@@ -214,8 +214,9 @@ pub fn build(b: *std.Build) void {
     const stdio_writers = b.addSystemCommand(&.{"python3"});
     stdio_writers.addFileArg(b.path("tools/check_stdio_writers.py"));
     stdio_writers.addDirectoryArg(b.path("."));
-    const stdio_writers_test = b.addSystemCommand(&.{"python3"});
-    stdio_writers_test.addFileArg(b.path("tests/check_stdio_writers_test.py"));
+    const tests_wired = b.addSystemCommand(&.{"python3"});
+    tests_wired.addFileArg(b.path("tools/check_tests_wired.py"));
+    tests_wired.addDirectoryArg(b.path("."));
 
     const cli_test_step = b.step("test-cli", "Run hermetic Python CLI checks (requires python3)");
     for ([_][]const u8{
@@ -406,7 +407,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&xdg_reads.step);
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&stdio_writers.step);
-    test_step.dependOn(&stdio_writers_test.step);
+    test_step.dependOn(&tests_wired.step);
+    for ([_][]const u8{
+        "tests/check_stdio_writers_test.py",
+        "tests/check_box_glyphs_test.py",
+        "tests/verify_bbr_control_test.py",
+    }) |script| {
+        const python_test = b.addSystemCommand(&.{"python3"});
+        python_test.addFileArg(b.path(script));
+        test_step.dependOn(&python_test.step);
+    }
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
 }
