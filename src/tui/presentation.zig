@@ -30843,6 +30843,24 @@ test "M24 browser Session replacement and return keep the Browser state" {
     try testing.expect(presentation.projection().browser == null);
 }
 
+test "M24 browser a replacement that the Browser did not start keeps the Browser visible" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("check24", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try browserKey(&presentation, 'b');
+    try testing.expect(presentation.projection().browser != null);
+    _ = try takeBrowserRepositoriesCommand(&presentation);
+    _ = try takeBrowserPullRequestsCommand(&presentation, "repo");
+
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') } } });
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
+    try testing.expect(presentation.projection().browser != null);
+}
+
 test "M24 browser a stale completion changes nothing and frees its payload" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
