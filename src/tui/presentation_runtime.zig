@@ -425,15 +425,15 @@ test "M21 kernel cache Frame launch failure and closed sink preserve content and
         const session = try @import("session.zig").create(testing.allocator);
         session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
         session.source = .{ .local = .{ .common_dir = "." } };
-        session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/b.zig b/b.zig\n--- a/b.zig\n+++ b/b.zig\n@@ -1 +1 @@\n-old\n+new\n");
+        session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/b.zig b/b.zig\n--- a/b.zig\n+++ b/b.zig\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/c.zig b/c.zig\n--- a/c.zig\n+++ b/c.zig\n@@ -1 +1 @@\n-old\n+new\n");
         try session.initializeEnrichment();
-        session.enrichment.focus(0);
+        session.enrichment.focus(.single(0));
         const enrichment = @import("file_enrichment.zig");
         var fake: bbr.http.FakeHttpClient = .{ .status = 200, .body = "cached needle\n" };
         const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
         var plain: bbr.highlight.PlainHighlighter = .{};
-        for (0..if (release_holds) @as(usize, 2) else 1) |index| {
-            if (index == 1) session.enrichment.hold(index);
+        for (([_]usize{ 0, 2 })[0..if (release_holds) 2 else 1]) |index| {
+            if (index == 2) session.enrichment.hold(index);
             var result = try enrichment.enrich(testing.allocator, client, plain.highlighter(), .{
                 .repo = "repo",
                 .status = .modified,
@@ -453,11 +453,11 @@ test "M21 kernel cache Frame launch failure and closed sink preserve content and
         });
         defer state.deinit();
         if (release_holds) {
-            session.enrichment.finishLeaseDeferred(1);
+            session.enrichment.finishLeaseDeferred(2);
             try state.dispatch(.{ .action = .open_review_search });
             try state.dispatch(.{ .key = .{ .codepoint = @import("keymap.zig").special.escape } });
         } else {
-            try state.dispatch(.{ .action = .next_file });
+            try state.dispatch(.{ .action = .to_bottom });
             try state.dispatch(.ensure_focused_enrichment);
         }
         const before = state.projection().review.?.frame;
@@ -485,9 +485,9 @@ test "M21 kernel cache Frame launch failure and closed sink preserve content and
         }
         if (closed) {
             try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
-            try testing.expectEqual(@as(?usize, 0), session.enrichment.focused_file);
-            try testing.expect(session.enrichment.file(if (release_holds) 1 else 0).new == .content);
-        } else try testing.expect(session.enrichment.file(if (release_holds) 1 else 0).new == .pending);
+            try testing.expectEqual(enrichment.FileRange.single(0), session.enrichment.focused);
+            try testing.expect(session.enrichment.file(if (release_holds) 2 else 0).new == .content);
+        } else try testing.expect(session.enrichment.file(if (release_holds) 2 else 0).new == .pending);
     };
 }
 

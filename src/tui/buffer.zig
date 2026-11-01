@@ -251,7 +251,7 @@ pub const BuildOptions = struct {
     /// Shared terminal geometry for ReviewCard wrapping.
     card_width: usize = 80,
     cell_metrics: CellMetrics = .bytes,
-    collapsed_rows: usize = 6,
+    collapsed_rows: usize = 9,
     emphasis_cache: ?*const EmphasisCache = null,
     mention_names: *const @import("review_body.zig").MentionNames = &.empty,
 };
@@ -275,6 +275,16 @@ pub fn disclosureKey(row: Row) ?DisclosureKey {
     return switch (row) {
         .disclosure => |value| value.key,
         .comment, .draft => |card| if (card.resolved_thread) .{ .resolved_thread = card.owner.comment } else if (card.part == .disclosure_footer) .{ .review_card = card.owner } else null,
+        else => null,
+    };
+}
+
+/// The ReviewCard disclosure that the `[...]` row of a collapsed card expands.
+/// It is not a disclosure control, so Review Search still reveals through the
+/// disclosure footer.
+pub fn hiddenIndicatorKey(row: Row) ?DisclosureKey {
+    return switch (row) {
+        .comment, .draft => |card| if (card.hidden_indicator) .{ .review_card = card.owner } else null,
         else => null,
     };
 }
@@ -3388,7 +3398,8 @@ test "M23 ancestry shares a width unit and caps indentation at readable body wid
         .{ .width = 80, .depth = 3, .unit = 3, .indent = 10, .body_width = 66 },
         .{ .width = 99, .depth = 3, .unit = 3, .indent = 10, .body_width = 85 },
     };
-    const body = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnop";
+    // The body wraps into at least three rows, so one collapsed row hides two or more.
+    const body = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnop" ** 3;
     for (cases) |case| for ([_]Layout{ .unified, .side_by_side }) |layout| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
@@ -3412,6 +3423,7 @@ test "M23 ancestry shares a width unit and caps indentation at readable body wid
                 try testing.expectEqual(depth * case.unit > case.width -| 45, std.mem.indexOf(u8, card.text(), "depth") != null);
             }
             if (card.draftItem().local_id != case.depth + 1 or card.part != .body) continue;
+            if (card.hidden_indicator) continue;
             var columns: usize = 0;
             for (card.segments) |segment| columns += segment.text.len;
             try testing.expectEqual(case.body_width, columns);

@@ -23,7 +23,9 @@ pub const PaneRects = struct {
     sidebar: Rect,
     diff: Rect,
     sidebar_content: Rect,
+    /// The DiffPane body, right of the Selected Version marker column.
     diff_content: Rect,
+    version_marker: Rect = .{},
 };
 
 pub const PaneFocus = enum { sidebar, diff };
@@ -102,6 +104,11 @@ pub fn reviewSearchGeometry(geometry: Geometry) ?ReviewSearchGeometry {
 
 fn area(geometry: Geometry) Rect {
     return .{ .width = geometry.cols, .height = geometry.rows };
+}
+
+/// The help lines that the help Overlay shows at once.
+pub fn helpBodyRows(geometry: Geometry, params: layouts.Help) u16 {
+    return view.solve(layouts.HelpSlot, layouts.help, params, area(geometry)).get(.body).content.height;
 }
 
 pub const OverlayTarget = struct {
@@ -263,7 +270,7 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
         if (index < frame.file_tree.entries.len) return .{ .sidebar_entry = index };
         return .sidebar;
     }
-    if (frame.panes.diff_content.contains(col, row)) {
+    if (frame.panes.diff_content.contains(col, row) or frame.panes.version_marker.contains(col, row)) {
         const index = frame.navigation.scroll + row - frame.panes.diff_content.y;
         if (index < frame.visual_rows.len) return .{ .diff_row = index };
         return .diff;
@@ -277,7 +284,8 @@ pub fn paneRects(geometry: Geometry) PaneRects {
         .sidebar = rects.get(.sidebar).border,
         .diff = rects.get(.diff).border,
         .sidebar_content = rects.get(.sidebar).content,
-        .diff_content = rects.get(.diff).content,
+        .diff_content = rects.get(.diff_body).content,
+        .version_marker = rects.get(.version_marker).content,
     };
 }
 
@@ -1135,7 +1143,15 @@ test "View Pane geometry keeps the cells of the previous formulas" {
             const diff_x: u16 = @min(sidebar_width, geometry.cols);
             const sidebar: Rect = .{ .x = 0, .y = 0, .width = sidebar_width, .height = geometry.rows };
             const diff: Rect = .{ .x = diff_x, .y = 0, .width = geometry.cols - diff_x, .height = geometry.rows };
-            return .{ .sidebar = sidebar, .diff = diff, .sidebar_content = content(sidebar), .diff_content = content(diff) };
+            const inner = content(diff);
+            const marker_width = @min(inner.width, 1);
+            return .{
+                .sidebar = sidebar,
+                .diff = diff,
+                .sidebar_content = content(sidebar),
+                .diff_content = .{ .x = inner.x + marker_width, .y = inner.y, .width = inner.width - marker_width, .height = inner.height },
+                .version_marker = .{ .x = inner.x, .y = inner.y, .width = marker_width, .height = inner.height },
+            };
         }
     };
     var cols: u16 = 5;
@@ -1149,6 +1165,7 @@ test "View Pane geometry keeps the cells of the previous formulas" {
             try expectSameCells(expected.diff, actual.diff);
             try expectSameCells(expected.sidebar_content, actual.sidebar_content);
             try expectSameCells(expected.diff_content, actual.diff_content);
+            try expectSameCells(expected.version_marker, actual.version_marker);
         }
     }
 }
