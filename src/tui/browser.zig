@@ -595,9 +595,16 @@ pub const Browser = struct {
     /// Recomputes the Browser Entries and moves the cursor to its Selection.
     /// A missing PullRequest falls back to its Repository row. A missing
     /// Repository falls back to the row at the same index. On error the
-    /// previous Entries stay.
+    /// Browser has no Entries, because the previous Entries can index past
+    /// changed data. The cursor keeps its Selection for the next rebuild.
     pub fn rebuild(self: *Browser) Allocator.Error!void {
-        const next = try entries(self.allocator, self.nodes.items, self.repositories, self.sort);
+        const next = entries(self.allocator, self.nodes.items, self.repositories, self.sort) catch |err| {
+            self.allocator.free(self.entries);
+            self.entries = &.{};
+            self.cursor_index = null;
+            self.scroll = 0;
+            return err;
+        };
         self.allocator.free(self.entries);
         self.entries = next;
         const previous_index = self.cursor_index;
@@ -653,7 +660,8 @@ pub const Browser = struct {
     }
 
     /// Switches between the updated-time Sort and the name Sort. The cursor
-    /// keeps its Selection. On error the previous Sort and Entries stay.
+    /// keeps its Selection. On error the previous Sort stays, and the
+    /// Browser has no Entries until the next rebuild.
     pub fn cycleSort(self: *Browser) Allocator.Error!void {
         const previous = self.sort;
         self.sort = switch (previous) {
