@@ -2359,7 +2359,10 @@ pub fn drawBrowser(scratch: std.mem.Allocator, win: vaxis.Window, projection: br
         const entry = projection.entries[index];
         switch (entry) {
             .repository => |node| drawBrowserRepository(scratch, content, row, projection.nodes[node], style),
-            .pull_request => drawBrowserPullRequest(scratch, content, row, projection.pullRequest(entry).?, style),
+            .pull_request => |pr| {
+                const cached = projection.nodes[pr.repository].pull_requests.settled == .cached;
+                drawBrowserPullRequest(scratch, content, row, projection.pullRequest(entry).?, if (cached) dimmed(style) else style);
+            },
             .message => |message| drawBrowserMessage(scratch, content, row, message, style),
         }
     }
