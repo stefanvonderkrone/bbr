@@ -31235,7 +31235,7 @@ test "M24 browser shutdown starts no Browser load and waits for the loads in fli
     try testing.expect(presentation.readyToExit());
 }
 
-test "M24 browser s switches the Sort, keeps the Selection, and survives a return and a Session replacement" {
+test "M24 browser s switches the Sort, keeps the Selection, and survives a return, a Session replacement, and a failed replacement" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
@@ -31279,9 +31279,17 @@ test "M24 browser s switches the Sort, keeps the Selection, and survives a retur
     try expectBrowserPullRequests(&presentation, "repo", &.{ 1, 2 });
     try testing.expectEqual(@as(u64, 1), browserCursor(&presentation).?.pull_request.id);
     try testing.expectEqual(@as(?usize, 1), presentation.projection().browser.?.cursor);
+
+    try browserKey(&presentation, 's');
+    try browserKey(&presentation, keymap_mod.special.escape);
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("check24", "repo", 3) });
+    const failing = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{ .command_id = failing.command_id, .intent = failing.intent, .outcome = .{ .failed = error.ConnectionResetByPeer } } });
+    try browserKey(&presentation, 'b');
+    try expectBrowserPullRequests(&presentation, "repo", &.{ 2, 1 });
 }
 
-test "M24 browser Session replacement keeps the Browser scroll" {
+test "M24 browser a Session replacement and a failed replacement keep the Browser scroll" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -31302,6 +31310,14 @@ test "M24 browser Session replacement keeps the Browser scroll" {
     try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
     try browserKey(&presentation, 'b');
     try expectNoCommand(&presentation);
+    try testing.expectEqual(scroll, presentation.projection().browser.?.scroll);
+    try testing.expectEqual(cursor, presentation.projection().browser.?.cursor);
+
+    try browserKey(&presentation, keymap_mod.special.escape);
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("check24", "repo", 3) });
+    const failing = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{ .command_id = failing.command_id, .intent = failing.intent, .outcome = .{ .failed = error.ConnectionResetByPeer } } });
+    try browserKey(&presentation, 'b');
     try testing.expectEqual(scroll, presentation.projection().browser.?.scroll);
     try testing.expectEqual(cursor, presentation.projection().browser.?.cursor);
 }
