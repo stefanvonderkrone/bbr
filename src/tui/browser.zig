@@ -358,6 +358,9 @@ pub const Browser = struct {
     entries: []Entry = &.{},
     cursor: ?Selection = null,
     cursor_index: ?usize = null,
+    /// The cursor row before a failed rebuild cleared `cursor_index`. The
+    /// next rebuild uses it to place a lost Selection.
+    fallback_row: ?usize = null,
     /// The Browser Start PullRequest. The cursor moves to it when its row
     /// appears, and a cursor Motion clears it.
     pending_focus: ?Selection = null,
@@ -596,18 +599,21 @@ pub const Browser = struct {
     /// A missing PullRequest falls back to its Repository row. A missing
     /// Repository falls back to the row at the same index. On error the
     /// Browser has no Entries, because the previous Entries can index past
-    /// changed data. The cursor keeps its Selection for the next rebuild.
+    /// changed data. The cursor keeps its Selection and its row for the next
+    /// rebuild.
     pub fn rebuild(self: *Browser) Allocator.Error!void {
         const next = entries(self.allocator, self.nodes.items, self.repositories, self.sort) catch |err| {
             self.allocator.free(self.entries);
             self.entries = &.{};
+            if (self.cursor_index) |index| self.fallback_row = index;
             self.cursor_index = null;
             self.scroll = 0;
             return err;
         };
         self.allocator.free(self.entries);
         self.entries = next;
-        const previous_index = self.cursor_index;
+        const previous_index = self.cursor_index orelse self.fallback_row;
+        self.fallback_row = null;
 
         if (self.pending_focus) |pending| {
             if (self.indexOf(pending) != null) {
