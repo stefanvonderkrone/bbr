@@ -881,6 +881,60 @@ fn usage() error{InvalidArguments} {
     return error.InvalidArguments;
 }
 
+/// How `tools/m28-baseline-run.sh` reacts to a failed run. The value is the exit code.
+pub const Failure = enum(u8) {
+    /// A rerun can succeed, for example after a network outage. The script waits and runs again.
+    transient = 1,
+    /// A rerun fails in the same way. The script stops, and a human must act.
+    permanent = 3,
+};
+
+/// The errors that the harness and the Bitbucket client return by name.
+const NamedError = bbr.bitbucket.ApiError || error{
+    CheckpointMismatch,
+    FileCountChanged,
+    InvalidArguments,
+    InvalidCheckpoint,
+    InvalidLine,
+    InvalidRunCount,
+    MissingCredential,
+    OutOfMemory,
+    ReplacementFailed,
+    RetriesExhausted,
+    ReviewSearchUnavailable,
+    RunInProgress,
+    ScenarioStalled,
+    Timeout,
+    UnsupportedCommand,
+};
+
+fn failureOf(err: NamedError) Failure {
+    return switch (err) {
+        // The measuring client retries every network error, 429, and 5xx before it gives up.
+        error.RetriesExhausted, error.Timeout, error.RateLimited, error.ServerError => .transient,
+        // A resumed run starts with an empty heap.
+        error.OutOfMemory => .transient,
+        error.Unauthorized, error.Forbidden, error.BadRequest, error.NotFound, error.Conflict => .permanent,
+        error.UnexpectedStatus, error.MalformedResponse => .permanent,
+        error.InvalidArguments, error.MissingCredential, error.RunInProgress, error.CheckpointMismatch => .permanent,
+        error.InvalidCheckpoint, error.FileCountChanged, error.InvalidLine, error.InvalidRunCount => .permanent,
+        error.UnsupportedCommand, error.ScenarioStalled, error.ReviewSearchUnavailable, error.ReplacementFailed => .permanent,
+    };
+}
+
+fn named(name: []const u8) ?NamedError {
+    inline for (@typeInfo(NamedError).error_set.?) |e| if (std.mem.eql(u8, e.name, name)) return @field(NamedError, e.name);
+    return null;
+}
+
+/// The exit code of a failed run. An unnamed error comes from the operating system, such as a
+/// full disk. It counts as transient. A wrong retry costs at most five waits of 15 minutes.
+/// A wrong stop can leave an overnight run idle.
+pub fn exitCode(err: anyerror) u8 {
+    const failure: Failure = if (named(@errorName(err))) |known| failureOf(known) else .transient;
+    return @intFromEnum(failure);
+}
+
 /// Runs the scenario chain for one PullRequest and prints the header, one line
 /// for each scenario, and the merged PullRequest check. A rerun with the same
 /// options resumes at the first unfinished segment.
@@ -2135,6 +2189,35 @@ fn writeCauses(out: *std.Io.Writer, causes: std.EnumSet(Cause)) !void {
 }
 
 const testing = std.testing;
+
+test "M28 cache a permanent failure exits with code 3 and a transient failure with code 1" {
+    for ([_]anyerror{
+        error.InvalidArguments,  error.MissingCredential, error.RunInProgress,      error.CheckpointMismatch,
+        error.InvalidCheckpoint, error.FileCountChanged,  error.UnsupportedCommand, error.ScenarioStalled,
+        error.InvalidRunCount,   error.Unauthorized,      error.Forbidden,          error.NotFound,
+    }) |err| try testing.expectEqual(@as(u8, 3), exitCode(err));
+    for ([_]anyerror{ error.RetriesExhausted, error.OutOfMemory, error.NoSpaceLeft, error.ServerError }) |err|
+        try testing.expectEqual(@as(u8, 1), exitCode(err));
+}
+
+test "M28 cache every error that the harness returns has a failure class" {
+    const source = @embedFile("file_cache.zig");
+    const code = source[0..std.mem.indexOf(u8, source, "\nconst testing = std.testing;").?];
+    var unclassified: usize = 0;
+    for ([_][]const u8{ "return error.", "catch error." }) |prefix| {
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, code, at, prefix)) |found| {
+            const start = found + prefix.len;
+            var end = start;
+            while (end < code.len and (std.ascii.isAlphanumeric(code[end]) or code[end] == '_')) end += 1;
+            at = end;
+            if (named(code[start..end]) != null) continue;
+            std.debug.print("unclassified harness error: {s}\n", .{code[start..end]});
+            unclassified += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), unclassified);
+}
 
 /// A virtual clock. Time moves only by `step_ns` on each `now` and by each sleep.
 const FakeClock = struct {

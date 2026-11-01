@@ -157,6 +157,12 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_file_cache_bench.addArgs(args);
     const file_cache_bench_step = b.step("bench-file-cache", "Run the opt-in M28 File cache benchmark");
     file_cache_bench_step.dependOn(&run_file_cache_bench.step);
+    const install_file_cache_bench_step = b.step("install-bench-file-cache", "Install bbr-file-cache-bench for tools/m28-baseline-run.sh");
+    install_file_cache_bench_step.dependOn(&b.addInstallArtifact(file_cache_bench, .{}).step);
+    const file_cache_bench_exit = b.addRunArtifact(file_cache_bench);
+    file_cache_bench_exit.addArg("summarize");
+    file_cache_bench_exit.expectExitCode(3);
+    _ = file_cache_bench_exit.captureStdErr(.{});
 
     // Live smoke check against real Bitbucket (opt-in; needs BITBUCKET_* env):
     //   zig build check -- <repo-slug> <pr-id>
@@ -428,6 +434,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&file_acquisition_bench.step);
     test_step.dependOn(&buffer_search_bench.step);
     test_step.dependOn(&file_cache_bench.step);
+    test_step.dependOn(&file_cache_bench_exit.step);
 }
 
 fn resolveVersion(b: *std.Build) []const u8 {
