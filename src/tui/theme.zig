@@ -203,6 +203,15 @@ pub const Theme = struct {
         return self.resolveStyle(style);
     }
 
+    /// A key in the help Overlay: the blue accent in bold on the Overlay
+    /// background.
+    pub fn helpKeyStyle(self: Theme) Style {
+        var style = self.picker;
+        style.fg = self.accent;
+        style.bold = true;
+        return style;
+    }
+
     pub fn resolvedThreadStyle(self: Theme) Style {
         return self.resolveStyle(.{ .fg = self.status_added, .bg = self.context.bg, .bold = true });
     }

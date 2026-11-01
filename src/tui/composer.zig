@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const bbr = @import("bbr");
+const search = @import("search.zig");
 
 const DraftKind = bbr.review.DraftKind;
 const CommentTarget = bbr.review.CommentTarget;
@@ -89,9 +90,9 @@ pub const Composer = struct {
         try self.body_buf.append(self.allocator, '\n');
     }
 
-    /// Delete the last byte. No-op on an empty body.
+    /// Delete the last scalar. No-op on an empty body.
     pub fn backspace(self: *Composer) void {
-        if (self.body_buf.items.len > 0) self.body_buf.items.len -= 1;
+        self.body_buf.items.len = search.lastScalarStart(self.body_buf.items);
     }
 
     /// Delete the word before the end (vim insert-mode `ctrl-w`): drop trailing
@@ -150,6 +151,9 @@ test "typing, newline, and backspace build the body" {
     try testing.expectEqualStrings("hello\nworld", comp.body());
     try testing.expect(!comp.isBlank());
 
+    comp.backspace();
+    try testing.expectEqualStrings("hello\nworl", comp.body());
+    try comp.insert("ä");
     comp.backspace();
     try testing.expectEqualStrings("hello\nworl", comp.body());
 }

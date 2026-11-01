@@ -71,6 +71,12 @@ jobs:
       - name: Check formatting
         if: matrix.target == 'linux-x86_64'
         run: zig fmt --check build.zig src tests
+      - name: Test release preparation
+        if: matrix.target == 'linux-x86_64'
+        run: python3 tests/prepare_release_test.py
+      - name: Test release publication
+        if: matrix.target == 'linux-x86_64'
+        run: python3 tests/publish_release_test.py
       - name: RE2 wrapper
         run: zig build test-re2 --summary all
       - name: Dynamic UserGrammar load
@@ -79,3 +85,14 @@ jobs:
         run: zig build test-user-grammar --summary all
       - name: Complete hermetic suite
         run: zig build test --summary all
+      - name: Install External Edit test tools
+        if: matrix.target == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux neovim
+      - name: Build bbr
+        if: matrix.target == 'linux-x86_64'
+        run: zig build --summary all
+      - name: External Edit terminal lifecycle
+        if: matrix.target == 'linux-x86_64'
+        run: python3 tests/external_edit_pty_test.py
