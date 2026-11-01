@@ -49,3 +49,8 @@ This ticket then waits for them.
 2026-11-01: The ADR number is no longer fixed.
 M27 keeps ADR-0014, so this ticket takes the next free number when it runs.
 The merge plan for all branches records this choice.
+
+2026-11-01: Review finding M28-7. No baseline and no ADR exist yet, and this ticket must not invent either.
+The order is fixed. A human does the live runs of ticket 02. Ticket 03 then decides on the recorded results.
+Only then does this ticket write the ADR, with the next free ADR number at that time.
+The pull request of the M28 branch claims only ticket 01.

@@ -40,3 +40,9 @@ If the outcome is `Delay`:
 - [ ] With `Delay`, `## Answer` names the remaining candidates and the reason for each dropped candidate.
 - [ ] With `Delay`, the new tickets exist from 05, and ticket 04 lists them in `Blocked by:`.
 - [ ] `python3 tools/check_agent_docs.py` passes.
+
+## Comments
+
+2026-11-01: Review finding M28-7. No baseline exists yet.
+This ticket starts only after a human records the live runs of ticket 02.
+Ticket 04 writes the ADR only after this ticket records its outcome.

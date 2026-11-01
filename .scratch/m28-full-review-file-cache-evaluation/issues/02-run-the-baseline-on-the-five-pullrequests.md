@@ -13,7 +13,22 @@ This ticket needs the user's Credential and live network access, so an agent can
 The runs measure only the current LRU with its default budget of 256 MiB.
 Do not run any candidate policy in this ticket.
 
+No baseline exists yet. The M28 order is fixed:
+
+1. A human does the live runs of this ticket.
+2. Ticket 03 decides on the recorded results.
+3. Ticket 04 then writes the ADR with the next free ADR number.
+
+The pull request of the M28 branch claims only ticket 01.
+It holds no baseline and no ADR.
+
 ## Steps
+
+Before run 1:
+
+1. Read `range_files` and `session_requests` in the `header` line of each PullRequest, as "Plan the runs" describes.
+2. Recompute the requests and the time of each PullRequest with the formulas in "Expected duration".
+3. Plan the run days with these numbers, not with the table values.
 
 For each run:
 
@@ -23,7 +38,8 @@ For each run:
 3. Start `tools/m28-baseline-run.sh` in the background, as "Start a run" describes.
    The script runs PullRequest A to PullRequest E one after another.
 4. Watch the progress.
-   If the run stops, run the same start command again to resume it.
+   If the script stops with exit code `1`, run the same start command again to resume it.
+   If the script stops with exit code `3`, fix the cause first, as "Resume a run" describes.
 5. If a PullRequest result has `failures` above `0`, run that PullRequest again.
 6. Copy the checkpoint files of the run into `## Completion` in this ticket.
 
@@ -77,6 +93,38 @@ zig build bench-file-cache -- remote pr-webapp <pull-request> --scenarios s1 --d
   --run-label smoke --network-label smoke --output-dir ~/m28-runs
 ```
 
+### Plan the runs
+
+Do this once before run 1.
+The duration table below uses planning values for W and L that nobody measured.
+The `header` line of each PullRequest prints the real values.
+The harness prints the header after the Session load and the probe, before S1 starts.
+For each PullRequest, run the smoke test command with that PullRequest number:
+
+```sh
+zig build bench-file-cache -- remote pr-webapp <pull-request> --scenarios s1 --dwell-ms 0 \
+  --run-label smoke --network-label smoke --output-dir ~/m28-runs
+```
+
+When the `header` line appears, press Ctrl-C.
+The header costs about L + 2W + 5 requests, so the five headers cost much less than the hourly budget.
+Read `files`, `range_files`, and `session_requests` from each header.
+Put them into the formulas in "Expected duration" as F, W, and L.
+
+You can also read the header of each PullRequest during run 1.
+But then the plan is late, because run 1 reaches PullRequest E last.
+
+No way exists to measure W or L without Bitbucket:
+
+- W comes from the Buffer of the loaded Session at the fixed Frame of 200 × 50 cells.
+  The Buffer has rows for the Comments of the PullRequest, and only Bitbucket has the Comments.
+  A local clone gives the Git diff, but Bitbucket can show another diff, for example for renames and binary Files.
+  A harness mode that builds a Session from a local diff is also new code, not a small change.
+- L is the requests of one Session load.
+  `session.loadWith` sends one request each for the PullRequest, the account, and the raw diff.
+  The Comment requests add one request per Comment page.
+  Only Bitbucket knows the Comment count, so L needs Bitbucket.
+
 ### Start a run
 
 Start the run detached from the terminal:
@@ -86,9 +134,30 @@ caffeinate -i nohup tools/m28-baseline-run.sh run1 office-wired ~/m28-runs > ~/m
 ```
 
 The script takes the run label, the network label, and the output directory.
-It runs `zig build bench-file-cache -- remote` for each PullRequest with these values.
-If one PullRequest fails, the script waits 15 minutes and runs it again.
-After 6 failed attempts for one PullRequest, the script stops with exit code `1`.
+First it runs `zig build install-bench-file-cache`.
+This builds the harness and installs it as `zig-out/bin/bbr-file-cache-bench`.
+Then it runs `zig-out/bin/bbr-file-cache-bench remote` for each PullRequest with these values.
+The script runs the binary, not `zig build bench-file-cache`, because `zig build` gives every failure exit code `1` or `2`.
+
+The harness exits with one of these codes:
+
+- `0`: the PullRequest is finished.
+- `1`: a transient failure. A rerun can succeed, for example after a network outage.
+  The script waits 15 minutes and runs the PullRequest again.
+  After 6 failed attempts for one PullRequest, the script stops with exit code `1`.
+- `3`: a permanent failure. A rerun fails in the same way.
+  The script stops at once with exit code `3` and prints `m28: #<pull-request> failed permanently, stop`.
+
+The last log line before that message names the error, for example `error: CheckpointMismatch`.
+These errors are permanent:
+
+- A wrong option or an invalid Credential: `InvalidArguments`, `MissingCredential`, `Unauthorized`, `Forbidden`, `NotFound`, `BadRequest`, `Conflict`.
+- A Bitbucket response that the harness cannot read: `UnexpectedStatus`, `MalformedResponse`.
+- A run file problem: `RunInProgress`, `CheckpointMismatch`, `InvalidCheckpoint`.
+- A changed PullRequest: `FileCountChanged`.
+- A harness defect: `UnsupportedCommand`, `ScenarioStalled`, `ReviewSearchUnavailable`, `ReplacementFailed`.
+
+These errors are transient: `RetriesExhausted`, `Timeout`, `RateLimited`, `ServerError`, `OutOfMemory`, and every error from the operating system, such as a full disk.
 
 Use the same run label for every PullRequest of one run, for example `run1`, `run2`, and `run3`.
 `summarize` groups the lines by the run label.
@@ -115,11 +184,19 @@ kill -- -"$(cat ~/m28-runs/run1.pid)"
 ```
 
 The shell gives the background job its own process group.
-This command stops every process of the group: `caffeinate`, the script, the build runner, and the benchmark.
+This command stops every process of the group: `caffeinate`, the script, and the benchmark.
 
 ### Resume a run
 
-After a crash, a kill, or a reboot, run the same start command again.
+After a crash, a kill, a reboot, or exit code `1`, run the same start command again.
+After exit code `3`, fix the cause first, then run the same start command again:
+
+- `CheckpointMismatch`: use the options of the first start.
+- `RunInProgress`: stop the other harness.
+- `MissingCredential`, `Unauthorized`, or `Forbidden`: fix the Credential, as "Prepare" describes.
+- `FileCountChanged`: the PullRequest changed during the run.
+  Record it under `## Comments`, and set this ticket to `needs-info`.
+- A harness defect or another permanent error: record it under `## Comments`, and set this ticket to `needs-info`.
 
 - A finished PullRequest sends no request. The harness prints its stored lines.
 - An unfinished PullRequest starts again at its first unfinished segment.
@@ -186,9 +263,9 @@ Each scenario whose `request_estimate` fits in the budget can also wait up to on
 
 The table uses the planning values W = 5 and L = 4.
 Nobody measured these values for the five PullRequests.
-The header of each run prints the real `range_files` and `session_requests`.
-The optional smoke test prints them for PullRequest E.
-Recompute the table with these values before you plan the runs.
+"Plan the runs" tells how to read the real values before run 1.
+Recompute the table with them before you plan the run days.
+The formulas match `Scenario.requestEstimate` in `src/benchmark/file_cache.zig`, with 3 Session replacements of 20 File Jumps each in S7 and S8.
 
 The rows of this table named the benchmark PullRequests. They are not in the repository.
 
@@ -234,7 +311,7 @@ Look for these values:
   `summarize` compares the S4 `complete_result_ms` with the S6 `complete_result_ms` instead.
 - `low_samples=true` means fewer than 20 refetch samples. The p95 is then the maximum.
 - For a merged PullRequest, `not_found_sides` and `hunk_mismatch_files` must be `0`. If not, record the PullRequest. Ticket 03 decides how to use it.
-- A line `error=unsupported_command` or an error such as `ScenarioStalled` stops the run.
+- A line `error=unsupported_command` or an error such as `ScenarioStalled` stops the run with exit code `3`.
   Record the error under `## Comments`, and set this ticket to `needs-info`.
 
 The log also holds these notes:
@@ -242,11 +319,14 @@ The log also holds these notes:
 - `resume skip=` names the finished scenarios that a resumed run skips.
 - `segment done=` names a finished segment.
 - `give_up attempts=8` means that one request failed 8 times.
-  The harness keeps the checkpoint, and the script runs the PullRequest again.
+  The harness keeps the checkpoint and exits with code `1`, and the script runs the PullRequest again.
+- `m28: #<pull-request> failed attempt <n> of 6 with exit code 1, retry in 900 s` is a transient failure.
+- `m28: #<pull-request> failed permanently, stop` follows an exit code `3`.
+  The line before it names the error. "Resume a run" tells what to do.
 - `checkpoint mismatch key=<key>` means that an option differs from the checkpoint.
-  Use the options of the first start.
+  The harness exits with code `3`. Use the options of the first start.
 - `another harness uses this output directory` means that a second harness runs.
-  Stop one of them.
+  The harness exits with code `3`. Stop one of them.
 
 ### Summarize
 
@@ -281,3 +361,62 @@ Check this before you paste it.
 - [ ] The `summarize` outcome for the runs is recorded.
 - [ ] A third run exists when the first two runs are `Inconclusive`.
 - [ ] The recorded output holds no source text, File path, query text, Comment text, or URL.
+
+## Comments
+
+2026-11-01: Review finding M28-12. `tools/m28-baseline-run.sh` retried every failure 6 times with 15-minute waits.
+A permanent failure, such as `CheckpointMismatch` or `MissingCredential`, used about 75 minutes before the script stopped.
+The harness now classifies each error in `failureOf` in `src/benchmark/file_cache.zig`.
+It exits with code `3` for a permanent failure and with code `1` for a transient failure.
+`zig build` cannot pass the child exit code through.
+The installed build runner ends with `process.exit(code)`, and `code` is only 0, 1, or 2.
+See `lib/zig/compiler/build_runner.zig` lines 974 to 980 of Zig 0.16.0.
+So the script now runs `zig build install-bench-file-cache` once and then runs `zig-out/bin/bbr-file-cache-bench`.
+It stops at once on exit code `3`.
+Nobody executed the changed script, because the M28 rest work bans every run of it, also with a stubbed `zig`.
+`sh -n` and `shellcheck` pass, and a review read checks the exit code paths.
+`zig build test` runs the real binary with `summarize` and no files, and it expects exit code `3`.
+
+2026-11-01: Review finding M28-10. `zig build test` compiled no benchmark executable, so CI missed a compile error in a benchmark root.
+A compile error in `src/benchmark_file_cache.zig` passed `zig build test` before the change.
+After the change, `zig build test` failed with `compile exe bbr-file-cache-bench ReleaseFast ... 1 errors`.
+The test step now depends on the compile steps of `bbr-bench`, `bbr-file-acquisition-bench`, `bbr-buffer-search-bench`, and `bbr-file-cache-bench`.
+
+2026-11-01: The formulas in "Expected duration" match `Scenario.requestEstimate`.
+The upper bound 16F + 778W + 8L + 5 agrees with the code for W = 5 and L = 4.
+For example, F = 100 gives 1,600 + 3,890 + 32 + 5 = 5,527 requests.
+No way exists to measure W or L without Bitbucket. "Plan the runs" gives the reason and the cheapest live way.
+
+2026-11-01: Review finding M28-7. No baseline and no ADR exist, and no agent can make them.
+This ticket needs the live runs by a human. Ticket 03 then decides, and ticket 04 then writes the ADR.
+The `Blocked by:` lines agree: 02 is blocked by 01, 03 by 02, and 04 by 03.
+The pull request of the M28 branch claims only ticket 01.
+
+2026-11-01: Review finding M28-13. Private PullRequest metadata is in the repository.
+`.scratch/m28-full-review-file-cache-evaluation/brief.md` lists the PullRequest numbers, File counts, binary File counts, changed lines, diff sizes, and the count of PullRequests that the user wrote.
+The "Benchmark PullRequests" table of the SPEC, the duration table of this ticket, and `tools/m28-baseline-run.sh` also name the PullRequests or their File counts.
+Evidence from local Git only, with no fetch:
+
+- Commit `78a54b9` added `brief.md`. `git branch -r --contains 78a54b9` shows `origin/m28-full-review-file-cache-evaluation`.
+- `origin/m28-full-review-file-cache-evaluation` is at `53c08e4`, and that commit has the brief table and the SPEC table.
+- `git branch -r --contains 5b385b7` shows no branch, so the local remote-tracking refs do not show that commit as pushed.
+  These refs can be out of date.
+
+So the data is already in the pushed history.
+A change at the branch tip does not remove it from that history.
+A history rewrite and a force push need the operator, so this work changes no file content.
+The operator can choose one of these options:
+
+1. Keep the data, because it holds no source text, File path, or Comment text.
+2. Remove the data at the tip only. The pushed history keeps it.
+3. Rewrite the branch history to remove the data, and force push. Every clone of the branch must reset.
+
+2026-11-01: Out of scope for M28, recorded only:
+
+- X-2: the Credential transport on `main` needs its own review.
+- X-3: the decoders of untrusted Bitbucket data need their own review.
+
+2026-11-01: `zig build test` under the hermetic environment of the M28 rest work fails one step, `tests/version_identity_test.sh`.
+That test fetches Zig dependencies over the network, and the environment blocks the network.
+The log shows `ConnectionRefused` for the dependency URLs.
+Every other step passes. So the failure comes from the environment, not from these changes.
