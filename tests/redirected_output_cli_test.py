@@ -8,7 +8,10 @@ import tempfile
 
 
 binary = str(Path(sys.argv[1]).resolve())
-env = {key: value for key, value in os.environ.items() if not key.startswith("BITBUCKET_") and key != "BBR_PROFILE"}
+data_home = tempfile.TemporaryDirectory()
+env = {key: value for key, value in os.environ.items()
+       if not key.startswith("BITBUCKET_") and key != "BBR_PROFILE" and not key.lower().endswith("_proxy")}
+env.update(XDG_DATA_HOME=data_home.name, BITBUCKET_USERNAME="user", BITBUCKET_TOKEN="token", BITBUCKET_WORKSPACE="workspace")
 prefix = b"written before bbr\n"
 
 
