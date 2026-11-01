@@ -82,3 +82,21 @@ Checks, run in `/Volumes/Work/t3-code/m22-durable-file-read-state`:
 - `zig build test-file-read --summary all` passed with 50 of 50 tests.
 - `zig build test --summary all` passed with 24 of 24 steps and 1423 of 1423 tests.
   The count before M22 was 1378.
+
+## Comments
+
+### Merge with main and review fixes M22-2, M22-5, and M22-6
+
+Merge commit `ecb8606` brings in `origin/main` at `497c86f`.
+Main made `keymap.helpSection` an exhaustive switch, so the merge did not compile.
+`toggle_file_read` now belongs to the Panes and Files help section, after `focus_file`.
+Both Actions act on the File under the cursor, so the help Overlay lists them together.
+
+Two AGENTS.md rows claimed more enforcement than exists.
+The `downgradeTo` row now covers only version 7 and later, because `downgrades` cannot make an older database.
+The row no longer quotes the compile error message, so the M30 test-name check does not misread it.
+The use of `downgradeTo` in a new migration test is a convention.
+The single receipt writer `Published.toggleFileRead` is also a convention.
+Both rows now say "convention (no check)" for those parts.
+
+After the fixes, `zig build test --summary all` passed with 24 of 24 steps and 1465 of 1465 tests.
