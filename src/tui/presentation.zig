@@ -7749,6 +7749,8 @@ pub const Presentation = struct {
     }
 
     fn landOnDraftCard(self: *Presentation, published: *Published, row: usize) void {
+        self.showDiffPane(published);
+        if (published.main_pane != .diff_pane) return;
         // The cursor leaves the Buffer Search match. A restore of the saved
         // disclosures could hide the Draft again, so the current ones stay.
         if (published.buffer_search.active != null) {
@@ -31246,6 +31248,34 @@ test "M29 overview Enter opens the entry and leaves an armed re-anchor alone" {
     try testing.expectEqual(@as(bbr.review.TempId, 1), presentation.projection().reanchor.?.temp_id);
     try testing.expectEqual(@as(?u32, 1), draftAnchor(&presentation, 1).to);
     try testing.expect(presentation.takeCommand() == null);
+}
+
+test "M29 overview a Submission Overlay jump to a shown Draft card shows the DiffPane" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "failed root" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 100, .rows = 16 },
+    });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testSession(testing.allocator, 1, 'a'));
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expect(presentation.projection().submission_tree != null);
+    try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    try testing.expect(presentation.takeCommand() == null);
+    try expectCursorOnHeader(&presentation, .{ .draft = 1 });
 }
 
 fn takeOverviewDestination(presentation: *Presentation) !*DisclosureBuild {
