@@ -7502,88 +7502,103 @@ pub const Presentation = struct {
         return false;
     }
 
+    fn fixedKeyInput(self: *const Presentation) ?help_mod.FixedKeyInput {
+        if (self.visibleSubmissionOverlay()) return .submission_overlay;
+        if (self.help != null) return .help;
+        if (self.unknown_resolution != null) return .unknown_resolution;
+        if (self.delete_confirmation != null) return .delete_confirmation;
+        if (self.published) |published| if (published.composer != null) return .composer;
+        if (self.list_overlay != null) return .list_overlay;
+        const published = self.published orelse return null;
+        if (published.buffer_search.input != null) return .buffer_search_input;
+        if (published.overview_query_input != null) return .comment_overview_query;
+        if (published.review_search.open) return .review_search;
+        return null;
+    }
+
+    /// A surface that reads keys outside the Keymap is a `FixedKeyInput` arm,
+    /// so the compiler asks for its section in `help.fixed_sections`.
     fn applyKey(self: *Presentation, key: keymap_mod.KeyStroke) !void {
-        if (self.visibleSubmissionOverlay()) {
-            self.applySubmissionTreeKey(key);
-            return;
-        }
-        if (self.help != null) {
-            self.applyHelpKey(key);
-            return;
-        }
-        if (self.unknown_resolution != null) {
-            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyUnknownResolutionInput(.cancel);
-            if (key.matches(keymap_mod.special.enter, .{})) return self.applyUnknownResolutionInput(.confirm);
-            if (key.matches(keymap_mod.special.backspace, .{})) return self.applyUnknownResolutionInput(.backspace);
-            if (key.text) |text| for (text) |byte| if (byte >= '0' and byte <= '9') self.applyUnknownResolutionInput(.{ .digit = byte - '0' });
-            return;
-        }
-        // The confirmation is keyboard-complete and captures everything else:
-        // no motion can drift the cursor away from the Draft it names.
-        if (self.delete_confirmation != null) {
-            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true }) or key.matches('n', .{}))
-                return self.applyDeleteConfirmationInput(.cancel);
-            if (key.matches(keymap_mod.special.enter, .{}) or key.matches('y', .{}))
-                return self.applyDeleteConfirmationInput(.confirm);
-            return;
-        }
-        if (self.published) |published| if (published.composer != null) {
-            if (self.external_edit_pending != null) return;
-            if (self.resolver.feed(self.dependencies.keymap, .composer, key) == .action)
-                return self.applyComposerInput(.external_edit);
-            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyComposerInput(.cancel);
-            if (key.matches('d', .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return self.applyComposerInput(.save);
-            if (key.matches(keymap_mod.special.enter, .{})) return self.applyComposerInput(.newline);
-            if (key.matches('w', .{ .ctrl = true })) return self.applyComposerInput(.delete_word);
-            if (key.matches('u', .{ .ctrl = true })) return self.applyComposerInput(.delete_to_line_start);
-            if (key.matches(keymap_mod.special.backspace, .{})) return self.applyComposerInput(.backspace);
-            if (key.text) |text| if (TextChunk.init(text)) |chunk| return self.applyComposerInput(.{ .insert = chunk }) else |_| {};
-            return;
-        };
-        if (self.list_overlay) |*overlay| {
-            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
-                self.closeListOverlay();
-            } else if (key.matches(keymap_mod.special.enter, .{})) {
-                try self.confirmListOverlay();
-            } else if (key.matches(keymap_mod.special.up, .{}) or key.matches('p', .{ .ctrl = true })) {
-                overlay.moveUp();
-            } else if (key.matches(keymap_mod.special.down, .{}) or key.matches('n', .{ .ctrl = true })) {
-                overlay.moveDown();
-            } else if (key.matches(keymap_mod.special.backspace, .{})) {
-                overlay.backspace(self.publishedFiles());
-            } else if (key.text) |text| overlay.insert(text, self.publishedFiles());
-            return;
-        }
-        if (self.published) |published| if (published.buffer_search.input != null) {
-            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.cancelBufferSearch();
-            if (key.matches(keymap_mod.special.enter, .{})) return self.acceptBufferSearch();
-            if (key.matches(keymap_mod.special.backspace, .{})) return try self.editBufferSearch(.backspace);
-            if (key.matches('w', .{ .ctrl = true })) return try self.editBufferSearch(.delete_word);
-            if (key.matches('u', .{ .ctrl = true })) return try self.editBufferSearch(.delete_all);
-            if (key.text) |text| return try self.insertBufferSearch(text);
-            return;
-        };
-        if (self.published) |published| if (published.overview_query_input) |*input| {
-            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.closeOverviewQuery(published, .{ .query = input.saved() });
-            if (key.matches(keymap_mod.special.enter, .{})) return self.closeOverviewQuery(published, null);
-            const query = published.overview.query();
-            if (key.matches(keymap_mod.special.backspace, .{})) return self.changeOverview(published, .{ .query = query[0..search.lastScalarStart(query)] });
-            if (key.matches('w', .{ .ctrl = true })) return self.changeOverview(published, .{ .query = query[0..search.wordStart(query)] });
-            if (key.matches('u', .{ .ctrl = true })) return self.changeOverview(published, .{ .query = "" });
-            if (key.text) |text| return self.insertOverviewQuery(published, text);
-            return;
-        };
-        if (self.published) |published| if (published.review_search.open) {
-            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.closeReviewSearch();
-            if (key.matches(keymap_mod.special.backspace, .{})) return self.editReviewSearch(.backspace);
-            if (key.matches('w', .{ .ctrl = true })) return self.editReviewSearch(.delete_word);
-            if (key.matches('k', .{ .ctrl = true })) return self.editReviewSearch(.delete_all);
-            switch (self.resolver.feed(self.dependencies.keymap, .review_search, key)) {
-                .action => |action| return self.applyAction(action),
-                else => {},
-            }
-            if (key.text) |text| self.insertReviewSearch(text);
-            return;
+        if (self.fixedKeyInput()) |fixed| switch (fixed) {
+            .submission_overlay => return self.applySubmissionTreeKey(key),
+            .help => return self.applyHelpKey(key),
+            .unknown_resolution => {
+                if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyUnknownResolutionInput(.cancel);
+                if (key.matches(keymap_mod.special.enter, .{})) return self.applyUnknownResolutionInput(.confirm);
+                if (key.matches(keymap_mod.special.backspace, .{})) return self.applyUnknownResolutionInput(.backspace);
+                if (key.text) |text| for (text) |byte| if (byte >= '0' and byte <= '9') self.applyUnknownResolutionInput(.{ .digit = byte - '0' });
+                return;
+            },
+            // The confirmation is keyboard-complete and captures everything else:
+            // no motion can drift the cursor away from the Draft it names.
+            .delete_confirmation => {
+                if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true }) or key.matches('n', .{}))
+                    return self.applyDeleteConfirmationInput(.cancel);
+                if (key.matches(keymap_mod.special.enter, .{}) or key.matches('y', .{}))
+                    return self.applyDeleteConfirmationInput(.confirm);
+                return;
+            },
+            .composer => {
+                if (self.external_edit_pending != null) return;
+                if (self.resolver.feed(self.dependencies.keymap, .composer, key) == .action)
+                    return self.applyComposerInput(.external_edit);
+                if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyComposerInput(.cancel);
+                if (key.matches('d', .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return self.applyComposerInput(.save);
+                if (key.matches(keymap_mod.special.enter, .{})) return self.applyComposerInput(.newline);
+                if (key.matches('w', .{ .ctrl = true })) return self.applyComposerInput(.delete_word);
+                if (key.matches('u', .{ .ctrl = true })) return self.applyComposerInput(.delete_to_line_start);
+                if (key.matches(keymap_mod.special.backspace, .{})) return self.applyComposerInput(.backspace);
+                if (key.text) |text| if (TextChunk.init(text)) |chunk| return self.applyComposerInput(.{ .insert = chunk }) else |_| {};
+                return;
+            },
+            .list_overlay => {
+                const overlay = &self.list_overlay.?;
+                if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+                    self.closeListOverlay();
+                } else if (key.matches(keymap_mod.special.enter, .{})) {
+                    try self.confirmListOverlay();
+                } else if (key.matches(keymap_mod.special.up, .{}) or key.matches('p', .{ .ctrl = true })) {
+                    overlay.moveUp();
+                } else if (key.matches(keymap_mod.special.down, .{}) or key.matches('n', .{ .ctrl = true })) {
+                    overlay.moveDown();
+                } else if (key.matches(keymap_mod.special.backspace, .{})) {
+                    overlay.backspace(self.publishedFiles());
+                } else if (key.text) |text| overlay.insert(text, self.publishedFiles());
+                return;
+            },
+            .buffer_search_input => {
+                if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.cancelBufferSearch();
+                if (key.matches(keymap_mod.special.enter, .{})) return self.acceptBufferSearch();
+                if (key.matches(keymap_mod.special.backspace, .{})) return try self.editBufferSearch(.backspace);
+                if (key.matches('w', .{ .ctrl = true })) return try self.editBufferSearch(.delete_word);
+                if (key.matches('u', .{ .ctrl = true })) return try self.editBufferSearch(.delete_all);
+                if (key.text) |text| return try self.insertBufferSearch(text);
+                return;
+            },
+            .comment_overview_query => {
+                const published = self.published.?;
+                const input = &published.overview_query_input.?;
+                if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.closeOverviewQuery(published, .{ .query = input.saved() });
+                if (key.matches(keymap_mod.special.enter, .{})) return self.closeOverviewQuery(published, null);
+                const query = published.overview.query();
+                if (key.matches(keymap_mod.special.backspace, .{})) return self.changeOverview(published, .{ .query = query[0..search.lastScalarStart(query)] });
+                if (key.matches('w', .{ .ctrl = true })) return self.changeOverview(published, .{ .query = query[0..search.wordStart(query)] });
+                if (key.matches('u', .{ .ctrl = true })) return self.changeOverview(published, .{ .query = "" });
+                if (key.text) |text| return self.insertOverviewQuery(published, text);
+                return;
+            },
+            .review_search => {
+                if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.closeReviewSearch();
+                if (key.matches(keymap_mod.special.backspace, .{})) return self.editReviewSearch(.backspace);
+                if (key.matches('w', .{ .ctrl = true })) return self.editReviewSearch(.delete_word);
+                if (key.matches('k', .{ .ctrl = true })) return self.editReviewSearch(.delete_all);
+                switch (self.resolver.feed(self.dependencies.keymap, .review_search, key)) {
+                    .action => |action| return self.applyAction(action),
+                    else => {},
+                }
+                if (key.text) |text| self.insertReviewSearch(text);
+                return;
+            },
         };
         // Stage two of re-anchor keeps the DiffPane's whole motion and Selection
         // vocabulary; only accept and cancel are claimed from it. The Comment

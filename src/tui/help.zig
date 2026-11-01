@@ -203,10 +203,23 @@ fn filter(lines: []Line, query: search.Query) []Line {
 
 const FixedSection = struct { title: []const u8, entries: []const Entry };
 
-/// The keys of the Overlays that capture input outside the Keymap.
-pub const fixed_sections = [_]FixedSection{
-    // `applySubmissionTreeKey`
-    .{ .title = "Submission Overlay", .entries = &.{
+/// An Overlay or input that reads keys outside the Keymap. `applyKey` in
+/// `presentation.zig` switches on it, so a new one needs a fixed section here.
+/// The declaration order is the order of the help sections.
+pub const FixedKeyInput = enum {
+    submission_overlay,
+    delete_confirmation,
+    unknown_resolution,
+    composer,
+    list_overlay,
+    buffer_search_input,
+    comment_overview_query,
+    review_search,
+    help,
+};
+
+pub const fixed_sections = std.EnumArray(FixedKeyInput, FixedSection).init(.{
+    .submission_overlay = .{ .title = "Submission Overlay", .entries = &.{
         .{ .keys = "j k ↑ ↓", .description = "select Draft" },
         .{ .keys = "⏎", .description = "jump to Draft (X shows the Overlay again)" },
         .{ .keys = "e", .description = "edit Draft" },
@@ -220,50 +233,43 @@ pub const fixed_sections = [_]FixedSection{
         .{ .keys = "p", .description = "open PullRequest Picker" },
         .{ .keys = "q esc", .description = "close Submission" },
     } },
-    // `applyDeleteConfirmationInput` callers in `applyKey`
-    .{ .title = "Delete Confirmation", .entries = &.{
+    .delete_confirmation = .{ .title = "Delete Confirmation", .entries = &.{
         .{ .keys = "y ⏎", .description = "delete" },
         .{ .keys = "n esc ctrl-c", .description = "cancel" },
     } },
-    // `applyUnknownResolutionInput` callers in `applyKey`
-    .{ .title = "Link Existing Comment", .entries = &.{
+    .unknown_resolution = .{ .title = "Link Existing Comment", .entries = &.{
         .{ .keys = "0-9", .description = "type Comment ID" },
         .{ .keys = "⌫", .description = "erase digit" },
         .{ .keys = "⏎", .description = "link Draft to Comment" },
         .{ .keys = "esc ctrl-c", .description = "cancel" },
     } },
-    // The Composer branch of `applyKey`
-    .{ .title = "Composer", .entries = &.{
+    .composer = .{ .title = "Composer", .entries = &.{
         .{ .keys = "⏎", .description = "insert newline" },
         .{ .keys = "⌫ ctrl-w ctrl-u", .description = "erase scalar, word, or to line start" },
         .{ .keys = "ctrl-d ctrl-s", .description = "save" },
         .{ .keys = "esc ctrl-c", .description = "cancel" },
     } },
-    // The List Overlay branch of `applyKey`
-    .{ .title = "Pickers and Command Palette", .entries = &.{
+    .list_overlay = .{ .title = "Pickers and Command Palette", .entries = &.{
         .{ .keys = "↑ ↓ ctrl-p ctrl-n", .description = "select entry" },
         .{ .keys = "⌫", .description = "erase scalar" },
         .{ .keys = "⏎", .description = "confirm entry" },
         .{ .keys = "esc ctrl-c", .description = "close" },
     } },
-    // The Buffer Search input branch of `applyKey`
-    .{ .title = "Buffer Search Input", .entries = &.{
+    .buffer_search_input = .{ .title = "Buffer Search Input", .entries = &.{
         .{ .keys = "⌫ ctrl-w ctrl-u", .description = "erase scalar, word, or query" },
         .{ .keys = "⏎", .description = "accept search" },
         .{ .keys = "esc ctrl-c", .description = "cancel search" },
     } },
-    // The Comment Overview query branch of `applyKey`
-    .{ .title = "Comment Overview Filter Input", .entries = &.{
+    .comment_overview_query = .{ .title = "Comment Overview Filter Input", .entries = &.{
         .{ .keys = "⌫ ctrl-w ctrl-u", .description = "erase scalar, word, or query" },
         .{ .keys = "⏎", .description = "keep filter" },
         .{ .keys = "esc ctrl-c", .description = "restore filter" },
     } },
-    // The Review Search branch of `applyKey`
-    .{ .title = "Review Search Input", .entries = &.{
+    .review_search = .{ .title = "Review Search Input", .entries = &.{
         .{ .keys = "⌫ ctrl-w ctrl-k", .description = "erase scalar, word, or query" },
         .{ .keys = "esc ctrl-c", .description = "close Review Search" },
     } },
-    .{ .title = "Help", .entries = &.{
+    .help = .{ .title = "Help", .entries = &.{
         .{ .keys = "/", .description = "search help with an empty query" },
         .{ .keys = "⌫ ctrl-w ctrl-u", .description = "erase scalar, word, or query during search" },
         .{ .keys = "⏎", .description = "keep help filter and scroll" },
@@ -274,14 +280,15 @@ pub const fixed_sections = [_]FixedSection{
         .{ .keys = "g G", .description = "go to top / bottom" },
         .{ .keys = "other key", .description = "close help outside search input" },
     } },
-    .{ .title = "Mouse", .entries = &.{
-        .{ .keys = "click", .description = "focus, select, toggle" },
-        .{ .keys = "click again", .description = "open selected Overview Entry" },
-        .{ .keys = "wheel", .description = "scroll" },
-        .{ .keys = "shift option", .description = "native terminal selection" },
-        .{ .keys = "config", .description = "[input.mouse] enabled = false" },
-    } },
-};
+});
+
+const mouse_section: FixedSection = .{ .title = "Mouse", .entries = &.{
+    .{ .keys = "click", .description = "focus, select, toggle" },
+    .{ .keys = "click again", .description = "open selected Overview Entry" },
+    .{ .keys = "wheel", .description = "scroll" },
+    .{ .keys = "shift option", .description = "native terminal selection" },
+    .{ .keys = "config", .description = "[input.mouse] enabled = false" },
+} };
 
 /// Build the help lines: one heading per section, one entry per Action with
 /// all of its chords, and a blank line between sections. An Action without a
@@ -313,7 +320,7 @@ fn build(scratch: std.mem.Allocator, km: keymap.Keymap) ![]Line {
             try lines.append(scratch, .{ .entry = .{ .keys = "unbound", .description = try actionHelp(scratch, action), .action = action } });
         }
     }
-    for (fixed_sections) |section| {
+    for (fixed_sections.values ++ [_]FixedSection{mouse_section}) |section| {
         if (lines.items.len > 0) try lines.append(scratch, .blank);
         try lines.append(scratch, .{ .heading = section.title });
         for (section.entries) |entry| try lines.append(scratch, .{ .entry = entry });
