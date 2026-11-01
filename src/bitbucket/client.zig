@@ -107,11 +107,7 @@ pub const Client = struct {
         repo_slug: []const u8,
         id: u64,
     ) !PullRequest {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}",
-            .{ base_url, self.cred.workspace, repo_slug, id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}", .{id});
         defer allocator.free(url);
 
         const auth = try self.cred.basicAuthHeader(allocator);
@@ -133,7 +129,7 @@ pub const Client = struct {
 
     pub fn createPullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, opts: types.PullRequestOptions) !PullRequest {
         try opts.validate(true);
-        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests");
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests", .{});
         defer allocator.free(url);
         const body = try pullRequestBody(allocator, opts);
         defer allocator.free(body);
@@ -144,9 +140,7 @@ pub const Client = struct {
 
     pub fn updatePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64, opts: types.PullRequestOptions) !PullRequest {
         try opts.validate(false);
-        const suffix = try std.fmt.allocPrint(allocator, "/pullrequests/{d}", .{id});
-        defer allocator.free(suffix);
-        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}", .{id});
         defer allocator.free(url);
         const body = try pullRequestBody(allocator, opts);
         defer allocator.free(body);
@@ -156,9 +150,7 @@ pub const Client = struct {
     }
 
     pub fn declinePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64) !PullRequest {
-        const suffix = try std.fmt.allocPrint(allocator, "/pullrequests/{d}/decline", .{id});
-        defer allocator.free(suffix);
-        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/decline", .{id});
         defer allocator.free(url);
         const response = try self.requestJson(allocator, .POST, url, null);
         defer allocator.free(response);
@@ -173,13 +165,13 @@ pub const Client = struct {
         try suffix.appendSlice(allocator, "/commit/");
         try percentEncodeInto(allocator, &suffix, commit);
         try suffix.appendSlice(allocator, "/pullrequests");
-        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix.items);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "{s}", .{suffix.items});
         defer allocator.free(url);
         return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url, opts, null, true);
     }
 
     pub fn listBranches(self: Client, allocator: Allocator, repo_slug: []const u8, opts: PageOptions) ![]types.Branch {
-        const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches");
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches", .{});
         defer allocator.free(url);
         return self.listPages(allocator, types.Branch, BranchPage, dupeBranch, deinitBranch, .{}, url, opts, null, false);
     }
@@ -190,7 +182,7 @@ pub const Client = struct {
         defer suffix.deinit(allocator);
         try suffix.appendSlice(allocator, "/refs/branches/");
         try percentEncodeInto(allocator, &suffix, name);
-        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix.items);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "{s}", .{suffix.items});
         defer allocator.free(url);
         const response = try self.requestJson(allocator, .GET, url, null);
         defer allocator.free(response);
@@ -200,7 +192,7 @@ pub const Client = struct {
     pub fn createBranch(self: Client, allocator: Allocator, repo_slug: []const u8, name: []const u8, target: []const u8) !types.Branch {
         try validateBranchName(name);
         if (target.len == 0) return error.BadRequest;
-        const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches");
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches", .{});
         defer allocator.free(url);
         const body = try std.json.Stringify.valueAlloc(allocator, .{ .name = name, .target = .{ .hash = target } }, .{});
         defer allocator.free(body);
@@ -209,16 +201,9 @@ pub const Client = struct {
         return parseBranch(allocator, response);
     }
 
-    fn repositoryEndpoint(self: Client, allocator: Allocator, repo_slug: []const u8, suffix: []const u8) ![]u8 {
+    fn repositoryEndpoint(self: Client, allocator: Allocator, repo_slug: []const u8, comptime suffix: []const u8, args: anytype) ![]u8 {
         if (repo_slug.len == 0) return error.BadRequest;
-        var url: std.ArrayList(u8) = .empty;
-        defer url.deinit(allocator);
-        try url.appendSlice(allocator, base_url ++ "/repositories/");
-        try percentEncodeInto(allocator, &url, self.cred.workspace);
-        try url.append(allocator, '/');
-        try percentEncodeInto(allocator, &url, repo_slug);
-        try url.appendSlice(allocator, suffix);
-        return url.toOwnedSlice(allocator);
+        return pathUrl(allocator, "/repositories", &.{ self.cred.workspace, repo_slug }, suffix, args);
     }
 
     /// Return owned JSON bytes. Mutations make one send and never retry.
@@ -265,7 +250,8 @@ pub const Client = struct {
     ) ![]PullRequestSummary {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        try buf.print(allocator, "{s}/repositories/{s}/{s}/pullrequests?", .{ base_url, self.cred.workspace, repo_slug });
+        try appendPath(allocator, &buf, "/repositories", &.{ self.cred.workspace, repo_slug });
+        try buf.appendSlice(allocator, "/pullrequests?");
         // Keep the TUI's first-page URL and page size stable.
         var page_opts = opts;
         if (opts.pagelen) |n| {
@@ -301,7 +287,7 @@ pub const Client = struct {
     /// Every open PullRequest Summary of one Repository, with approval and changes-requested counts.
     /// A failed page fails the whole list. Free the result with `deinitSummaries`.
     pub fn listOpenPullRequestSummaries(self: Client, allocator: Allocator, repo_slug: []const u8) ![]PullRequestSummary {
-        const url = try self.repositoryEndpoint(allocator, repo_slug, open_pull_request_summaries_query);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "{s}", .{open_pull_request_summaries_query});
         defer allocator.free(url);
         return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url, .{}, null, false);
     }
@@ -309,8 +295,7 @@ pub const Client = struct {
     fn repositorySummariesUrl(self: Client, allocator: Allocator) ![]u8 {
         var url: std.ArrayList(u8) = .empty;
         defer url.deinit(allocator);
-        try url.appendSlice(allocator, base_url ++ "/repositories/");
-        try percentEncodeInto(allocator, &url, self.cred.workspace);
+        try appendPath(allocator, &url, "/repositories", &.{self.cred.workspace});
         try url.appendSlice(allocator, repository_summaries_query);
         return url.toOwnedSlice(allocator);
     }
@@ -335,7 +320,7 @@ pub const Client = struct {
             allocator.free(shape.repository);
             shape.repository = try allocator.dupe(u8, repositories[0].slug);
         }
-        const pull_requests_url = try self.repositoryEndpoint(allocator, shape.repository, open_pull_request_summaries_query);
+        const pull_requests_url = try self.repositoryEndpoint(allocator, shape.repository, "{s}", .{open_pull_request_summaries_query});
         defer allocator.free(pull_requests_url);
         if (try self.missingShapeField(allocator, pull_requests_url, &pull_request_summary_fields, &shape.participants)) |field| {
             shape.missing = .{ .list = .pull_requests, .field = field };
@@ -396,11 +381,7 @@ pub const Client = struct {
         repo_slug: []const u8,
         id: u64,
     ) ![]u8 {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/diff",
-            .{ base_url, self.cred.workspace, repo_slug, id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/diff", .{id});
         defer allocator.free(url);
 
         const auth = try self.cred.basicAuthHeader(allocator);
@@ -486,7 +467,8 @@ pub const Client = struct {
     fn getSourceAttempt(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, path: []const u8, metadata: bool) !FileBlobAttempt {
         var url_buf: std.ArrayList(u8) = .empty;
         defer url_buf.deinit(allocator);
-        try url_buf.print(allocator, "{s}/repositories/{s}/{s}/src/{s}/", .{ base_url, self.cred.workspace, repo_slug, commit });
+        try appendPath(allocator, &url_buf, "/repositories", &.{ self.cred.workspace, repo_slug });
+        try url_buf.print(allocator, "/src/{s}/", .{commit});
         if (!git_path.isRepositoryRelative(path)) return error.InvalidPath;
         try appendEncodedPath(allocator, &url_buf, path);
         if (metadata) try url_buf.appendSlice(allocator, "?format=meta");
@@ -544,11 +526,7 @@ pub const Client = struct {
         id: u64,
         nc: NewComment,
     ) !CreateCommentAttempt {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments",
-            .{ base_url, self.cred.workspace, repo_slug, id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/comments", .{id});
         defer allocator.free(url);
 
         const auth = try self.cred.basicAuthHeader(allocator);
@@ -672,7 +650,7 @@ pub const Client = struct {
     /// GET /repositories/{workspace} to prove the workspace exists and the
     /// credential can see it. Used by `bbr auth login` and `bbr auth status`.
     pub fn checkWorkspace(self: Client, allocator: Allocator, workspace: []const u8) !void {
-        const url = try std.fmt.allocPrint(allocator, "{s}/repositories/{s}?pagelen=1", .{ base_url, workspace });
+        const url = try pathUrl(allocator, "/repositories", &.{workspace}, "?pagelen=1", .{});
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -721,11 +699,7 @@ pub const Client = struct {
         };
         const method: httpc.Method = if (target == .no_verdict) .DELETE else .POST;
 
-        const mutation_url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/{s}",
-            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, endpoint },
-        );
+        const mutation_url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/{s}", .{ pull_request_id, endpoint });
         defer allocator.free(mutation_url);
         const mutation_auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(mutation_auth);
@@ -778,11 +752,7 @@ pub const Client = struct {
         comment_id: CommentId,
         body_raw: []const u8,
     ) !void {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}",
-            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, comment_id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/comments/{d}", .{ pull_request_id, comment_id });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -811,11 +781,7 @@ pub const Client = struct {
         pull_request_id: u64,
         comment_id: CommentId,
     ) !void {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}",
-            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, comment_id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/comments/{d}", .{ pull_request_id, comment_id });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -839,11 +805,7 @@ pub const Client = struct {
         repo_slug: []const u8,
         id: u64,
     ) ![]u8 {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments?pagelen=100",
-            .{ base_url, self.cred.workspace, repo_slug, id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/comments?pagelen=100", .{id});
         defer allocator.free(url);
 
         const auth = try self.cred.basicAuthHeader(allocator);
@@ -872,11 +834,7 @@ pub const Client = struct {
         id: u64,
         comment_id: u64,
     ) ![]u8 {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}",
-            .{ base_url, self.cred.workspace, repo_slug, id, comment_id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/comments/{d}", .{ id, comment_id });
         defer allocator.free(url);
 
         const auth = try self.cred.basicAuthHeader(allocator);
@@ -946,11 +904,7 @@ pub const Client = struct {
     }
 
     fn commentsPage(self: Client, allocator: Allocator, repo_slug: []const u8, pr_id: u64, head: HeadCommits, opts: PageOptions, rejection: ?*?PageRejection) ![]Comment {
-        const first = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments",
-            .{ base_url, self.cred.workspace, repo_slug, pr_id },
-        );
+        const first = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/comments", .{pr_id});
         defer allocator.free(first);
         return self.listPages(allocator, Comment, CommentsPage, dupeComment, deinitComment, .{head}, first, opts, rejection, false);
     }
@@ -1113,11 +1067,7 @@ pub const Client = struct {
         allocator: Allocator,
         workspace: []const u8,
     ) !types.Workspace {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/workspaces/{s}",
-            .{ base_url, workspace },
-        );
+        const url = try pathUrl(allocator, "/workspaces", &.{workspace}, "", .{});
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -1148,7 +1098,7 @@ pub const Client = struct {
         opts: PageOptions,
     ) ![]types.Repository {
         const ws = workspace_override orelse self.cred.workspace;
-        const first = try std.fmt.allocPrint(allocator, "{s}/repositories/{s}", .{ base_url, ws });
+        const first = try pathUrl(allocator, "/repositories", &.{ws}, "", .{});
         defer allocator.free(first);
         return self.listPages(allocator, types.Repository, RepositoryPage, dupeRepository, deinitRepository, .{}, first, opts, null, false);
     }
@@ -1161,11 +1111,7 @@ pub const Client = struct {
         workspace_override: ?[]const u8,
     ) !types.Repository {
         const ws = workspace_override orelse self.cred.workspace;
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}",
-            .{ base_url, ws, repo_slug },
-        );
+        const url = try pathUrl(allocator, "/repositories", &.{ ws, repo_slug }, "", .{});
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -1195,11 +1141,7 @@ pub const Client = struct {
         id: u64,
         opts: PageOptions,
     ) ![]types.Commit {
-        const first = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/commits",
-            .{ base_url, self.cred.workspace, repo_slug, id },
-        );
+        const first = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/commits", .{id});
         defer allocator.free(first);
         return self.listCommitsFrom(allocator, first, opts);
     }
@@ -1212,11 +1154,7 @@ pub const Client = struct {
         revision: []const u8,
         opts: PageOptions,
     ) ![]types.Commit {
-        const first = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/commits/{s}",
-            .{ base_url, self.cred.workspace, repo_slug, revision },
-        );
+        const first = try self.repositoryEndpoint(allocator, repo_slug, "/commits/{s}", .{revision});
         defer allocator.free(first);
         return self.listCommitsFrom(allocator, first, opts);
     }
@@ -1235,7 +1173,8 @@ pub const Client = struct {
         if (from.len == 0 or to.len == 0) return error.BadRequest;
         var first: std.ArrayList(u8) = .empty;
         defer first.deinit(allocator);
-        try first.print(allocator, "{s}/repositories/{s}/{s}/commits?include=", .{ base_url, self.cred.workspace, repo_slug });
+        try appendPath(allocator, &first, "/repositories", &.{ self.cred.workspace, repo_slug });
+        try first.appendSlice(allocator, "/commits?include=");
         try percentEncodeInto(allocator, &first, to);
         try first.appendSlice(allocator, "&exclude=");
         try percentEncodeInto(allocator, &first, from);
@@ -1336,11 +1275,7 @@ pub const Client = struct {
         patch: bool,
     ) ![]u8 {
         const kind: []const u8 = if (patch) "patch" else "diff";
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/{s}/{s}..{s}",
-            .{ base_url, self.cred.workspace, repo_slug, kind, from, to },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/{s}/{s}..{s}", .{ kind, from, to });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -1367,11 +1302,7 @@ pub const Client = struct {
         id: u64,
         comment_id: u64,
     ) !Comment {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}",
-            .{ base_url, self.cred.workspace, repo_slug, id, comment_id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/comments/{d}", .{ id, comment_id });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -1400,11 +1331,7 @@ pub const Client = struct {
         pull_request_id: u64,
         comment_id: CommentId,
     ) !void {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}/resolve",
-            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, comment_id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/comments/{d}/resolve", .{ pull_request_id, comment_id });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -1428,11 +1355,7 @@ pub const Client = struct {
         pull_request_id: u64,
         comment_id: CommentId,
     ) !void {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}/resolve",
-            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, comment_id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/comments/{d}/resolve", .{ pull_request_id, comment_id });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -1457,11 +1380,7 @@ pub const Client = struct {
         id: u64,
         opts: PageOptions,
     ) ![]types.Task {
-        const first = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks",
-            .{ base_url, self.cred.workspace, repo_slug, id },
-        );
+        const first = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/tasks", .{id});
         defer allocator.free(first);
         return self.listPages(allocator, types.Task, TaskPage, dupeTask, deinitTask, .{}, first, opts, null, false);
     }
@@ -1474,11 +1393,7 @@ pub const Client = struct {
         id: u64,
         task_id: u64,
     ) !types.Task {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks/{d}",
-            .{ base_url, self.cred.workspace, repo_slug, id, task_id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/tasks/{d}", .{ id, task_id });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -1509,11 +1424,7 @@ pub const Client = struct {
         content: []const u8,
         comment_id: ?u64,
     ) !u64 {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks",
-            .{ base_url, self.cred.workspace, repo_slug, id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/tasks", .{id});
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -1561,11 +1472,7 @@ pub const Client = struct {
         state: ?types.TaskState,
     ) !types.Task {
         if (content == null and state == null) return error.BadRequest;
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks/{d}",
-            .{ base_url, self.cred.workspace, repo_slug, id, task_id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/tasks/{d}", .{ id, task_id });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -1606,11 +1513,7 @@ pub const Client = struct {
         id: u64,
         task_id: u64,
     ) !void {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks/{d}",
-            .{ base_url, self.cred.workspace, repo_slug, id, task_id },
-        );
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests/{d}/tasks/{d}", .{ id, task_id });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -2242,6 +2145,25 @@ pub const NewComment = struct {
 /// Percent-encode `raw` into `buf`, escaping everything outside the RFC 3986
 /// unreserved set. Keeps the `q` filter (with its `=`, quotes, spaces) safe as
 /// a single query-parameter value.
+fn pathUrl(allocator: Allocator, comptime root: []const u8, segments: []const []const u8, comptime suffix: []const u8, args: anytype) ![]u8 {
+    var url: std.ArrayList(u8) = .empty;
+    defer url.deinit(allocator);
+    try appendPath(allocator, &url, root, segments);
+    try url.print(allocator, suffix, args);
+    return url.toOwnedSlice(allocator);
+}
+
+/// Appends `base_url ++ root` and one percent-encoded path segment per name.
+/// Percent-encoding leaves a dot segment intact, so a dot segment is refused.
+fn appendPath(allocator: Allocator, url: *std.ArrayList(u8), comptime root: []const u8, segments: []const []const u8) !void {
+    try url.appendSlice(allocator, base_url ++ root);
+    for (segments) |segment| {
+        if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.BadRequest;
+        try url.append(allocator, '/');
+        try percentEncodeInto(allocator, url, segment);
+    }
+}
+
 fn percentEncodeInto(allocator: Allocator, buf: *std.ArrayList(u8), raw: []const u8) !void {
     for (raw) |c| {
         if (isUnreserved(c)) {
@@ -3084,7 +3006,7 @@ test "Repository paths percent-encode the Workspace and the Repository slug and 
     try testing.expectEqualStrings(repository ++ "/pullrequests/7/comments?pagelen=100", fake.lastUrl().?);
 
     const sent = fake.call_count;
-    for ([_][]const u8{ "", ".", ".." }) |dots| try testing.expectError(error.BadRequest, bb.listPullRequests(a, dots, .{}));
+    for ([_][]const u8{ ".", ".." }) |dots| try testing.expectError(error.BadRequest, bb.listPullRequests(a, dots, .{}));
     try testing.expectEqual(sent, fake.call_count);
 }
 
