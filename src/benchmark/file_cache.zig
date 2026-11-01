@@ -2075,22 +2075,30 @@ const fixture_comments =
     \\{ "values": [ { "id": 1, "content": { "raw": "CMTSENTINEL qrysentinel" }, "user": { "display_name": "Ada" } } ] }
 ;
 
+/// Each text File is taller than the 50-row Frame, so the Enrichment Range
+/// never holds every File and the budget can evict a File outside it.
+const tall = 60;
+
+const modified_hunk = "@@ -1,61 +1,61 @@\n-old SRCSENTINEL\n" ++ "-oldtail\n" ** tall ++ "+qrysentinel new SRCSENTINEL\n" ++ "+newtail\n" ** tall;
+
 const fixture_diff =
     "diff --git a/PATHSENTINEL/a.zig b/PATHSENTINEL/a.zig\n--- a/PATHSENTINEL/a.zig\n+++ b/PATHSENTINEL/a.zig\n" ++
-    "@@ -1,2 +1,2 @@\n-old SRCSENTINEL\n+qrysentinel new SRCSENTINEL\n keep\n" ++
+    modified_hunk ++
     "diff --git a/PATHSENTINEL/b.zig b/PATHSENTINEL/b.zig\n--- a/PATHSENTINEL/b.zig\n+++ b/PATHSENTINEL/b.zig\n" ++
-    "@@ -1,2 +1,2 @@\n-old SRCSENTINEL\n+qrysentinel new SRCSENTINEL\n keep\n" ++
+    modified_hunk ++
     "diff --git a/PATHSENTINEL/c.zig b/PATHSENTINEL/c.zig\nnew file mode 100644\n--- /dev/null\n+++ b/PATHSENTINEL/c.zig\n" ++
-    "@@ -0,0 +1,2 @@\n+qrysentinel added SRCSENTINEL\n+tail\n" ++
+    "@@ -0,0 +1,61 @@\n+qrysentinel added SRCSENTINEL\n" ++ "+tail\n" ** tall ++
     "diff --git a/PATHSENTINEL/d.zig b/PATHSENTINEL/d.zig\ndeleted file mode 100644\n--- a/PATHSENTINEL/d.zig\n+++ /dev/null\n" ++
-    "@@ -1,2 +0,0 @@\n-qrysentinel removed SRCSENTINEL\n-tail\n" ++
+    "@@ -1,61 +0,0 @@\n-qrysentinel removed SRCSENTINEL\n" ++ "-tail\n" ** tall ++
     "diff --git a/PATHSENTINEL/e.png b/PATHSENTINEL/e.png\nindex 1111111..2222222 100644\n" ++
     "Binary files a/PATHSENTINEL/e.png and b/PATHSENTINEL/e.png differ\n" ++
     "diff --git a/PATHSENTINEL/f.zig b/PATHSENTINEL/f.zig\n--- a/PATHSENTINEL/f.zig\n+++ b/PATHSENTINEL/f.zig\n" ++
-    "@@ -1,2 +1,2 @@\n-old SRCSENTINEL\n+qrysentinel new SRCSENTINEL\n keep\n";
+    modified_hunk;
 
-const old_blob = "old SRCSENTINEL\nkeep\n";
-const new_blob = "qrysentinel new SRCSENTINEL\nkeep\n";
+const old_blob = "old SRCSENTINEL\n" ++ "oldtail\n" ** tall;
+const new_blob = "qrysentinel new SRCSENTINEL\n" ++ "newtail\n" ** tall;
+const added_blob = "qrysentinel added SRCSENTINEL\n" ++ "tail\n" ** tall;
+const removed_blob = "qrysentinel removed SRCSENTINEL\n" ++ "tail\n" ** tall;
 
 fn fixtureResponses(comptime blob_b_new: bbr.http.Canned) [12]bbr.http.Canned {
     return .{
@@ -2098,8 +2106,8 @@ fn fixtureResponses(comptime blob_b_new: bbr.http.Canned) [12]bbr.http.Canned {
         .{ .request_key = "/src/aaaa/PATHSENTINEL/a.zig", .body = new_blob },
         .{ .request_key = "/src/bbbb/PATHSENTINEL/b.zig", .body = old_blob },
         blob_b_new,
-        .{ .request_key = "/src/aaaa/PATHSENTINEL/c.zig", .body = "qrysentinel added SRCSENTINEL\ntail\n" },
-        .{ .request_key = "/src/bbbb/PATHSENTINEL/d.zig", .body = "qrysentinel removed SRCSENTINEL\ntail\n" },
+        .{ .request_key = "/src/aaaa/PATHSENTINEL/c.zig", .body = added_blob },
+        .{ .request_key = "/src/bbbb/PATHSENTINEL/d.zig", .body = removed_blob },
         .{ .request_key = "/src/bbbb/PATHSENTINEL/f.zig", .body = old_blob },
         .{ .request_key = "/src/aaaa/PATHSENTINEL/f.zig", .body = new_blob },
         .{ .request_key = "/pullrequests/7/diff", .body = fixture_diff },
@@ -2265,9 +2273,10 @@ test "M28 cache every scenario runs to the end with text, binary, added, and rem
     try testing.expectEqualStrings("MERGED", try field(output, "header", "state"));
     // The first fetch of a File is cold.
     try testing.expect(try intField(output, "scenario=s1 ", "cold_fetches") > 0);
-    // S2 revisits the four text Files that S1 left, and the budget evicted them. The binary File never fetches.
-    try testing.expectEqual(@as(usize, 4), try intField(output, "scenario=s2 ", "refetches"));
-    try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s2 ", "hits"));
+    // S2 revisits the Files that S1 left, and the budget evicted them. The overscan refetches the
+    // next revisited File inside the span of the jump before it, so only some samples are refetches.
+    try testing.expect(try intField(output, "scenario=s2 ", "refetches") > 0);
+    try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s2 ", "cold_fetches"));
     try testing.expect(try intField(output, "scenario=s5 ", "refetches") > 0);
     try testing.expect(try intField(output, "scenario=s6 ", "refetches") > 0);
     // After refresh and after the restart, every fetch is of an admitted File.
@@ -2294,7 +2303,7 @@ test "M28 cache a 429 response counts in rate_limited, also after the retry" {
     defer testing.allocator.free(path);
     const responses = fixtureResponses(matching_b);
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    var flaky: FlakyHttpClient = .{ .fake = &fake, .key = "/src/aaaa/PATHSENTINEL/b.zig", .script = &.{.{ .status = 429, .retry_after_ms = 1 }} };
+    var flaky: FlakyHttpClient = .{ .fake = &fake, .key = "/src/aaaa/PATHSENTINEL/c.zig", .script = &.{.{ .status = 429, .retry_after_ms = 1 }} };
     var transport: FakeTransport = .{ .client = flaky.httpClient() };
     var clock: FakeClock = .{};
     var notes: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -2303,7 +2312,8 @@ test "M28 cache a 429 response counts in rate_limited, also after the retry" {
     options.scenarios = .initOne(.s1);
     const output = try runIn(&transport, path, options, &clock, &notes.writer);
     defer testing.allocator.free(output);
-    // S1 fetches b.zig once. The harness retries the 429 below RemoteBlobSource, so the retry succeeds.
+    // The overscan fetches b.zig before S1. S1 fetches c.zig once. The harness retries the 429 below
+    // RemoteBlobSource, so the retry succeeds.
     try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s1 ", "rate_limited"));
     try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s1 ", "retries"));
     try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s1 ", "failures"));
@@ -2400,7 +2410,7 @@ test "M28 cache merged PullRequest check counts Hunk mismatch Files" {
     defer testing.allocator.free(clean);
     try testing.expectEqual(@as(usize, 0), try intField(clean, "check", "hunk_mismatch_files"));
     try testing.expectEqual(@as(usize, 0), try intField(clean, "check", "not_found_sides"));
-    const changed = fixtureResponses(.{ .request_key = "/src/aaaa/PATHSENTINEL/b.zig", .body = "qrysentinel CHANGED SRCSENTINEL\nkeep\n" });
+    const changed = fixtureResponses(.{ .request_key = "/src/aaaa/PATHSENTINEL/b.zig", .body = "qrysentinel CHANGED SRCSENTINEL\n" ++ "newtail\n" ** tall });
     const mismatch = try runFixture(&changed, options, &clock);
     defer testing.allocator.free(mismatch);
     try testing.expectEqual(@as(usize, 1), try intField(mismatch, "check", "hunk_mismatch_files"));
@@ -2448,7 +2458,8 @@ test "M28 cache a harness wait inside a span is not latency" {
     const responses = fixtureResponses(matching_b);
     var clock: FakeClock = .{};
     var options = fixture_options;
-    // Each scenario estimates more requests than the budget, so the request gate waits inside its spans.
+    // Each scenario estimates more requests than the budget, so the request gate waits. In S1 it waits
+    // inside a span. In S2 it waits for an overscan fetch outside the spans.
     options.hourly_request_budget = 4;
     options.scenarios = .initMany(&.{ .s1, .s2 });
     var notes: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -2460,9 +2471,9 @@ test "M28 cache a harness wait inside a span is not latency" {
     for ([_][]const u8{ "scenario=s1 ", "scenario=s2 " }) |prefix| {
         try testing.expect(try intField(output, prefix, "samples") > 0);
         try testing.expectEqualStrings("0.0", try field(output, prefix, "latency_p95_ms"));
-        try testing.expect(try intField(output, prefix, "paced_samples") > 0);
         try testing.expect(try floatField(output, prefix, "paused_ms") > 0);
     }
+    try testing.expect(try intField(output, "scenario=s1 ", "paced_samples") > 0);
 }
 
 test "M28 cache the request window survives a restart and never exceeds the budget in any hour" {
@@ -2626,7 +2637,7 @@ test "M28 cache the Credential token never reaches the output, the notes, or the
     defer testing.allocator.free(path);
     const responses = fixtureResponses(matching_b);
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    var flaky: FlakyHttpClient = .{ .fake = &fake, .key = "/src/aaaa/PATHSENTINEL/b.zig", .script = &.{.{ .status = 503 }} };
+    var flaky: FlakyHttpClient = .{ .fake = &fake, .key = "/src/aaaa/PATHSENTINEL/c.zig", .script = &.{.{ .status = 503 }} };
     defer flaky.deinit();
     var transport: FakeTransport = .{ .client = flaky.httpClient() };
     var clock: FakeClock = .{};
