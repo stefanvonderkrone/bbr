@@ -30863,6 +30863,60 @@ test "M29 overview a smaller terminal keeps the selected entry in view" {
     }
 }
 
+test "M29 overview g o from the Sidebar of the Comment Overview changes nothing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewTreePresentation(&store);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .key = .{ .codepoint = vaxis_tab } });
+    try typeOverviewKey(&presentation, "j");
+    const before = presentation.projection().review.?.frame;
+    const overview_before = before.overview.state.*;
+    const revision = presentation.projection().revision.frame;
+
+    try typeOverviewKey(&presentation, "g");
+    try typeOverviewKey(&presentation, "o");
+    const after = presentation.projection().review.?.frame;
+    try testing.expectEqual(MainPane.comment_overview, after.main_pane);
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, after.focus);
+    try testing.expectEqual(before.file_tree.cursor, after.file_tree.cursor);
+    try testing.expectEqual(overview_before.selected, after.overview.state.selected);
+    try testing.expectEqual(overview_before.scroll, after.overview.state.scroll);
+    try testing.expectEqual(revision, presentation.projection().revision.frame);
+    try testing.expect(presentation.projection().action_error == null);
+}
+
+test "M29 overview g d from the Sidebar of the DiffPane changes nothing, and g o moves focus to the Main Pane" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewTreePresentation(&store);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = .{ .codepoint = vaxis_tab } });
+    try typeOverviewKey(&presentation, "j");
+    const before = presentation.projection().review.?.frame;
+    const revision = presentation.projection().revision.frame;
+
+    try typeOverviewKey(&presentation, "g");
+    try typeOverviewKey(&presentation, "d");
+    var after = presentation.projection().review.?.frame;
+    try testing.expectEqual(MainPane.diff_pane, after.main_pane);
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, after.focus);
+    try testing.expectEqual(before.file_tree.cursor, after.file_tree.cursor);
+    try testing.expectEqual(before.navigation.cursor, after.navigation.cursor);
+    try testing.expectEqual(before.navigation.scroll, after.navigation.scroll);
+    try testing.expectEqual(revision, presentation.projection().revision.frame);
+    try testing.expect(presentation.projection().action_error == null);
+
+    try typeOverviewKey(&presentation, "g");
+    try typeOverviewKey(&presentation, "o");
+    after = presentation.projection().review.?.frame;
+    try testing.expectEqual(MainPane.comment_overview, after.main_pane);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, after.focus);
+    try testing.expectEqual(keymap_mod.InteractionContext.comment_overview, presentation.interactionContext());
+}
+
 test "M29 overview showing the Comment Overview changes no disclosure" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
