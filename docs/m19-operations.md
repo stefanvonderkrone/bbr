@@ -54,15 +54,76 @@ Source-copy builds require all four explicit values:
 If one explicit value exists, all four values are required. The build never combines explicit and
 Git metadata. Documentation changes and ignored files do not mark a build dirty.
 
-## Release validation
+## Release workflow
 
-`.github/workflows/release.yml` runs for a `v*` tag push. It requires an annotated
+`.github/workflows/release.yml` runs for each push to `main`, including a merged pull request.
+Direct pushes also start a release. Release runs use one queue, so concurrent merges cannot select the same sequence.
+GitHub permits up to 100 pending runs in this queue.
+
+`tools/prepare_release.py` selects the next sequence for the source commit's UTC date.
+It makes a release commit that changes only the package version in `build.zig.zon`.
+The release commit has the source commit as its parent and keeps its UTC committer time.
+The workflow pushes an annotated tag for this commit. It does not push a commit to `main`.
+A retry reuses the release commit and tag for the same source commit.
+Builds and publication run in the same workflow because tags from `GITHUB_TOKEN` do not start another workflow.
+
+The workflow also accepts a manual `v*` tag push. It requires an annotated
 `vYYYY.M.D-N` tag that points directly at `HEAD`. The tag date must match the commit's UTC date, and
-the sequence must be the next sequence for that date.
+the sequence history must contain every number from `1` through that date's maximum sequence.
+An existing tag remains valid when newer same-day tags exist, so an earlier release can be retried.
 
 The workflow also checks the clean checkout, `build.zig.zon`, `bbr --version`, and a source-copy
-build without `.git`. Git metadata and explicit metadata must produce the same version. Release
-validation publishes no binary, archive, source copy, GitHub release, or other artifact.
+build without `.git`. Git metadata and explicit metadata must produce the same version.
+
+After validation, four native jobs run `zig build test --summary all` and build with `-Doptimize=ReleaseSafe`.
+The jobs use the same macOS and Linux runners as CI for x86_64 and aarch64.
+Each job checks the binary's release identity and packages only `bbr` in a `.tar.gz` archive.
+The archive retains the binary's execute permission.
+
+After all four builds pass, the publish job creates a GitHub release for the existing tag.
+The release contains `bbr-vYYYY.M.D-N-<target>.tar.gz` for each target and `SHA256SUMS`.
+GitHub generates the release notes. After upload, the workflow checks the current latest release.
+If none exists, the workflow marks the new release as latest.
+Otherwise, it compares only canonical `vYYYY.M.D-N` tags with valid calendar dates and a positive sequence.
+It marks the new release as latest only when its dated tag is not older.
+If the current latest tag cannot be compared, publication continues with `--latest=false`.
+For example, `v1.2.0-rc1`, `v1.2.0`, and `nightly` keep their latest designation.
+Only the prepare and publish jobs have repository write access. The workflow needs no custom secret.
+A repeat run refuses to replace an already published release.
+
+Publication uses a draft until all archive and checksum uploads succeed.
+If publication stops, use `Re-run failed jobs` on the original workflow run within seven days of the build.
+The build archives expire after seven days. The publish job needs these archives.
+After expiry, a failed-job rerun cannot recover the release.
+Preparation reuses its tag, even after a later same-day release.
+`tools/publish_release.py` finds the existing draft and replaces its expected archives and `SHA256SUMS`.
+If the draft contains an unexpected asset, publication stops before any write and leaves the draft unchanged.
+Inspect the named assets before you change the draft and retry.
+After upload, the publisher reads every remote asset page again.
+A missing asset, an unexpected asset, or a failed final read stops publication.
+It publishes the draft only after every upload succeeds and the final check passes.
+The assets then become available for download.
+Recovery refuses to start with an already published release.
+Direct GitHub UI or API changes can still race with the final check before publication.
+
+Merge a pull request into `main` to make a release automatically. No version edit or tag command is required.
+Run `python3 tests/prepare_release_test.py` to check release preparation locally without pushing a tag.
+Run `python3 tests/publish_release_test.py` to check draft recovery with a fake GitHub CLI.
+
+To make a manual release instead:
+
+1. Fetch `main` and all tags with `git fetch origin main --tags`.
+2. Start a separate local release branch from `origin/main`.
+3. Set the `.version` field in `build.zig.zon` to `YYYY.M.D-N` and commit the change.
+   Use the commit's UTC date with no leading zeroes. Start the date's sequence at `1`.
+   If that date has releases, use the next sequence.
+4. Create an annotated tag with `git tag -a vYYYY.M.D-N -m 'Release vYYYY.M.D-N'`.
+5. Push only the tag with `git push origin vYYYY.M.D-N`. This push also sends the release commit.
+   Do not push the manual release commit to `main`, because that push starts another automatic release.
+
+To check a downloaded archive on Linux, run `sha256sum --ignore-missing --check SHA256SUMS`.
+On macOS, run `shasum -a 256 --ignore-missing --check SHA256SUMS`.
+Extract the matching archive with `tar -xzf <archive>` and put `bbr` on your `PATH`.
 
 ## Credential handling
 
