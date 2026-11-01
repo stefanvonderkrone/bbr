@@ -3358,9 +3358,12 @@ test "M28 cache summarize applies rule 3, not rule 1, to the S4 restart Review S
 
 /// Delays each `/src/` request in real time, so a File fetch is still in flight
 /// when the next File Jump starts. The fake clock does not see the delay.
+/// The start fetches the first two Files at once. The second File waits longer, so its
+/// fetch is still in flight when the jump to it starts, also on a busy CPU.
 const SlowSourceHttpClient = struct {
     fake: *bbr.http.FakeHttpClient,
     delay_ms: i64 = 500,
+    second_file_delay_ms: i64 = 1500,
 
     fn httpClient(self: *SlowSourceHttpClient) bbr.http.HttpClient {
         return .{ .ptr = self, .vtable = &.{ .send = send } };
@@ -3368,7 +3371,10 @@ const SlowSourceHttpClient = struct {
 
     fn send(ptr: *anyopaque, allocator: Allocator, request: bbr.http.client.Request) anyerror!bbr.http.client.Response {
         const self: *SlowSourceHttpClient = @ptrCast(@alignCast(ptr));
-        if (std.mem.indexOf(u8, request.url, "/src/") != null) testing.io.sleep(.fromMilliseconds(self.delay_ms), .awake) catch {};
+        if (std.mem.indexOf(u8, request.url, "/src/") != null) {
+            const delay_ms = if (std.mem.indexOf(u8, request.url, "/b.zig") != null) self.second_file_delay_ms else self.delay_ms;
+            testing.io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
+        }
         return self.fake.httpClient().send(allocator, request);
     }
 };
@@ -3390,11 +3396,11 @@ test "M28 cache a File Jump to a File whose fetch is still in flight is a fetch,
     const output = try runIn(&transport, path, options, &clock, &notes.writer);
     defer testing.allocator.free(output);
     // The Enrichment Range starts each next File before the jump to it. The slow source keeps
-    // that fetch in flight when the jump starts, so the reviewer waits for it. Only the first
-    // File, which the start loaded, and the binary File are ready.
+    // that fetch in flight when the jump starts, so the reviewer waits for it. Only the binary
+    // File, which needs no fetch, is ready.
     try testing.expectEqual(@as(usize, 6), try intField(output, "scenario=s1 ", "samples"));
-    try testing.expectEqual(@as(usize, 2), try intField(output, "scenario=s1 ", "hits"));
-    try testing.expectEqual(@as(usize, 4), try intField(output, "scenario=s1 ", "cold_fetches"));
+    try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s1 ", "hits"));
+    try testing.expectEqual(@as(usize, 5), try intField(output, "scenario=s1 ", "cold_fetches"));
     // S2 revisits the five Files before the last one. The budget evicted the four text Files.
     try testing.expectEqual(@as(usize, 5), try intField(output, "scenario=s2 ", "samples"));
     try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s2 ", "hits"));
