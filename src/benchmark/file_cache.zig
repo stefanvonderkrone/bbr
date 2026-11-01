@@ -2943,6 +2943,20 @@ test "M28 cache a harness wait inside a span is not latency" {
 }
 
 test "M28 cache the request window survives a restart and never exceeds the budget in any hour" {
+    {
+        var logged = testing.tmpDir(.{});
+        defer logged.cleanup();
+        try logged.dir.writeFile(testing.io, .{ .sub_path = "requests.log", .data = "1\n2\n" });
+        var logged_clock: FakeClock = .{};
+        logged_clock.time.store(3, .monotonic);
+        var logged_text: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer logged_text.deinit();
+        var logged_notes: Notes = .{ .io = testing.io, .writer = &logged_text.writer };
+        var reopened: RequestWindow = try .open(testing.io, logged.dir, logged_clock.clock(), &logged_notes, 2);
+        defer reopened.deinit();
+        // The two logged requests fill the budget, so the next one waits until the first leaves the hour.
+        try testing.expectEqual(@as(?u64, 1 + hour_ns), try reopened.tryAcquire());
+    }
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpPath(&tmp);
