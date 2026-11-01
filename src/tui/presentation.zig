@@ -2633,12 +2633,12 @@ pub const DisclosureBuild = struct {
             };
         }
 
-        /// The Main Pane that a job of this kind publishes. A destination
-        /// shows the DiffPane. Every other job keeps the Main Pane it read.
-        fn publishedPane(kind: Kind, main_pane: MainPane) MainPane {
+        /// The Main Pane that a job of this kind shows. A destination shows
+        /// the DiffPane. Every other job keeps the Main Pane.
+        fn publishedPane(kind: Kind) ?MainPane {
             return switch (kind) {
                 .review_destination, .overview_destination, .draft_destination => .diff_pane,
-                .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .enrichment, .cache_update, .draft_save, .draft_mutation => main_pane,
+                .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .enrichment, .cache_update, .draft_save, .draft_mutation => null,
             };
         }
     };
@@ -3003,7 +3003,7 @@ pub const DisclosureBuild = struct {
         if (self.version_restoration) |target| self.version_destination = versionNavigationDestination(self.session, self.buffer, self.visual_rows, target, self.preferences.selected_version);
         if (self.deletion_origin) |origin| self.surviving_row = survivingRowAfterDeletion(origin.deletion_rows, self.deleted_ids);
         const panes = frame_mod.paneRects(self.geometry);
-        self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics, hasRootEntry(self.kind.publishedPane(self.main_pane)));
+        self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics, hasRootEntry(self.kind.publishedPane() orelse self.main_pane));
         self.projection = try SearchProjection.create(self.buffer, self.visual_rows, .{
             .session = self.session,
             .drafts = self.drafts,
@@ -4160,6 +4160,7 @@ const Published = struct {
     search_corpus: ?*BufferSearchCorpus = null,
     review_search: ReviewSearchState,
     active_search: enum { none, buffer, review } = .none,
+    /// Only `showMainPane` changes it after init.
     main_pane: MainPane,
     overview: comment_overview.State,
     /// The open query input of the Comment Overview.
@@ -5126,6 +5127,19 @@ const Published = struct {
         var state = self.overview;
         state.apply(change);
         try self.rebuildOverview(authenticated_account_uuid, state);
+    }
+
+    /// The one writer of `main_pane` after init. The Main Pane takes focus.
+    /// Leaving the Comment Overview closes its query input and cancels a
+    /// pending Overview destination.
+    fn showMainPane(self: *Published, pane: MainPane) void {
+        if (self.main_pane == .comment_overview and pane != .comment_overview) {
+            self.overview_query_input = null;
+            self.overview_destination_generation +%= 1;
+        }
+        self.main_pane = pane;
+        self.focus = .diff;
+        self.frame_revision += 1;
     }
 
     /// The scroll keeps its top entry until the selection leaves the
@@ -9588,8 +9602,7 @@ pub const Presentation = struct {
         published.buffer = job.buffer;
         published.visual_rows = job.visual_rows;
         published.tree = job.tree;
-        published.main_pane = job.kind.publishedPane(published.main_pane);
-        if (published.main_pane != .comment_overview) published.overview_query_input = null;
+        if (job.kind.publishedPane()) |pane| published.showMainPane(pane);
         published.navigation = switch (job.navigation_policy) {
             .restore, .file_header, .center, .version => frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation),
             .reset => Nav.init(job.visual_rows.len, frame_mod.paneRects(job.geometry).diff_content.height),
@@ -10271,9 +10284,7 @@ pub const Presentation = struct {
         };
         published.trees.commit();
         published.tree = tree;
-        published.main_pane = .comment_overview;
-        published.focus = .diff;
-        published.frame_revision += 1;
+        published.showMainPane(.comment_overview);
         cancelOverviewDestination(published);
         return cleared;
     }
@@ -10328,11 +10339,8 @@ pub const Presentation = struct {
         };
         published.trees.commit();
         published.tree = tree;
-        published.main_pane = .diff_pane;
-        published.focus = .diff;
-        published.frame_revision += 1;
+        published.showMainPane(.diff_pane);
         self.revealActiveFile(published);
-        cancelOverviewDestination(published);
     }
 
     /// Rebuilds a stale index after any input while the Comment Overview
