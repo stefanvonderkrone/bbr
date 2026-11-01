@@ -122,8 +122,9 @@ pub fn statusRects(params: Status, area: Rect) view.Rects(StatusSlot) {
 
 /// The Sidebar and the DiffPane. Each Pane has a rounded border with its
 /// Title in the top border, and its body starts in the next row. The scroll
-/// bars sit in the right border.
-pub const PaneSlot = enum { sidebar, diff };
+/// bars sit in the right border. Inside its border, the DiffPane has a
+/// one-column Selected Version marker column left of its body.
+pub const PaneSlot = enum { sidebar, diff, version_marker, diff_body };
 
 pub const Panes = struct {
     sidebar_focused: bool = false,
@@ -151,6 +152,8 @@ pub fn panes(params: Panes, area: Rect, visitor: anytype) void {
                 .slot = .diff,
                 .border = .{ .stroke = diff_stroke },
                 .scrollbar = bar(params.diff_scroll, .border, diff_stroke),
+                .composition = .{ .flow = .{ .axis = .horizontal } },
+                .children = &.{ .{ .slot = .version_marker, .width = .cells(1) }, .{ .slot = .diff_body } },
             },
         },
     };
@@ -248,29 +251,41 @@ pub fn loading(_: void, area: Rect, visitor: anytype) void {
     view.walk(LoadingSlot, &root, area, visitor);
 }
 
-/// The keybinding help: Motions and commands in two columns, then the Mouse
-/// notes and the hint row.
-pub const HelpSlot = enum { surface, title, motions, commands, mouse, hint };
+/// The keybinding help: the Title in the top border, the scrolled help lines,
+/// and the hint row.
+pub const HelpSlot = enum { surface, query, body, hint };
 
-pub fn help(rows: usize, area: Rect, visitor: anytype) void {
+pub const Help = struct {
+    /// The count of help lines. The box grows to show them all when the area
+    /// is tall enough.
+    rows: usize = 0,
+    scroll: Scroll = .{},
+    query: bool = false,
+};
+
+pub fn help(params: Help, area: Rect, visitor: anytype) void {
+    const height: u16 = @intCast(@min(params.rows +| 1, std.math.maxInt(u16) - 2));
+    const contents = [_]view.View(HelpSlot){
+        .{ .slot = .body, .padding = .{ .left = 1, .right = 1 }, .scrollbar = bar(params.scroll, .padding, overlay_stroke) },
+        .{ .slot = .hint, .height = .cells(1) },
+    };
+    var boxes = [_]view.View(HelpSlot){
+        .{ .slot = .query, .padding = .{ .left = 1, .right = 1 }, .title = .{ .text = "Keybindings", .@"align" = .center, .inset = 1 } },
+        .{ .composition = .{ .flow = .{} }, .children = &contents },
+    };
+    const plain_contents = [_]view.View(HelpSlot){.{ .slot = .query, .height = .cells(0) }} ++ contents;
+    const surface = if (params.query)
+        inputSurface(HelpSlot, .surface, .cells(78), .cells(height +| 5), &boxes)
+    else
+        overlaySurface(HelpSlot, .{ .width = 76, .height = height }, .{
+            .slot = .surface,
+            .title = .{ .text = "Keybindings", .@"align" = .center, .inset = 1 },
+            .composition = .{ .flow = .{} },
+            .children = &plain_contents,
+        });
     const root: view.View(HelpSlot) = .{
         .composition = .{ .center = .{} },
-        .children = &.{overlaySurface(HelpSlot, .{ .width = 74, .height = @intCast(@min(rows + 5, 255)) }, .{
-            .slot = .surface,
-            .composition = .{ .flow = .{} },
-            .children = &.{
-                .{ .slot = .title, .height = .cells(1) },
-                .{
-                    .composition = .{ .flow = .{ .axis = .horizontal } },
-                    .children = &.{
-                        .{ .slot = .motions, .width = .fraction(1, 2), .padding = .{ .left = 2 } },
-                        .{ .slot = .commands, .padding = .{ .left = 1 } },
-                    },
-                },
-                .{ .slot = .mouse, .height = .cells(3), .padding = .{ .left = 1 } },
-                .{ .slot = .hint, .height = .cells(1) },
-            },
-        })},
+        .children = &.{surface},
     };
     view.walk(HelpSlot, &root, area, visitor);
 }
@@ -370,7 +385,8 @@ test "every layout places each of its Slots" {
         _ = view.solve(ListSlot, listOverlay, ListOverlay{ .box = .{ .width = 60, .height = 16 } }, area);
         _ = view.solve(DialogSlot, dialog, composer, area);
         _ = view.solve(LoadingSlot, loading, {}, area);
-        _ = view.solve(HelpSlot, help, @as(usize, 20), area);
+        _ = view.solve(HelpSlot, help, Help{ .rows = 20, .scroll = .{ .total = 20, .offset = 4 } }, area);
+        _ = view.solve(HelpSlot, help, Help{ .rows = 20, .query = true, .scroll = .{ .total = 20, .offset = 4 } }, area);
         _ = view.solve(SubmissionSlot, submission, {}, area);
         _ = view.solve(SearchSlot, reviewSearch, ReviewSearch{ .list_scroll = .{ .total = 50, .offset = 0 } }, area);
     }
@@ -381,6 +397,8 @@ test "the Panes touch with no gap and a 28-cell Sidebar" {
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 28, .height = 24 }, wide.get(.sidebar).border);
     try testing.expectEqual(Rect{ .x = 28, .y = 0, .width = 52, .height = 24 }, wide.get(.diff).border);
     try testing.expectEqual(Rect{ .x = 29, .y = 1, .width = 50, .height = 22 }, wide.get(.diff).content);
+    try testing.expectEqual(Rect{ .x = 29, .y = 1, .width = 1, .height = 22 }, wide.get(.version_marker).content);
+    try testing.expectEqual(Rect{ .x = 30, .y = 1, .width = 49, .height = 22 }, wide.get(.diff_body).content);
     try testing.expectEqual(Rect{ .x = 1, .y = 1, .width = 26, .height = 22 }, wide.get(.sidebar).content);
     const narrow = view.solve(PaneSlot, panes, Panes{}, .{ .width = 40, .height = 24 });
     try testing.expectEqual(narrow.get(.sidebar).border.width, narrow.get(.diff).border.x);
@@ -417,10 +435,18 @@ test "the status parts wrap by item and stack the hints under the meta informati
     try testing.expectEqual(height, bottom - 5);
 }
 
-test "the Help columns start at column 2 and one cell after the middle" {
-    const rects = view.solve(HelpSlot, help, @as(usize, 10), .{ .width = 100, .height = 40 });
-    const surface = rects.get(.surface).content;
-    try testing.expectEqual(surface.x + 2, rects.get(.motions).content.x);
-    try testing.expectEqual(surface.x + surface.width / 2 + 1, rects.get(.commands).content.x);
-    try testing.expectEqual(surface.y + 1, rects.get(.motions).content.y);
+test "the Help body starts under the top border and keeps a scroll bar cell" {
+    const tall = view.solve(HelpSlot, help, Help{ .rows = 10 }, .{ .width = 100, .height = 40 });
+    const surface = tall.get(.surface).content;
+    const body = tall.get(.body);
+    try testing.expectEqual(surface.x + 1, body.content.x);
+    try testing.expectEqual(surface.y, body.content.y);
+    try testing.expectEqual(@as(u16, 10), body.content.height);
+    try testing.expectEqual(surface.x + surface.width - 1, body.track.x);
+    try testing.expectEqual(body.content.y + body.content.height, tall.get(.hint).content.y);
+
+    // A short area clips the box, and the body takes the rows that remain.
+    const short = view.solve(HelpSlot, help, Help{ .rows = 100 }, .{ .width = 100, .height = 24 });
+    try testing.expectEqual(@as(u16, 24), short.get(.surface).border.height);
+    try testing.expectEqual(@as(u16, 21), short.get(.body).content.height);
 }
