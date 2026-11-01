@@ -225,7 +225,21 @@ The harness applies two gates:
 1. Before each attempt, the per-request gate checks the window.
    If the window holds the budget, the attempt waits until the oldest entry leaves the hour.
    One lock covers the check and the record, so concurrent requests never exceed the budget.
-2. Before each scenario, the harness estimates two requests for each File that the scenario can fetch.
+2. Before each scenario, the harness estimates an upper bound of its requests.
+   `range_files` is the largest Enrichment Range at the fixed Frame.
+   The harness gets it from the production `enrichmentRange` at each scroll position of the start Frame.
+   `session_requests` is the largest number of requests that one Session load sent at a start.
+   Each scenario has a count of full passes over every File, of File Jumps, and of Session loads.
+   A File Jump can fetch the whole Enrichment Range.
+   A Session load sends `session_requests` requests and also fetches the Enrichment Range of its start.
+   Each File uses at most two requests.
+   So the estimate is `loads * session_requests + 2 * (passes * files + (jumps + loads) * range_files)`.
+   S1 has one pass and one File Jump, for its `to_top` jump.
+   S2 has 50 File Jumps, and S3 has 200 File Jumps.
+   S4 has one pass and one Session load.
+   S5 has four passes, because it can open the Overlay before its three edits.
+   S6 has two passes and 10 File Jumps.
+   S7 and S8 each have three Session loads and 60 File Jumps.
    If the estimate fits in the budget, the harness waits until the window has room for the whole estimate.
    Then the scenario runs without waits from the window, if the estimate holds.
    If the estimate exceeds the budget, the harness does not wait before the scenario.
@@ -349,6 +363,7 @@ The header holds the run label, the network label, the bbr commit, and the cache
 It also holds the PullRequest id, its state, and its File count.
 The header also holds `probe_ms`, the median of five `getPullRequest` latencies before the chain.
 It also holds the Frame size as `cols` and `rows`.
+It also holds `range_files` and `session_requests`, the inputs of the request estimate in "Request budget".
 Each scenario line holds these keys:
 
 - `samples`, `hits`, `cold_fetches`, and `refetches`.
@@ -361,6 +376,8 @@ Each scenario line holds these keys:
 - `added_delay_p95_ms`, computed over the samples with a refetch.
 - `first_result_ms` and `complete_result_ms` for S4, S5, and S6.
 - `requests`, `src_requests`, `failures`, and `rate_limited`, as the "Retry" section defines them.
+- `request_estimate`, the estimate of gate 2 in "Request budget".
+  A `requests` value above `request_estimate` means that the estimate failed.
 - `retries`, the attempts that the harness retried.
 - `paused_ms`, the stall time in the scenario, which the latencies exclude.
 - `paced_samples`, the Visible Actions with stall time in their span.
@@ -610,13 +627,21 @@ Request budget:
 
 - "M28 cache the request window survives a restart and never exceeds the budget in any hour".
   Two runs share one output directory.
-  No hour in `requests.log` holds more entries than the budget, and the second run waits with `reason=window`.
+  No hour in `requests.log` holds more entries than the budget.
+  The second run keeps the entries of the last hour of the first run, and its own entries follow them.
 - "M28 cache a harness wait inside a span is not latency".
   A budget below the scenario estimate makes the gate wait inside spans.
   The latency stays 0, and `paused_ms` and `paced_samples` are above 0.
 - "M28 cache a 429 marks the request window full".
   After one `429`, the window holds the budget, and the retry waits with `reason=window`.
 - The harness waits before a scenario when the window has no room for an estimate that fits in the budget.
+- "M28 cache the request estimate bounds the requests of each scenario".
+  The tall fixture and a fixture of 20 short Files each run every scenario at a cache budget of 1 and at the default budget.
+  No scenario sends more requests than its `request_estimate`.
+  In the short fixture, `range_files` is above 3, and S3 sends more than 400 requests at a cache budget of 1.
+  So one File for each File Jump is not an upper bound.
+  The short fixture has 41 Comment pages, so the Session load costs more than the start Enrichment Range.
+  Its `session_requests` equals the requests of one Session load of the fixture.
 
 Retry:
 
@@ -698,3 +723,8 @@ The human can change a choice at ticket 03.
     Before this change, S4 ran after S1 had admitted every File, so S4 sent no request and rule 3 could not fire.
     A restart before S4 costs one Session load and adds no Review Search, so it is the smallest change that makes S4 cold.
     The alternative, a Review Search after each S7 refresh and each S8 restart, costs six full acquisitions and changes the S7 and S8 File Jumps.
+16. The request estimate of a scenario is an upper bound of its requests.
+    So a scenario whose estimate fits in the budget waits before it starts and never inside a measured span.
+    The estimate counts the production Enrichment Range for each File Jump and Session load, and the observed Session-load requests.
+    An estimate of one File for each File Jump was too low after the Enrichment Range arrived.
+    The budget stays 900 requests an hour.

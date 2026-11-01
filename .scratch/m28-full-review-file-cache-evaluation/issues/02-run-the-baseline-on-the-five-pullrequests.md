@@ -39,6 +39,11 @@ After both runs:
 - S4 starts with a process restart, so its Review Search is cold.
   Before, S4 ran after S1 had admitted every File, so it sent no request, and stop rule 3 could not fire.
   The SPEC records this change as choice 15.
+- The request estimate of a scenario is now an upper bound of its requests.
+  Each File Jump and each Session load can fetch the whole Enrichment Range, not one File.
+  The estimate also counts the requests of each Session load.
+  The header prints `range_files` and `session_requests`, and each scenario line prints `request_estimate`.
+  The SPEC records this change as choice 16.
 
 ## Run guide
 
@@ -156,29 +161,48 @@ Record each split under `## Completion`.
 
 These numbers are estimates. Nobody measured them.
 
-The table predates the Enrichment Range that main added in PR #16.
-The Enrichment Range fetches every visible File and one File above and below each File Jump.
-A 20-File fixture probe in the branch review sent about 3 times more requests in S3 and S7 after the merge.
-So the requests and the times below can be up to about 3 times higher.
-The per-scenario request estimate in the harness has the same gap, so the per-request gate sets the pace.
+The formulas use three values of a PullRequest:
 
-F is the File count of a PullRequest.
-One PullRequest needs at least 2F + 240 requests, when every File stays in the LRU.
-It needs at most 12F + 780 requests, when no File stays in the LRU.
+- F is the File count, the header key `files`.
+- W is the largest Enrichment Range in Files, the header key `range_files`.
+- L is the requests of one Session load, the header key `session_requests`.
+
+The upper bound applies when no File stays in the LRU.
+It is the sum of the `request_estimate` values of S1 to S8, plus the start and the probe.
+The start sends L + 2W requests, and the probe sends 5 requests.
+So the upper bound is 16F + 778W + 8L + 5 requests.
+
+The lower bound applies when every File stays in the LRU:
+
+- S1 sends 2F requests, and S4 sends L + 2F requests.
+- S7 and S8 each send 3 × (L + 2 × min(F, 21W)) requests.
+- S2, S3, S5, and S6 send no request.
+- The start and the probe add L + 2W + 5 requests.
+
 The request window allows 900 requests in one hour.
+So the time is the requests divided by 900 requests an hour, plus the dwell time.
 The dwell time adds about F + 380 seconds.
+Each scenario whose `request_estimate` fits in the budget can also wait up to one hour before it starts.
+
+The table uses the planning values W = 5 and L = 4.
+Nobody measured these values for the five PullRequests.
+The header of each run prints the real `range_files` and `session_requests`.
+The optional smoke test prints them for PullRequest E.
+Recompute the table with these values before you plan the runs.
 
 The rows of this table named the benchmark PullRequests. They are not in the repository.
 
-One run of the five PullRequests takes the sum of their times.
+One run of the five PullRequests sends the sum of the requests of each PullRequest.
+It takes the sum of their times, without the waits before scenarios.
 A segment restart repeats its requests.
+S1 to S6 of the largest PullRequest send most of its requests.
 So a crash late in S1 to S6 of the largest PullRequest can add most of its time.
 
 ### Read the output
 
 Each PullRequest prints these lines:
 
-- One `header` line with `bbr_version`, `state`, `files`, `probe_ms`, and the Frame size `cols` and `rows`.
+- One `header` line with `bbr_version`, `state`, `files`, `range_files`, `session_requests`, `probe_ms`, and the Frame size `cols` and `rows`.
 - One `scenario=sN` line for each scenario.
 - One `check` line with `not_found_sides` and `hunk_mismatch_files`.
 
@@ -189,6 +213,12 @@ Look for these values:
 
 - `failures` must be `0` on every scenario line. If not, run that PullRequest again.
 - `requests` counts attempts. `rate_limited` counts the attempts with a `429` response. Record the count.
+- `range_files` in the header is the largest Enrichment Range in Files at the fixed Frame.
+  `session_requests` in the header is the largest number of requests of one Session load.
+  The request estimate uses both values.
+- `request_estimate` is the upper bound of the requests of the scenario.
+  A `requests` value above `request_estimate` means that the estimate failed.
+  Then the scenario can wait inside a measured span. Record the scenario and both values under `## Comments`.
 - `retries` counts the attempts that the harness retried.
 - `paused_ms` is the time in which the harness waited, and the latencies exclude it.
 - `paced_samples` counts the Visible Actions with a harness wait in their span.

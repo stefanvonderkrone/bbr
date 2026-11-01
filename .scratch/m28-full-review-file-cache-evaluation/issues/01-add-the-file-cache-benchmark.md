@@ -93,7 +93,9 @@ The commit that resolves this ticket is the commit with the subject "benchmark: 
 
 ### Production hooks
 
-None. The harness reads public Presentation fields, such as `published`, `commands`, and `issued_commands`.
+- `Presentation.enrichmentRange` in `src/tui/presentation.zig` is `pub`, so the request estimate uses the production Enrichment Range. Its behavior does not change.
+
+The harness reads public Presentation fields, such as `published`, `commands`, and `issued_commands`.
 The executor calls the same production functions as the `app.zig` workers.
 The worker glue in the harness is a copy of the `app.zig` glue without the vaxis loop.
 The executor switch has no `else` branch, so a new command kind fails the build.
@@ -117,7 +119,7 @@ The spec does not answer these questions. The harness uses these choices.
 13. The 10 File Jumps in S6 are not samples. A reopened Overlay keeps its query.
 14. S7 and S8 use the same seed over the admitted Files, so S8 repeats the S7 targets.
 15. `candidate_session_ms` in S8 is the median of the three restart load times.
-16. The request estimate counts only `/src/` requests. It does not count the Session loads in S7 and S8.
+16. The request estimate is an upper bound. It counts the Enrichment Range for each File Jump and Session load, and the requests of each Session load. SPEC choice 16 records it.
 17. A label with a space or `=` fails. A query must have 1 to 64 bytes of UTF-8.
 18. A `--scenarios` subset must keep its dependencies. S2 needs S1. S7 and S8 need S1 or S4. Without them, S2, S7, and S8 have almost no samples. `Options.requireDependencies` enforces this rule.
 

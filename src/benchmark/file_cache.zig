@@ -38,9 +38,12 @@ pub const Scenario = enum {
     s8,
 
     const Spec = struct {
-        /// The Files the scenario can fetch: this multiple of every File, plus `fetch_fixed`.
-        fetch_all: u8 = 0,
-        fetch_fixed: u16 = 0,
+        /// Passes that can fetch every File.
+        files: u8 = 0,
+        /// File Jumps. Each can fetch the whole Enrichment Range.
+        jumps: u16 = 0,
+        /// Session loads. Each also fetches the Enrichment Range of its start.
+        loads: u8 = 0,
         search: bool = false,
         first_result: bool = false,
         restart: bool = false,
@@ -48,25 +51,33 @@ pub const Scenario = enum {
     };
 
     const specs = std.EnumArray(Scenario, Spec).init(.{
-        .s1 = .{ .fetch_all = 1, .steps = sequentialReview },
-        .s2 = .{ .fetch_fixed = 50, .steps = revisitAfterEviction },
-        .s3 = .{ .fetch_fixed = 200, .steps = nonSequentialNavigation },
-        .s4 = .{ .fetch_all = 1, .search = true, .first_result = true, .steps = firstReviewSearch },
-        .s5 = .{ .fetch_all = 3, .search = true, .steps = queryEdits },
-        .s6 = .{ .fetch_all = 1, .fetch_fixed = 10, .search = true, .steps = overlayReopen },
-        .s7 = .{ .fetch_fixed = replacement_repeats * replacement_jumps, .steps = sessionReplacement },
-        .s8 = .{ .fetch_fixed = replacement_repeats * replacement_jumps, .restart = true, .steps = processRestart },
+        // S1 counts its `to_top` jump. S5 can open the Overlay before its three edits.
+        .s1 = .{ .files = 1, .jumps = 1, .steps = sequentialReview },
+        .s2 = .{ .jumps = 50, .steps = revisitAfterEviction },
+        .s3 = .{ .jumps = 200, .steps = nonSequentialNavigation },
+        .s4 = .{ .files = 1, .loads = 1, .search = true, .first_result = true, .steps = firstReviewSearch },
+        .s5 = .{ .files = 4, .search = true, .steps = queryEdits },
+        .s6 = .{ .files = 2, .jumps = 10, .search = true, .steps = overlayReopen },
+        .s7 = .{ .loads = replacement_repeats, .jumps = replacement_repeats * replacement_jumps, .steps = sessionReplacement },
+        .s8 = .{ .loads = replacement_repeats, .jumps = replacement_repeats * replacement_jumps, .restart = true, .steps = processRestart },
     });
 
     fn spec(self: Scenario) Spec {
         return specs.get(self);
     }
 
-    /// Each File uses at most two `/src/` requests.
-    fn requestEstimate(self: Scenario, file_count: usize) usize {
+    /// An upper bound of the requests. Each File uses at most two `/src/` requests.
+    fn requestEstimate(self: Scenario, shape: Shape) usize {
         const s = self.spec();
-        return 2 * (s.fetch_all * file_count + s.fetch_fixed);
+        return s.loads * shape.session_requests + 2 * (s.files * shape.files + (@as(usize, s.jumps) + s.loads) * shape.range_files);
     }
+};
+
+/// What a scenario's request estimate depends on in one PullRequest.
+const Shape = struct {
+    files: usize,
+    range_files: usize,
+    session_requests: usize,
 };
 
 pub const FetchClass = enum { hit, cold, refetch };
@@ -171,6 +182,7 @@ pub const ScenarioReport = struct {
     pull_request: u64,
     stats: Stats,
     traffic: Traffic,
+    request_estimate: usize,
     peak_retained_bytes: usize,
     retained_bytes: usize,
     full_review_bytes: usize,
@@ -191,8 +203,8 @@ pub const ScenarioReport = struct {
         if (spec.first_result) try out.print(" first_result_ms={d:.1}", .{ms(s.first_result_ns)});
         if (spec.search) try out.print(" complete_result_ms={d:.1}", .{ms(s.complete_result_ns)});
         const t = self.traffic;
-        try out.print(" requests={d} src_requests={d} failures={d} rate_limited={d} request_median_ms={d:.1} request_p95_ms={d:.1}", .{
-            t.requests, t.src_requests, t.failures, t.rate_limited, ms(t.request_median_ns), ms(t.request_p95_ns),
+        try out.print(" requests={d} request_estimate={d} src_requests={d} failures={d} rate_limited={d} request_median_ms={d:.1} request_p95_ms={d:.1}", .{
+            t.requests, self.request_estimate, t.src_requests, t.failures, t.rate_limited, ms(t.request_median_ns), ms(t.request_p95_ns),
         });
         try out.print(" retries={d} paused_ms={d:.1} paced_samples={d}", .{ t.retries, ms(t.paused_ns), self.paced_samples });
         const e = self.enrichments;
@@ -949,8 +961,8 @@ fn chain(env: Environment, options: Options, files: RunFiles, repository: []cons
     } else {
         const probe_ns = try probe(env, files.measuring, repository, pull_request_id);
         _ = try driver.start();
-        try checkpoint.header.print(gpa, "header run_label={s} network_label={s} bbr_version={s} cache_max_bytes={d} pull_request={d} state={s} files={d} probe_ms={d:.1}", .{
-            options.run_label, options.network_label, env.bbr_version, options.cache_max_bytes, pull_request_id, driver.stateText(), driver.file_count, ms(probe_ns),
+        try checkpoint.header.print(gpa, "header run_label={s} network_label={s} bbr_version={s} cache_max_bytes={d} pull_request={d} state={s} files={d} range_files={d} session_requests={d} probe_ms={d:.1}", .{
+            options.run_label, options.network_label, env.bbr_version, options.cache_max_bytes, pull_request_id, driver.stateText(), driver.file_count, driver.range_files, driver.session_requests, ms(probe_ns),
         });
         try checkpoint.header.print(gpa, " dwell_ms={d} seed={d} query_bytes={d} second_query_bytes={d} hourly_request_budget={d} cols={d} rows={d}\n", .{
             options.dwell_ms, options.seed, options.query.len, options.second_query.len, options.hourly_request_budget, frame_geometry.cols, frame_geometry.rows,
@@ -986,7 +998,7 @@ fn chain(env: Environment, options: Options, files: RunFiles, repository: []cons
 
 fn runScenario(env: Environment, options: Options, files: RunFiles, driver: *Driver, scenario: Scenario, pull_request_id: u64, lines: *std.Io.Writer) !void {
     // An estimate above the budget gets no upfront wait. The request gate paces it.
-    const estimate = scenario.requestEstimate(driver.file_count);
+    const estimate = scenario.requestEstimate(.{ .files = driver.file_count, .range_files = driver.range_files, .session_requests = driver.session_requests });
     if (estimate <= options.hourly_request_budget) files.window.reserve(scenario, estimate);
     const start = files.measuring.mark();
     const enrichments_start = driver.enrichments;
@@ -1006,6 +1018,7 @@ fn runScenario(env: Environment, options: Options, files: RunFiles, driver: *Dri
         .pull_request = pull_request_id,
         .stats = try stats(env.gpa, recorder.samples.items),
         .traffic = try files.measuring.since(env.gpa, start),
+        .request_estimate = estimate,
         .peak_retained_bytes = driver.peak_retained,
         .retained_bytes = driver.retainedBytes(),
         .full_review_bytes = driver.fullReviewBytes(),
@@ -1209,6 +1222,10 @@ const Driver = struct {
     group: std.Io.Group = .init,
     outstanding: usize = 0,
     file_count: usize = 0,
+    /// The most Files that the production Enrichment Range holds at the Frame of a start.
+    range_files: usize = 0,
+    /// The most requests that one Session load of a start sent.
+    session_requests: usize = 0,
     admitted: []bool = &.{},
     checked: []bool = &.{},
     largest_result: []usize = &.{},
@@ -1272,7 +1289,9 @@ const Driver = struct {
     /// Loads a Candidate Session as the production startup does and returns its time.
     fn start(self: *Driver) !u64 {
         const span: Span = .begin(self.env.clock, self.measuring);
+        const requests_before = self.measuring.mark().traffic.requests;
         const loaded = try session_mod.loadWith(self.env.io, std.heap.page_allocator, self.client(), self.repository, self.pull_request_id);
+        self.session_requests = @max(self.session_requests, self.measuring.mark().traffic.requests - requests_before);
         self.state = presentation.Presentation.init(self.env.gpa, .{
             .reviews = self.store.store(),
             .highlight_max_file_bytes = config.Configuration.default_highlight_max_file_bytes,
@@ -1310,7 +1329,21 @@ const Driver = struct {
         try self.pump();
         try self.waitUntil(FocusSettled{});
         self.noteFocus();
+        self.range_files = @max(self.range_files, self.widestEnrichmentRange());
         return elapsed;
+    }
+
+    /// The most Files that the production Enrichment Range holds at any scroll of this Frame.
+    fn widestEnrichmentRange(self: *Driver) usize {
+        const published = self.ui().published orelse return 1;
+        var copy = published.*;
+        var widest: usize = 1;
+        for (0..copy.visual_rows.len) |top| {
+            copy.navigation.scroll = top;
+            const range = presentation.Presentation.enrichmentRange(&copy, null, self.file_count);
+            widest = @max(widest, range.focused.end - range.focused.first);
+        }
+        return widest;
     }
 
     /// Closes the Presentation and the network client, then starts both again.
@@ -2273,6 +2306,53 @@ fn fixtureResponses(comptime blob_b_new: bbr.http.Canned) [12]bbr.http.Canned {
 
 const matching_b: bbr.http.Canned = .{ .request_key = "/src/aaaa/PATHSENTINEL/b.zig", .body = new_blob };
 
+/// Many short Files fit the 50-row Frame, so the Enrichment Range holds many Files.
+const short_files = 20;
+
+fn shortPath(comptime index: usize) []const u8 {
+    return std.fmt.comptimePrint("PATHSENTINEL/s{d:0>2}.zig", .{index});
+}
+
+const short_diff = diff: {
+    var text: []const u8 = "";
+    for (0..short_files) |index| {
+        const path = shortPath(index);
+        text = text ++ "diff --git a/" ++ path ++ " b/" ++ path ++ "\n--- a/" ++ path ++ "\n+++ b/" ++ path ++
+            "\n@@ -1,1 +1,1 @@\n-old SRCSENTINEL\n+qrysentinel new SRCSENTINEL\n";
+    }
+    break :diff text;
+};
+
+/// More Comment pages than the requests of the start Enrichment Range, so the
+/// request estimate needs its Session-load term.
+const short_comment_pages = 40;
+
+fn commentPageUrl(comptime page: usize) []const u8 {
+    return std.fmt.comptimePrint("/commentpage/{d:0>2}", .{page});
+}
+
+fn commentPage(comptime page: usize) []const u8 {
+    return std.fmt.comptimePrint("{{ \"values\": [], \"next\": \"https://api.bitbucket.org/2.0{s}\" }}", .{commentPageUrl(page)});
+}
+
+const short_responses = responses: {
+    var responses: [2 * short_files + short_comment_pages + 4]bbr.http.Canned = undefined;
+    for (0..short_files) |index| {
+        responses[2 * index] = .{ .request_key = "/src/bbbb/" ++ shortPath(index), .body = "old SRCSENTINEL\n" };
+        responses[2 * index + 1] = .{ .request_key = "/src/aaaa/" ++ shortPath(index), .body = "qrysentinel new SRCSENTINEL\n" };
+    }
+    for (1..short_comment_pages) |page|
+        responses[2 * short_files + page - 1] = .{ .request_key = commentPageUrl(page), .body = commentPage(page + 1) };
+    responses[2 * short_files + short_comment_pages - 1] = .{ .request_key = commentPageUrl(short_comment_pages), .body = fixture_comments };
+    responses[2 * short_files + short_comment_pages ..].* = .{
+        .{ .request_key = "/pullrequests/7/diff", .body = short_diff },
+        .{ .request_key = "/pullrequests/7/comments", .body = commentPage(1) },
+        .{ .request_key = "/pullrequests/7", .body = fixture_pull_request },
+        .{ .request_key = "/user", .body = "{ \"uuid\": \"{ada}\" }" },
+    };
+    break :responses responses;
+};
+
 const fixture_options: Options = .{ .dwell_ms = 0, .query = "qrysentinel", .second_query = "qrytwo", .run_label = "fixture" };
 
 /// The path of a test directory, relative to the working directory of the test.
@@ -2361,6 +2441,7 @@ fn reportText(samples: []const Sample) ![]u8 {
         .pull_request = 1,
         .stats = try stats(testing.allocator, samples),
         .traffic = .{},
+        .request_estimate = 0,
         .peak_retained_bytes = 0,
         .retained_bytes = 0,
         .full_review_bytes = 0,
@@ -2635,13 +2716,18 @@ test "M28 cache the request budget waits before a scenario and never inside a me
     const responses = fixtureResponses(matching_b);
     // The clock moves only when the harness sleeps, so a wait inside a span would show as latency.
     var clock: FakeClock = .{};
-    var options = fixture_options;
-    // S2 estimates 100 requests. The window holds the earlier requests, so S2 waits before it starts.
-    options.hourly_request_budget = 100;
+    var options = withBudget(fixture_options, 1);
     options.scenarios = .initMany(&.{ .s1, .s2 });
     var notes: std.Io.Writer.Allocating = .init(testing.allocator);
     defer notes.deinit();
-    const output = try runWithNotes(&responses, withBudget(options, 1), &clock, &notes);
+    var first_clock: FakeClock = .{};
+    const first = try runWithNotes(&responses, options, &first_clock, &notes);
+    defer testing.allocator.free(first);
+    // The budget equals the S2 estimate. The window holds the earlier requests, so S2 waits before it starts.
+    options.hourly_request_budget = try intField(first, "scenario=s2 ", "request_estimate");
+    try testing.expect(try intField(first, "scenario=s1 ", "request_estimate") < options.hourly_request_budget);
+    notes.clearRetainingCapacity();
+    const output = try runWithNotes(&responses, options, &clock, &notes);
     defer testing.allocator.free(output);
     try testing.expect(clock.time.load(.monotonic) >= hour_ns);
     try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=scenario scenario=s2 seconds=") != null);
@@ -2652,6 +2738,50 @@ test "M28 cache the request budget waits before a scenario and never inside a me
         try testing.expectEqualStrings("0.0", try field(output, prefix, "paused_ms"));
         try testing.expectEqual(@as(usize, 0), try intField(output, prefix, "paced_samples"));
     }
+}
+
+/// The requests of one Session load of the fixture on a fake client of its own.
+fn sessionLoadRequests(responses: []const bbr.http.Canned) !usize {
+    var fake: bbr.http.FakeHttpClient = .{ .responses = responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    const loaded = try session_mod.loadWith(testing.io, std.heap.page_allocator, client, "repo", 7);
+    loaded.destroy();
+    return fake.callCount();
+}
+
+test "M28 cache the request estimate bounds the requests of each scenario" {
+    const tall_responses = fixtureResponses(matching_b);
+    var exceeded = false;
+    for ([_][]const bbr.http.Canned{ &tall_responses, &short_responses }) |responses| {
+        for ([_]usize{ 1, fixture_options.cache_max_bytes }) |budget| {
+            var clock: FakeClock = .{};
+            const output = try runFixture(responses, withBudget(fixture_options, budget), &clock);
+            defer testing.allocator.free(output);
+            for (std.enums.values(Scenario)) |scenario| {
+                var prefix_buffer: [16]u8 = undefined;
+                const prefix = try std.fmt.bufPrint(&prefix_buffer, "scenario={s} ", .{@tagName(scenario)});
+                const requests = try intField(output, prefix, "requests");
+                const estimate = try intField(output, prefix, "request_estimate");
+                if (requests > estimate) {
+                    std.debug.print("files={s} cache_max_bytes={d} scenario={s} requests={d} request_estimate={d}\n", .{
+                        try field(output, "header", "files"), budget, @tagName(scenario), requests, estimate,
+                    });
+                    exceeded = true;
+                }
+            }
+            if (responses.ptr != &short_responses) continue;
+            const session_requests = try intField(output, "header", "session_requests");
+            const range_files = try intField(output, "header", "range_files");
+            try testing.expectEqual(try sessionLoadRequests(responses), session_requests);
+            // Several short Files share the Frame, so each File Jump can fetch more than one File.
+            try testing.expect(range_files > 3);
+            // The start Enrichment Range alone cannot cover the Session load.
+            try testing.expect(session_requests > 2 * range_files);
+            // One File for each of the 200 S3 jumps would allow only 400 requests.
+            if (budget == 1) try testing.expect(try intField(output, "scenario=s3 ", "requests") > 400);
+        }
+    }
+    try testing.expect(!exceeded);
 }
 
 test "M28 cache a harness wait inside a span is not latency" {
@@ -2688,18 +2818,27 @@ test "M28 cache the request window survives a restart and never exceeds the budg
     options.scenarios = .initMany(&.{ .s1, .s2, .s3 });
     var notes: std.Io.Writer.Allocating = .init(testing.allocator);
     defer notes.deinit();
-    for ([_][]const u8{ "first", "second" }) |run_label| {
+    var last_hour: std.ArrayList(u8) = .empty;
+    defer last_hour.deinit(testing.allocator);
+    for ([_][]const u8{ "first", "second" }, 0..) |run_label, index| {
         notes.clearRetainingCapacity();
         var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
         var transport: FakeTransport = .{ .client = fake.httpClient() };
         options.run_label = run_label;
         const output = try runIn(&transport, path, options, &clock, &notes.writer);
         testing.allocator.free(output);
+        if (index > 0) continue;
+        const first_log = try tmp.dir.readFileAlloc(testing.io, "requests.log", testing.allocator, .unlimited);
+        defer testing.allocator.free(first_log);
+        var first_lines = std.mem.tokenizeScalar(u8, first_log, '\n');
+        while (first_lines.next()) |line| if (try std.fmt.parseInt(u64, line, 10) + hour_ns > clock.time.load(.monotonic))
+            try last_hour.print(testing.allocator, "{s}\n", .{line});
     }
-    // The first run left a full window, so the second run waits before its first request.
-    try testing.expect(std.mem.startsWith(u8, notes.written(), "wait reason=window seconds="));
+    // The second run keeps the requests of the last hour of the first run, and its own requests follow them.
+    try testing.expect(last_hour.items.len > 0);
     const log = try tmp.dir.readFileAlloc(testing.io, "requests.log", testing.allocator, .unlimited);
     defer testing.allocator.free(log);
+    try testing.expect(std.mem.startsWith(u8, log, last_hour.items));
     var entries: std.ArrayList(u64) = .empty;
     defer entries.deinit(testing.allocator);
     var lines = std.mem.tokenizeScalar(u8, log, '\n');

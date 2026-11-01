@@ -11363,7 +11363,7 @@ pub const Presentation = struct {
     /// The Files with a row in the DiffPane viewport, and the focused range:
     /// those Files plus `enrichment_overscan_files` Files above and below.
     /// It always holds the active File. An isolated File is the whole range.
-    fn enrichmentRange(published: *const Published, active: ?usize, files: usize) EnrichmentRange {
+    pub fn enrichmentRange(published: *const Published, active: ?usize, files: usize) EnrichmentRange {
         if (published.isolated_file) |isolated| {
             const range: file_enrichment.FileRange = if (isolated < files) .single(isolated) else .{};
             return .{ .visible = range, .focused = range };
