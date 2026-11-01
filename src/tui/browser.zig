@@ -323,10 +323,14 @@ const PullRequestOrder = struct {
     }
 };
 
-/// `YYYY-MM-DD` in UTC, or null for a missing or negative time.
+/// 9999-12-31T23:59:59Z, the last second with a four-digit year.
+const last_four_digit_second: i64 = 253402300799;
+
+/// `YYYY-MM-DD` in UTC, or null for a missing, negative, or post-9999 time.
 pub fn formatDate(buf: *[10]u8, seconds: ?i64) ?[]const u8 {
     const value = seconds orelse return null;
-    if (value < 0) return null;
+    // std.time.epoch overflows for a large time, such as one from a corrupt Summary Cache.
+    if (value < 0 or value > last_four_digit_second) return null;
     const day = (std.time.epoch.EpochSeconds{ .secs = @intCast(value) }).getEpochDay();
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
