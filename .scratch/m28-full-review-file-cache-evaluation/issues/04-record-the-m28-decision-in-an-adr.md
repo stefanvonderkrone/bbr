@@ -14,7 +14,8 @@ This ticket then waits for them.
 
 ## Scope
 
-- Add `docs/adr/0014-<slug>.md` with the decision.
+- Add `docs/adr/<next free number>-<slug>.md` with the decision.
+  Use the next free ADR number when this ticket runs. M27 keeps ADR-0014.
   Name the decision: no change, a revised LRU, a full-Review memory cache, or an opt-in disk cache.
 - State the evidence in the ADR: the five PullRequests, the run dates and network labels, and the numbers that decide.
   Link tickets 02 and 03.
@@ -42,3 +43,9 @@ This ticket then waits for them.
 
 - `python3 tools/check_agent_docs.py`
 - `zig build test --summary all`, if a ticket after 03 changed code.
+
+## Comments
+
+2026-11-01: The ADR number is no longer fixed.
+M27 keeps ADR-0014, so this ticket takes the next free number when it runs.
+The merge plan for all branches records this choice.
