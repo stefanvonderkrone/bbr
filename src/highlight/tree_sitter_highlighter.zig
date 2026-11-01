@@ -1322,6 +1322,29 @@ test "M27 injection offset moves the range and an invalid offset drops only its 
     try expectRoleAt(result, source, "f(", .function);
 }
 
+test "M27 injection an offset that ends inside a UTF-8 sequence drops its Injection" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const source = "<a title=\"${x}é\">t</a>\n";
+    const value_start = std.mem.indexOf(u8, source, "${").?;
+    const value_end = std.mem.indexOf(u8, source, "\">").?;
+    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
+    const intervals = try collectCaptureIntervals(testing.allocator, html, &highlighter.packages, source, null);
+    defer testing.allocator.free(intervals);
+    for (intervals) |interval| {
+        if (interval.depth > 0) try testing.expect(interval.end <= value_start or interval.start >= value_end);
+    }
+
+    const result = try highlighter.highlighter().highlight(testing.allocator, "a.html", source);
+    defer freeResult(result);
+    try testing.expect(result.spans.len > 0);
+    for (result.spans) |span| {
+        try testing.expectEqual(@as(u32, 1), span.line);
+        try testing.expect(predicate_mod.utf8Boundary(source, span.start));
+        try testing.expect(predicate_mod.utf8Boundary(source, span.end));
+    }
+}
+
 test "M27 injection depth stops at 4 for a self-injecting query" {
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
