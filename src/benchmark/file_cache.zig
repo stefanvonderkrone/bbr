@@ -3514,3 +3514,54 @@ test "M28 cache a File Jump to a File whose fetch is still in flight is a fetch,
     try testing.expectEqual(@as(usize, 4), try intField(output, "scenario=s2 ", "refetches"));
     try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s2 ", "cold_fetches"));
 }
+
+test "M28 cache a File Jump whose fetch the Presentation still queues at the span end is a fetch, not a hit" {
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var clock: FakeClock = .{};
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var notes_text: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes_text.deinit();
+    var notes: Notes = .{ .io = testing.io, .writer = &notes_text.writer };
+    var window: RequestWindow = try .open(testing.io, tmp.dir, clock.clock(), &notes, 900);
+    defer window.deinit();
+    var prng: std.Random.DefaultPrng = .init(28);
+    var measuring: MeasuringHttpClient = .{ .io = testing.io, .inner = try transport.transport().open(), .clock = clock.clock(), .window = &window, .notes = &notes, .random = prng.random() };
+    defer measuring.deinit();
+    const env: Environment = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .clock = clock.clock(),
+        .transport = transport.transport(),
+        .credential = .{ .username = "u", .token = "t", .workspace = "ws" },
+        .highlighter = plain.highlighter(),
+        .bbr_version = "test",
+        .out = undefined,
+        .notes = undefined,
+        .random = prng.random(),
+    };
+    var driver: Driver = undefined;
+    try driver.init(env, fixture_options, &measuring, "repo", 7);
+    defer driver.deinit();
+    _ = try driver.start();
+    driver.quiesce();
+    const target = driver.file_count - 1;
+    try testing.expect(!driver.ui().published.?.session.enrichment.isTerminal(target));
+    // The Driver issues nothing after the jump, as when a running disclosure build holds the queue head.
+    const span = try driver.beginSpan();
+    try driver.ui().dispatch(.{ .action = .open_file_finder });
+    for (0..target) |_| try driver.ui().dispatch(.{ .key = .{ .codepoint = keymap.special.down } });
+    try driver.ui().dispatch(.{ .key = .{ .codepoint = keymap.special.enter } });
+    try driver.ui().dispatch(.ensure_focused_enrichment);
+    _ = driver.endSpan(span);
+    var queued = false;
+    for (driver.ui().commands.items) |command| queued = queued or command == .enrich_file and command.enrich_file.file_index == target;
+    try testing.expect(queued);
+    for (driver.span_fetches.items) |fetch| try testing.expect(fetch.file_index != target);
+    try testing.expectEqual(FetchClass.cold, driver.classify(target));
+    driver.admitted[target] = true;
+    try testing.expectEqual(FetchClass.refetch, driver.classify(target));
+}
