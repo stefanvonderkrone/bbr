@@ -3141,7 +3141,9 @@ test "M28 cache benchmark output holds no source, path, query, or Comment text" 
     defer testing.allocator.free(path);
     const responses = fixtureResponses(matching_b);
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    var transport: FakeTransport = .{ .client = fake.httpClient() };
+    var flaky: FlakyHttpClient = .{ .fake = &fake, .key = "/src/aaaa/PATHSENTINEL/c.zig", .script = &.{.{ .status = 503 }} };
+    defer flaky.deinit();
+    var transport: FakeTransport = .{ .client = flaky.httpClient() };
     var clock: FakeClock = .{ .step_ns = 1000 };
     var notes: std.Io.Writer.Allocating = .init(testing.allocator);
     defer notes.deinit();
@@ -3155,6 +3157,8 @@ test "M28 cache benchmark output holds no source, path, query, or Comment text" 
     try expectNone(notes.written(), &forbidden);
     // The lock, the request log, and the checkpoint.
     try testing.expectEqual(@as(usize, 3), try expectNoneInFiles(tmp.dir, &forbidden));
+    // The retry of a request prints a note, so the check covered a note about one request.
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=retry status=503") != null);
 }
 
 test "M28 cache the Credential token never reaches the output, the notes, or the run files" {
@@ -3175,7 +3179,11 @@ test "M28 cache the Credential token never reaches the output, the notes, or the
     options.scenarios = .initMany(&.{ .s1, .s2 });
     const output = try runIn(&transport, path, options, &clock, &notes.writer);
     defer testing.allocator.free(output);
-    const forbidden = [_][]const u8{"TOKENSENTINEL"};
+    const credential: bbr.bitbucket.Credential = .{ .username = "u", .token = "TOKENSENTINEL", .workspace = "ws" };
+    const header = try credential.basicAuthHeader(testing.allocator);
+    defer testing.allocator.free(header);
+    // The Authorization header carries the token only in base64.
+    const forbidden = [_][]const u8{ "TOKENSENTINEL", header["Basic ".len..] };
     try expectNone(output, &forbidden);
     try expectNone(notes.written(), &forbidden);
     try testing.expectEqual(@as(usize, 3), try expectNoneInFiles(tmp.dir, &forbidden));
