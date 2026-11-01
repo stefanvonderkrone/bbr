@@ -1198,6 +1198,8 @@ pub const Client = struct {
         defer allocator.free(auth);
         var url = try pageUrlWithBase(allocator, first_url, opts);
         defer allocator.free(url);
+        var followed: FollowedPages = .{};
+        defer followed.deinit(allocator);
         while (true) {
             const res = try self.send(allocator, .{
                 .method = .GET,
@@ -1238,6 +1240,7 @@ pub const Client = struct {
                 if (out.items.len >= limit) break;
             }
             const next = parsed.value.next orelse break;
+            try followed.follow(allocator, url, next);
             const next_url = try allocator.dupe(u8, next);
             allocator.free(url);
             url = next_url;
@@ -1743,6 +1746,26 @@ const PagePosition = struct {
     }
 };
 
+/// The page URLs that one list followed `next` from. A `next` link that repeats one of them
+/// would page forever, because nothing else ends a list without a limit or with empty pages.
+const FollowedPages = struct {
+    urls: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *FollowedPages, allocator: Allocator) void {
+        var keys = self.urls.keyIterator();
+        while (keys.next()) |url| allocator.free(url.*);
+        self.urls.deinit(allocator);
+    }
+
+    /// Records `url`, the page that links to `next`, and rejects a `next` that repeats a recorded page.
+    fn follow(self: *FollowedPages, allocator: Allocator, url: []const u8, next: []const u8) !void {
+        if (std.mem.eql(u8, url, next) or self.urls.contains(next)) return error.MalformedResponse;
+        const owned = try allocator.dupe(u8, url);
+        errdefer allocator.free(owned);
+        try self.urls.putNoClobber(allocator, owned, {});
+    }
+};
+
 /// The coordinator state of `listPagesConcurrent`.
 fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytype, comptime deinitItem: fn (Allocator, Item) void) type {
     const Page = NumberedPage(Value);
@@ -1771,6 +1794,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             last: ?u32 = null,
             /// One state for each launched page, in page order.
             pages: std.ArrayList(PageState) = .empty,
+            followed: FollowedPages = .{},
         };
 
         /// One request. Its worker owns the arena until it completes.
@@ -1824,6 +1848,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                 for (list.pages.items) |*page| self.release(page);
                 list.pages.deinit(self.allocator);
                 if (list.link) |link| self.allocator.free(link);
+                list.followed.deinit(self.allocator);
             }
             self.allocator.free(self.lists);
         }
@@ -1926,10 +1951,11 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                 if (number < list.known) {
                     if (!numberedNext(next, list.first, page_number + 1)) return error.MalformedResponse;
                 } else {
+                    try list.followed.follow(self.allocator, slot.url, next);
                     list.link = try self.allocator.dupe(u8, next);
                     list.known = number + 1;
                 }
-            } else list.last = number;
+            } else list.last = @min(list.last orelse number, number);
             return items;
         }
 
@@ -5012,6 +5038,63 @@ test "a PullRequest limit follows a short page that has a next link" {
     }
 }
 
+test "a PullRequest limit follows successive short pages to the limit" {
+    const link = "https://api.bitbucket.org/2.0/next?cursor=";
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[" ++ comptime workspacePr("alpha", "3") ++ "],\"pagelen\":3,\"next\":\"" ++ link ++ "b\"}" },
+        .{ .request_key = "cursor=b", .body = "{\"values\":[" ++ comptime workspacePr("alpha", "2") ++ "],\"pagelen\":3,\"next\":\"" ++ link ++ "c\"}" },
+        .{ .request_key = "cursor=c", .body = "{\"values\":[" ++ comptime workspacePr("alpha", "1") ++ "],\"pagelen\":3,\"next\":\"" ++ link ++ "d\"}" },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    var done: std.atomic.Value(bool) = .init(false);
+    const items = try listPagedPullRequestsForTest(Client.init(fake.httpClient(), testCredential()), author_scope, 3, 8, &done);
+    defer deinitSummaries(testing.allocator, items);
+    try testing.expectEqual(@as(usize, 3), fake.callCount());
+    try testing.expectEqual(@as(usize, 3), items.len);
+    for ([_]u64{ 3, 2, 1 }, items) |id, item| try testing.expectEqual(id, item.id);
+}
+
+test "a list that ends early ignores a failed page past its end in any completion order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var early: std.atomic.Value(bool) = .init(false);
+    var late: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    // Page 1 reports 8 rows, but page 2 ends the list. Page 4 also has no next link and completes last.
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = try pullRequestPage(a, author_endpoint, "alpha", 1, 4, true) },
+        .{ .request_key = "&page=2", .body = try pullRequestPage(a, author_endpoint, "alpha", 2, 2, false), .released = &early },
+        .{ .request_key = "&page=3", .status = 429, .released = &early },
+        .{ .request_key = "&page=4", .body = try pullRequestPage(a, author_endpoint, "alpha", 4, 4, false), .released = &late },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    var claimed = false;
+    var future = try testing.io.concurrent(listPagedPullRequestsForTest, .{ Client.init(fake.httpClient(), testCredential()), author_scope, null, 3, &done });
+    defer {
+        early.store(true, .release);
+        late.store(true, .release);
+        if (future.await(testing.io)) |items| {
+            if (!claimed) deinitSummaries(testing.allocator, items);
+        } else |_| {}
+    }
+    try waitMemberCalls(&fake, 4);
+    early.store(true, .release);
+    for (0..100_000_000) |_| {
+        if (fake.activeRequestCount() == 1) break;
+        std.atomic.spinLoopHint();
+    }
+    try testing.expectEqual(@as(usize, 1), fake.activeRequestCount());
+    // A worker decodes its page after the fake returns, so page 2 can still be in flight here.
+    try testing.io.sleep(.fromMilliseconds(100), .awake);
+    late.store(true, .release);
+    const items = try future.await(testing.io);
+    claimed = true;
+    defer deinitSummaries(testing.allocator, items);
+    try testing.expectEqual(@as(usize, 4), items.len);
+    for (items, 1..) |item, id| try testing.expectEqual(@as(u64, id), item.id);
+}
+
 test "a failed PullRequest page fails the list and reports its detail" {
     for ([_]usize{ 1, 3 }) |concurrency| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -5508,6 +5591,28 @@ test "review fixes typed pagers stop at cap and preserve page options" {
                 try testing.expect(std.mem.indexOf(u8, url, "page=3") != null);
                 try testing.expect(std.mem.indexOf(u8, url, "id%20%3E%200") != null);
                 try testing.expect(std.mem.indexOf(u8, url, "sort=-updated_on") != null);
+            }
+        }
+    }
+}
+
+test "every pager rejects a next link that repeats a requested page" {
+    const link = "https://api.bitbucket.org/2.0/next?cursor=";
+    const repeat = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[],\"next\":\"" ++ link ++ "a\"}" },
+        .{ .request_key = "cursor=a", .body = "{\"values\":[],\"next\":\"" ++ link ++ "a\"}" },
+    };
+    const cycle = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[],\"next\":\"" ++ link ++ "a\"}" },
+        .{ .request_key = "cursor=a", .body = "{\"values\":[],\"next\":\"" ++ link ++ "b\"}" },
+        .{ .request_key = "cursor=b", .body = "{\"values\":[],\"next\":\"" ++ link ++ "a\"}" },
+    };
+    for ([_][]const httpc_fixture.Canned{ &repeat, &cycle }) |responses| {
+        for (std.enums.values(PagingKind)) |kind| {
+            for ([_]?usize{ null, 3 }) |limit| {
+                var fake: FakeHttpClient = .{ .responses = responses, .max_calls = 10 };
+                try testing.expectError(error.MalformedResponse, pagedCount(testing.allocator, Client.init(fake.httpClient(), testCredential()), kind, .{ .limit = limit }));
+                try testing.expectEqual(responses.len, fake.call_count);
             }
         }
     }

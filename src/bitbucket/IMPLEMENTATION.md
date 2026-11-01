@@ -70,6 +70,9 @@ A PullRequest list page reports `size`, `page`, and `pagelen` when `fields` sele
 Its `next` link is the same URL with `page=N+1`, and it keeps `q` and `fields`.
 `listPagesConcurrent` in `client.zig` reads page 1, then requests the remaining pages as `page=N` in parallel.
 A list without `size` or without a numbered `next` link follows `next` one page at a time.
+A `next` link that repeats a page that the list already followed fails the list with `MalformedResponse`.
+`FollowedPages` in `client.zig` records the pages for both `listPages` and `listPagesConcurrent`.
+The first page without a `next` link ends the list, also when `size` claims more pages and a later page completes after it.
 The Workspace members endpoint behaves the same way. It reported `size` 4278 for `check24`.
 The Repository and branch lists also report `size`, `page`, and `pagelen` and have numbered `next` links.
 `list-repositories`, `list-branches`, and `list-pull-requests` use the same pager.
