@@ -30638,6 +30638,58 @@ test "M22 read m on a binary File without blob ids reports file_read_unverifiabl
     try testing.expectEqual(@as(usize, 0), reads.writes);
 }
 
+test "M22 read two Files with one display path ignore a matching receipt and m on each is file_read_unverifiable" {
+    const type_change =
+        \\diff --git a/link b/link
+        \\deleted file mode 120000
+        \\index 1111111..0000000
+        \\--- a/link
+        \\+++ /dev/null
+        \\@@ -1 +0,0 @@
+        \\-target
+        \\diff --git a/link b/link
+        \\new file mode 100644
+        \\index 0000000..2222222
+        \\--- /dev/null
+        \\+++ b/link
+        \\@@ -0,0 +1 @@
+        \\+content
+        \\
+    ;
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var parsed = std.heap.ArenaAllocator.init(testing.allocator);
+    defer parsed.deinit();
+    const diff = try bbr.diff.parse(parsed.allocator(), type_change);
+    try testing.expectEqual(@as(usize, 2), diff.files.len);
+    try testing.expectEqualStrings("link", diff.files[0].displayPath());
+    try testing.expectEqualStrings("link", diff.files[1].displayPath());
+    try reads.store().put(m22_remote, "link", bbr.review.file_read.fingerprint(diff.files[1]).?);
+    const seeded = reads.writes;
+
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, type_change) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expectEqual(ActionError.file_read_unverifiable, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .down });
+    const tree = presentation.projection().review.?.frame.file_tree;
+    try testing.expect(tree.entries[tree.cursor].identity.eql(.{ .file = 1 }));
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expectEqual(ActionError.file_read_unverifiable, presentation.projection().action_error.?);
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expectEqual(seeded, reads.writes);
+}
+
 test "M22 read a refresh that only shifts Hunk line numbers keeps every File read" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
