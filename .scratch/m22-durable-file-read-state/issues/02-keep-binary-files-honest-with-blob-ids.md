@@ -106,3 +106,24 @@ The self-review found no remaining correctness issue or change beyond the SPEC.
 I removed trailing whitespace from the parser fixture before the final checks.
 The new behavioral tests enforce the blob hashing and full-id requirements.
 I found no repeated repository mistake class in this task.
+
+## Comments
+
+### Review fix M22-1: a binary File with a space in its path
+
+Git does not quote a space in a `diff --git` path.
+A binary diff has no `---` or `+++` line, so nothing repairs the paths.
+The parser marked both sides unavailable, and `fingerprint` skipped the blob ids.
+A changed image then stayed read.
+
+Fix: `fingerprint` returns null when a present side is unavailable.
+Such a File is unverifiable, so `m` reports `file_read_unverifiable`.
+This choice is the most conservative one, and it keeps the SPEC rule that bbr never claims a check it cannot make.
+A text File with an unrepairable path is now unverifiable too.
+
+The parser still does not read paths from the `Binary files ... differ` line.
+That change touches main's parser, so it stays open as a follow-up.
+
+Proof: the test "M22 read a binary File with a space in its path is unverifiable" in `src/review/file_read.zig`.
+It failed on commit `518e6a7` with "expected null, found .{ .bytes = ... }".
+It passes after the fix.

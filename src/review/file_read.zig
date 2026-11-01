@@ -23,6 +23,8 @@ pub const FileReviewFingerprint = struct {
 /// is unverifiable. Hunk headers and line numbers do not participate, so a
 /// pure line shift keeps the fingerprint.
 pub fn fingerprint(file: diff.File) ?FileReviewFingerprint {
+    // An unavailable side can hide a binary change, so no digest can follow it.
+    if (isUnavailable(file.content.old) or isUnavailable(file.content.new)) return null;
     const binary = isBinary(file.content.old) or isBinary(file.content.new);
     if (binary and file.blob_ids == null) return null;
     var hash = Sha256.init(.{});
@@ -58,6 +60,10 @@ pub fn fingerprint(file: diff.File) ?FileReviewFingerprint {
 
 fn isBinary(side: ?diff.FileContentStatus) bool {
     return if (side) |status| status == .binary else false;
+}
+
+fn isUnavailable(side: ?diff.FileContentStatus) bool {
+    return if (side) |status| status == .unavailable else false;
 }
 
 fn sideTag(side: ?diff.FileContentStatus) u8 {
