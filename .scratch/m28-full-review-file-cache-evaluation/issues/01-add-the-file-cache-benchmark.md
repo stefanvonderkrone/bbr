@@ -259,3 +259,50 @@ A loaded run had 16 `yes` processes and 16 test processes at the same time on 18
   No change.
 
 The full `zig build test-file-cache` passed 10 of 10 runs after the fixes, 5 of them loaded.
+
+### Mutation audit of the M28 rules (X-5, X-6) (2026-11-01)
+
+Each M28 row of the `AGENTS.md` rule table got one or more mutations in the code, not in the tests.
+The named step ran on each mutation, and `git checkout` reverted the mutation at once.
+The step is `zig build test-file-cache` unless the row says `zig build test`.
+Every test name that the rows quote is in `src/benchmark/file_cache.zig` verbatim.
+
+| Row | Mutation | Named test before | Action | Result after |
+| --- | --- | --- | --- | --- |
+| Output holds no source, path, query, or Comment text | The header prints the repository | Fails | None | Fails |
+| Output holds no source, path, query, or Comment text | The retry note prints the request URL | Survives. Only the exact-note `429` tests fail | The output test now retries one `503` and checks the retry note (`6295058`) | Fails |
+| A scenario subset keeps its dependencies | `requireDependencies` drops the S2 check | Fails | None | Fails |
+| Request window | `RequestWindow.open` rewrites the log but keeps no entry in memory | Survives | The window test now reopens a full log and expects a wait (`fa7a707`) | Fails |
+| Request window | `deadline` allows one request over the budget | Fails | None | Fails |
+| Request window | A `429` does not fill the window | Fails | None | Fails |
+| File Jump class | An admitted File counts as ready at the span start | Fails | None | Fails |
+| File Jump class | `beginSpan` drops the in-flight fetches | Fails | None | Fails |
+| File Jump class | `classify` ignores the queued `enrich_file` commands | Survives | New Driver test "M28 cache a File Jump whose fetch the Presentation still queues at the span end is a fetch, not a hit" (`931f168`). The row names it | Fails |
+| Request estimate | The estimate drops the Session-load requests | Fails | None | Fails |
+| Request estimate | The estimate drops the Enrichment Range of each Session load | Survives | No fixture makes a run exceed the File Jump terms. The row marks the term as convention (no check) (`3f70ca3`) | Survives |
+| Harness wait | `Span.end` keeps the excluded time | Fails | None | Fails |
+| Retry | The backoff always waits the ceiling, with no jitter | Survives | The retry test adds a draw of 0 that expects a wait of 0 (`da300d7`) | Fails |
+| Retry | The wait ignores `Retry-After` | Fails | None | Fails |
+| Retry | The harness gives up after 9 attempts | Fails | None | Fails |
+| Retry | A timeout is final, with no retry | Fails | None | Fails |
+| Retry | `chain` drops the `gaveUp` check after a segment | Survives | The check covers a give-up that completes after the last step. No deterministic test reaches it. The row marks it as convention (no check) (`3f70ca3`) | Survives |
+| Resume | A rerun repeats the finished segments | Fails | None | Fails |
+| Resume | A rerun of a finished run runs again | Fails | None | Fails |
+| Resume | S1 to S6 split into two segments | Fails | None | Fails |
+| `summarize` | A line with `failures` above 0 counts as complete | Fails | None | Fails |
+| `summarize` | A run needs no `check` line | Fails | None | Fails |
+| S4 restart | S4 starts without a restart | Fails | None | Fails |
+| S4 restart | Stop rule 1 applies to S4 | Fails | None | Fails |
+| `zig build test` compiles every benchmark | A type error in `src/benchmark_buffer_search.zig` | Fails (`zig build test`) | None | Fails |
+| `zig build test` compiles every benchmark | The same type error, and its `test_step.dependOn` line removed | Survives (`zig build test`) | The row marks a removed line as convention (no check) (`3f70ca3`) | Survives |
+| Exit code 3 | `ScenarioStalled` is transient | Fails | None | Fails |
+| Exit code 3 | An unnamed error is permanent | Fails | None | Fails |
+| Exit code 3 | `runScenario` returns a new error outside `NamedError` | Fails | None | Fails |
+| Exit code 3 | `main` in `src/benchmark_file_cache.zig` returns 1 for every error | Fails (`zig build test`, "expected exited with code 3") | The row names this check. No check runs or parses `tools/m28-baseline-run.sh`, so the row marks the script as convention (no check) (`3f70ca3`) | Fails |
+| Credential token | The header prints the token | Fails | None | Fails |
+| Credential token | The retry note prints the Authorization header | Survives, because the header holds the token only in base64 | The Credential test also forbids the base64 credential (`6295058`) | Fails |
+
+Nobody ran `tools/m28-baseline-run.sh`. `sh -n tools/m28-baseline-run.sh` parsed it without an error.
+
+X-4 (2026-11-01): the branch contains `origin/main` `497c86f` through merge `36627c6`, so the harness measures the Enrichment Range.
+`git merge-base --is-ancestor 497c86f HEAD` exited with 0.
