@@ -2497,3 +2497,70 @@ test "M22 read a version 9 database migrates to version 10, keeps its Drafts, an
     try testing.expectEqual(@as(usize, 1), receipts.len);
     try testing.expectEqual(@as(usize, 1), (try reopened.store().load(arena.allocator(), key)).len);
 }
+
+test "M22 read SqliteStore.open sets a busy timeout so a write waits for another bbr process" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, ".zig-cache/tmp/{s}/busy.db", .{&tmp.sub_path}, 0);
+    defer testing.allocator.free(path);
+    var sqlite = try SqliteStore.open(path);
+    defer sqlite.deinit();
+
+    var stmt: ?*c.sqlite3_stmt = null;
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(sqlite.db, "PRAGMA busy_timeout;", -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try testing.expectEqual(@as(i64, 2000), c.sqlite3_column_int64(stmt, 0));
+}
+
+fn openUnmigrated(path: [:0]const u8) !SqliteStore {
+    var db: ?*c.sqlite3 = null;
+    if (c.sqlite3_open_v2(path.ptr, &db, c.SQLITE_OPEN_READWRITE, null) != c.SQLITE_OK) {
+        _ = c.sqlite3_close(db);
+        return error.Open;
+    }
+    return .{ .db = db.? };
+}
+
+const unlocked_v10_step =
+    \\CREATE TABLE file_read_receipts (
+    \\  review_kind   INTEGER NOT NULL,
+    \\  workspace     TEXT NOT NULL,
+    \\  repository    TEXT NOT NULL,
+    \\  pr_id         INTEGER NOT NULL,
+    \\  repository_id INTEGER NOT NULL,
+    \\  base_ref      TEXT NOT NULL,
+    \\  source_ref    TEXT NOT NULL,
+    \\  path          TEXT NOT NULL,
+    \\  fingerprint   BLOB NOT NULL,
+    \\  PRIMARY KEY (review_kind, workspace, repository, pr_id,
+    \\               repository_id, base_ref, source_ref, path)
+    \\) WITHOUT ROWID;
+    \\PRAGMA user_version = 10;
+;
+
+test "M22 read a migration step that another process already applied is skipped" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/race.db", .{&tmp.sub_path}, 0);
+    {
+        var sqlite = try SqliteStore.open(path);
+        defer sqlite.deinit();
+        try downgradeTo(&sqlite, 9);
+    }
+    var stale = try openUnmigrated(path);
+    defer stale.deinit();
+    var rival = try openUnmigrated(path);
+    defer rival.deinit();
+
+    const seen = try stale.userVersion();
+    try rival.exec("BEGIN IMMEDIATE;\n" ++ unlocked_v10_step ++ "\nCOMMIT;");
+    if (seen < 10) try stale.exec("BEGIN;\n" ++ unlocked_v10_step ++ "\nCOMMIT;");
+
+    try testing.expectEqual(@as(i64, 10), try stale.userVersion());
+    const review: ReviewIdentity = .{ .remote = testReviewKey(81) };
+    try stale.fileReadStore().put(review, "src/a.zig", .{ .bytes = @splat(8) });
+    try testing.expectEqual(@as(usize, 1), (try stale.fileReadStore().load(arena.allocator(), review)).len);
+}
