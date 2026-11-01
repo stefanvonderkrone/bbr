@@ -252,6 +252,12 @@ pub const fixed_sections = [_]FixedSection{
         .{ .keys = "⏎", .description = "accept search" },
         .{ .keys = "esc ctrl-c", .description = "cancel search" },
     } },
+    // The Comment Overview query branch of `applyKey`
+    .{ .title = "Comment Overview Filter Input", .entries = &.{
+        .{ .keys = "⌫ ctrl-w ctrl-u", .description = "erase scalar, word, or query" },
+        .{ .keys = "⏎", .description = "keep filter" },
+        .{ .keys = "esc ctrl-c", .description = "restore filter" },
+    } },
     // The Review Search branch of `applyKey`
     .{ .title = "Review Search Input", .entries = &.{
         .{ .keys = "⌫ ctrl-w ctrl-k", .description = "erase scalar, word, or query" },
@@ -270,6 +276,7 @@ pub const fixed_sections = [_]FixedSection{
     } },
     .{ .title = "Mouse", .entries = &.{
         .{ .keys = "click", .description = "focus, select, toggle" },
+        .{ .keys = "click again", .description = "open selected Overview Entry" },
         .{ .keys = "wheel", .description = "scroll" },
         .{ .keys = "shift option", .description = "native terminal selection" },
         .{ .keys = "config", .description = "[input.mouse] enabled = false" },
@@ -549,8 +556,8 @@ test "help keeps only nonempty headings and separators and includes fixed keys" 
     _ = try state.applyKey(km, .{ .codepoint = keymap.special.escape }, 3);
     try typeQuery(&state, km, "ctrl-w");
     const fixed = state.view().lines;
-    try testing.expectEqual(@as(usize, 11), fixed.len);
-    for ([_][]const u8{ "Composer", "Buffer Search Input", "Review Search Input", "Help" }, 0..) |title, index| {
+    try testing.expectEqual(@as(usize, 14), fixed.len);
+    for ([_][]const u8{ "Composer", "Buffer Search Input", "Comment Overview Filter Input", "Review Search Input", "Help" }, 0..) |title, index| {
         try testing.expectEqualStrings(title, fixed[index * 3].heading);
         try testing.expect(std.mem.indexOf(u8, fixed[index * 3 + 1].entry.keys, "ctrl-w") != null);
     }
@@ -559,6 +566,16 @@ test "help keeps only nonempty headings and separators and includes fixed keys" 
     try testing.expectEqual(@as(usize, 1), state.view().lines.len);
     try testing.expect(state.view().lines[0] == .no_matches);
     try testing.expectEqualStrings("Motions", state.view().query.input);
+}
+
+test "M29 overview help lists the second click that opens an Overview Entry" {
+    var state = try State.init(testing.allocator, .default);
+    defer state.deinit();
+    try typeQuery(&state, .default, "click again");
+    const lines = state.view().lines;
+    try testing.expectEqual(@as(usize, 2), lines.len);
+    try testing.expectEqualStrings("Mouse", lines[0].heading);
+    try testing.expectEqualStrings("open selected Overview Entry", lines[1].entry.description);
 }
 
 test "help accepts filters cancels to prior query and scroll and clears before closing" {
