@@ -56,7 +56,7 @@ The benchmark measures them and does not change them.
 | The configuration keys | `[files.cache]` keys `enabled` and `max_bytes` in `src/tui/config.zig`. The default is `Configuration.default_inactive_file_cache_max_bytes`, 256 MiB. Zero means unlimited inactive content. |
 | The focused File | `Storage.focusAdmitted` and `Storage.requiresCacheEnforcement`. The focused File is outside the budget. |
 | The remote fetch | `file_enrichment.enrichConcurrent` with `RemoteBlobSource`. Each File uses at most two requests to `GET /repositories/{workspace}/{repo}/src/{commit}/{path}`. |
-| The prefetch | `PrefetchArm`, `maybeQueuePrefetch`, and `pauseQueuedPrefetch` in `src/tui/presentation.zig`. Only `next_file` to the next File in a RemoteReview arms the prefetch of one successor. |
+| The prefetch | `ensureFocusedEnrichment` and `enrichmentRange` in `src/tui/presentation.zig`. The Enrichment Range holds every File with a row in the DiffPane viewport, plus one File above and one File below. The active File is demand work. After it is terminal, the other Files of the range follow as speculative work, up to four at once. Files in the range are outside the budget. An open Review Search stops new speculative work. |
 | Review Search acquisition | `openReviewSearch`, `pumpReviewSearchAcquisition`, `holdReviewSearchFiles`, `maybeQueueReviewSourceScan`, and `replaceReviewSearchQuery` in `src/tui/presentation.zig`. Up to eight File Enrichments run at once, in display path order. A query edit clears the source scan and scans every File again. |
 | The worker | `presentationEnrichmentWorker` in `src/tui/app.zig`. |
 | The command seam | `presentation_runtime.CommandExecutor` and `CompletionSink` in `src/tui/presentation_runtime.zig`. |
@@ -74,7 +74,11 @@ They are measurement words, not domain terms, so no glossary gets them.
 - Cold fetch: the first File Enrichment of a File in one benchmark run of one PullRequest.
 - Refetch: a File Enrichment of a File that the same benchmark run already admitted once.
   A refetch after eviction, after Session replacement, and after a process restart are all refetches.
-- Hit: a Visible Action whose File content is present when the Action starts, so no `enrich_file` command starts for it.
+- Hit: a Visible Action whose File content is ready when the Action starts.
+  A File Jump is a hit when File Enrichment of its target File is terminal at the start.
+  A fetch that is in flight at the start is no hit, because the reviewer waits for its rest.
+  A File that a speculative refetch made ready before the Action counts as a hit.
+  The `enrichment_refetches` key shows those refetches.
 - Added delay: the latency of a Visible Action sample with a refetch, minus the hit median.
   The hit median is the median latency of the hit samples of the same Action kind.
   The median comes from the same run, PullRequest, and scenario.
@@ -132,7 +136,11 @@ Ticket 01 then lists the hook and the reason under `## Completion`.
   It records the latency of each attempt and the time in which the harness waits.
   It never stores a URL, a header, or a body.
 - The executor records the start and the end of each `enrich_file` command.
-  It records the File index, the `speculative` flag, and the `search_acquisition` flag.
+  It records the File index, the work id, and the `speculative` flag.
+  It counts every `enrich_file` command, inside or outside a span.
+- At the start of each span, the harness records which Files have terminal File Enrichment.
+  It also keeps the fetches that are in flight at the start.
+  A span can wait for these fetches, so they count for the span.
 - The harness keeps one admitted flag for each File in each run.
   The flag survives Session replacement and the simulated restart.
   An `enrich_file` command for a File with the flag set is a refetch.
@@ -330,6 +338,11 @@ The header also holds `probe_ms`, the median of five `getPullRequest` latencies 
 Each scenario line holds these keys:
 
 - `samples`, `hits`, `cold_fetches`, and `refetches`.
+  These keys count Visible Action samples by their class in "Definitions".
+- `enrichments`, the `enrich_file` commands that the scenario executed, inside or outside a span.
+  `enrichment_refetches` counts the commands for an admitted File.
+  `speculative_enrichments` counts the commands that started as speculative work.
+  These counts show the refetches that the prefetch did before a File Jump.
 - `latency_median_ms` and `latency_p95_ms`.
 - `added_delay_p95_ms`, computed over the samples with a refetch.
 - `first_result_ms` and `complete_result_ms` for S4, S5, and S6.
@@ -339,6 +352,7 @@ Each scenario line holds these keys:
 - `paced_samples`, the Visible Actions with stall time in their span.
 - `peak_retained_bytes`, `retained_bytes`, `full_review_bytes`, and `peak_rss_bytes`.
 - `cache_hit_rate`, which is hits divided by hits plus refetches. Cold fetches do not count.
+  A hit that a speculative refetch made ready counts as a hit, so compare `enrichment_refetches` too.
 - `low_samples=true` when the scenario has fewer than 20 samples with a refetch.
 
 The p95 uses the nearest rank, like `harness.run`.
@@ -551,6 +565,9 @@ Statistics:
 Classification:
 
 - A first fetch counts as a cold fetch.
+- "M28 cache a File Jump to a File whose fetch is still in flight is a fetch, not a hit".
+  A slow source keeps each prefetch in flight when the File Jump starts.
+  S1 counts those jumps as cold fetches, and S2 counts them as refetches.
 - A File that a small budget evicts and that a File Jump revisits counts as one refetch.
 - A File after `refresh` counts as a refetch.
 - A File after the simulated restart counts as a refetch.

@@ -181,6 +181,11 @@ Look for these values:
 - `paused_ms` is the time in which the harness waited, and the latencies exclude it.
 - `paced_samples` counts the Visible Actions with a harness wait in their span.
 - `refetches` above `0` in S5 or S6 is a delay.
+- `hits`, `cold_fetches`, and `refetches` classify the Visible Actions.
+  A File Jump to a File whose fetch is still in flight is a fetch, not a hit.
+- `enrichments` counts every File Enrichment of the scenario, also the speculative ones outside a span.
+  `enrichment_refetches` counts those for an admitted File, and `speculative_enrichments` counts the speculative ones.
+  A File that the prefetch refetched before the File Jump counts as a hit, so `cache_hit_rate` can be high while `enrichment_refetches` is high too.
 - `added_delay_p95_ms` above `300` on any scenario line is a delay.
 - `low_samples=true` means fewer than 20 refetch samples. The p95 is then the maximum.
 - For a merged PullRequest, `not_found_sides` and `hunk_mismatch_files` must be `0`. If not, record the PullRequest. Ticket 03 decides how to use it.

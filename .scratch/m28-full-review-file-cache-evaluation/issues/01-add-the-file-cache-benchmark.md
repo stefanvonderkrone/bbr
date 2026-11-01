@@ -154,3 +154,20 @@ The spec sections "Request budget", "Excluded time", "Retry", "Resume", and "Out
 Some acceptance criteria above describe the old rules, such as "The request budget never waits inside a measured span".
 The spec replaces them.
 [Ticket 02](02-run-the-baseline-on-the-five-pullrequests.md) has the new run guide.
+
+### Fixes after the merge with main (2026-11-01)
+
+The branch merged `origin/main` at `497c86f`.
+Main replaced the single successor prefetch with the Enrichment Range.
+The review findings M28-1 and M28-4 in the adversarial branch review describe the effects.
+
+- M28-1: five M28 tests failed after the merge.
+  The six small fixture Files fitted in the 50-row Frame, so every File loaded before S1.
+  The fixture Files are now taller than the Frame.
+  The `429` and `503` triggers moved to `c.zig`, outside the first Enrichment Range.
+- M28-4: a File Jump to a File whose speculative fetch was in flight counted as a hit.
+  The harness now records the terminal Files and the in-flight fetches at each span start.
+  A File Jump is a hit only when its target File was terminal at the start.
+  Each scenario line now prints `enrichments`, `enrichment_refetches`, and `speculative_enrichments`.
+  The test "M28 cache a File Jump to a File whose fetch is still in flight is a fetch, not a hit" proves it.
+  On the old classification, the test failed with S1 `hits` 5 against the expected 2.

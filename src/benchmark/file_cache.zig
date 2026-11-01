@@ -177,6 +177,7 @@ pub const ScenarioReport = struct {
     peak_rss_bytes: usize,
     candidate_session_ns: u64 = 0,
     paced_samples: usize = 0,
+    enrichments: EnrichmentCounts = .{},
 
     pub fn write(self: ScenarioReport, out: *std.Io.Writer) !void {
         const s = self.stats;
@@ -194,6 +195,8 @@ pub const ScenarioReport = struct {
             t.requests, t.src_requests, t.failures, t.rate_limited, ms(t.request_median_ns), ms(t.request_p95_ns),
         });
         try out.print(" retries={d} paused_ms={d:.1} paced_samples={d}", .{ t.retries, ms(t.paused_ns), self.paced_samples });
+        const e = self.enrichments;
+        try out.print(" enrichments={d} enrichment_refetches={d} speculative_enrichments={d}", .{ e.all, e.refetches, e.speculative });
         try out.print(" peak_retained_bytes={d} retained_bytes={d} full_review_bytes={d} peak_rss_bytes={d}", .{
             self.peak_retained_bytes, self.retained_bytes, self.full_review_bytes, self.peak_rss_bytes,
         });
@@ -942,6 +945,7 @@ fn runScenario(env: Environment, options: Options, files: RunFiles, driver: *Dri
     const estimate = scenario.requestEstimate(driver.file_count);
     if (estimate <= options.hourly_request_budget) files.window.reserve(scenario, estimate);
     const start = files.measuring.mark();
+    const enrichments_start = driver.enrichments;
     driver.peak_retained = driver.retainedBytes();
     var recorder: Recorder = .{};
     defer recorder.deinit(env.gpa);
@@ -964,6 +968,7 @@ fn runScenario(env: Environment, options: Options, files: RunFiles, driver: *Dri
         .peak_rss_bytes = peakRssBytes(),
         .candidate_session_ns = median(recorder.candidate_session_ns.items),
         .paced_samples = recorder.paced,
+        .enrichments = driver.enrichments.since(enrichments_start),
     };
     try report.write(lines);
 }
@@ -1126,10 +1131,22 @@ const Span = struct {
     }
 };
 
-/// One `enrich_file` command that started inside the measured span.
+/// One `enrich_file` command.
 const Fetch = struct {
+    work_id: presentation.WorkId,
     file_index: usize,
     admitted_before: bool,
+};
+
+/// The `enrich_file` commands that the Driver executed, inside or outside a span.
+const EnrichmentCounts = struct {
+    all: usize = 0,
+    refetches: usize = 0,
+    speculative: usize = 0,
+
+    fn since(self: EnrichmentCounts, start: EnrichmentCounts) EnrichmentCounts {
+        return .{ .all = self.all - start.all, .refetches = self.refetches - start.refetches, .speculative = self.speculative - start.speculative };
+    }
 };
 
 /// Owns the Presentation, executes its commands on worker threads, and keeps
@@ -1155,7 +1172,12 @@ const Driver = struct {
     tick: u64 = 0,
     not_found_sides: usize = 0,
     hunk_mismatch_files: usize = 0,
+    /// The fetches that a span can wait for: those in flight at its start, then those it starts.
     span_fetches: std.ArrayList(Fetch) = .empty,
+    in_flight: std.ArrayList(Fetch) = .empty,
+    /// The Files whose File Enrichment was terminal when the span started.
+    ready_at_span: []bool = &.{},
+    enrichments: EnrichmentCounts = .{},
     peak_retained: usize = 0,
     unsupported: ?std.meta.Tag(OwnedCommand) = null,
     state_buffer: [32]u8 = undefined,
@@ -1186,7 +1208,9 @@ const Driver = struct {
         gpa.free(self.checked);
         gpa.free(self.largest_result);
         gpa.free(self.focus_tick);
+        gpa.free(self.ready_at_span);
         self.span_fetches.deinit(gpa);
+        self.in_flight.deinit(gpa);
     }
 
     fn client(self: *Driver) bbr.bitbucket.Client {
@@ -1234,6 +1258,7 @@ const Driver = struct {
             @memset(self.largest_result, 0);
             self.focus_tick = try gpa.alloc(u64, files);
             @memset(self.focus_tick, 0);
+            self.ready_at_span = try gpa.alloc(bool, files);
             const state_text = if (loaded.remotePullRequestConst()) |pull_request| pull_request.state else "";
             self.state_len = @min(state_text.len, self.state_buffer.len);
             @memcpy(self.state_buffer[0..self.state_len], state_text[0..self.state_len]);
@@ -1276,8 +1301,14 @@ const Driver = struct {
             .enrich_file => |enrich| {
                 if (enrich.source != .remote) return self.unsupportedCommand(command.*);
                 try self.span_fetches.ensureUnusedCapacity(self.env.gpa, 1);
+                try self.in_flight.ensureUnusedCapacity(self.env.gpa, 1);
                 try group.concurrent(io, enrichmentWorker, .{ completion, io, self.client(), self.env.highlighter, enrich });
-                self.span_fetches.appendAssumeCapacity(.{ .file_index = enrich.file_index, .admitted_before = self.admitted[enrich.file_index] });
+                const fetch: Fetch = .{ .work_id = enrich.work_id, .file_index = enrich.file_index, .admitted_before = self.admitted[enrich.file_index] };
+                self.span_fetches.appendAssumeCapacity(fetch);
+                self.in_flight.appendAssumeCapacity(fetch);
+                self.enrichments.all += 1;
+                self.enrichments.refetches += @intFromBool(fetch.admitted_before);
+                self.enrichments.speculative += @intFromBool(enrich.speculative);
             },
             .load_session => |load| {
                 if (load.key.kind != .remote) return self.unsupportedCommand(command.*);
@@ -1368,6 +1399,10 @@ const Driver = struct {
     fn observe(self: *Driver, input: OwnedInput) void {
         if (input != .file_enrichment_completed) return;
         const completed = input.file_enrichment_completed;
+        for (self.in_flight.items, 0..) |fetch, position| if (fetch.work_id == completed.work_id) {
+            _ = self.in_flight.swapRemove(position);
+            break;
+        };
         if (completed.outcome != .completed) return;
         const result = &completed.outcome.completed;
         const index = completed.file_index;
@@ -1418,6 +1453,7 @@ const Driver = struct {
         self.largest_result = try gpa.alloc(usize, admitted.len);
         self.focus_tick = try gpa.alloc(u64, admitted.len);
         @memset(self.focus_tick, 0);
+        self.ready_at_span = try gpa.alloc(bool, admitted.len);
         for (admitted, checked, self.admitted, self.checked) |a, c, *admitted_bit, *checked_bit| {
             if (a != '0' and a != '1' or c != '0' and c != '1') return error.InvalidCheckpoint;
             admitted_bit.* = a == '1';
@@ -1450,8 +1486,11 @@ const Driver = struct {
         self.focus_tick[file] = self.tick;
     }
 
-    fn beginSpan(self: *Driver) Span {
+    fn beginSpan(self: *Driver) !Span {
         self.span_fetches.clearRetainingCapacity();
+        try self.span_fetches.appendSlice(self.env.gpa, self.in_flight.items);
+        const enrichment = &self.ui().published.?.session.enrichment;
+        for (self.ready_at_span, 0..) |*ready, index| ready.* = index < enrichment.len() and enrichment.isTerminal(index);
         return .begin(self.env.clock, self.measuring);
     }
 
@@ -1459,8 +1498,10 @@ const Driver = struct {
         return span.end(self.env.clock, self.measuring);
     }
 
-    /// A refetch wins over a cold fetch. `file` limits the span to one File.
+    /// A File that was ready at the span start is a hit, even when the span refetches it later.
+    /// Else a refetch wins over a cold fetch. `file` limits the span to one File.
     fn classify(self: *const Driver, file: ?usize) FetchClass {
+        if (file) |index| if (self.ready_at_span[index]) return .hit;
         var class: FetchClass = .hit;
         for (self.span_fetches.items) |fetch| if (file == null or fetch.file_index == file.?) {
             if (fetch.admitted_before) return .refetch;
@@ -1512,7 +1553,7 @@ const Driver = struct {
         try self.closeReviewSearch();
         try self.send(.{ .action = .open_file_finder });
         for (0..file) |_| try self.ui().dispatch(.{ .key = .{ .codepoint = keymap.special.down } });
-        const span = self.beginSpan();
+        const span = try self.beginSpan();
         try self.send(.{ .key = .{ .codepoint = keymap.special.enter } });
         try self.waitUntil(FileShown{ .file = file });
         try self.finishJump(recorder, span, file);
@@ -1521,7 +1562,7 @@ const Driver = struct {
     /// Returns false when `next_file` finds no next File.
     fn nextFileJump(self: *Driver, recorder: *Recorder) !bool {
         const before = self.activeFile();
-        const span = self.beginSpan();
+        const span = try self.beginSpan();
         try self.send(.{ .action = .next_file });
         if (self.ui().published.?.pending_view == null and self.activeFile() == before) return false;
         try self.waitUntil(MovedFrom{ .before = before });
@@ -1647,7 +1688,7 @@ fn nonSequentialNavigation(driver: *Driver, recorder: *Recorder) !void {
 }
 
 fn firstReviewSearch(driver: *Driver, recorder: *Recorder) !void {
-    const span = driver.beginSpan();
+    const span = try driver.beginSpan();
     try driver.openReviewSearch();
     try driver.recordSearch(recorder, span, true);
 }
@@ -1663,7 +1704,7 @@ fn queryEdits(driver: *Driver, recorder: *Recorder) !void {
         },
     };
     for (edits) |inputs| {
-        const span = driver.beginSpan();
+        const span = try driver.beginSpan();
         for (inputs) |input| try driver.send(input);
         try driver.recordSearch(recorder, span, false);
     }
@@ -1674,7 +1715,7 @@ fn overlayReopen(driver: *Driver, recorder: *Recorder) !void {
     try driver.closeReviewSearch();
     var prng = std.Random.DefaultPrng.init(driver.options.seed);
     for (0..10) |_| try driver.finderJump(null, prng.random().uintLessThan(usize, driver.file_count));
-    const span = driver.beginSpan();
+    const span = try driver.beginSpan();
     try driver.openReviewSearch();
     try driver.recordSearch(recorder, span, false);
 }
@@ -2277,6 +2318,8 @@ test "M28 cache every scenario runs to the end with text, binary, added, and rem
     // next revisited File inside the span of the jump before it, so only some samples are refetches.
     try testing.expect(try intField(output, "scenario=s2 ", "refetches") > 0);
     try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s2 ", "cold_fetches"));
+    // A refetch outside a span still counts: S2 refetches each of the four evicted text Files.
+    try testing.expect(try intField(output, "scenario=s2 ", "enrichment_refetches") >= 4);
     try testing.expect(try intField(output, "scenario=s5 ", "refetches") > 0);
     try testing.expect(try intField(output, "scenario=s6 ", "refetches") > 0);
     // After refresh and after the restart, every fetch is of an admitted File.
@@ -2849,4 +2892,50 @@ test "M28 cache summarize reports the restart Review Search delay only when S6 h
     const text = try summaryText(std.fmt.comptimePrint(run_lines, .{ "a", "a" }) ++ std.fmt.comptimePrint(run_lines, .{ "b", "b" }));
     defer testing.allocator.free(text);
     try testing.expect(std.mem.endsWith(u8, text, "outcome=Delay scenarios=restart_review_search\n"));
+}
+
+/// Delays each `/src/` request in real time, so a File fetch is still in flight
+/// when the next File Jump starts. The fake clock does not see the delay.
+const SlowSourceHttpClient = struct {
+    fake: *bbr.http.FakeHttpClient,
+    delay_ms: i64 = 500,
+
+    fn httpClient(self: *SlowSourceHttpClient) bbr.http.HttpClient {
+        return .{ .ptr = self, .vtable = &.{ .send = send } };
+    }
+
+    fn send(ptr: *anyopaque, allocator: Allocator, request: bbr.http.client.Request) anyerror!bbr.http.client.Response {
+        const self: *SlowSourceHttpClient = @ptrCast(@alignCast(ptr));
+        if (std.mem.indexOf(u8, request.url, "/src/") != null) testing.io.sleep(.fromMilliseconds(self.delay_ms), .awake) catch {};
+        return self.fake.httpClient().send(allocator, request);
+    }
+};
+
+test "M28 cache a File Jump to a File whose fetch is still in flight is a fetch, not a hit" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var slow: SlowSourceHttpClient = .{ .fake = &fake };
+    var transport: FakeTransport = .{ .client = slow.httpClient() };
+    var clock: FakeClock = .{};
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    var options = withBudget(fixture_options, 1);
+    options.scenarios = .initMany(&.{ .s1, .s2 });
+    const output = try runIn(&transport, path, options, &clock, &notes.writer);
+    defer testing.allocator.free(output);
+    // The Enrichment Range starts each next File before the jump to it. The slow source keeps
+    // that fetch in flight when the jump starts, so the reviewer waits for it. Only the first
+    // File, which the start loaded, and the binary File are ready.
+    try testing.expectEqual(@as(usize, 6), try intField(output, "scenario=s1 ", "samples"));
+    try testing.expectEqual(@as(usize, 2), try intField(output, "scenario=s1 ", "hits"));
+    try testing.expectEqual(@as(usize, 4), try intField(output, "scenario=s1 ", "cold_fetches"));
+    // S2 revisits the five Files before the last one. The budget evicted the four text Files.
+    try testing.expectEqual(@as(usize, 5), try intField(output, "scenario=s2 ", "samples"));
+    try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s2 ", "hits"));
+    try testing.expectEqual(@as(usize, 4), try intField(output, "scenario=s2 ", "refetches"));
+    try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s2 ", "cold_fetches"));
 }
