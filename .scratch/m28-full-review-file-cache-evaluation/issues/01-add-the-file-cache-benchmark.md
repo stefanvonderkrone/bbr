@@ -178,3 +178,8 @@ The review findings M28-1 and M28-4 in the adversarial branch review describe th
 - M28-6: the Frame size sets the Enrichment Range, so it sets the cache policy that a run measures.
   The header now prints `cols` and `rows`, and the checkpoint check compares them.
   The test "M28 cache every scenario runs to the end with text, binary, added, and removed Files" checks the header.
+- M28-3: `summarize` applied the stop rule to partial runs and could give "No delay" without evidence.
+  It now requires a complete result from each run for each PullRequest of the input.
+  A missing `check` line, a missing scenario, or `failures` above 0 gives "Inconclusive".
+  The test "M28 cache summarize gives Inconclusive for a partial or failed run" proves it.
+  On the old code, the test failed with `outcome=No delay`.

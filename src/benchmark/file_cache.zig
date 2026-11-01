@@ -1922,17 +1922,35 @@ pub fn decide(delayed: []const bool) error{InvalidRunCount}!Outcome {
     return if (count * 2 > delayed.len) .delay else .no_delay;
 }
 
+/// The result of one PullRequest in one run.
+const RunKey = struct {
+    run_label: []const u8,
+    pull_request: []const u8,
+
+    fn eql(self: RunKey, other: RunKey) bool {
+        return std.mem.eql(u8, self.run_label, other.run_label) and std.mem.eql(u8, self.pull_request, other.pull_request);
+    }
+};
+
+/// The first reason why a PullRequest result is not complete.
+const Gap = union(enum) {
+    check,
+    missing: Scenario,
+    failures: Scenario,
+};
+
 const ScenarioLine = struct {
     run_label: []const u8,
     pull_request: []const u8,
     scenario: Scenario,
     refetches: usize,
+    failures: ?usize,
     added_delay_p95_ms: f64,
     complete_result_ms: ?f64,
 
     fn parse(line: []const u8) !?ScenarioLine {
         if (!std.mem.startsWith(u8, line, "scenario=")) return null;
-        var parsed: ScenarioLine = .{ .run_label = "", .pull_request = "", .scenario = .s1, .refetches = 0, .added_delay_p95_ms = 0, .complete_result_ms = null };
+        var parsed: ScenarioLine = .{ .run_label = "", .pull_request = "", .scenario = .s1, .refetches = 0, .failures = null, .added_delay_p95_ms = 0, .complete_result_ms = null };
         var tokens = std.mem.tokenizeScalar(u8, line, ' ');
         while (tokens.next()) |token| {
             const split = std.mem.indexOfScalar(u8, token, '=') orelse return error.InvalidLine;
@@ -1942,6 +1960,7 @@ const ScenarioLine = struct {
             if (std.mem.eql(u8, key, "run_label")) parsed.run_label = value;
             if (std.mem.eql(u8, key, "pull_request")) parsed.pull_request = value;
             if (std.mem.eql(u8, key, "refetches")) parsed.refetches = try std.fmt.parseInt(usize, value, 10);
+            if (std.mem.eql(u8, key, "failures")) parsed.failures = try std.fmt.parseInt(usize, value, 10);
             if (std.mem.eql(u8, key, "added_delay_p95_ms")) parsed.added_delay_p95_ms = try std.fmt.parseFloat(f64, value);
             if (std.mem.eql(u8, key, "complete_result_ms")) parsed.complete_result_ms = try std.fmt.parseFloat(f64, value);
         }
@@ -1949,20 +1968,48 @@ const ScenarioLine = struct {
     }
 };
 
-/// Reads the scenario lines of two or three runs and prints the stop rule outcome.
+/// Reads the checkpoint lines of two or three runs and prints the stop rule outcome.
+/// A run that lacks a result for a PullRequest of another run makes the outcome Inconclusive.
 pub fn summarize(allocator: Allocator, text: []const u8, out: *std.Io.Writer) !void {
     var lines: std.ArrayList(ScenarioLine) = .empty;
     defer lines.deinit(allocator);
+    var checks: std.ArrayList(RunKey) = .empty;
+    defer checks.deinit(allocator);
     var labels: std.ArrayList([]const u8) = .empty;
     defer labels.deinit(allocator);
+    var pull_requests: std.ArrayList([]const u8) = .empty;
+    defer pull_requests.deinit(allocator);
     var rows = std.mem.tokenizeScalar(u8, text, '\n');
     while (rows.next()) |row| {
-        const line = try ScenarioLine.parse(std.mem.trimEnd(u8, row, "\r")) orelse continue;
-        try lines.append(allocator, line);
-        for (labels.items) |known| {
-            if (std.mem.eql(u8, known, line.run_label)) break;
-        } else try labels.append(allocator, line.run_label);
+        const text_line = std.mem.trimEnd(u8, row, "\r");
+        const key: RunKey = if (try ScenarioLine.parse(text_line)) |line| key: {
+            try lines.append(allocator, line);
+            break :key .{ .run_label = line.run_label, .pull_request = line.pull_request };
+        } else if (std.mem.startsWith(u8, text_line, "check ")) key: {
+            const key: RunKey = .{
+                .run_label = lineValue(text_line, "run_label") orelse return error.InvalidLine,
+                .pull_request = lineValue(text_line, "pull_request") orelse return error.InvalidLine,
+            };
+            try checks.append(allocator, key);
+            break :key key;
+        } else continue;
+        try appendNew(allocator, &labels, key.run_label);
+        try appendNew(allocator, &pull_requests, key.pull_request);
     }
+    if (labels.items.len < 2 or labels.items.len > 3) return error.InvalidRunCount;
+    var complete = true;
+    for (labels.items) |run_label| for (pull_requests.items) |pull_request| {
+        const gap = firstGap(lines.items, checks.items, .{ .run_label = run_label, .pull_request = pull_request }) orelse continue;
+        complete = false;
+        try out.print("run_label={s} incomplete pull_request={s} ", .{ run_label, pull_request });
+        switch (gap) {
+            .check => try out.writeAll("missing=check\n"),
+            .missing => |scenario| try out.print("missing={t}\n", .{scenario}),
+            .failures => |scenario| try out.print("reason=failures scenario={t}\n", .{scenario}),
+        }
+        break;
+    };
+    if (!complete) return out.writeAll("outcome=Inconclusive scenarios=none\n");
     const delayed = try allocator.alloc(bool, labels.items.len);
     defer allocator.free(delayed);
     var all_causes: std.EnumSet(Cause) = .initEmpty();
@@ -1976,6 +2023,25 @@ pub fn summarize(allocator: Allocator, text: []const u8, out: *std.Io.Writer) !v
     const outcome = try decide(delayed);
     try out.print("outcome={s} scenarios=", .{outcome.text()});
     try writeCauses(out, all_causes);
+}
+
+fn appendNew(allocator: Allocator, values: *std.ArrayList([]const u8), value: []const u8) !void {
+    for (values.items) |known| if (std.mem.eql(u8, known, value)) return;
+    try values.append(allocator, value);
+}
+
+/// A complete result has a check line and one scenario line per scenario, each with `failures=0`.
+fn firstGap(lines: []const ScenarioLine, checks: []const RunKey, key: RunKey) ?Gap {
+    for (checks) |check| {
+        if (check.eql(key)) break;
+    } else return .check;
+    var seen: std.EnumSet(Scenario) = .initEmpty();
+    for (lines) |line| if (key.eql(.{ .run_label = line.run_label, .pull_request = line.pull_request })) {
+        if ((line.failures orelse 1) != 0) return .{ .failures = line.scenario };
+        seen.insert(line.scenario);
+    };
+    var missing = seen.complement().iterator();
+    return if (missing.next()) |scenario| .{ .missing = scenario } else null;
 }
 
 fn runCauses(lines: []const ScenarioLine, run_label: []const u8) std.EnumSet(Cause) {
@@ -2925,19 +2991,60 @@ fn summaryText(input: []const u8) ![]u8 {
     return output.toOwnedSlice();
 }
 
-const quiet_run =
-    "scenario=s2 run_label={s} pull_request=12 refetches=3 added_delay_p95_ms=120.0\n" ++
-    "scenario=s4 run_label={s} pull_request=12 refetches=0 added_delay_p95_ms=0.0 complete_result_ms=900.0\n" ++
-    "scenario=s5 run_label={s} pull_request=12 refetches=0 added_delay_p95_ms=0.0 complete_result_ms=100.0\n" ++
-    "scenario=s6 run_label={s} pull_request=12 refetches=0 added_delay_p95_ms=0.0 complete_result_ms=700.0\n";
-const slow_run = "scenario=s3 run_label={s} pull_request=12 refetches=40 added_delay_p95_ms=450.0\n";
+const RunFixture = struct {
+    /// Scenario lines with one `{s}` for the run label. Each replaces the default line of its scenario.
+    lines: []const []const u8 = &.{},
+    omit: ?Scenario = null,
+    check: bool = true,
+};
+
+/// The checkpoint lines of one complete run for PullRequest 12, changed by `fixture`.
+inline fn fullRun(comptime label: []const u8, comptime fixture: RunFixture) []const u8 {
+    return comptime text: {
+        var text: []const u8 = if (fixture.check) "check run_label=" ++ label ++ " pull_request=12 state=ok not_found_sides=0 hunk_mismatch_files=0\n" else "";
+        scenarios: for (std.enums.values(Scenario)) |scenario| {
+            if (fixture.omit == scenario) continue;
+            const prefix = "scenario=" ++ @tagName(scenario) ++ " ";
+            for (fixture.lines) |line| if (std.mem.startsWith(u8, line, prefix)) {
+                text = text ++ std.fmt.comptimePrint(line, .{label});
+                continue :scenarios;
+            };
+            text = text ++ prefix ++ "run_label=" ++ label ++ " pull_request=12 refetches=0 failures=0 added_delay_p95_ms=0.0\n";
+        }
+        break :text text;
+    };
+}
+
+const quiet_run: RunFixture = .{ .lines = &.{
+    "scenario=s2 run_label={s} pull_request=12 refetches=3 failures=0 added_delay_p95_ms=120.0\n",
+    "scenario=s4 run_label={s} pull_request=12 refetches=0 failures=0 added_delay_p95_ms=0.0 complete_result_ms=900.0\n",
+    "scenario=s5 run_label={s} pull_request=12 refetches=0 failures=0 added_delay_p95_ms=0.0 complete_result_ms=100.0\n",
+    "scenario=s6 run_label={s} pull_request=12 refetches=0 failures=0 added_delay_p95_ms=0.0 complete_result_ms=700.0\n",
+} };
+const slow_run: RunFixture = .{ .lines = &.{"scenario=s3 run_label={s} pull_request=12 refetches=40 failures=0 added_delay_p95_ms=450.0\n"} };
+
+test "M28 cache summarize gives Inconclusive for a partial or failed run" {
+    const failed = "scenario=s1 run_label={s} pull_request=12 refetches=0 failures=3 added_delay_p95_ms=0.0\n";
+    const other = "scenario=s1 run_label={s} pull_request=15 refetches=0 failures=0 added_delay_p95_ms=0.0\n";
+    const cases = [_]struct { input: []const u8, gap: []const u8 }{
+        .{ .input = fullRun("a", .{}) ++ fullRun("b", .{ .omit = .s7 }), .gap = "run_label=b incomplete pull_request=12 missing=s7\n" },
+        .{ .input = fullRun("a", .{}) ++ fullRun("b", .{ .lines = &.{failed} }), .gap = "run_label=b incomplete pull_request=12 reason=failures scenario=s1\n" },
+        .{ .input = fullRun("a", .{}) ++ fullRun("b", .{ .check = false }), .gap = "run_label=b incomplete pull_request=12 missing=check\n" },
+        .{ .input = std.fmt.comptimePrint(failed, .{"a"}) ++ std.fmt.comptimePrint(other, .{"b"}), .gap = "run_label=a incomplete pull_request=12 missing=check\nrun_label=b incomplete pull_request=12 missing=check\n" },
+    };
+    inline for (cases) |case| {
+        const text = try summaryText(case.input);
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings(case.gap ++ "outcome=Inconclusive scenarios=none\n", text);
+    }
+}
 
 test "M28 cache summarize gives No delay, Delay, and Inconclusive" {
     const cases = [_]struct { input: []const u8, outcome: []const u8 }{
-        .{ .input = std.fmt.comptimePrint(quiet_run, .{ "a", "a", "a", "a" }) ++ std.fmt.comptimePrint(quiet_run, .{ "b", "b", "b", "b" }), .outcome = "outcome=No delay scenarios=none\n" },
-        .{ .input = std.fmt.comptimePrint(slow_run, .{"a"}) ++ std.fmt.comptimePrint(slow_run, .{"b"}), .outcome = "outcome=Delay scenarios=s3\n" },
-        .{ .input = std.fmt.comptimePrint(slow_run, .{"a"}) ++ std.fmt.comptimePrint(quiet_run, .{ "b", "b", "b", "b" }), .outcome = "outcome=Inconclusive scenarios=s3\n" },
-        .{ .input = std.fmt.comptimePrint(slow_run, .{"a"}) ++ std.fmt.comptimePrint(quiet_run, .{ "b", "b", "b", "b" }) ++ std.fmt.comptimePrint(slow_run, .{"c"}), .outcome = "outcome=Delay scenarios=s3\n" },
+        .{ .input = fullRun("a", quiet_run) ++ fullRun("b", quiet_run), .outcome = "outcome=No delay scenarios=none\n" },
+        .{ .input = fullRun("a", slow_run) ++ fullRun("b", slow_run), .outcome = "outcome=Delay scenarios=s3\n" },
+        .{ .input = fullRun("a", slow_run) ++ fullRun("b", quiet_run), .outcome = "outcome=Inconclusive scenarios=s3\n" },
+        .{ .input = fullRun("a", slow_run) ++ fullRun("b", quiet_run) ++ fullRun("c", slow_run), .outcome = "outcome=Delay scenarios=s3\n" },
     };
     for (cases) |case| {
         const text = try summaryText(case.input);
@@ -2947,9 +3054,9 @@ test "M28 cache summarize gives No delay, Delay, and Inconclusive" {
 }
 
 test "M28 cache summarize treats one refetch in S5 or S6 as a delay" {
-    const s5 = "scenario=s5 run_label={s} pull_request=12 refetches=1 added_delay_p95_ms=2.0 complete_result_ms=30.0\n";
-    const s6 = "scenario=s6 run_label={s} pull_request=12 refetches=1 added_delay_p95_ms=2.0 complete_result_ms=30.0\n";
-    for ([_][]const u8{ std.fmt.comptimePrint(s5, .{"a"}) ++ std.fmt.comptimePrint(s5, .{"b"}), std.fmt.comptimePrint(s6, .{"a"}) ++ std.fmt.comptimePrint(s6, .{"b"}) }) |input| {
+    const s5: RunFixture = .{ .lines = &.{"scenario=s5 run_label={s} pull_request=12 refetches=1 failures=0 added_delay_p95_ms=2.0 complete_result_ms=30.0\n"} };
+    const s6: RunFixture = .{ .lines = &.{"scenario=s6 run_label={s} pull_request=12 refetches=1 failures=0 added_delay_p95_ms=2.0 complete_result_ms=30.0\n"} };
+    for ([_][]const u8{ fullRun("a", s5) ++ fullRun("b", s5), fullRun("a", s6) ++ fullRun("b", s6) }) |input| {
         const text = try summaryText(input);
         defer testing.allocator.free(text);
         try testing.expect(std.mem.indexOf(u8, text, "outcome=Delay scenarios=s") != null);
@@ -2957,10 +3064,11 @@ test "M28 cache summarize treats one refetch in S5 or S6 as a delay" {
 }
 
 test "M28 cache summarize reports the restart Review Search delay only when S6 has no refetch" {
-    const run_lines =
-        "scenario=s4 run_label={s} pull_request=12 refetches=0 added_delay_p95_ms=0.0 complete_result_ms=900.0\n" ++
-        "scenario=s6 run_label={s} pull_request=12 refetches=0 added_delay_p95_ms=0.0 complete_result_ms=100.0\n";
-    const text = try summaryText(std.fmt.comptimePrint(run_lines, .{ "a", "a" }) ++ std.fmt.comptimePrint(run_lines, .{ "b", "b" }));
+    const restart: RunFixture = .{ .lines = &.{
+        "scenario=s4 run_label={s} pull_request=12 refetches=0 failures=0 added_delay_p95_ms=0.0 complete_result_ms=900.0\n",
+        "scenario=s6 run_label={s} pull_request=12 refetches=0 failures=0 added_delay_p95_ms=0.0 complete_result_ms=100.0\n",
+    } };
+    const text = try summaryText(fullRun("a", restart) ++ fullRun("b", restart));
     defer testing.allocator.free(text);
     try testing.expect(std.mem.endsWith(u8, text, "outcome=Delay scenarios=restart_review_search\n"));
 }

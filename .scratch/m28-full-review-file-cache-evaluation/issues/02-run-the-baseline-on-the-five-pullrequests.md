@@ -220,7 +220,10 @@ zig build bench-file-cache -- summarize ~/m28-runs/run1-*-all.txt ~/m28-runs/run
 It prints one line for each run and then `outcome=No delay`, `outcome=Delay`, or `outcome=Inconclusive`.
 The `scenarios=` key names each scenario that shows a delay.
 `restart_review_search` names the restart Review Search delay.
-For `Inconclusive`, do a third run with the run label `run3`, then give all three runs to `summarize`.
+A line such as `run_label=run1 incomplete pull_request=<pull-request> missing=s7` names the first gap of an incomplete run.
+The gap is `missing=check`, `missing=<scenario>`, or `reason=failures scenario=<scenario>`.
+An incomplete run gives `outcome=Inconclusive scenarios=none`, so run that PullRequest again before a third run.
+For `Inconclusive` without an `incomplete` line, do a third run with the run label `run3`, then give all three runs to `summarize`.
 
 ### Record
 

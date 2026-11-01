@@ -394,6 +394,13 @@ The baseline result is one of these outcomes:
   The human runs a third run on a third day under a third network condition.
   The outcome follows the two runs that agree.
 
+The rule applies only to complete runs.
+A run is complete when it has a result for each PullRequest that any run of the input has.
+A result is one `check` line and one scenario line for each of S1 to S8.
+Each of these scenario lines must have `failures=0`.
+If one run is not complete, `summarize` prints an `incomplete` line for that run and gives "Inconclusive".
+The human then runs the missing PullRequest again.
+
 Ticket 03 applies this rule.
 Ticket 03 also records which scenarios show the delay, because the trigger limits the candidates.
 
@@ -635,6 +642,7 @@ Stop rule:
 - Two runs with a delay give "Delay".
 - One run with a delay gives "Inconclusive".
 - One refetch in S5 or S6 is a delay, even with a low latency.
+- A run with a missing or failed result gives "Inconclusive".
 
 ## Out of Scope
 
