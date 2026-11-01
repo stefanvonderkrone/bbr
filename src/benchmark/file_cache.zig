@@ -2730,6 +2730,8 @@ test "M28 cache retries back off with full jitter up to the cap and honour Retry
     }{
         .{ .responses = &.{ .{ .status = 503 }, .{ .status = 503 }, .{ .status = 503 }, .{ .status = 200 } }, .random = &max_jitter, .sleeps = &.{ 2 * s, 4 * s, 8 * s }, .retries = 3 },
         .{ .responses = &.{ .{ .status = 503 }, .{ .status = 503 }, .{ .status = 503 }, .{ .status = 503 }, .{ .status = 200 } }, .random = &max_jitter, .policy = .{ .cap_ns = 5 * s }, .sleeps = &.{ 2 * s, 4 * s, 5 * s, 5 * s }, .retries = 4 },
+        // Full jitter can draw no wait at all.
+        .{ .responses = &.{ .{ .status = 503 }, .{ .status = 200 } }, .random = &zero_jitter, .sleeps = &.{0}, .retries = 1 },
         // The 429 also fills the window, so the retry then waits at the request gate.
         .{ .responses = &.{ .{ .status = 429, .retry_after_ms = 7000 }, .{ .status = 200 } }, .random = &zero_jitter, .sleeps = &.{ 7 * s, hour_ns - 7 * s }, .retries = 1, .rate_limited = 1 },
     };
