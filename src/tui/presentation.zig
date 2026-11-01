@@ -9569,6 +9569,7 @@ pub const Presentation = struct {
         published.visual_rows = job.visual_rows;
         published.tree = job.tree;
         published.main_pane = job.kind.publishedPane(published.main_pane);
+        if (published.main_pane != .comment_overview) published.overview_query_input = null;
         published.navigation = switch (job.navigation_policy) {
             .restore, .file_header, .center, .version => frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation),
             .reset => Nav.init(job.visual_rows.len, frame_mod.paneRects(job.geometry).diff_content.height),
@@ -31193,6 +31194,27 @@ test "M29 overview g o after the jump shows the same selection and scroll" {
     try testing.expectEqual(MainPane.comment_overview, presentation.projection().review.?.frame.main_pane);
     try testing.expectEqual(before.selected, after.selected);
     try testing.expectEqual(before.scroll, after.scroll);
+}
+
+test "M29 overview a destination that lands closes the query input and keeps the query" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testOverviewJumpPresentation(&store, 1);
+    defer presentation.deinit();
+    try openOverviewOwner(&presentation, .{ .comment = 3 });
+    const job = try takeOverviewDestination(&presentation);
+    try typeOverviewKey(&presentation, "/");
+    try typeOverviewKey(&presentation, "x");
+    try testing.expect(presentation.projection().review.?.frame.overview.query_input);
+    job.build();
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    try expectCursorOnHeader(&presentation, .{ .comment = 3 });
+    try testing.expect(!presentation.projection().review.?.frame.overview.query_input);
+    try testing.expectEqual(keymap_mod.InteractionContext.diff_review_card, presentation.interactionContext());
+    try testing.expectEqualStrings("x", testOverviewQuery(&presentation));
+    const cursor = presentation.projection().review.?.frame.navigation.cursor;
+    try typeOverviewKey(&presentation, "j");
+    try testing.expect(presentation.projection().review.?.frame.navigation.cursor > cursor);
 }
 
 fn takeOverviewDestination(presentation: *Presentation) !*DisclosureBuild {
