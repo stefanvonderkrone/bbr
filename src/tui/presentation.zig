@@ -31824,6 +31824,53 @@ test "M29 overview a File Tree cursor move sets the File Tree Filter, and the ro
     try testing.expect(presentation.published.?.overview.file_tree_filter == null);
 }
 
+test "M29 overview the root entry takes the Sidebar Motions and the Submission Actions" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "draft" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testOverviewTreeSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 6 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .show_comment_overview });
+    try presentation.dispatch(.{ .key = .{ .codepoint = vaxis_tab } });
+    try expectFileTreeCursor(&presentation, .root);
+    const tree = presentation.projection().review.?.frame.file_tree;
+    try testing.expect(tree.viewport < tree.entries.len);
+
+    // As on a File entry, `G` and `g g` move the DiffPane cursor.
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'G', .text = "G" } });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame.visual_rows.len - 1, frame.navigation.cursor);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
+    try expectFileTreeCursor(&presentation, .root);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .mods = .{ .ctrl = true } } });
+    try testing.expectEqual(@as(usize, 1), presentation.projection().review.?.frame.file_tree.scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'y', .mods = .{ .ctrl = true } } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.frame.file_tree.scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .text = "k" } });
+    try expectFileTreeCursor(&presentation, .root);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'Y', .text = "Y" } });
+    try testing.expectEqual(ActionError.action_refused, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    try testing.expect(presentation.projection().submission_tree != null);
+    var post = presentation.takeCommand().?;
+    defer post.deinit();
+    try testing.expectEqual(@as(bbr.review.TempId, 1), post.post_draft.draft.local_id);
+}
+
 test "M29 overview the File Tree cursor stays on the File Tree Filter" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
