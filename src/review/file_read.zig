@@ -472,6 +472,35 @@ test "M22 read a binary File without blob ids is unverifiable" {
     try testing.expectEqual(@as(?FileReviewFingerprint, null), fingerprint(parsed.files[0]));
 }
 
+test "M22 read a binary File with a space in its path is unverifiable" {
+    // Git does not quote a space in a `diff --git` path, and a binary diff has
+    // no `---` or `+++` line, so the parser cannot name these sides.
+    const raws = [_][]const u8{
+        \\diff --git a/my logo.png b/my logo.png
+        \\index 1111111..2222222 100644
+        \\Binary files a/my logo.png and b/my logo.png differ
+        \\
+        ,
+        \\diff --git a/my logo.png b/my logo.png
+        \\index 1111111..3333333 100644
+        \\Binary files a/my logo.png and b/my logo.png differ
+        \\
+        ,
+        \\diff --git a/my logo.png b/my logo.png
+        \\new file mode 100644
+        \\index 0000000..2222222
+        \\Binary files /dev/null and b/my logo.png differ
+        \\
+        ,
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for (raws) |raw| {
+        const parsed = try parser.parse(arena.allocator(), raw);
+        try testing.expectEqual(@as(?FileReviewFingerprint, null), fingerprint(parsed.files[0]));
+    }
+}
+
 test "M22 read a text File fingerprint ignores its index blob ids" {
     try expectSame(base_diff,
         \\diff --git a/src/a.zig b/src/a.zig
