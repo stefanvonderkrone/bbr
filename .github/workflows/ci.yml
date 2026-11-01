@@ -85,6 +85,9 @@ jobs:
         run: zig build test-user-grammar --summary all
       - name: Complete hermetic suite
         run: zig build test --summary all
+      - name: Guard tests catch guard removal
+        if: matrix.target == 'linux-x86_64'
+        run: python3 tools/check_guard_mutations.py
       - name: Install External Edit test tools
         if: matrix.target == 'linux-x86_64'
         run: |
