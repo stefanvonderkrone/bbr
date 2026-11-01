@@ -201,10 +201,6 @@ pub fn build(b: *std.Build) void {
         version_command.removeEnvironmentVariable(name);
     }
     version_command.expectStdOutEqual(b.fmt("bbr {s}\n", .{version}));
-    const version_integration = b.addSystemCommand(&.{ "sh", "tests/version_identity_test.sh" });
-    version_integration.setCwd(b.path("."));
-    const release_validation = b.addSystemCommand(&.{ "sh", "tests/release_validation_test.sh" });
-    release_validation.setCwd(b.path("."));
     const xdg_reads = b.addSystemCommand(&.{"python3"});
     xdg_reads.addFileArg(b.path("tools/check_xdg_reads.py"));
     xdg_reads.addDirectoryArg(b.path("."));
@@ -214,27 +210,9 @@ pub fn build(b: *std.Build) void {
     const stdio_writers = b.addSystemCommand(&.{"python3"});
     stdio_writers.addFileArg(b.path("tools/check_stdio_writers.py"));
     stdio_writers.addDirectoryArg(b.path("."));
-    const tests_wired = b.addSystemCommand(&.{"python3"});
-    tests_wired.addFileArg(b.path("tools/check_tests_wired.py"));
-    tests_wired.addDirectoryArg(b.path("."));
-
+    const test_step = b.step("test", "Run tests");
     const cli_test_step = b.step("test-cli", "Run hermetic Python CLI checks (requires python3)");
-    for ([_][]const u8{
-        "tests/auth_cli_test.py",
-        "tests/api_auth_cli_test.py",
-        "tests/completion_cli_test.py",
-        "tests/redirected_output_cli_test.py",
-    }) |script| {
-        const cli_test = b.addSystemCommand(&.{"python3"});
-        cli_test.addFileArg(b.path(script));
-        cli_test.addArtifactArg(exe);
-        cli_test.setCwd(b.path("."));
-        // A developer's saved Profile or Credential variables would let a check pass only on that machine.
-        cli_test.clearEnvironment();
-        if (b.graph.environ_map.get("PATH")) |path| cli_test.setEnvironmentVariable("PATH", path);
-        cli_test.setEnvironmentVariable("BBR_TEST_CLI", "1");
-        cli_test_step.dependOn(&cli_test.step);
-    }
+    addTestScripts(b, exe, test_step, cli_test_step);
 
     const re2_tests = b.addTest(.{
         .name = "re2-wrapper-tests",
@@ -397,31 +375,76 @@ pub fn build(b: *std.Build) void {
     const user_grammar_test_step = b.step("test-user-grammar", "Run the native UserGrammar load and CLI lifecycle fixture");
     user_grammar_test_step.dependOn(&run_lifecycle_test.step);
 
-    const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_version_tests.step);
     test_step.dependOn(&version_command.step);
-    test_step.dependOn(&version_integration.step);
-    test_step.dependOn(&release_validation.step);
     test_step.dependOn(&xdg_reads.step);
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&stdio_writers.step);
-    test_step.dependOn(&tests_wired.step);
-    for ([_][]const u8{
-        "tests/source_lines_test.py",
-        "tests/check_stdio_writers_test.py",
-        "tests/check_box_glyphs_test.py",
-        "tests/check_xdg_reads_test.py",
-        "tests/check_tests_wired_test.py",
-        "tests/verify_bbr_control_test.py",
-    }) |script| {
-        const python_test = b.addSystemCommand(&.{"python3"});
-        python_test.addFileArg(b.path(script));
-        test_step.dependOn(&python_test.step);
-    }
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
+}
+
+const TestScript = enum { python, shell, cli, ci };
+
+/// The first suffix that ends a tests/ file name decides where the file runs.
+const test_script_suffixes = [_]struct { []const u8, TestScript }{
+    .{ "_cli_test.py", .cli },
+    .{ "_ci_test.py", .ci },
+    .{ "_test.py", .python },
+    .{ "_test.sh", .shell },
+};
+
+/// Files in tests/ that tests use and that run in no step of their own.
+const test_support_files = [_][]const u8{
+    "cli_env.py",
+    "validate_release.sh",
+    "grammar_cli_integration.zig",
+    "user_grammar_fixture.zig",
+};
+
+/// Runs each tests/ script by the suffix of its name, so a new test needs no registration.
+/// The `test` step fails on a file that fits no suffix and is not a support file.
+fn addTestScripts(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, cli_test_step: *std.Build.Step) void {
+    const io = b.graph.io;
+    var dir = b.build_root.handle.openDir(io, "tests", .{ .iterate = true }) catch |err|
+        std.process.fatal("cannot open tests/: {s}", .{@errorName(err)});
+    defer dir.close(io);
+    var entries = dir.iterate();
+    files: while (entries.next(io) catch |err| std.process.fatal("cannot list tests/: {s}", .{@errorName(err)})) |entry| {
+        if (entry.kind != .file or entry.name[0] == '.') continue;
+        for (test_support_files) |name| {
+            if (std.mem.eql(u8, entry.name, name)) continue :files;
+        }
+        const path = b.fmt("tests/{s}", .{entry.name});
+        const script = for (test_script_suffixes) |suffix| {
+            if (std.mem.endsWith(u8, entry.name, suffix[0])) break suffix[1];
+        } else {
+            test_step.dependOn(&b.addFail(b.fmt(
+                "{s} runs in no step. Name a test *_test.py or *_test.sh for `zig build test`, *_cli_test.py for `zig build test-cli`, or *_ci_test.py for CI, or add a support file to test_support_files in build.zig.",
+                .{path},
+            )).step);
+            continue;
+        };
+        const run = switch (script) {
+            .ci => continue,
+            .python, .cli => b.addSystemCommand(&.{"python3"}),
+            .shell => b.addSystemCommand(&.{"sh"}),
+        };
+        run.addFileArg(b.path(path));
+        run.setCwd(b.path("."));
+        if (script != .cli) {
+            test_step.dependOn(&run.step);
+            continue;
+        }
+        run.addArtifactArg(exe);
+        // A developer's saved Profile or Credential variables would let a check pass only on that machine.
+        run.clearEnvironment();
+        if (b.graph.environ_map.get("PATH")) |env_path| run.setEnvironmentVariable("PATH", env_path);
+        run.setEnvironmentVariable("BBR_TEST_CLI", "1");
+        cli_test_step.dependOn(&run.step);
+    }
 }
 
 fn resolveVersion(b: *std.Build) []const u8 {

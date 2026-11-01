@@ -6,7 +6,7 @@ import unittest
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
-from source_lines import yaml_code, zig_code, zig_code_without_literals  # noqa: E402
+from source_lines import zig_code, zig_code_without_literals  # noqa: E402
 
 
 class ZigCodeTest(unittest.TestCase):
@@ -54,38 +54,14 @@ class ZigCodeWithoutLiteralsTest(unittest.TestCase):
                 self.assertEqual(zig_code_without_literals(line), [code])
 
 
-class YamlCodeTest(unittest.TestCase):
-    def test_comments_end_the_code(self):
-        for line, code in (
-            ("# note", ""),
-            ("    # note", ""),
-            ("run: make # note", "run: make"),
-            ("run: |  # note", "run: |"),
-        ):
-            with self.subTest(line=line):
-                self.assertEqual(yaml_code(line), [code])
-
-    def test_quotes_and_words_keep_a_hash(self):
-        for line in (
-            'run: echo "a # not a comment"',
-            "run: echo 'a # not a comment'",
-            "run: echo 'it''s # quoted'",
-            'run: echo "say \\" # quoted"',
-            "run: echo ${#items}",
-            "url: https://example.test/#anchor",
-        ):
-            with self.subTest(line=line):
-                self.assertEqual(yaml_code(line), [line])
-
-
 class CheckersTest(unittest.TestCase):
-    def test_every_zig_or_yaml_checker_reads_lines_through_source_lines(self):
+    def test_every_zig_checker_reads_lines_through_source_lines(self):
         for path in sorted(TOOLS.glob("check_*.py")):
             text = path.read_text(encoding="utf-8")
-            if ".zig" not in text and ".yml" not in text:
+            if ".zig" not in text:
                 continue
             with self.subTest(checker=path.name):
-                fix = f"tools/{path.name}: read each line with source_lines.zig_code, source_lines.zig_code_without_literals, or source_lines.yaml_code, which drop comments outside literals."
+                fix = f"tools/{path.name}: read each line with source_lines.zig_code or source_lines.zig_code_without_literals, which drop comments outside literals."
                 self.assertTrue("from source_lines import" in text, fix)
                 for raw in (".splitlines()", 'startswith("//")', 'startswith("#")'):
                     self.assertFalse(raw in text, fix)

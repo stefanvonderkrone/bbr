@@ -22,8 +22,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Test document validator
-        run: python3 tests/check_agent_docs_test.py
       - name: Check agent documents and tracker
         run: python3 tools/check_agent_docs.py
 
@@ -71,12 +69,6 @@ jobs:
       - name: Check formatting
         if: matrix.target == 'linux-x86_64'
         run: zig fmt --check build.zig src tests
-      - name: Test release preparation
-        if: matrix.target == 'linux-x86_64'
-        run: python3 tests/prepare_release_test.py
-      - name: Test release publication
-        if: matrix.target == 'linux-x86_64'
-        run: python3 tests/publish_release_test.py
       - name: RE2 wrapper
         run: zig build test-re2 --summary all
       - name: Dynamic UserGrammar load
@@ -93,6 +85,9 @@ jobs:
       - name: Build bbr
         if: matrix.target == 'linux-x86_64'
         run: zig build --summary all
-      - name: External Edit terminal lifecycle
+      - name: Tests that need CI tools
         if: matrix.target == 'linux-x86_64'
-        run: python3 tests/external_edit_pty_test.py
+        run: |
+          for test in tests/*_ci_test.py; do
+            python3 "$test"
+          done
