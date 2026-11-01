@@ -77,6 +77,7 @@ A File Jump, such as a File Finder choice, shows the DiffPane.
 - The File Tree Filter chip uses the active chip style. It is the first chip, so a narrow row drops it last.
 - Open: while the Comment Overview shows, the active File of the hidden DiffPane keeps the selected File Tree style and the `›` marker. So two rows can look selected. The spec does not decide this.
 - Open: no test proves the `centerActiveFile` guard. The fixture File Trees fit in their viewports, so a centered scroll never hides the cursor.
+- Review finding M29-7 changed the Directory filter to the display path of the item's File. Ticket 06 records the fix. Ticket 09 asks triage about Sidebar Motions in the Comment Overview.
 
 ## Completion
 

@@ -107,6 +107,7 @@ The filter row shows only the query placeholder and the `o review order` chip in
 - The status puts the `main_pane` hint before the submit hint, after the `filter` and `open` slots. So the Comment Overview hints follow the SPEC order.
 - The test "unbinding a default can free its Leader for a shorter Action" in `src/tui/config.zig` now also unbinds `show_comment_overview` and `show_diff_pane`, because `g o` and `g d` keep `g` as a Leader.
 - Left for ticket 04: Enter on a File Tree File while the Comment Overview shows still runs the File Jump in the hidden DiffPane, and focus goes to the Comment Overview.
+- The second review fix round touched this ticket: M29-6 (root entry Actions), M29-8 (resize scroll), M29-10 (`g o` focus), M29-11 (excerpt cut), and the `showMainPane` owner. Ticket 06 records the fixes.
 
 ## Completion
 

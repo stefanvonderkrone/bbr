@@ -59,6 +59,17 @@ The integrated hermetic suite passes with every M29 test.
 - M29-4. A Submission Overlay jump to a Draft card shows the DiffPane on the fast path too. A failed DiffPane change shows the Submission Overlay again.
 - Ticket 08 records the Overview scroll bar defect that exists after the M30 merge. The operator chose a follow-up ticket.
 - After the fixes: `zig build test --summary all` passes, 24/24 steps and 1499/1499 tests. `python3 tools/check_agent_docs.py` passes.
+- Second fix round on 2026-11-02 for the remaining review findings. Each fix commit has a test that failed before the fix, or a mutation that the new test kills.
+- M29-9, commit `8df6955`. Three tests prove that a deleted Draft, a submitting Draft, and a Draft linked to its fetched Comment leave the listing. Each test fails when its `overview_index_stale = true` line goes. A Draft delete cannot happen while the Overview shows, so the delete test goes through `g d` and `g o`.
+- M29-6, commit `c20f84f`. The `.sidebar` context gains `to_top`, `to_bottom`, the row scroll Actions, `submit`, and `recover_submission`. The root entry now acts like a File entry. These Motions move the hidden DiffPane on every entry, so ticket 09 asks triage for the visible behavior.
+- M29-8, commit `e2deedb`. A geometry change calls `followOverviewSelection`. It clamps the scroll and rebuilds nothing.
+- M29-10, commit `7dc9093`. The SPEC contradicted itself. The runner chose the step list reading, because the code, user story 3, and the acceptance list follow it. In its own view, `g o` or `g d` changes nothing, focus included. Rule 11 now says so. Two tests prove both cases.
+- M29-7, commit `77845a1`. Each Overview record has a `tree_path`, the display path of its File. The Directory filter compares it. The SPEC File Tree Filter section now says so.
+- M29-11, commit `6ce35e2`. `review_body.excerpt` cuts on a grapheme boundary with the Presentation `CellMetrics`. A cut excerpt ends with `…`, and the painter adds no second one. The SPEC excerpt lines now say so.
+- Fixed help sections, commit `7b639dd`. `help.FixedKeyInput` names each raw key input. `applyKey` switches on it, and `help.fixed_sections` is an `EnumArray` over it. A new raw input without a section is a compile error. Removing the Comment Overview entry gives `missing struct field: comment_overview_query`. Ticket 10 records the re-anchor keys, which the check does not cover.
+- Main Pane owner, commit `cb75794`. `Published.showMainPane` is the one writer of `main_pane` after init. It closes the query input and cancels a pending Overview destination when the Comment Overview hides. M29-2 and M29-4 came from writers that skipped a side effect. Removing either side effect fails an existing test. A Draft destination that leaves the Overview now also cancels a pending Overview destination.
+- X-5 and X-6, M29 part, commit `f588ca6`. 32 mutations ran against the M29 `AGENTS.md` rows. 27 failed a named check at once. New tests kill three more. Two survivors have no cheap test, so their `AGENTS.md` cells now say "convention (no check)". These are the single-Pane draw loop in `app.zig` and the `draft_destination` arm of `Kind.publishedPane`.
+- Out of scope: X-2 (Credential transport on main) and X-3 (decoders that panic on untrusted bytes). Ticket 08 waits for M30 and triage.
 
 ## Completion
 

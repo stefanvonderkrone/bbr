@@ -77,6 +77,7 @@ The filters, the query, and the order survive `g d` and `g o`.
 - The order chip stays muted in both orders, because it is not a filter. Its text names the order.
 - At 80 columns, the filter row is 50 cells wide. The chips then drop from the end, so the order chip shows only from about 85 columns. This follows the spec rule for a narrow row.
 - After the merge with PR #16, review findings M29-2 and M29-5 touched the query input. Ticket 06 records the fixes.
+- The second review fix round added M29-9 tests for Overview Index invalidation. Ticket 06 records them.
 
 ## Completion
 

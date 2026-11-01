@@ -106,7 +106,8 @@ Each item states the choice.
     `u` toggles unresolved only, `d` toggles Drafts only, and `a` toggles mine only.
     `o` toggles the order.
     No new binding uses `m` (M22), `b` or `s` (M24), or Escape.
-11. `g o` and `g d` move focus to the Main Pane.
+11. `g o` and `g d` move focus to the Main Pane when they change the view.
+    In their own view, they change nothing, focus included.
 12. A File Jump always shows the DiffPane.
     Enter on a File Tree File while the Comment Overview shows is not a File Jump.
     It moves focus to the Comment Overview.
@@ -312,7 +313,8 @@ It borrows nothing from the Session or the PendingReview.
 
 The excerpt is the first non-blank prose line of the ReviewBody, with mention names applied.
 It collapses each run of whitespace into one space.
-It stops at 200 bytes on a UTF-8 scalar boundary.
+It stops at 200 bytes on a grapheme boundary.
+A cut excerpt ends with `…`.
 A body with only a Suggestion fence has the excerpt "suggestion".
 A Deleted Comment without a body has an empty excerpt.
 
@@ -365,7 +367,9 @@ Without a known Authenticated Account, no Comment is mine.
 The File Tree Filter compares the scope path of the Thread root:
 
 - A File entry matches an item when `pathMatchesFile` accepts the scope path for that File.
-- A Directory entry matches an item when the scope path starts with the Directory path and a `/`.
+- A Directory entry matches an item when its tree path starts with the Directory path and a `/`.
+  The tree path is the display path of the item's File, as in the File Tree.
+  An item outside the Diff uses its scope path.
 - A Review-level item matches only the root entry.
 
 The listing shows each matching item.
@@ -824,7 +828,7 @@ Index and listing:
 - Mine-only keeps a Comment only when its `author_uuid` equals the Authenticated Account.
 - A matching Reply shows its non-matching parent as a context entry.
 - The Title counts exclude context entries.
-- The excerpt applies mention names, collapses whitespace, and stops at 200 bytes on a scalar boundary.
+- The excerpt applies mention names, collapses whitespace, and stops at 200 bytes on a grapheme boundary with `…`.
 
 Presentation:
 
@@ -929,3 +933,7 @@ It does not gate the hermetic suite.
   The Browser replaces the whole content region, so the Comment Overview hides under it and keeps its Overview State.
 - The TODO line "Show nearby source Lines for an inline item" stays open as deferred work.
   Ticket 06 marks it as deferred in `TODO.md`.
+- The review on 2026-11-01 found contradictions and gaps in this spec. Ticket 06 records the amendments.
+  Rule 11 now follows the step list for `g o` and `g d` in their own view.
+  The Directory File Tree Filter uses the display path of the item's File.
+  The excerpt cuts on a grapheme boundary and ends with `…`.
