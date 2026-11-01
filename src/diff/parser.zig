@@ -148,11 +148,25 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
                 if (std.mem.eql(u8, new_path, "/dev/null")) status = .removed;
                 continue;
             }
-            if (std.mem.eql(u8, line, "GIT binary patch") or
-                (std.mem.startsWith(u8, line, "Binary files ") and std.mem.endsWith(u8, line, " differ")))
-            {
+            if (std.mem.eql(u8, line, "GIT binary patch")) {
                 binary = true;
-                binary_expects_block = std.mem.eql(u8, line, "GIT binary patch");
+                binary_expects_block = true;
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "Binary files ") and std.mem.endsWith(u8, line, " differ")) {
+                binary = true;
+                binary_expects_block = false;
+                // This line is the only place a binary diff names paths that `diff --git` cannot split.
+                if (splitBinaryOperands(line["Binary files ".len .. line.len - " differ".len])) |operands| {
+                    const old = try normalizeDiffPath(allocator, operands.old);
+                    const new = try normalizeDiffPath(allocator, operands.new);
+                    old_path = old.path;
+                    old_path_valid = old.valid;
+                    new_path = new.path;
+                    new_path_valid = new.valid;
+                    if (std.mem.eql(u8, old_path, "/dev/null")) status = .added;
+                    if (std.mem.eql(u8, new_path, "/dev/null")) status = .removed;
+                }
                 continue;
             }
             if (binary and line.len == 0) {
@@ -276,6 +290,25 @@ fn fileContent(status: FileStatus, binary: bool, old_size: ?usize, new_size: ?us
     else
         .{ .text = null };
     return .{ .old = old, .new = new };
+}
+
+const BinaryOperands = struct { old: []const u8, new: []const u8 };
+
+/// Split `<old> and <new>` from a `Binary files … differ` line. Null when the
+/// operands have an unexpected shape or more than one ` and ` separator fits.
+fn splitBinaryOperands(operands: []const u8) ?BinaryOperands {
+    var split: ?usize = null;
+    var index: usize = 0;
+    while (std.mem.findPos(u8, operands, index, " and ")) |at| : (index = at + 1) {
+        const rest = operands[at + " and ".len ..];
+        if (!std.mem.startsWith(u8, rest, "b/") and !std.mem.eql(u8, rest, "/dev/null") and !std.mem.startsWith(u8, rest, "\"")) continue;
+        if (split != null) return null;
+        split = at;
+    }
+    const at = split orelse return null;
+    const old = operands[0..at];
+    if (!std.mem.startsWith(u8, old, "a/") and !std.mem.eql(u8, old, "/dev/null") and !std.mem.startsWith(u8, old, "\"")) return null;
+    return .{ .old = old, .new = operands[at + " and ".len ..] };
 }
 
 const GitPaths = struct { old: []const u8, new: []const u8, old_valid: bool, new_valid: bool };
