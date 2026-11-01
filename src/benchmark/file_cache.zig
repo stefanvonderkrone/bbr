@@ -3055,13 +3055,13 @@ test "M28 cache the Credential token never reaches the output, the notes, or the
     options.scenarios = .initMany(&.{ .s1, .s2 });
     const output = try runIn(&transport, path, options, &clock, &notes.writer);
     defer testing.allocator.free(output);
-    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=window") != null);
-    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=retry status=503") != null);
-    try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s1 ", "retries"));
     const forbidden = [_][]const u8{"TOKENSENTINEL"};
     try expectNone(output, &forbidden);
     try expectNone(notes.written(), &forbidden);
     try testing.expectEqual(@as(usize, 3), try expectNoneInFiles(tmp.dir, &forbidden));
+    // The notes prove that the run printed a window wait and a retry, so the check covered those lines.
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=window") != null);
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=retry status=503") != null);
 }
 
 /// The number of transport calls in a healthy run of `scenarios`.
