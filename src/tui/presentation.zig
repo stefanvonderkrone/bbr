@@ -5035,6 +5035,7 @@ const Published = struct {
     fn resizeHeight(self: *Published, geometry: frame_mod.Geometry) void {
         self.geometry = geometry;
         frame_mod.resizeViewports(&self.navigation, &self.tree, geometry);
+        self.followOverviewSelection();
         self.frame_revision += 1;
     }
 
@@ -9578,6 +9579,7 @@ pub const Presentation = struct {
             .reset => Nav.init(job.visual_rows.len, frame_mod.paneRects(job.geometry).diff_content.height),
         };
         published.geometry = job.geometry;
+        published.followOverviewSelection();
         published.selected_version = job.preferences.selected_version;
         published.isolated_file = job.isolated_file;
         if (job.kind == .view or job.kind == .cache_update) if (published.buffer_search.input) |*input| {
@@ -30839,6 +30841,26 @@ test "M29 overview g o shows the Comment Overview and g d restores the DiffPane"
     try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expectEqual(overview_before.scroll, frame.overview.state.scroll);
     try testing.expectEqual(overview_before.selected, frame.overview.state.selected);
+}
+
+test "M29 overview a smaller terminal keeps the selected entry in view" {
+    for ([_]frame_mod.Geometry{ .{ .cols = 80, .rows = 9 }, .{ .cols = 70, .rows = 9 } }) |smaller| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try testOverviewPresentation(&store, 30);
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .show_comment_overview });
+        try presentation.dispatch(.{ .action = .to_bottom });
+        const records = presentation.projection().review.?.frame.overview.records.ptr;
+        try presentation.dispatch(.{ .resize = smaller });
+        while (presentation.commands.items.len > 0) try completeDisclosureBuild(&presentation);
+        const frame = presentation.projection().review.?.frame;
+        try testing.expectEqual(smaller, frame.geometry);
+        try testing.expectEqual(records, frame.overview.records.ptr);
+        const viewport = frame_mod.overviewRects(frame.geometry).entries.height;
+        try testing.expectEqual(@as(?usize, 31), frame.overview.selected);
+        try testing.expectEqual(32 - viewport, frame.overview.state.scroll);
+    }
 }
 
 test "M29 overview showing the Comment Overview changes no disclosure" {
