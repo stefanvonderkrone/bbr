@@ -171,3 +171,7 @@ The review findings M28-1 and M28-4 in the adversarial branch review describe th
   Each scenario line now prints `enrichments`, `enrichment_refetches`, and `speculative_enrichments`.
   The test "M28 cache a File Jump to a File whose fetch is still in flight is a fetch, not a hit" proves it.
   On the old classification, the test failed with S1 `hits` 5 against the expected 2.
+- A live request that got no response stalled the run forever, because `StdHttpClient` has no request timeout.
+  `TimedHttpClient` now ends each live attempt after 120 s with `error.Timeout`, and the harness retries it.
+  The test "M28 cache a request that hangs times out and the harness retries it" proves it.
+  Its loopback server never answers.

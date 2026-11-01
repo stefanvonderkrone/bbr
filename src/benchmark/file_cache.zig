@@ -486,7 +486,7 @@ pub const MeasuringHttpClient = struct {
             const retryable = request.method == .GET and if (result) |response|
                 response.status == 429 or (response.status >= 500 and response.status <= 599)
             else |err|
-                err != error.OutOfMemory;
+                err != error.OutOfMemory and err != error.Canceled;
             const give_up = retryable and attempt >= self.policy.max_attempts;
             self.count(request, result, elapsed, retryable, give_up);
             if (!retryable) return result;
@@ -636,11 +636,54 @@ pub const Transport = struct {
     }
 };
 
+/// Ends an attempt with `error.Timeout` after `timeout`. `StdHttpClient` has no request timeout,
+/// so a server that never answers would stall the run forever.
+const TimedHttpClient = struct {
+    io: std.Io,
+    inner: bbr.http.HttpClient,
+    // A slow download of a large File must not time out.
+    timeout: std.Io.Duration = .fromSeconds(120),
+
+    const Race = union(enum) {
+        response: anyerror!bbr.http.client.Response,
+        timer: std.Io.Cancelable!void,
+    };
+
+    fn httpClient(self: *TimedHttpClient) bbr.http.HttpClient {
+        return .{ .ptr = self, .vtable = &.{ .send = send } };
+    }
+
+    fn send(ptr: *anyopaque, allocator: Allocator, request: bbr.http.client.Request) anyerror!bbr.http.client.Response {
+        const self: *TimedHttpClient = @ptrCast(@alignCast(ptr));
+        var buffer: [2]Race = undefined;
+        var select: std.Io.Select(Race) = .init(self.io, &buffer);
+        // The cancel interrupts the blocked read. A response that completes after the timer is freed here.
+        defer while (select.cancel()) |late| switch (late) {
+            .response => |result| if (result) |response| allocator.free(response.body) else |_| {},
+            .timer => {},
+        };
+        try select.concurrent(.response, sendInner, .{ self.inner, allocator, request });
+        try select.concurrent(.timer, std.Io.sleep, .{ self.io, self.timeout, .awake });
+        return switch (try select.await()) {
+            .response => |result| result,
+            .timer => |result| {
+                try result;
+                return error.Timeout;
+            },
+        };
+    }
+
+    fn sendInner(inner: bbr.http.HttpClient, allocator: Allocator, request: bbr.http.client.Request) anyerror!bbr.http.client.Response {
+        return inner.vtable.send(inner.ptr, allocator, request);
+    }
+};
+
 const StdTransport = struct {
     io: std.Io,
     arena: Allocator,
     environ_map: *const std.process.Environ.Map,
     client: ?bbr.http.StdHttpClient = null,
+    timed: TimedHttpClient = undefined,
 
     fn transport(self: *StdTransport) Transport {
         return .{ .ptr = self, .vtable = &.{ .open = open, .close = close } };
@@ -651,7 +694,8 @@ const StdTransport = struct {
         self.client = bbr.http.StdHttpClient.init(std.heap.page_allocator, self.io);
         errdefer close(ptr);
         try self.client.?.initDefaultProxies(self.arena, self.environ_map);
-        return self.client.?.httpClient();
+        self.timed = .{ .io = self.io, .inner = self.client.?.httpClient() };
+        return self.timed.httpClient();
     }
 
     fn close(ptr: *anyopaque) void {
@@ -2425,6 +2469,30 @@ test "M28 cache retries back off with full jitter up to the cap and honour Retry
         try testing.expectEqual(case.rate_limited, traffic.rate_limited);
         try testing.expectEqual(@as(usize, 0), traffic.failures);
     }
+}
+
+test "M28 cache a request that hangs times out and the harness retries it" {
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    // The server never accepts. The kernel completes the handshake, so the request waits for a head that never comes.
+    var server = try address.listen(testing.io, .{});
+    defer server.deinit(testing.io);
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/hang", .{server.socket.address.getPort()});
+    defer testing.allocator.free(url);
+    var std_client = bbr.http.StdHttpClient.init(testing.allocator, testing.io);
+    defer std_client.deinit();
+    var timed: TimedHttpClient = .{ .io = testing.io, .inner = std_client.httpClient(), .timeout = .fromMilliseconds(200) };
+
+    const start = std.Io.Timestamp.now(testing.io, .awake);
+    try testing.expectError(error.Timeout, timed.httpClient().send(testing.allocator, .{ .method = .GET, .url = url }));
+    try testing.expect(start.untilNow(testing.io, .awake).toSeconds() < 5);
+
+    var zero_jitter: FixedRandom = .{ .value = 1 };
+    var probe_client: RetryProbe = undefined;
+    try probe_client.init(timed.httpClient(), zero_jitter.random(), .{ .max_attempts = 2 }, 900);
+    defer probe_client.deinit();
+    try testing.expectError(error.RetriesExhausted, probe_client.measuring.httpClient().send(testing.allocator, .{ .method = .GET, .url = url }));
+    try testing.expect(std.mem.indexOf(u8, probe_client.notes_text.written(), "wait reason=retry error=Timeout attempt=1") != null);
+    try testing.expectEqual(@as(usize, 2), (try probe_client.measuring.since(testing.allocator, .{ .traffic = .{}, .latency_count = 0, .excluded_ns = 0 })).retries);
 }
 
 test "M28 cache a 429 marks the request window full" {

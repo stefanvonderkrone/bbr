@@ -247,7 +247,7 @@ This rule has two limits:
 
 The harness retries a failed attempt below the `HttpClient` seam.
 It retries only a `GET` request.
-It retries after a `429` response, a `5xx` response, or a send error other than `OutOfMemory`.
+It retries after a `429` response, a `5xx` response, or a send error other than `OutOfMemory` and `Canceled`.
 It does not retry another status, such as `401` or `404`.
 
 The policy uses full jitter backoff:
@@ -275,9 +275,10 @@ This changes the old rule that a `429` response stays in the data.
 The harness retry handles a retryable response first.
 So the production retry runs only after the harness gives up, and then it fails at once.
 
-`StdHttpClient` has no request timeout.
-An OS timeout comes back as a send error, and the harness retries it.
-A request that hangs without an OS error never ends, and the harness does not retry it.
+`StdHttpClient` has no request timeout, so the harness adds one.
+Each live attempt times out after 120 s.
+The timeout cancels the attempt and counts as a send error, so the harness retries it.
+A slow download of a large File must finish inside the 120 s.
 
 ### Resume
 
