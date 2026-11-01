@@ -20,6 +20,9 @@ This check needs a Bitbucket Credential, real Repositories, and a human eye, so 
 4. Open the same File at the same commit in Neovim with `:Inspect` available.
 5. For each File, compare the color role of comments, strings, keywords, functions, types, and constants.
 6. In a Markdown File, check headings, inline code, links, and one fenced code block.
+   Also check an inline HTML tag that opens in one paragraph and closes in the next paragraph.
+   bbr parses the inline HTML of each paragraph as a separate tree. Neovim combines them in one tree.
+   Record whether the difference changes a role that a reviewer needs.
 7. In an HTML File, check `<script>` and `<style>` content.
 8. In a PHP File, check the PHP code and the HTML around it.
 9. Open a `.h` File and confirm that the C++ BuiltInGrammar highlights it.
@@ -148,3 +151,11 @@ Add `## Completion` to this ticket with these items:
 
 Then tick the acceptance criteria that the results prove, and set `Status: resolved`.
 After that, set the SPEC `Status: resolved` with the integrated evidence, as `docs/agents/issue-tracker.md` describes.
+
+### Review finding M27-6
+
+The review of 2026-10-31 found that a combined Injection groups its ranges per parent layer.
+Neovim groups them per child language tree.
+So each Markdown `(inline)` node gets its own HTML layer in bbr.
+The SPEC says "one layer for each host layer and Grammar", so the code follows the SPEC.
+Step 6 now asks for this check. Ticket 14 records the decision.

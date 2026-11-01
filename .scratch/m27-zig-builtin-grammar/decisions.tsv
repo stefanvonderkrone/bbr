@@ -26,3 +26,10 @@ ts	phase	decision	why	evidence	result
 2026-10-31T00:43:47Z	t12	did not add lazy query preparation although init grows from 28 ms to 422 ms	the SPEC puts lazy preparation out of scope, so the operator decides	.scratch/m27-zig-builtin-grammar/binary-size.md	open
 2026-10-31T00:43:47Z	t13	wrote exact human steps into ticket 13 and left it ready-for-human	it needs a human eye and Neovim	4d9704b	done
 2026-10-31T00:43:47Z	review	skipped the cross-model trail review	this runner cannot choose another model family, the Subagent tool forbids a model choice the operator did not ask for	none	skipped
+2026-11-01T18:00:00Z	merge	merged origin/main 497c86f with a merge commit, no conflict, no help section change	M27 adds no Keymap Action and no Overlay	da8743b, 31/31 steps, 1506/1506 tests	tests green
+2026-11-01T18:00:00Z	review	fixed M27-1, M27-2, M27-3, M27-4, M27-7 test first in separate worktrees, then cherry-picked	the fixes touch disjoint regions or files	3e2e555..bed3aa5, ticket 14	done
+2026-11-01T18:00:00Z	review	kept M27-8 open, no legitimate state reaches a child layer error	a skip would guard an impossible state	ticket 14 M27-8 evidence	no change
+2026-11-01T18:00:00Z	review	kept M27-6 as the SPEC states and added a check to ticket 13	the SPEC wording allows the bbr form, the brief and SPEC stay final	ticket 13 step 6	open for the human
+2026-11-01T18:00:00Z	review	wrote ticket 15 for lazy query preparation as needs-triage, no code change	the SPEC puts lazy preparation out of scope, the operator decides	ticket 15	open
+2026-11-01T18:00:00Z	review	shipped THIRD_PARTY_NOTICES in each archive and added no bbr --licenses	the conservative option adds no CLI surface	bed3aa5	done
+2026-11-01T18:00:00Z	correct	added tools/check_guard_mutations.py to CI for X-6	weak guard tests recurred on several branches, a check beats a doc rule	03329e8	8 of 8 caught
