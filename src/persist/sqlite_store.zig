@@ -5,7 +5,7 @@
 //! One row per Draft, keyed `(workspace, repository, pr_id, local_id)`. `put` is INSERT OR REPLACE,
 //! `remove` a keyed DELETE, `load` a per-PR SELECT that dupes every string into
 //! the caller's allocator. Schema versioning rides SQLite's `PRAGMA user_version`
-//! so migrations are a simple forward switch (see `migrate`).
+//! so migrations are a forward table (see `migrations`).
 //!
 //! Concurrency: the store is touched only on the main thread (design §10/§11);
 //! the amalgamation is compiled `SQLITE_THREADSAFE=0` to match. The Bitbucket
@@ -92,6 +92,9 @@ const schema_v1 =
 pub const SqliteStore = struct {
     db: *c.sqlite3,
 
+    /// Another bbr process can hold the write lock. Writes run on the TUI thread, so the wait stays short.
+    const busy_timeout_ms = 2000;
+
     /// Open (creating if needed) the database at `path`, a NUL-terminated path or
     /// `":memory:"`. Applies pending migrations before returning.
     pub fn open(path: [:0]const u8) SqliteError!SqliteStore {
@@ -103,6 +106,7 @@ pub const SqliteStore = struct {
         }
         var self: SqliteStore = .{ .db = db.? };
         errdefer _ = c.sqlite3_close(self.db);
+        _ = c.sqlite3_busy_timeout(self.db, busy_timeout_ms);
         try self.migrate();
         return self;
     }
@@ -123,185 +127,151 @@ pub const SqliteStore = struct {
 
     // --- migrations ---------------------------------------------------------
 
-    /// The `user_version` that the last step of `migrate` sets.
-    const schema_version: i64 = 10;
-
-    fn migrate(self: *SqliteStore) SqliteError!void {
-        if (try self.userVersion() < 1) {
-            try self.exec(schema_v1);
-            try self.exec("PRAGMA user_version = 1;");
-        }
+    /// Entry `i` turns a version `i` database into a version `i + 1` database.
+    /// `migrateStep` owns the transaction and the `user_version` write.
+    const migrations = [_][:0]const u8{
+        schema_v1,
         // v2 (M10b): multi-line anchors. Add the range's top-line columns. They
         // append at the end of the row, so v1 column indices are unaffected.
-        if (try self.userVersion() < 2) {
-            try self.exec(
-                \\ALTER TABLE drafts ADD COLUMN anchor_start_from INTEGER;
-                \\ALTER TABLE drafts ADD COLUMN anchor_start_to   INTEGER;
-            );
-            try self.exec("PRAGMA user_version = 2;");
-        }
+        \\ALTER TABLE drafts ADD COLUMN anchor_start_from INTEGER;
+        \\ALTER TABLE drafts ADD COLUMN anchor_start_to   INTEGER;
+        ,
         // v3: PullRequestId is only Repository-unique. Rebuild the table so
         // Workspace + Repository participate in the primary key. Legacy rows
         // retain an empty scope because the old schema did not record it.
-        if (try self.userVersion() < 3) {
-            try self.exec(
-                \\BEGIN;
-                \\ALTER TABLE drafts RENAME TO drafts_v2;
-                \\CREATE TABLE drafts (
-                \\  pr_id INTEGER NOT NULL, local_id INTEGER NOT NULL,
-                \\  kind INTEGER NOT NULL, target INTEGER NOT NULL,
-                \\  parent_kind INTEGER NOT NULL, parent_id INTEGER,
-                \\  anchor_path TEXT, anchor_from INTEGER, anchor_to INTEGER,
-                \\  anchor_commit TEXT, body TEXT NOT NULL,
-                \\  state_kind INTEGER NOT NULL, state_id INTEGER, state_err TEXT,
-                \\  anchor_start_from INTEGER, anchor_start_to INTEGER,
-                \\  workspace TEXT NOT NULL, repository TEXT NOT NULL,
-                \\  PRIMARY KEY (workspace, repository, pr_id, local_id)
-                \\) WITHOUT ROWID;
-                \\INSERT INTO drafts
-                \\ SELECT pr_id, local_id, kind, target, parent_kind, parent_id,
-                \\        anchor_path, anchor_from, anchor_to, anchor_commit,
-                \\        body, state_kind, state_id, state_err,
-                \\        anchor_start_from, anchor_start_to, '', ''
-                \\ FROM drafts_v2;
-                \\DROP TABLE drafts_v2;
-                \\COMMIT;
-            );
-            try self.exec("PRAGMA user_version = 3;");
-        }
+        \\ALTER TABLE drafts RENAME TO drafts_v2;
+        \\CREATE TABLE drafts (
+        \\  pr_id INTEGER NOT NULL, local_id INTEGER NOT NULL,
+        \\  kind INTEGER NOT NULL, target INTEGER NOT NULL,
+        \\  parent_kind INTEGER NOT NULL, parent_id INTEGER,
+        \\  anchor_path TEXT, anchor_from INTEGER, anchor_to INTEGER,
+        \\  anchor_commit TEXT, body TEXT NOT NULL,
+        \\  state_kind INTEGER NOT NULL, state_id INTEGER, state_err TEXT,
+        \\  anchor_start_from INTEGER, anchor_start_to INTEGER,
+        \\  workspace TEXT NOT NULL, repository TEXT NOT NULL,
+        \\  PRIMARY KEY (workspace, repository, pr_id, local_id)
+        \\) WITHOUT ROWID;
+        \\INSERT INTO drafts
+        \\ SELECT pr_id, local_id, kind, target, parent_kind, parent_id,
+        \\        anchor_path, anchor_from, anchor_to, anchor_commit,
+        \\        body, state_kind, state_id, state_err,
+        \\        anchor_start_from, anchor_start_to, '', ''
+        \\ FROM drafts_v2;
+        \\DROP TABLE drafts_v2;
+        ,
         // v4: durable Submission recovery state. A partial unique index makes
         // the agreed single active Submission structural across processes.
-        if (try self.userVersion() < 4) {
-            try self.exec(
-                \\BEGIN;
-                \\CREATE TABLE submission_runs (
-                \\  operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                \\  workspace TEXT NOT NULL, repository TEXT NOT NULL,
-                \\  pr_id INTEGER NOT NULL, source_commit TEXT NOT NULL,
-                \\  current_temp_id INTEGER, state INTEGER NOT NULL DEFAULT 0
-                \\);
-                \\CREATE UNIQUE INDEX one_active_submission
-                \\  ON submission_runs(state) WHERE state=0;
-                \\PRAGMA user_version = 4;
-                \\COMMIT;
-            );
-        }
+        \\CREATE TABLE submission_runs (
+        \\  operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  workspace TEXT NOT NULL, repository TEXT NOT NULL,
+        \\  pr_id INTEGER NOT NULL, source_commit TEXT NOT NULL,
+        \\  current_temp_id INTEGER, state INTEGER NOT NULL DEFAULT 0
+        \\);
+        \\CREATE UNIQUE INDEX one_active_submission
+        \\  ON submission_runs(state) WHERE state=0;
+        ,
         // v5 (M14): stable logical-repository aliases and transactional Draft
         // identifiers shared by concurrent bbr processes.
-        if (try self.userVersion() < 5) {
-            try self.exec(
-                \\BEGIN;
-                \\CREATE TABLE review_repositories (
-                \\  repository_id INTEGER PRIMARY KEY AUTOINCREMENT
-                \\);
-                \\CREATE TABLE review_repository_aliases (
-                \\  alias TEXT PRIMARY KEY,
-                \\  repository_id INTEGER NOT NULL REFERENCES review_repositories(repository_id)
-                \\);
-                \\CREATE TABLE draft_temp_ids (
-                \\  workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
-                \\  next_id INTEGER NOT NULL,
-                \\  PRIMARY KEY (workspace, repository, pr_id)
-                \\) WITHOUT ROWID;
-                \\PRAGMA user_version = 5;
-                \\COMMIT;
-            );
-        }
+        \\CREATE TABLE review_repositories (
+        \\  repository_id INTEGER PRIMARY KEY AUTOINCREMENT
+        \\);
+        \\CREATE TABLE review_repository_aliases (
+        \\  alias TEXT PRIMARY KEY,
+        \\  repository_id INTEGER NOT NULL REFERENCES review_repositories(repository_id)
+        \\);
+        \\CREATE TABLE draft_temp_ids (
+        \\  workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
+        \\  next_id INTEGER NOT NULL,
+        \\  PRIMARY KEY (workspace, repository, pr_id)
+        \\) WITHOUT ROWID;
+        ,
         // v6 (M14): immutable fallback context for local root Draft Anchors.
-        if (try self.userVersion() < 6) {
-            try self.exec(
-                \\BEGIN;
-                \\ALTER TABLE drafts ADD COLUMN snapshot_text TEXT;
-                \\ALTER TABLE drafts ADD COLUMN snapshot_selection_start INTEGER;
-                \\ALTER TABLE drafts ADD COLUMN snapshot_selection_len INTEGER;
-                \\PRAGMA user_version = 6;
-                \\COMMIT;
-            );
-        }
+        \\ALTER TABLE drafts ADD COLUMN snapshot_text TEXT;
+        \\ALTER TABLE drafts ADD COLUMN snapshot_selection_start INTEGER;
+        \\ALTER TABLE drafts ADD COLUMN snapshot_selection_len INTEGER;
+        ,
         // v7 (M15): exhaustive root CommentScope. Legacy parentless rows map
         // from optional anchors; Replies discard echoed scope and inherit.
-        if (try self.userVersion() < 7) {
-            try self.exec(
-                \\BEGIN;
-                \\ALTER TABLE drafts ADD COLUMN scope_kind INTEGER;
-                \\ALTER TABLE drafts ADD COLUMN file_source_commit TEXT;
-                \\UPDATE drafts SET scope_kind = CASE
-                \\  WHEN parent_kind != 0 THEN NULL
-                \\  WHEN anchor_path IS NULL THEN 0
-                \\  ELSE 2 END;
-                \\UPDATE drafts SET kind = CASE WHEN kind = 3 THEN 1 ELSE 0 END;
-                \\PRAGMA user_version = 7;
-                \\COMMIT;
-            );
-        }
+        \\ALTER TABLE drafts ADD COLUMN scope_kind INTEGER;
+        \\ALTER TABLE drafts ADD COLUMN file_source_commit TEXT;
+        \\UPDATE drafts SET scope_kind = CASE
+        \\  WHEN parent_kind != 0 THEN NULL
+        \\  WHEN anchor_path IS NULL THEN 0
+        \\  ELSE 2 END;
+        \\UPDATE drafts SET kind = CASE WHEN kind = 3 THEN 1 ELSE 0 END;
+        ,
         // v8 (M16): freeze each SubmissionRun's ordered dependency graph.
-        if (try self.userVersion() < 8) {
-            try self.exec(
-                \\BEGIN;
-                \\CREATE TABLE submission_run_items (
-                \\  operation_id INTEGER NOT NULL REFERENCES submission_runs(operation_id) ON DELETE CASCADE,
-                \\  ordinal INTEGER NOT NULL, temp_id INTEGER NOT NULL,
-                \\  parent_kind INTEGER NOT NULL, parent_id INTEGER,
-                \\  PRIMARY KEY (operation_id, ordinal),
-                \\  UNIQUE (operation_id, temp_id)
-                \\) WITHOUT ROWID;
-                // Legacy active runs did not record membership. Preserve their
-                // current item as the only participant that can be recovered safely.
-                \\INSERT INTO submission_run_items(operation_id, ordinal, temp_id, parent_kind, parent_id)
-                \\ SELECT r.operation_id, 0, r.current_temp_id, d.parent_kind, d.parent_id
-                \\ FROM submission_runs r JOIN drafts d
-                \\   ON d.workspace=r.workspace AND d.repository=r.repository
-                \\  AND d.pr_id=r.pr_id AND d.local_id=r.current_temp_id
-                \\ WHERE r.state=0 AND r.current_temp_id IS NOT NULL;
-                \\PRAGMA user_version = 8;
-                \\COMMIT;
-            );
-        }
+        \\CREATE TABLE submission_run_items (
+        \\  operation_id INTEGER NOT NULL REFERENCES submission_runs(operation_id) ON DELETE CASCADE,
+        \\  ordinal INTEGER NOT NULL, temp_id INTEGER NOT NULL,
+        \\  parent_kind INTEGER NOT NULL, parent_id INTEGER,
+        \\  PRIMARY KEY (operation_id, ordinal),
+        \\  UNIQUE (operation_id, temp_id)
+        \\) WITHOUT ROWID;
+        // Legacy active runs did not record membership. Preserve their
+        // current item as the only participant that can be recovered safely.
+        \\INSERT INTO submission_run_items(operation_id, ordinal, temp_id, parent_kind, parent_id)
+        \\ SELECT r.operation_id, 0, r.current_temp_id, d.parent_kind, d.parent_id
+        \\ FROM submission_runs r JOIN drafts d
+        \\   ON d.workspace=r.workspace AND d.repository=r.repository
+        \\  AND d.pr_id=r.pr_id AND d.local_id=r.current_temp_id
+        \\ WHERE r.state=0 AND r.current_temp_id IS NOT NULL;
+        ,
         // v9 (M16): crash-safe bounded retry checkpoints. Durations are stored
         // as integer milliseconds; null retry_phase means no retry checkpoint.
-        if (try self.userVersion() < 9) {
-            try self.exec(
-                \\BEGIN;
-                \\ALTER TABLE submission_runs ADD COLUMN retry_phase INTEGER;
-                \\ALTER TABLE submission_runs ADD COLUMN retry_attempt INTEGER;
-                \\ALTER TABLE submission_runs ADD COLUMN retry_reason INTEGER;
-                \\ALTER TABLE submission_runs ADD COLUMN retry_local_ms INTEGER;
-                \\ALTER TABLE submission_runs ADD COLUMN retry_server_ms INTEGER;
-                \\ALTER TABLE submission_runs ADD COLUMN retry_effective_ms INTEGER;
-                \\ALTER TABLE submission_runs ADD COLUMN retry_pending_wait INTEGER;
-                \\ALTER TABLE submission_run_items ADD COLUMN retry_reason INTEGER;
-                \\ALTER TABLE submission_run_items ADD COLUMN retry_after_ms INTEGER;
-                \\CREATE TABLE submission_retry_carryovers (
-                \\ workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
-                \\ temp_id INTEGER NOT NULL, retry_reason INTEGER NOT NULL, retry_after_ms INTEGER NOT NULL,
-                \\ PRIMARY KEY (workspace, repository, pr_id, temp_id)
-                \\) WITHOUT ROWID;
-                \\PRAGMA user_version = 9;
-                \\COMMIT;
-            );
-        }
+        \\ALTER TABLE submission_runs ADD COLUMN retry_phase INTEGER;
+        \\ALTER TABLE submission_runs ADD COLUMN retry_attempt INTEGER;
+        \\ALTER TABLE submission_runs ADD COLUMN retry_reason INTEGER;
+        \\ALTER TABLE submission_runs ADD COLUMN retry_local_ms INTEGER;
+        \\ALTER TABLE submission_runs ADD COLUMN retry_server_ms INTEGER;
+        \\ALTER TABLE submission_runs ADD COLUMN retry_effective_ms INTEGER;
+        \\ALTER TABLE submission_runs ADD COLUMN retry_pending_wait INTEGER;
+        \\ALTER TABLE submission_run_items ADD COLUMN retry_reason INTEGER;
+        \\ALTER TABLE submission_run_items ADD COLUMN retry_after_ms INTEGER;
+        \\CREATE TABLE submission_retry_carryovers (
+        \\ workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
+        \\ temp_id INTEGER NOT NULL, retry_reason INTEGER NOT NULL, retry_after_ms INTEGER NOT NULL,
+        \\ PRIMARY KEY (workspace, repository, pr_id, temp_id)
+        \\) WITHOUT ROWID;
+        ,
         // v10 (M22): File Read Receipts, one per ReviewIdentity and canonical
         // path. The table is independent of every PendingReview table.
-        if (try self.userVersion() < 10) {
-            try self.exec(
-                \\BEGIN;
-                \\CREATE TABLE file_read_receipts (
-                \\  review_kind   INTEGER NOT NULL,
-                \\  workspace     TEXT NOT NULL,
-                \\  repository    TEXT NOT NULL,
-                \\  pr_id         INTEGER NOT NULL,
-                \\  repository_id INTEGER NOT NULL,
-                \\  base_ref      TEXT NOT NULL,
-                \\  source_ref    TEXT NOT NULL,
-                \\  path          TEXT NOT NULL,
-                \\  fingerprint   BLOB NOT NULL,
-                \\  PRIMARY KEY (review_kind, workspace, repository, pr_id,
-                \\               repository_id, base_ref, source_ref, path)
-                \\) WITHOUT ROWID;
-                \\PRAGMA user_version = 10;
-                \\COMMIT;
-            );
+        \\CREATE TABLE file_read_receipts (
+        \\  review_kind   INTEGER NOT NULL,
+        \\  workspace     TEXT NOT NULL,
+        \\  repository    TEXT NOT NULL,
+        \\  pr_id         INTEGER NOT NULL,
+        \\  repository_id INTEGER NOT NULL,
+        \\  base_ref      TEXT NOT NULL,
+        \\  source_ref    TEXT NOT NULL,
+        \\  path          TEXT NOT NULL,
+        \\  fingerprint   BLOB NOT NULL,
+        \\  PRIMARY KEY (review_kind, workspace, repository, pr_id,
+        \\               repository_id, base_ref, source_ref, path)
+        \\) WITHOUT ROWID;
+        ,
+    };
+
+    /// The `user_version` that the last migration sets.
+    const schema_version: i64 = migrations.len;
+
+    fn migrate(self: *SqliteStore) SqliteError!void {
+        // A current database opens without a write lock.
+        if (try self.userVersion() >= schema_version) return;
+        for (migrations, 1..) |sql, version| try self.migrateStep(@intCast(version), sql);
+    }
+
+    /// Another process can migrate between the first read and the lock, so the
+    /// step reads the version again inside its transaction.
+    fn migrateStep(self: *SqliteStore, version: i64, sql: [:0]const u8) SqliteError!void {
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+        if (try self.userVersion() < version) {
+            try self.exec(sql);
+            var buf: [40]u8 = undefined;
+            try self.exec(std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{version}) catch unreachable);
         }
+        try self.exec("COMMIT;");
     }
 
     fn userVersion(self: *SqliteStore) SqliteError!i64 {
@@ -2510,7 +2480,7 @@ test "M22 read SqliteStore.open sets a busy timeout so a write waits for another
     try testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(sqlite.db, "PRAGMA busy_timeout;", -1, &stmt, null));
     defer _ = c.sqlite3_finalize(stmt);
     try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
-    try testing.expectEqual(@as(i64, 2000), c.sqlite3_column_int64(stmt, 0));
+    try testing.expectEqual(@as(i64, SqliteStore.busy_timeout_ms), c.sqlite3_column_int64(stmt, 0));
 }
 
 fn openUnmigrated(path: [:0]const u8) !SqliteStore {
@@ -2521,23 +2491,6 @@ fn openUnmigrated(path: [:0]const u8) !SqliteStore {
     }
     return .{ .db = db.? };
 }
-
-const unlocked_v10_step =
-    \\CREATE TABLE file_read_receipts (
-    \\  review_kind   INTEGER NOT NULL,
-    \\  workspace     TEXT NOT NULL,
-    \\  repository    TEXT NOT NULL,
-    \\  pr_id         INTEGER NOT NULL,
-    \\  repository_id INTEGER NOT NULL,
-    \\  base_ref      TEXT NOT NULL,
-    \\  source_ref    TEXT NOT NULL,
-    \\  path          TEXT NOT NULL,
-    \\  fingerprint   BLOB NOT NULL,
-    \\  PRIMARY KEY (review_kind, workspace, repository, pr_id,
-    \\               repository_id, base_ref, source_ref, path)
-    \\) WITHOUT ROWID;
-    \\PRAGMA user_version = 10;
-;
 
 test "M22 read a migration step that another process already applied is skipped" {
     var tmp = testing.tmpDir(.{});
@@ -2555,9 +2508,8 @@ test "M22 read a migration step that another process already applied is skipped"
     var rival = try openUnmigrated(path);
     defer rival.deinit();
 
-    const seen = try stale.userVersion();
-    try rival.exec("BEGIN IMMEDIATE;\n" ++ unlocked_v10_step ++ "\nCOMMIT;");
-    if (seen < 10) try stale.exec("BEGIN;\n" ++ unlocked_v10_step ++ "\nCOMMIT;");
+    try rival.migrateStep(10, SqliteStore.migrations[9]);
+    try stale.migrateStep(10, SqliteStore.migrations[9]);
 
     try testing.expectEqual(@as(i64, 10), try stale.userVersion());
     const review: ReviewIdentity = .{ .remote = testReviewKey(81) };
