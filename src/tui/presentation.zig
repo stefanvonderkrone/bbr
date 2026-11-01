@@ -6199,6 +6199,9 @@ pub const Presentation = struct {
     delete_confirmation: ?DeleteConfirmation = null,
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
+    /// The key of the last failed replacement. With no Session, it is the
+    /// Browser Start of the first `open_browser`.
+    failed_replacement_key: ?OwnedReviewIdentity = null,
     action_error: ?ActionError = null,
     fatal_error: ?FatalError = null,
     clipboard_status: ?ClipboardStatus = null,
@@ -12440,20 +12443,24 @@ pub const Presentation = struct {
                     }
                 };
                 if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
-                self.replacement = null;
-                self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .session_load_failed;
+                self.failReplacement(replacement.key, if (err == error.OutOfMemory) .out_of_memory else .session_load_failed);
             },
             .loaded => |session| {
                 self.queueCandidateSession(session, replacement.intent, replacement.key) catch |err| {
-                    self.replacement = null;
-                    self.replacement_error = switch (err) {
+                    self.failReplacement(replacement.key, switch (err) {
                         error.OutOfMemory => .out_of_memory,
                         else => .pending_review_load_failed,
-                    };
+                    });
                     if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
                 };
             },
         }
+    }
+
+    fn failReplacement(self: *Presentation, key: OwnedReviewIdentity, failure: ReplacementError) void {
+        self.replacement = null;
+        self.replacement_error = failure;
+        self.failed_replacement_key = key;
     }
 
     fn queueCandidateSession(self: *Presentation, session: *Session, intent: LoadIntent, key: OwnedReviewIdentity) !void {
@@ -12497,8 +12504,7 @@ pub const Presentation = struct {
         const replacement = self.replacement orelse return;
         if (self.shutdown_requested or replacement.intent != job.intent) return;
         if (job.failure) |failure| {
-            self.replacement = null;
-            self.replacement_error = failure;
+            self.failReplacement(replacement.key, failure);
             if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
             return;
         }
@@ -12509,8 +12515,7 @@ pub const Presentation = struct {
         {
             candidate.session.retain();
             self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
-                self.replacement = null;
-                self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .pending_review_load_failed;
+                self.failReplacement(replacement.key, if (err == error.OutOfMemory) .out_of_memory else .pending_review_load_failed);
                 if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
             };
             return;
@@ -12609,18 +12614,15 @@ pub const Presentation = struct {
     }
 
     /// The first `open_browser` starts the Browser on the published Session's
-    /// Repository and PullRequest.
+    /// Repository and PullRequest. With no Session, it uses the failed
+    /// replacement key.
     fn openBrowser(self: *Presentation) void {
         if (self.browser != null) {
             self.surface = .browser;
             self.action_error = null;
             return;
         }
-        const published = self.published orelse {
-            self.action_error = .action_refused;
-            return;
-        };
-        const key = published.key;
+        const key = if (self.published) |published| published.key else self.failed_replacement_key orelse return self.refuse(.action_refused);
         self.startBrowser(.{
             .workspace = browser_mod.Name.init(key.workspace()) catch return self.refuse(.action_refused),
             .repository = browser_mod.Name.init(key.repository()) catch return self.refuse(.action_refused),
