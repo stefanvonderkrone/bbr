@@ -217,3 +217,45 @@ The review findings M28-1 and M28-4 in the adversarial branch review describe th
   A mutation that prints the token into the notes fails the test with `ForbiddenText`.
   With that leak and no retry count, the old order failed on `retries` and hid the leak.
   Commit `bbfccaf`.
+
+### Intermittent test failures (2026-11-01)
+
+Three tests of `zig build test-file-cache` failed now and then on a busy CPU.
+Each run below used the hermetic environment.
+A loaded run had 16 `yes` processes and 16 test processes at the same time on 18 cores.
+
+- "M28 cache every scenario runs to the end with text, binary, added, and removed Files" failed its S6 `refetches > 0` check.
+  The S6 reopen of Review Search reuses the scan results, so the search is complete at once.
+  The reopen also queues `enrich_file` commands for the evicted Files.
+  `Presentation.takeCommand` issues commands in order.
+  When a running disclosure build holds the head of the queue, it issues nothing.
+  The span then ended before the harness issued the fetches, so S6 had no refetch.
+  Instrumented failing runs showed the queue `build_buffer_disclosure, enrich_file, enrich_file` after the open, with no fetch in the span.
+  Passing runs had a speculative fetch in flight at the span start, which counted for the span.
+  The production event loop uses the same `takeCommand` order, so the state is legal.
+  The harness counted only the commands that it executed.
+  Now `Driver.classify` also counts the `enrich_file` commands that the Presentation still queues for the current Session.
+  A forced run settled the in-flight fetches before the reopen and delayed each S6 disclosure build by 100 ms.
+  On the old classification, 12 of 20 forced runs failed. On the new one, 0 of 20 failed.
+  Before the fix, 8 of 400 loaded runs of this test failed. After the fix, 0 of 252 runs failed, 192 of them loaded.
+- "M28 cache a File Jump to a File whose fetch is still in flight is a fetch, not a hit" failed with S1 `hits` 1 against the expected 2.
+  It also failed on the first cold-cache build of this work.
+  The start fetches the first two Files at once, and the slow source delayed both by 500 ms.
+  The jump to the second File was a hit only when its fetch completed before that jump started.
+  A failing trace showed the completion of the second File after the start of its jump.
+  Both orders are legal, so the test assumption was wrong.
+  The slow source now delays the second File by 1500 ms, so its fetch is always in flight at its jump.
+  S1 now expects 1 hit and 5 cold fetches. S2 does not change.
+  A forced run added a jitter of 0 to 199 ms to each source request.
+  The old test failed 9 of 20 forced runs. The new test failed 0 of 30.
+  Before the fix, 2 of 144 loaded runs failed. After the fix, 0 of 156 runs failed, 96 of them loaded.
+- "M28 cache the request window survives a restart and never exceeds the budget in any hour" did not fail in 416 runs, 368 of them loaded.
+  The fake clock moves only while every request in flight sleeps, and it checks that under the client lock.
+  `RequestWindow.tryAcquire` checks and records under one lock.
+  `RequestWindow.open` and the test keep the same entries, because both use `at + hour > now`.
+  `Driver.deinit` awaits every worker, so the clock does not move between the two runs.
+  The old failure probably came from the assertion that the second run waits first, which `3936f0f` removed.
+  The number of requests in the first run depends on thread timing, so the first wait of the second run did too.
+  No change.
+
+The full `zig build test-file-cache` passed 10 of 10 runs after the fixes, 5 of them loaded.
