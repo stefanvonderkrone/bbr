@@ -29,6 +29,9 @@ pub const Line = struct {
     /// blob-sourced line never captures a comment or Draft (M9). Defaults true so
     /// the parser and every existing construction stay Hunk lines.
     in_hunk: bool = true,
+    /// True when a `\ No newline at end of file` marker follows this Line, so
+    /// its side of the file ends without a newline.
+    no_newline_at_eof: bool = false,
 
     pub fn oldNo(self: Line) ?u32 {
         return if (self.old_no == 0) null else self.old_no;

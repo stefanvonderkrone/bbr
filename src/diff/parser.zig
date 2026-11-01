@@ -672,6 +672,46 @@ test "\\ No newline marker does not create a line" {
     try testing.expectEqual(LineKind.added, lines_[1].kind);
 }
 
+test "M22 read a no newline marker flags the Line before it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const raw =
+        \\diff --git a/both.txt b/both.txt
+        \\--- a/both.txt
+        \\+++ b/both.txt
+        \\@@ -1,2 +1,2 @@
+        \\ keep
+        \\-a
+        \\\ No newline at end of file
+        \\+b
+        \\\ No newline at end of file
+        \\diff --git a/old.txt b/old.txt
+        \\--- a/old.txt
+        \\+++ b/old.txt
+        \\@@ -1 +1 @@
+        \\\ No newline at end of file
+        \\-a
+        \\\ No newline at end of file
+        \\+a
+        \\
+    ;
+
+    const diff = try parseInArena(&arena, raw);
+    const both = diff.files[0].hunks[0].lines;
+    try testing.expectEqual(@as(usize, 3), both.len);
+    try testing.expect(!both[0].no_newline_at_eof);
+    try testing.expect(both[1].no_newline_at_eof);
+    try testing.expect(both[2].no_newline_at_eof);
+
+    const old_only = diff.files[1].hunks[0].lines;
+    try testing.expectEqual(@as(usize, 2), old_only.len);
+    try testing.expectEqual(LineKind.removed, old_only[0].kind);
+    try testing.expect(old_only[0].no_newline_at_eof);
+    try testing.expectEqual(LineKind.added, old_only[1].kind);
+    try testing.expect(!old_only[1].no_newline_at_eof);
+}
+
 test "empty input yields no files" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

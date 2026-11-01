@@ -406,6 +406,29 @@ test "M22 read a changed Line, Hunk boundary, path, or change kind gives a diffe
     try expectDifferent(modified, renamed);
 }
 
+test "M22 read a change to only the end-of-file newline gives a different fingerprint" {
+    const without_newline =
+        \\diff --git a/src/a.zig b/src/a.zig
+        \\--- a/src/a.zig
+        \\+++ b/src/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\\ No newline at end of file
+        \\
+    ;
+    try expectSame(without_newline, without_newline);
+    try expectDifferent(without_newline,
+        \\diff --git a/src/a.zig b/src/a.zig
+        \\--- a/src/a.zig
+        \\+++ b/src/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    );
+}
+
 test "M22 read an added File, a removed File, and a pure rename each have a fingerprint" {
     const added = try expectFingerprint(
         \\diff --git a/src/new.zig b/src/new.zig
