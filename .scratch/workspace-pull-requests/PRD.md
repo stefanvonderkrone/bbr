@@ -38,7 +38,7 @@ bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author
 - The order does not depend on the completion order of the pages.
 - `--reviewer` without `--repository` fails before any HTTP request, and the help says that the reviewer scan needs `--repository`.
 - Each row names its Repository by `full_name`. The human row is `full_name#id [STATE draft] title (src -> dst)`.
-- The command prints nothing to stdout when any request fails. A 429 fails the command with the existing `RateLimited` error.
+- The command prints nothing to stdout when a request fails. A 429 fails the command with the existing `RateLimited` error. The exception is a failed request whose rows all come after the first `--limit` rows of the output. The command ignores that failure, so the result does not depend on whether the request started before the earlier rows arrived. Only a scan with several Repositories sends such a request, because page 1 of every Repository goes first.
 - The command rejects bad options before any HTTP request.
 
 ## Decisions

@@ -33,7 +33,8 @@ pub const workspace_list_help =
     \\Repeat --state to select several states. --state ignores letter case. The default is OPEN.
     \\--query is a Bitbucket q expression. The command joins it to its own filter with AND.
 ++ ws.concurrency_help ++
-    \\--limit caps the total. A failed request fails the complete list. HTTP 429 is not retried.
+    \\--limit caps the total. A failed request fails the complete list, unless all its rows
+    \\come after the first --limit rows. HTTP 429 is not retried.
     \\
 ;
 

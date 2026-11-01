@@ -74,6 +74,8 @@ The Workspace members endpoint behaves the same way. It reported `size` 4278 for
 The Repository and branch lists also report `size`, `page`, and `pagelen` and have numbered `next` links.
 `list-repositories`, `list-branches`, and `list-pull-requests` use the same pager.
 With `--page N`, the pager reads page N first and numbers the remaining pages from there.
+With a limit, a failed page fails the result unless the pages before it in the merged order already hold the limit.
+So the result does not depend on the request timing. Only a later list can hold such a page, because page 1 of every list goes first.
 
 Live checks on 31 October 2026 compared `page=N` with following `next`:
 
