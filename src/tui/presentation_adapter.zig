@@ -425,8 +425,6 @@ fn writeSummaryCache(io: std.Io, path: []const u8, bytes: []const u8) !void {
     defer atomic.deinit(io);
     try atomic.file.writeStreamingAll(io, bytes);
     try atomic.replace(io);
-    // The atomic fallback can keep the mode of the old file.
-    try dir.setFilePermissions(io, name, summary_cache_permissions, .{});
 }
 
 const testing = std.testing;
@@ -706,9 +704,12 @@ test "M24 cache the save worker creates the directory and writes mode 0600, and 
     defer testing.allocator.free(bytes);
     for ([_][]const u8{ "token", "description", "http", "://" }) |word| try testing.expect(std.mem.indexOf(u8, bytes, word) == null);
 
+    try std.Io.Dir.cwd().setFilePermissions(testing.io, path, @enumFromInt(0o644), .{});
     var second = saveSummaryCache(testing.io, path, try testSaveCommand(.{ .workspace = "check24", .repositories = &.{} }));
     defer second.deinit();
     try testing.expect(second.summary_cache_saved.saved);
+    const replaced = try std.Io.Dir.cwd().statFile(testing.io, path, .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(replaced.permissions)) & 0o777);
     var dir = try tmp.dir.openDir(testing.io, "state/bbr", .{ .iterate = true });
     defer dir.close(testing.io);
     var it = dir.iterate();
