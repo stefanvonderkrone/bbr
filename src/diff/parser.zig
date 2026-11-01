@@ -711,6 +711,64 @@ test "Git binary stubs classify present File sides without Lines" {
     try testing.expectEqual(@as(?usize, null), diff.files[5].content.new.?.binary);
 }
 
+test "M22 read a Binary files line names binary File sides whose paths have a space" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const raw =
+        \\diff --git a/my logo.png b/my logo.png
+        \\index 1111111..2222222 100644
+        \\Binary files a/my logo.png and b/my logo.png differ
+        \\diff --git a/my logo.png b/my logo.png
+        \\new file mode 100644
+        \\index 0000000..3333333
+        \\Binary files /dev/null and b/my logo.png differ
+        \\diff --git a/my logo.png b/my logo.png
+        \\deleted file mode 100644
+        \\index 4444444..0000000
+        \\Binary files a/my logo.png and /dev/null differ
+        \\
+    ;
+
+    const diff = try parseInArena(&arena, raw);
+    try testing.expectEqual(@as(usize, 3), diff.files.len);
+    const modified = diff.files[0];
+    try testing.expectEqual(FileStatus.modified, modified.status);
+    try testing.expectEqualStrings("my logo.png", modified.old_path);
+    try testing.expectEqualStrings("my logo.png", modified.new_path);
+    try testing.expect(modified.content.old.? == .binary);
+    try testing.expect(modified.content.new.? == .binary);
+    try testing.expectEqualStrings("1111111", modified.blob_ids.?.old);
+    try testing.expectEqualStrings("2222222", modified.blob_ids.?.new);
+
+    const added = diff.files[1];
+    try testing.expectEqual(FileStatus.added, added.status);
+    try testing.expectEqualStrings("/dev/null", added.old_path);
+    try testing.expectEqualStrings("my logo.png", added.new_path);
+    try testing.expect(added.content.old == null);
+    try testing.expect(added.content.new.? == .binary);
+    try testing.expectEqualStrings("3333333", added.blob_ids.?.new);
+
+    const removed = diff.files[2];
+    try testing.expectEqual(FileStatus.removed, removed.status);
+    try testing.expectEqualStrings("my logo.png", removed.old_path);
+    try testing.expectEqualStrings("/dev/null", removed.new_path);
+    try testing.expect(removed.content.old.? == .binary);
+    try testing.expect(removed.content.new == null);
+}
+
+test "M22 read an ambiguous Binary files line leaves the File sides unavailable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const diff = try parseInArena(&arena,
+        \\diff --git a/x and b/y b/x and b/y
+        \\index 1111111..2222222 100644
+        \\Binary files a/x and b/y and b/x and b/y differ
+        \\
+    );
+    try testing.expect(diff.files[0].content.old.? == .unavailable);
+    try testing.expect(diff.files[0].content.new.? == .unavailable);
+}
+
 test "M22 read the parser reads short and full index blob ids with and without a trailing mode" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
