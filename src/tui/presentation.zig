@@ -1368,7 +1368,9 @@ pub const LoadSession = struct {
     cause: SessionLoadCause = .picker,
 };
 
-pub const SessionLoadCause = enum { picker, refresh, reconciliation };
+/// `browser` names a PullRequest that the reviewer opened from the Browser.
+/// Only its publish switches the surface back to the review.
+pub const SessionLoadCause = enum { picker, browser, refresh, reconciliation };
 
 /// Owns a private Candidate Session until its complete initial Frame can publish.
 /// Store reads and ScopeProjection resolution finish before worker handoff.
@@ -6302,7 +6304,7 @@ pub const Presentation = struct {
             self.interaction_revision +%= 1;
         }
         switch (input) {
-            .choose_pull_request => |key| if (!self.shutdown_requested) try self.choosePullRequest(key),
+            .choose_pull_request => |key| if (!self.shutdown_requested) try self.choosePullRequest(key, .picker),
             .start_browser => |start| if (!self.shutdown_requested) self.startBrowser(start),
             .detect_startup => |detection| if (!self.shutdown_requested) self.detectStartup(detection),
             .adjacent_detected => |detected| try self.acceptAdjacentDetected(detected),
@@ -12247,7 +12249,7 @@ pub const Presentation = struct {
                 picked.repository.workspace(),
                 picked.repository.name(),
                 picked.id,
-            )),
+            ), .picker),
             .file => |index| if (self.published) |published| {
                 published.focus = .diff;
                 self.focusFile(published, index);
@@ -12317,7 +12319,7 @@ pub const Presentation = struct {
         }
     }
 
-    fn choosePullRequest(self: *Presentation, key: OwnedReviewIdentity) !void {
+    fn choosePullRequest(self: *Presentation, key: OwnedReviewIdentity, cause: SessionLoadCause) !void {
         self.unknown_resolution = null;
         self.closeHelp();
         if (self.published) |published| {
@@ -12353,9 +12355,9 @@ pub const Presentation = struct {
         // to supersede. Already-taken commands complete normally and are
         // rejected later by their LoadIntent.
         self.removeQueuedSessionLoads();
-        self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .picker } });
+        self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = cause } });
         self.next_intent = intent;
-        self.replacement = .{ .intent = intent, .key = key, .cause = .picker };
+        self.replacement = .{ .intent = intent, .key = key, .cause = cause };
         self.replacement_error = null;
     }
 
@@ -12523,7 +12525,7 @@ pub const Presentation = struct {
         if (self.list_overlay) |*overlay| if (overlay.closesOnReplacement()) self.closeListOverlay();
         self.published = candidate;
         self.preferences = job.preferences;
-        if (replacement.cause == .picker) self.surface = .review;
+        if (replacement.cause == .browser) self.surface = .review;
         self.discardQueuedBufferSearchScans(null);
         if (self.stale_repair) |*gate| if (OwnedReviewIdentity.eql(gate.key, candidate.key)) {
             gate.observed_source_commit = BoundedText(64).init(candidate.session.header.source_commit) catch gate.observed_source_commit;
@@ -12599,7 +12601,7 @@ pub const Presentation = struct {
         if (self.shutdown_requested) return;
         self.surface = .review;
         switch (detected.outcome) {
-            .open => |key| try self.choosePullRequest(key),
+            .open => |key| try self.choosePullRequest(key, .picker),
             .browse => |start| self.startBrowser(start),
         }
     }
@@ -12679,7 +12681,7 @@ pub const Presentation = struct {
             .pull_request => |pr| {
                 const key = OwnedReviewIdentity.init(state.workspace.slice(), state.nodes.items[pr.repository].summary.slug, state.pullRequest(entry).?.id) catch
                     return self.refuse(.action_refused);
-                self.choosePullRequest(key) catch return self.refuse(.out_of_memory);
+                self.choosePullRequest(key, .browser) catch return self.refuse(.out_of_memory);
                 if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, key)) {
                     self.surface = .review;
                 };
