@@ -43,12 +43,23 @@ class StdioWritersTest(unittest.TestCase):
         for line in (
             'const url = "https://example.test"; var w = std.Io.File.stdout().writer(io, &buf);',
             "const quote = '\"'; const url = \"https://example.test\"; var w = std.Io.File.stderr().writer(io, &buf);",
-            "const lines = \\\\ // a multiline string, not a comment: stdout().writer(",
+            "var w = std.Io.File.stdout().writer(io, \\\\ // a multiline string, not a comment",
             'const s = "\\"//"; var w = std.Io.File.stdout().writer(io, &buf);',
         ):
             with self.subTest(line=line):
                 self.source.write_text(line + "\n", encoding="utf-8")
                 self.assertEqual(len(list(checker.violations(self.root))), 1)
+
+    def test_a_literal_that_quotes_a_positional_writer_is_text(self):
+        for line in (
+            'const help = "avoid stdout().writer(";',
+            "const help = 's'; const tip = \"stderr().writer( is positional\";",
+            "    \\\\ avoid stdout().writer(",
+            "const help = \\\\ avoid stderr().writer(",
+        ):
+            with self.subTest(line=line):
+                self.source.write_text(line + "\n", encoding="utf-8")
+                self.assertEqual(list(checker.violations(self.root)), [])
 
 
 if __name__ == "__main__":
