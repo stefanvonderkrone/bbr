@@ -4348,7 +4348,6 @@ const Published = struct {
                 .buffer => self.buffer_search.currentRanges(),
                 .review => if (self.review_search.pending) &.{} else self.review_search.ranges orelse &.{},
             },
-            .search_ranges_sorted = true,
             .buffer_search_active = if (self.active_search == .buffer) self.buffer_search.currentActive() else null,
             .buffer_search_ranges = self.active_search == .buffer,
         };

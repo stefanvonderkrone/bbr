@@ -99,7 +99,7 @@ pub fn drawReview(
     var diff_scroll = paneScroll(frame, .diff_pane);
     const track = view_mod.solve(layouts.PaneSlot, layouts.panes, layouts.Panes{}, .{ .width = win.width, .height = win.height }).get(.diff).track;
     const hits = if (frame.buffer_search_ranges) frame.search_ranges else &.{};
-    diff_scroll.marks = scroll_marks.project(scratch, track.height, diff_scroll.total, frame.row_marks, hits, frame.search_ranges_sorted) catch &.{};
+    diff_scroll.marks = scroll_marks.project(scratch, track.height, diff_scroll.total, frame.row_marks, hits) catch &.{};
     const panes = view_paint.paint(layouts.PaneSlot, layouts.panes, layouts.Panes{
         .sidebar_focused = frame.focus == .sidebar,
         .sidebar_scroll = paneScroll(frame, .sidebar),
@@ -176,18 +176,16 @@ fn drawReviewCardSyntaxAt(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCa
 
 fn drawSearchRanges(win: vaxis.Window, frame: @import("frame.zig").Projection, theme: Theme) void {
     var ranges = frame.search_ranges;
-    if (frame.search_ranges_sorted) {
-        var low: usize = 0;
-        var high = ranges.len;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            if (ranges[middle].visual_row < frame.navigation.scroll) low = middle + 1 else high = middle;
-        }
-        ranges = ranges[low..];
+    var low: usize = 0;
+    var high = ranges.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (ranges[middle].visual_row < frame.navigation.scroll) low = middle + 1 else high = middle;
     }
+    ranges = ranges[low..];
     for (ranges) |range| {
         const active = if (frame.buffer_search_ranges and range.occurrence_index != null) frame.buffer_search_active == range.occurrence_index else range.active;
-        if (frame.search_ranges_sorted and range.visual_row >= frame.navigation.scroll +| win.height) break;
+        if (range.visual_row >= frame.navigation.scroll +| win.height) break;
         if (range.visual_row < frame.navigation.scroll) continue;
         const screen_row = range.visual_row - frame.navigation.scroll;
         if (screen_row >= win.height or range.visual_row >= frame.visual_rows.len) continue;
@@ -3064,7 +3062,6 @@ test "sorted Buffer Search ranges paint only the visible row" {
         .buffer = buf,
         .navigation = nav,
         .search_ranges = &ranges,
-        .search_ranges_sorted = true,
     };
     var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 30, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(testing.allocator);
@@ -6018,7 +6015,7 @@ test "M30 scrollbar a section rule join leaves a Scroll Mark alone" {
         shifted.frame.navigation.cursor = offset;
         win.clear();
         drawReview(arena.allocator(), win, shifted, theme_dark, 0);
-        const marks = try scroll_marks.project(arena.allocator(), track.height, total, review.frame.row_marks, &.{}, true);
+        const marks = try scroll_marks.project(arena.allocator(), track.height, total, review.frame.row_marks, &.{});
         try testing.expectEqual(@as(usize, track.height), marks.len);
         for (marks, 0..) |mark, cell| {
             const grapheme = win.readCell(track.x, @intCast(track.y + cell)).?.char.grapheme;
@@ -6154,7 +6151,7 @@ fn expectHitMarks(a: std.mem.Allocator, win: vaxis.Window, review: ReviewProject
     const track = frame.panes.diff_track;
     const total = frame.visual_rows.len;
     try testing.expect(total > track.height);
-    const row_cells = try scroll_marks.project(a, track.height, total, frame.row_marks, &.{}, true);
+    const row_cells = try scroll_marks.project(a, track.height, total, frame.row_marks, &.{});
     var hits: usize = 0;
     for (0..track.height) |cell| {
         var hit = false;
@@ -6194,7 +6191,7 @@ test "M30 scrollbar a Buffer Search hit in a source Line and in a ReviewBody out
     try testing.expectEqual(@as(usize, 3), state.projection().buffer_search.?.total);
     try testing.expectEqual(@as(usize, 3), try expectHitMarks(a, win, review));
     const track = frame.panes.diff_track;
-    const row_cells = try scroll_marks.project(a, track.height, frame.visual_rows.len, frame.row_marks, &.{}, true);
+    const row_cells = try scroll_marks.project(a, track.height, frame.visual_rows.len, frame.row_marks, &.{});
     var found = std.EnumSet(buffer_mod.RowKind).initEmpty();
     for (frame.search_ranges) |range| {
         const kind = std.meta.activeTag(frame.buffer.rows[frame.visual_rows[range.visual_row].buffer_index]);

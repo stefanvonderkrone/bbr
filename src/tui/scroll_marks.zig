@@ -52,14 +52,13 @@ pub fn rowMarks(allocator: Allocator, buffer: buffer_mod.Buffer, visual_rows: []
 
 /// One entry per track cell, or none when every row fits. A cell shows its
 /// highest priority Scroll Mark, and a Buffer Search hit outranks every row
-/// mark.
+/// mark. The hits must be sorted by visual row.
 pub fn project(
     allocator: Allocator,
     extent: u16,
     total: usize,
     row_marks: []const RowMark,
     hits: []const frame.ProjectedSourceRange,
-    hits_sorted: bool,
 ) ![]const ?view.ScrollMark {
     if (extent == 0 or total <= extent) return &.{};
     const cells = try allocator.alloc(?view.ScrollMark, extent);
@@ -71,17 +70,11 @@ pub fn project(
             if (cell.* == null or mark.kind.outranks(cell.*.?)) cell.* = mark.kind;
         }
     }
-    if (hits_sorted) {
-        for (cells, 0..) |*cell, index| {
-            const first = view.cellFirstRow(extent, total, @intCast(index));
-            const end = if (index + 1 == extent) total else view.cellFirstRow(extent, total, @intCast(index + 1));
-            const hit = std.sort.partitionPoint(frame.ProjectedSourceRange, hits, first, rowBefore);
-            if (hit < hits.len and hits[hit].visual_row < end) cell.* = .buffer_search_hit;
-        }
-    } else {
-        for (hits) |hit| if (hit.visual_row < total) {
-            cells[view.trackCell(extent, total, hit.visual_row)] = .buffer_search_hit;
-        };
+    for (cells, 0..) |*cell, index| {
+        const first = view.cellFirstRow(extent, total, @intCast(index));
+        const end = if (index + 1 == extent) total else view.cellFirstRow(extent, total, @intCast(index + 1));
+        const hit = std.sort.partitionPoint(frame.ProjectedSourceRange, hits, first, rowBefore);
+        if (hit < hits.len and hits[hit].visual_row < end) cell.* = .buffer_search_hit;
     }
     return cells;
 }
@@ -275,14 +268,14 @@ test "M30 scrollbar the mark projection puts each row range on its track cells" 
         .{ .kind = .resolved_thread, .first = 99, .end = 100 },
         .{ .kind = .draft, .first = 100, .end = 140 },
     };
-    const cells = try project(a, 10, 100, &marks, &.{}, true);
+    const cells = try project(a, 10, 100, &marks, &.{});
     const expected = [_]?view.ScrollMark{ .file_header, null, .unresolved_thread, .unresolved_thread, .unresolved_thread, null, null, null, null, .resolved_thread };
     try testing.expectEqualSlices(?view.ScrollMark, &expected, cells);
 
     for (1..30) |extent| for (extent + 1..90) |total| for (0..total) |first| {
         const end = @min(total, first + 1 + first % 7);
         const one = [_]RowMark{.{ .kind = .draft, .first = first, .end = end }};
-        const projected = try project(a, @intCast(extent), total, &one, &.{}, true);
+        const projected = try project(a, @intCast(extent), total, &one, &.{});
         try testing.expectEqual(extent, projected.len);
         for (projected, 0..) |cell, index| {
             const cell_first = view.cellFirstRow(@intCast(extent), total, @intCast(index));
@@ -300,17 +293,15 @@ test "M30 scrollbar a cell shows the highest priority Scroll Mark" {
         if (!high.outranks(low)) continue;
         for ([_][2]view.ScrollMark{ .{ high, low }, .{ low, high } }) |order| {
             const marks = [_]RowMark{ .{ .kind = order[0], .first = 40, .end = 41 }, .{ .kind = order[1], .first = 44, .end = 49 } };
-            const cells = try project(a, 10, 100, &marks, &.{}, true);
+            const cells = try project(a, 10, 100, &marks, &.{});
             try testing.expectEqual(@as(?view.ScrollMark, high), cells[4]);
         }
     };
     const hit: frame.ProjectedSourceRange = .{ .visual_row = 45, .relation = .neutral, .source = .{ .start = 0, .end = 1 }, .row = .{ .start = 0, .end = 1 }, .active = false };
     for (std.meta.tags(view.ScrollMark)) |kind| {
         const marks = [_]RowMark{.{ .kind = kind, .first = 40, .end = 50 }};
-        for ([_]bool{ true, false }) |sorted| {
-            const cells = try project(a, 10, 100, &marks, &.{hit}, sorted);
-            try testing.expectEqual(@as(?view.ScrollMark, .buffer_search_hit), cells[4]);
-        }
+        const cells = try project(a, 10, 100, &marks, &.{hit});
+        try testing.expectEqual(@as(?view.ScrollMark, .buffer_search_hit), cells[4]);
     }
 }
 
@@ -319,10 +310,10 @@ test "M30 scrollbar the projection gives no cell when every row fits and ignores
     defer arena.deinit();
     const a = arena.allocator();
     const marks = [_]RowMark{.{ .kind = .draft, .first = 0, .end = 5 }};
-    try testing.expectEqual(@as(usize, 0), (try project(a, 10, 10, &marks, &.{}, true)).len);
-    try testing.expectEqual(@as(usize, 0), (try project(a, 0, 10, &marks, &.{}, true)).len);
+    try testing.expectEqual(@as(usize, 0), (try project(a, 10, 10, &marks, &.{})).len);
+    try testing.expectEqual(@as(usize, 0), (try project(a, 0, 10, &marks, &.{})).len);
     const past = [_]RowMark{.{ .kind = .draft, .first = 30, .end = 40 }};
-    for (try project(a, 10, 20, &past, &.{}, true)) |cell| try testing.expectEqual(@as(?view.ScrollMark, null), cell);
+    for (try project(a, 10, 20, &past, &.{})) |cell| try testing.expectEqual(@as(?view.ScrollMark, null), cell);
 }
 
 test "M30 scrollbar the binary search and a linear scan give the same hit cells" {
@@ -341,7 +332,12 @@ test "M30 scrollbar the binary search and a linear scan give the same hit cells"
                 return lhs.visual_row < rhs.visual_row;
             }
         }.lessThan);
-        try testing.expectEqualSlices(?view.ScrollMark, try project(a, extent, total, &.{}, hits, false), try project(a, extent, total, &.{}, hits, true));
+        const linear = try a.alloc(?view.ScrollMark, extent);
+        @memset(linear, null);
+        for (hits) |hit| if (hit.visual_row < total) {
+            linear[view.trackCell(extent, total, hit.visual_row)] = .buffer_search_hit;
+        };
+        try testing.expectEqualSlices(?view.ScrollMark, linear, try project(a, extent, total, &.{}, hits));
     }
 }
 
@@ -353,8 +349,6 @@ test "M30 scrollbar the projection ignores a hit at or past the total" {
     for (&hits, [_]usize{ 19, 20, 23 }) |*hit, row| hit.* = .{ .visual_row = row, .relation = .neutral, .source = .{ .start = 0, .end = 1 }, .row = .{ .start = 0, .end = 1 }, .active = false };
     var expected = [_]?view.ScrollMark{null} ** 10;
     expected[9] = .buffer_search_hit;
-    for ([_]bool{ true, false }) |sorted| {
-        try testing.expectEqualSlices(?view.ScrollMark, &expected, try project(a, 10, 20, &.{}, &hits, sorted));
-        for (try project(a, 10, 20, &.{}, hits[1..], sorted)) |cell| try testing.expectEqual(@as(?view.ScrollMark, null), cell);
-    }
+    try testing.expectEqualSlices(?view.ScrollMark, &expected, try project(a, 10, 20, &.{}, &hits));
+    for (try project(a, 10, 20, &.{}, hits[1..])) |cell| try testing.expectEqual(@as(?view.ScrollMark, null), cell);
 }
