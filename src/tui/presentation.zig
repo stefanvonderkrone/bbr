@@ -31087,6 +31087,80 @@ test "M30 scrollbar a press off the thumb and a drag that move the scroll repain
     }
 }
 
+test "M30 scrollbar a press off the thumb centers the pressed cell and clamps at both track ends" {
+    // The SPEC offset is clamp(cellFirstRow(cell) - extent / 2, 0, total - extent),
+    // with cellFirstRow(cell) = ceil(cell * total / extent). Each press starts off the thumb.
+    const Press = struct { cell: u16, offset: usize };
+    const cases = [_]struct { bar: frame_mod.ScrollBar, total: usize, extent: u16, presses: [3]Press }{
+        // 15 - 5, then 27 - 5 clamped to 20, then 3 - 5 clamped to 0.
+        .{ .bar = .sidebar, .total = 30, .extent = 10, .presses = .{ .{ .cell = 5, .offset = 10 }, .{ .cell = 9, .offset = 20 }, .{ .cell = 1, .offset = 0 } } },
+        // 75 - 5, then 135 - 5, then 0 - 5 clamped to 0.
+        .{ .bar = .diff_pane, .total = 150, .extent = 10, .presses = .{ .{ .cell = 5, .offset = 70 }, .{ .cell = 9, .offset = 130 }, .{ .cell = 0, .offset = 0 } } },
+        // 30 - 7, then 56 - 7 clamped to 46, then 5 - 7 clamped to 0.
+        .{ .bar = .review_search_list, .total = 60, .extent = 14, .presses = .{ .{ .cell = 7, .offset = 23 }, .{ .cell = 13, .offset = 46 }, .{ .cell = 1, .offset = 0 } } },
+    };
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    for (cases) |case| {
+        var presentation = try m30BarState(&store, case.bar);
+        defer presentation.deinit();
+        const track = m30Scroll(&presentation, case.bar).track;
+        try testing.expectEqual(case.total, m30Scroll(&presentation, case.bar).total);
+        try testing.expectEqual(case.extent, track.height);
+        for (case.presses) |press| {
+            const thumb = m30Scroll(&presentation, case.bar).thumb().?;
+            try testing.expect(press.cell < thumb.first or press.cell >= thumb.first + thumb.len);
+            try m30Left(&presentation, track.x, track.y + press.cell, .press);
+            try testing.expectEqual(press.offset, m30Scroll(&presentation, case.bar).offset);
+            try m30Left(&presentation, track.x, track.y + press.cell, .release);
+        }
+    }
+}
+
+test "M30 scrollbar a press on the thumb ends a Review Search double click and a pending version restoration" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try m30ReviewSearchState(&store, m30_search_geometries[0], false);
+    defer presentation.deinit();
+    const list = presentation.projection().review_search.?.geometry.list;
+    const state = m30Scroll(&presentation, .review_search_list);
+    const thumb_row = state.track.y + state.thumb().?.first;
+    const entry: MouseInput = .{ .col = list.x, .row = list.y + 2, .button = .left, .type = .press };
+    const click = struct {
+        fn at(p: *Presentation, input: MouseInput, time_ns: i96) !void {
+            var press = input;
+            press.time_ns = time_ns;
+            try p.dispatch(.{ .mouse = press });
+            press.type = .release;
+            try p.dispatch(.{ .mouse = press });
+        }
+    }.at;
+
+    try click(&presentation, entry, 1_000_000_000);
+    try testing.expectEqual(@as(?usize, 2), m30Selected(&presentation));
+    try m30Left(&presentation, state.track.x, thumb_row, .press);
+    try m30Left(&presentation, state.track.x, thumb_row, .release);
+    try testing.expectEqual(state.offset, m30Scroll(&presentation, .review_search_list).offset);
+    try click(&presentation, entry, 1_100_000_000);
+    for (presentation.commands.items) |command| try testing.expect(command != .build_buffer_disclosure);
+    try testing.expect(presentation.projection().review_search != null);
+    try click(&presentation, entry, 1_200_000_000);
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.projection().review_search == null);
+
+    // A test sees no version restoration without a File Enrichment round
+    // trip, so this part reads the field.
+    for (m30_pane_bars) |bar| {
+        var panes = try m30DragState(&store, true);
+        defer panes.deinit();
+        const pane = m30Scroll(&panes, bar);
+        panes.version_restoration = .{ .session_epoch = panes.published.?.epoch, .file_index = 0, .selected_version = .old, .destination_hunk_line = null, .visual_row = 0, .source_offset = 0, .viewport_offset = 0 };
+        try m30Left(&panes, pane.track.x, pane.track.y + pane.thumb().?.first, .press);
+        try testing.expectEqual(pane.offset, m30Scroll(&panes, bar).offset);
+        try testing.expect(panes.version_restoration == null);
+    }
+}
+
 /// The published row marks are the row marks of the published visual rows.
 fn expectPublishedRowMarks(frame: frame_mod.Projection) !void {
     const expected = try scroll_marks.rowMarks(testing.allocator, frame.buffer, frame.visual_rows);
