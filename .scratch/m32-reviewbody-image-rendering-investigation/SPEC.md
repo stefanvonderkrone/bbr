@@ -253,6 +253,10 @@ The prototype lives on the branch `m32-image-prototype`.
 Ticket 03 creates the branch from the M32 branch in its own Worktree.
 The branch never merges.
 The M32 branch keeps only the tracker files, the research notes, the evidence, and the ADR.
+One exception exists: commit `a787b12` adds the `opencode.jsonc` deny rules for live bbr runs and `tools/check_live_run_denial.py`.
+The operator approved this rule on the M32 branch.
+Agents in two earlier milestones started bbr with the operator's real environment, and the M32 prototype is a bbr build that an agent must not start.
+The rule protects every later agent session, so the branch keeps it instead of moving it to another PR.
 Ticket 03 records the branch name and the final prototype commit under `## Completion`.
 The branch stays until the implementation milestone resolves, so the evidence stays reproducible.
 
@@ -589,3 +593,4 @@ The human can change a choice at ticket 05.
 - M32I-9: The security rules had no rule for the bytes in an image escape sequence or for shared tmux state.
   The new "Image escape sequences" section allows only bbr-made numbers and base64, and forbids `d=a` delete-all and fixed image ids.
 - M32I-6: The branch has no decision and no ADR. The new "Merge status" section says that the branch merges only as a research checkpoint, and that the PR body must say so.
+- M32I-12: Commit `a787b12` is outside the stated M32 scope. The commits stay in place. The "Where it lives" section records that the operator approved the deny rule on this branch, and why.
