@@ -397,6 +397,22 @@ M23 shows an image label, alternative text, and the authored destination.
 - [ ] Compare inline images with a separate image preview. Review sizing, aspect ratio, scrolling, Reply indentation, and ReviewCard disclosure with a human.
 - [ ] Evaluate acquisition latency, image decoding, memory limits, and cache lifetime. Record the selected behavior and evidence before planning implementation.
 
+## M33 - BuiltInGrammar libraries on demand  ·  L  ·  needs M27
+Make the bbr executable small again. M27 grew the ReleaseSafe executable from 13 MB to 57.5 MB,
+and the parser tables of the BuiltInGrammars cause almost all of that growth. Each BuiltInGrammar
+parser moves into a GrammarLibrary, a shared library that the release publishes for each target.
+bbr downloads a GrammarLibrary on first use, checks it against a SHA-256 pinned in the executable,
+and loads it. The queries, GrammarMatch rules, and Injection rules stay in the executable. The
+full write-up is [the M33 brief](.scratch/m33-builtin-grammar-libraries/brief.md).
+
+- [ ] Grill the brief, then write the SPEC and the ADR that replaces the compiled-in parser delivery of ADR-0009 and ADR-0014.
+- [ ] Build each BuiltInGrammar parser as a GrammarLibrary per release target. Pin the SHA-256 of each GrammarLibrary in the executable that the same build makes.
+- [ ] Publish the GrammarLibraries with each release. Change the release publication rules and their tests to the new asset set.
+- [ ] Download, verify, store, and load a GrammarLibrary on first use, off the input and paint path. Show plain text until the Spans arrive. Never send a Bitbucket Credential with a GrammarLibrary request.
+- [ ] Keep Injection for every BuiltInGrammar. An unavailable injected GrammarLibrary leaves the host Spans and shows the injected region as plain text.
+- [ ] Add `bbr grammar` commands to install, list, and remove GrammarLibraries, an offline import from a folder, a mirror setting, and a setting that turns downloads off.
+- [ ] Add hermetic tests with a loopback server for download, digest mismatch, redirect, proxy, timeout, partial write, concurrent first use, and offline behavior. Measure the executable size, the first-use latency, and the steady-state Highlighting cost before and after.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -431,11 +447,12 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M13 ─ M17 ─ M27 (BuiltInGrammar expansion)
               ├─ M17 ─ M21 ─ M28 (full-Review File cache evaluation)
               ├─ M15 ─ M21 ─ M29 (Comment Overview)
-              └─ M15 ─ M30       (viewer scrollbars)
+              ├─ M15 ─ M30       (viewer scrollbars)
+              └─ M17 ─ M27 ─ M33 (BuiltInGrammar libraries on demand)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M32 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M33 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.
