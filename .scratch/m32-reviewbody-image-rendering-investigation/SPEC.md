@@ -381,6 +381,17 @@ The ADR from ticket 06 keeps them or tightens them.
   The second path moves the decode risk to the terminal, and ticket 05 decides if that is acceptable.
 - The prototype runs I9 and I10 in a `ReleaseSafe` build and records the result.
 
+### Image escape sequences
+
+- Only numbers that bbr makes and base64 of the image bytes enter an image escape sequence.
+  No Comment text, alternative text, title, URL, or file name enters it.
+  For example, bbr writes no OSC 1337 `name=` value from a Comment.
+- bbr never sends a kitty delete-all command, such as `a=d,d=a`.
+  Inside tmux, the outer terminal is shared by every pane, so a delete-all removes the images of other programs.
+  bbr deletes only its own images by id.
+- bbr uses no fixed image ids.
+  It picks ids at run time so that they are unlikely to collide with the ids of other programs in the same outer terminal.
+
 ### Cache lifetime
 
 - The prototype keeps images only in memory, for one Session.
@@ -568,3 +579,5 @@ The human can change a choice at ticket 05.
 - M32I-11: The terminal research note named `BBR_M32_IMAGE_PROTOCOL` and `BBR_M32_PLACEMENT`, but the prototype reads `BBR_M32_PROTOCOL` and has no placement switch.
   The research note now uses the prototype names and values.
   The I14 state in the run guide is left for the helper that edits the run guide.
+- M32I-9: The security rules had no rule for the bytes in an image escape sequence or for shared tmux state.
+  The new "Image escape sequences" section allows only bbr-made numbers and base64, and forbids `d=a` delete-all and fixed image ids.
