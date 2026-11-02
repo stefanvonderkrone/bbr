@@ -76,7 +76,7 @@ pub fn versionTitleTargets(diff: Rect, selected: SelectedVersion) VersionTitleTa
     };
 }
 
-pub const OverlayKind = enum { list, review_search, other };
+pub const OverlayKind = enum { list, review_search, help, other };
 
 pub const ReviewSearchGeometry = struct {
     rect: Rect,
@@ -126,11 +126,13 @@ pub const OverlayTarget = struct {
     list_total: usize = 0,
     scroll: usize = 0,
     review_search: ?ReviewSearchGeometry = null,
+    /// The numbers of the help scroll bar, from `helpOverlayTarget`.
+    help: ?ScrollState = null,
 };
 
 /// Every scroll bar on screen. A new scroll bar is one arm here, and
 /// `scrollState` gives it its numbers.
-pub const ScrollBar = enum { sidebar, diff_pane, review_search_list };
+pub const ScrollBar = enum { sidebar, diff_pane, review_search_list, help };
 
 /// The numbers that paint and hit testing share for one scroll bar.
 pub const ScrollState = struct {
@@ -154,6 +156,7 @@ pub fn scrollState(projection: Projection, bar: ScrollBar) ?ScrollState {
             const geometry = overlay.review_search orelse return null;
             return .{ .track = geometry.list_track, .total = overlay.list_total, .offset = overlay.scroll };
         },
+        .help => (projection.overlay orelse return null).help,
     };
 }
 
@@ -164,6 +167,7 @@ pub fn scrollTarget(projection: Projection, bar: ScrollBar) ?ScrollState {
     const covered = switch (bar) {
         .sidebar, .diff_pane => projection.overlay != null,
         .review_search_list => if (projection.overlay) |overlay| overlay.kind != .review_search else true,
+        .help => if (projection.overlay) |overlay| overlay.kind != .help else true,
     };
     if (covered) return null;
     const state = scrollState(projection, bar) orelse return null;
@@ -319,6 +323,7 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
             if (geometry.preview.contains(col, row)) return .review_search_preview;
             return null;
         }
+        if (overlay.kind == .help) return if (scrollBarHit(frame, .help, col, row)) |hit| .{ .scroll_bar = hit } else null;
         if (overlay.kind != .list or !overlay.entries.contains(col, row)) return null;
         const index = overlay.scroll + row - overlay.entries.y;
         if (index >= overlay.row_count) return null;
@@ -362,6 +367,16 @@ pub fn listOverlayTarget(geometry: Geometry, box: layouts.Box) ?OverlayTarget {
     const rect = rects.get(.surface).border;
     if (rect.isEmpty()) return null;
     return .{ .kind = .list, .rect = rect, .entries = rects.get(.entries).content };
+}
+
+/// The help Overlay captures the whole Frame. Its scroll bar shows the stored
+/// scroll clamped to the last page, as the help scroll keys clamp it.
+pub fn helpOverlayTarget(geometry: Geometry, params: layouts.Help) ?OverlayTarget {
+    var target = screenOverlayTarget(geometry) orelse return null;
+    const track = view.solve(layouts.HelpSlot, layouts.help, params, area(geometry)).get(.body).track;
+    target.kind = .help;
+    target.help = .{ .track = track, .total = params.scroll.total, .offset = @min(params.scroll.offset, params.scroll.total -| track.height) };
+    return target;
 }
 
 /// An Overlay without row targets captures the whole Frame.
@@ -1496,6 +1511,10 @@ test "M30 scrollbar every track is as tall as the content of its View at every s
             try testing.expectEqual(panes.diff_content.height, panes.diff_track.height);
             try testing.expectEqual(panes.sidebar.x + panes.sidebar.width -| 1, panes.sidebar_track.x);
             try testing.expectEqual(panes.diff.x + panes.diff.width -| 1, panes.diff_track.x);
+            for ([_]bool{ false, true }) |query| {
+                const params: layouts.Help = .{ .rows = 200, .query = query, .scroll = .{ .total = 200 } };
+                try testing.expectEqual(helpBodyRows(geometry, params), helpOverlayTarget(geometry, params).?.help.?.track.height);
+            }
             const review_search = reviewSearchGeometry(geometry) orelse continue;
             try testing.expectEqual(review_search.list.height, review_search.list_track.height);
             if (review_search.list_track.height > 0) try testing.expectEqual(review_search.list.x + review_search.list.width, review_search.list_track.x);
@@ -1616,4 +1635,35 @@ test "M30 scrollbar the Review Search list track takes a press before the list w
         covered.overlay.?.kind = .other;
         try testing.expect(scrollTarget(covered, .review_search_list) == null);
     }
+}
+
+/// Counts the Views that declare a scroll bar.
+const ScrollBarCount = struct {
+    count: usize = 0,
+
+    pub fn visit(self: *ScrollBarCount, node: anytype, _: view.Placed) void {
+        self.count += @intFromBool(node.scrollbar != null);
+    }
+};
+
+/// A public `fn (params, area, visitor) void` in layouts.zig is a View tree.
+fn isLayoutTree(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .@"fn") return false;
+    const params = info.@"fn".params;
+    return params.len == 3 and params[0].type != null and params[1].type == Rect and params[2].type == null;
+}
+
+test "M30 scrollbar every layout scroll bar is one arm of frame.ScrollBar" {
+    var counter: ScrollBarCount = .{};
+    var trees: usize = 0;
+    inline for (@typeInfo(layouts).@"struct".decls) |decl| {
+        const tree = @field(layouts, decl.name);
+        if (comptime isLayoutTree(@TypeOf(tree))) {
+            tree(std.mem.zeroes(@typeInfo(@TypeOf(tree)).@"fn".params[0].type.?), .{ .width = 80, .height = 24 }, &counter);
+            trees += 1;
+        }
+    }
+    try testing.expect(trees >= 8);
+    try testing.expectEqual(std.meta.tags(ScrollBar).len, counter.count);
 }

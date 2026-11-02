@@ -6036,10 +6036,11 @@ pub const Presentation = struct {
     };
 
     /// A Scroll Drag. `grab` is the pressed track cell minus `thumb.first`.
+    /// `epoch` is null when the drag starts without a published Session.
     const ScrollDrag = struct {
         bar: frame_mod.ScrollBar,
         grab: u16,
-        epoch: SessionEpoch,
+        epoch: ?SessionEpoch,
     };
 
     pub fn init(allocator: Allocator, dependencies: Dependencies, boot: Boot) !Presentation {
@@ -6376,7 +6377,8 @@ pub const Presentation = struct {
     }
 
     fn overlayTarget(self: *const Presentation) ?frame_mod.OverlayTarget {
-        if (self.help != null or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
+        if (self.help) |*help| return frame_mod.helpOverlayTarget(self.geometry, help.view().layout());
+        if (self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
             return frame_mod.screenOverlayTarget(self.geometry);
         if (self.list_overlay) |*overlay| {
             var target = frame_mod.listOverlayTarget(self.geometry, overlay.box()) orelse return null;
@@ -6481,7 +6483,6 @@ pub const Presentation = struct {
     /// A press on the thumb grabs it. A press off the thumb first centers the
     /// visible rows on the pressed cell, so the thumb then covers that cell.
     fn pressScrollBar(self: *Presentation, frame: frame_mod.Projection, hit: frame_mod.ScrollBarHit) void {
-        const published = self.published orelse return;
         const state = frame_mod.scrollTarget(frame, hit.bar) orelse return;
         self.last_review_click = null;
         self.version_restoration = null;
@@ -6489,34 +6490,38 @@ pub const Presentation = struct {
         if (hit.cell < thumb.first or hit.cell >= thumb.first + thumb.len) {
             const extent = state.track.height;
             const row = view_mod.cellFirstRow(extent, state.total, hit.cell);
-            self.scrollBarTo(published, hit.bar, state, @min(row -| extent / 2, state.total - extent));
+            self.scrollBarTo(hit.bar, state, @min(row -| extent / 2, state.total - extent));
             thumb = (frame_mod.scrollTarget(self.frameProjection(), hit.bar) orelse return).thumb().?;
         }
-        self.scroll_drag = .{ .bar = hit.bar, .grab = hit.cell - thumb.first, .epoch = published.epoch };
+        self.scroll_drag = .{ .bar = hit.bar, .grab = hit.cell - thumb.first, .epoch = self.publishedEpoch() };
     }
 
     /// The pointer row sets the thumb position, whatever the column and also
     /// past the track ends. Each event reads the current Frame, so a content
     /// change or a resize applies at once.
     fn dragScrollBar(self: *Presentation, drag: ScrollDrag, pointer_row: u16) void {
-        const published = self.published orelse return;
-        if (published.epoch != drag.epoch) return;
+        if (self.publishedEpoch() != drag.epoch) return;
         const state = frame_mod.scrollTarget(self.frameProjection(), drag.bar) orelse return;
         self.scroll_drag = drag;
         const extent = state.track.height;
         const first = @as(i32, pointer_row) - state.track.y - drag.grab;
         const offset = if (first <= 0) 0 else @min(view_mod.cellFirstRow(extent, state.total, @intCast(first)), state.total - extent);
-        self.scrollBarTo(published, drag.bar, state, offset);
+        self.scrollBarTo(drag.bar, state, offset);
     }
 
-    fn scrollBarTo(self: *Presentation, published: *Published, bar: frame_mod.ScrollBar, state: frame_mod.ScrollState, offset: usize) void {
+    fn publishedEpoch(self: *const Presentation) ?SessionEpoch {
+        return if (self.published) |published| published.epoch else null;
+    }
+
+    fn scrollBarTo(self: *Presentation, bar: frame_mod.ScrollBar, state: frame_mod.ScrollState, offset: usize) void {
         if (offset == state.offset) return;
         const delta = @as(isize, @intCast(offset)) - @as(isize, @intCast(state.offset));
         self.version_restoration = null;
         switch (bar) {
-            .sidebar => self.scrollPane(published, .sidebar, delta),
-            .diff_pane => self.scrollPane(published, .diff, delta),
-            .review_search_list => published.review_search.list_scroll = offset,
+            .sidebar => self.scrollPane(self.published orelse return, .sidebar, delta),
+            .diff_pane => self.scrollPane(self.published orelse return, .diff, delta),
+            .review_search_list => (self.published orelse return).review_search.list_scroll = offset,
+            .help => (if (self.help) |*help| help else return).setScroll(offset),
         }
         self.interaction_revision +%= 1;
     }
@@ -30980,6 +30985,54 @@ test "M30 scrollbar a Review Search close during the drag ends it" {
     try testing.expect(presentation.scroll_drag == null);
     try testing.expectEqual(opened, m30Scroll(&presentation, .diff_pane).offset);
     try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, .sidebar).offset);
+}
+
+test "M30 scrollbar the help track takes a press and a Scroll Drag and the help stays open" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    for ([_]bool{ true, false }) |with_session| {
+        var presentation = if (with_session)
+            try m30DragState(&store, true)
+        else
+            try Presentation.init(testing.allocator, .{ .reviews = store.store(), .mouse_enabled = true }, .{ .geometry = .{ .cols = 100, .rows = 12 } });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .help });
+        const help = presentation.projection().help.?;
+        const area: view_mod.Rect = .{ .width = presentation.geometry.cols, .height = presentation.geometry.rows };
+        const track = view_mod.solve(@import("layouts.zig").HelpSlot, @import("layouts.zig").help, help.layout(), area).get(.body).track;
+        const last = help.lines.len - track.height;
+        const thumb = view_mod.thumb(track.height, help.lines.len, 0).?;
+        try testing.expect(thumb.first + thumb.len < track.height);
+
+        const cell = track.height - 1;
+        const centered = @min(view_mod.cellFirstRow(track.height, help.lines.len, cell) -| track.height / 2, last);
+        try m30Left(&presentation, track.x, track.y + cell, .press);
+        try testing.expectEqual(centered, presentation.projection().help.?.scroll);
+        const jumped = view_mod.thumb(track.height, help.lines.len, centered).?;
+        try testing.expect(cell >= jumped.first and cell < jumped.first + jumped.len);
+        try testing.expectEqual(cell - jumped.first, presentation.scroll_drag.?.grab);
+
+        const before = presentation.projection().revision;
+        try m30Left(&presentation, 0, track.y + cell - jumped.first, .drag);
+        try testing.expectEqual(@as(usize, 0), presentation.projection().help.?.scroll);
+        try testing.expect(!std.meta.eql(before, presentation.projection().revision));
+        try m30Left(&presentation, 0, presentation.geometry.rows - 1, .drag);
+        try testing.expectEqual(last, presentation.projection().help.?.scroll);
+        try m30Left(&presentation, track.x, track.y, .release);
+        try testing.expect(presentation.scroll_drag == null);
+
+        try m30Left(&presentation, 0, 0, .press);
+        try m30Left(&presentation, 0, 0, .release);
+        try testing.expect(presentation.scroll_drag == null);
+        try testing.expectEqual(last, presentation.projection().help.?.scroll);
+
+        try m30Left(&presentation, track.x, track.y, .press);
+        try testing.expectEqual(@as(usize, 0), presentation.projection().help.?.scroll);
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+        try testing.expect(presentation.scroll_drag == null);
+        try testing.expectEqual(@as(usize, 1), presentation.projection().help.?.scroll);
+        if (with_session) for (m30_pane_bars) |bar| try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, bar).offset);
+    }
 }
 
 test "M30 scrollbar a Review Search entry click and a double click behave as before" {

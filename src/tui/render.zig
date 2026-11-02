@@ -2302,8 +2302,7 @@ fn fitHelpKeys(scratch: std.mem.Allocator, keys: []const u8, width: u16) []const
 pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, help: help_mod.View, availability: presentation.ActionAvailability) void {
     const rows = help.lines;
     var params = help.layout();
-    const body_rows = view_mod.solve(layouts.HelpSlot, layouts.help, params, .{ .width = win.width, .height = win.height }).get(.body).content.height;
-    const offset = @min(help.scroll, rows.len -| body_rows);
+    const offset = (frame_mod.helpOverlayTarget(.{ .cols = win.width, .rows = win.height }, params) orelse return).help.?.offset;
     params.scroll.offset = offset;
     const rects = view_paint.paint(layouts.HelpSlot, layouts.help, params, win, theme);
     if (rects.get(.surface).border.isEmpty()) return;
@@ -5868,6 +5867,32 @@ test "M30 scrollbar every scroll bar hit target matches the painted thumb" {
                 const cell: u16 = @intCast(index);
                 const row = target.track.y + cell;
                 try testing.expectEqual(frame_mod.HitTarget{ .scroll_bar = .{ .bar = .review_search_list, .cell = cell } }, frame_mod.hitTest(frame, target.track.x, row).?);
+                const painted = std.mem.eql(u8, win.readCell(target.track.x, row).?.char.grapheme, "│");
+                try testing.expectEqual(cell >= thumb.first and cell < thumb.first + thumb.len, painted);
+            }
+        }
+    }
+
+    for ([_]frame_mod.Geometry{ .{ .cols = 100, .rows = 12 }, .{ .cols = 90, .rows = 40 } }) |geometry| {
+        var state = try testScrollPresentation(&store, 60, 2, geometry);
+        defer state.deinit();
+        try state.dispatch(.{ .action = .help });
+        var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+        const win = headlessWindow(&screen);
+        const lines = state.projection().help.?.lines.len;
+        for ([_]usize{ 0, lines / 3, lines / 2, lines }) |scroll| {
+            state.help.?.setScroll(scroll);
+            const projection = state.projection();
+            drawHelp(arena.allocator(), win, theme_dark, projection.help.?, .{ .remote = true });
+            const frame = projection.review.?.frame;
+            const target = frame_mod.scrollTarget(frame, .help).?;
+            const thumb = target.thumb().?;
+            if (scroll == 0) try testing.expectEqual(@as(u16, 0), thumb.first);
+            if (scroll == lines) try testing.expectEqual(target.track.height, thumb.first + thumb.len);
+            for (0..target.track.height) |index| {
+                const cell: u16 = @intCast(index);
+                const row = target.track.y + cell;
+                try testing.expectEqual(frame_mod.HitTarget{ .scroll_bar = .{ .bar = .help, .cell = cell } }, frame_mod.hitTest(frame, target.track.x, row).?);
                 const painted = std.mem.eql(u8, win.readCell(target.track.x, row).?.char.grapheme, "│");
                 try testing.expectEqual(cell >= thumb.first and cell < thumb.first + thumb.len, painted);
             }

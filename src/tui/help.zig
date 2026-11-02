@@ -91,6 +91,15 @@ pub const State = struct {
         };
     }
 
+    /// Set the scroll of the shown lines. A press or a Scroll Drag on the
+    /// help track gives an offset inside the scroll range.
+    pub fn setScroll(self: *State, offset: usize) void {
+        switch (self.mode) {
+            .browse => |*snapshot| snapshot.scroll = offset,
+            .input => |*input| input.current.scroll = offset,
+        }
+    }
+
     pub fn applyKey(self: *State, km: keymap.Keymap, key: keymap.KeyStroke, page: u16) !enum { stay, close } {
         switch (self.mode) {
             .input => |*input| {

@@ -472,5 +472,12 @@ test "M30 scrollbar the layout rects do not depend on the scroll numbers or the 
             const solved = view.solve(SearchSlot, reviewSearch, ReviewSearch{ .list_scroll = list_scroll }, area);
             for (std.enums.values(SearchSlot)) |slot| try testing.expectEqual(search_base.get(slot), solved.get(slot));
         }
+        for ([_]bool{ false, true }) |query| {
+            const help_base = view.solve(HelpSlot, help, Help{ .rows = 40, .query = query }, area);
+            for (scrolls) |scroll| {
+                const solved = view.solve(HelpSlot, help, Help{ .rows = 40, .query = query, .scroll = scroll }, area);
+                for (std.enums.values(HelpSlot)) |slot| try testing.expectEqual(help_base.get(slot), solved.get(slot));
+            }
+        }
     }
 }

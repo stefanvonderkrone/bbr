@@ -38,7 +38,7 @@ A View lays out each Pane, but a Pane is the role, not the View.
 _Avoid_: window (reserved for vaxis's surface), view, panel.
 
 **View**:
-One rectangular node of a layout tree. It has margin, an optional border, padding, and content, in that order from the outside. Its border always has rounded corners and can have a Title. Its scroll bar sits in its padding, border, or margin ring and never moves its content. Its scroll bar shows a thumb over its track and takes a press and a Scroll Drag. One Composition places its child Views in its content. A View paints only decoration. A content painter fills its content.
+One rectangular node of a layout tree. It has margin, an optional border, padding, and content, in that order from the outside. Its border always has rounded corners and can have a Title. Its scroll bar sits in its padding, border, or margin ring and never moves its content. Its scroll bar shows a thumb over its track. While it shows a thumb and no other Overlay covers it, it takes a press and a Scroll Drag. One Composition places its child Views in its content. A View paints only decoration. A content painter fills its content.
 _Avoid_: widget, component, box, container.
 
 **Scroll Mark**:
