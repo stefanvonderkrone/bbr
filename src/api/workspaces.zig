@@ -12,7 +12,7 @@ pub const list_help =
     \\List workspaces visible to the authenticated account (GET /user/workspaces).
     \\Follows pages by default; --no-follow returns one page.
     \\
-;
+++ pagelenHelp(bbr.bitbucket.max_pagelen.workspaces);
 
 pub const get_help =
     \\usage: bbr api get-workspace [--workspace SLUG] [--json]
@@ -29,7 +29,7 @@ pub const members_help =
     \\Follow pages by default. --no-follow returns one page. --limit caps fetched members.
     \\Requires the read:workspace:bitbucket API token scope.
     \\
-;
+++ pagelenHelp(bbr.bitbucket.max_pagelen.members);
 
 pub const search_members_help =
     \\usage: bbr api search-workspace-members --name TEXT [--name TEXT ...] [--pagelen N] [--concurrency N] [--limit N] [--json]
@@ -42,9 +42,9 @@ pub const search_members_help =
     \\Results have one group per name in input order, including repeated names.
     \\JSON is an array of groups, including for one name. Human output labels each name.
     \\Search always follows all pages. --limit caps ranked results per name, not requests.
-    \\Page size defaults to 100, the maximum. --pagelen overrides it.
+++ "\n" ++ pagelenHelp(bbr.bitbucket.max_pagelen.members) ++
     \\Concurrency defaults to 8. --concurrency accepts a positive integer, capped by logical CPUs.
-    \\Fetch the next page as a request finishes. Unknown page counts can cause extra empty-page requests.
+    \\Page 1 gives the page count. The other pages load in parallel. Without a count, pages load in order.
     \\A failed page fails the complete search. HTTP 429 is not retried.
     \\Each JSON group contains name and matches with UUID, display name, and nickname.
     \\No matches is a successful empty result.
@@ -70,18 +70,49 @@ fn searchOptions(allocator: std.mem.Allocator, args: []const []const u8) !Search
             try names.append(allocator, name);
         } else if (std.mem.eql(u8, f.name, "concurrency")) {
             _ = cur.next();
-            const value = try arg.parseUsize(try arg.takeValue(&cur, f));
-            if (value == 0) return error.InvalidNumber;
-            try arg.setOption(usize, &concurrency, value);
+            try takeConcurrency(&cur, f, &concurrency);
         } else if (std.mem.eql(u8, f.name, "pagelen") or std.mem.eql(u8, f.name, "limit")) {
-            _ = try takePageFlag(&cur, f, &page);
+            _ = try takePageFlag(&cur, f, &page, bbr.bitbucket.max_pagelen.members);
         } else return error.UnknownFlag;
     }
     if (names.items.len == 0) return error.MissingRequired;
-    return .{ .names = names, .page = page, .concurrency = concurrency orelse 8 };
+    return .{ .names = names, .page = page, .concurrency = concurrency orelse default_concurrency };
 }
 
-fn effectiveConcurrency(requested: usize, cpu_count: std.Thread.CpuCountError!usize) usize {
+pub const default_concurrency: usize = 8;
+
+/// The help of a command that pages with `--concurrency`.
+pub const concurrency_help = std.fmt.comptimePrint(
+    \\--concurrency bounds the parallel page requests of the whole command.
+    \\It defaults to {d} and accepts a positive integer, capped by logical CPUs.
+    \\
+, .{default_concurrency});
+
+/// The `--pagelen` help of a list command. `max` is the largest page of its endpoint.
+pub fn pagelenHelp(comptime max: u32) []const u8 {
+    return std.fmt.comptimePrint("--pagelen accepts 1 to {d} and defaults to {d}, the maximum.\n", .{ max, max });
+}
+
+/// The paging help of a list command with `--concurrency`. `max` is its largest page.
+pub fn pagingHelp(comptime max: u32) []const u8 {
+    return
+    \\Follow pages by default. --no-follow returns one page. --page N starts at page N.
+    \\--limit caps the total.
+    \\
+    ++ pagelenHelp(max) ++ concurrency_help ++
+        \\A failed request fails the complete list. HTTP 429 is not retried.
+        \\
+    ;
+}
+
+/// The cursor points past the flag. A value must be positive and appear once.
+pub fn takeConcurrency(cur: *arg.Cursor, f: arg.Flag, slot: *?usize) !void {
+    const value = try arg.parseUsize(try arg.takeValue(cur, f));
+    if (value == 0) return error.InvalidNumber;
+    try arg.setOption(usize, slot, value);
+}
+
+pub fn effectiveConcurrency(requested: usize, cpu_count: std.Thread.CpuCountError!usize) usize {
     return @max(1, @min(requested, cpu_count catch 1));
 }
 
@@ -115,7 +146,7 @@ pub fn runSearchMembers(init: std.process.Init, bb: bbr.bitbucket.Client, args: 
     const a = arena.allocator();
     var opts = try searchOptions(a, args);
     defer opts.names.deinit(a);
-    const members = try bb.listWorkspaceMembersConcurrent(init.io, a, opts.page.pagelen orelse 100, effectiveConcurrency(opts.concurrency, std.Thread.getCpuCount()));
+    const members = try bb.listWorkspaceMembersConcurrent(init.io, a, opts.page.pagelen orelse bbr.bitbucket.max_pagelen.members, effectiveConcurrency(opts.concurrency, std.Thread.getCpuCount()));
     const groups = try a.alloc(SearchGroup, opts.names.items.len);
     for (opts.names.items, groups) |name, *group| {
         const result = try member_search.search(a, members, name, opts.page.limit);
@@ -167,7 +198,7 @@ fn memberPageOptions(args: []const []const u8) !bbr.bitbucket.PageOptions {
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse return error.UnknownFlag;
         if (std.mem.eql(u8, f.name, "query") or std.mem.eql(u8, f.name, "sort")) return error.UnknownFlag;
-        if (!try takePageFlag(&cur, f, &opts)) return error.UnknownFlag;
+        if (!try takePageFlag(&cur, f, &opts, bbr.bitbucket.max_pagelen.members)) return error.UnknownFlag;
     }
     return opts;
 }
@@ -194,11 +225,12 @@ test "Workspace Member list parser accepts only documented pagination options" {
 }
 
 /// The cursor points at the flag. Unknown flags leave the cursor and options unchanged.
-pub fn takePageFlag(cur: *arg.Cursor, f: arg.Flag, opts: *bbr.bitbucket.PageOptions) !bool {
+/// `max_pagelen` is the largest page of the command's endpoint, a `bbr.bitbucket.max_pagelen` value.
+pub fn takePageFlag(cur: *arg.Cursor, f: arg.Flag, opts: *bbr.bitbucket.PageOptions, max_pagelen: u32) !bool {
     if (std.mem.eql(u8, f.name, "pagelen")) {
         _ = cur.next();
         const n = try arg.parseU32(try arg.takeValue(cur, f));
-        if (n == 0 or n > 100) return error.InvalidNumber;
+        if (n == 0 or n > max_pagelen) return error.InvalidNumber;
         opts.pagelen = n;
     } else if (std.mem.eql(u8, f.name, "page")) {
         _ = cur.next();
@@ -226,7 +258,7 @@ pub fn pageOpts(args: []const []const u8, cur: *arg.Cursor) !bbr.bitbucket.PageO
     var opts: bbr.bitbucket.PageOptions = .{};
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse break;
-        if (!try takePageFlag(cur, f, &opts)) break;
+        if (!try takePageFlag(cur, f, &opts, bbr.bitbucket.max_pagelen.workspaces)) break;
     }
     _ = args;
     return opts;
@@ -277,14 +309,14 @@ test "page flag parser consumes recognized flags and leaves unknown flags unchan
     var opts: bbr.bitbucket.PageOptions = .{};
     for (0..3) |_| {
         const f = arg.splitFlag(cur.peek().?).?;
-        try std.testing.expect(try takePageFlag(&cur, f, &opts));
+        try std.testing.expect(try takePageFlag(&cur, f, &opts, 100));
     }
     try std.testing.expectEqual(@as(usize, 4), cur.pos);
     try std.testing.expectEqual(@as(u32, 2), opts.page.?);
     try std.testing.expectEqualStrings("id > 0", opts.query.?);
     try std.testing.expect(!opts.follow);
     const before = opts;
-    try std.testing.expect(!try takePageFlag(&cur, arg.splitFlag(cur.peek().?).?, &opts));
+    try std.testing.expect(!try takePageFlag(&cur, arg.splitFlag(cur.peek().?).?, &opts, 100));
     try std.testing.expectEqual(@as(usize, 4), cur.pos);
     try std.testing.expectEqual(before, opts);
 }

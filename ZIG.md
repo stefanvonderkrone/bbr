@@ -51,6 +51,10 @@ interfaces that carry their own buffer:
 Implications for us:
 - Buffers are explicit; you hand the interface a `[]u8` and it manages fill/drain.
 - Formatting goes through `writer.print(...)`; there is no more `anytype`-generic stream.
+- `File.writer(io, buf)` starts in `.positional` mode at offset 0 (`std/Io/File/Writer.zig`
+  `init`). On stdout or stderr redirected to a file, it overwrites earlier text, and later
+  writers overwrite its text. Use `File.writerStreaming` for stdout and stderr.
+  `tools/check_stdio_writers.py` enforces it.
 - Anything wrapping I/O (our diff parser reading a `RawDiff`, JSON decoding) targets these
   interfaces. Prefer taking a `*std.Io.Reader` over a concrete stream.
 

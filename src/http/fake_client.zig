@@ -38,6 +38,9 @@ pub const FakeHttpClient = struct {
     /// transport failure (connection reset, timeout) so callers can exercise the
     /// "did it post or not?" ambiguous path.
     send_error: ?anyerror = null,
+    /// A `send` after this many calls fails with `error.TestUnexpectedResult`, so a
+    /// caller that never stops requesting fails its test instead of hanging it.
+    max_calls: ?usize = null,
 
     /// Snapshot of the most recent request.
     last_method: ?client.Method = null,
@@ -123,7 +126,7 @@ pub const FakeHttpClient = struct {
             self.active_requests += 1;
             self.max_active_requests = @max(self.max_active_requests, self.active_requests);
             canned = self.responseFor(req.url, call_index);
-            send_error = if (canned.send_error) |err| err else self.send_error;
+            send_error = if (call_index >= self.max_calls orelse std.math.maxInt(usize)) error.TestUnexpectedResult else canned.send_error orelse self.send_error;
         }
         defer {
             self.lock();

@@ -115,6 +115,8 @@ pub const PullRequestSummary = struct {
     updated_on: ?i64 = null,
     approval_count: u32 = 0,
     changes_requested_count: u32 = 0,
+    /// The `full_name` of the Repository that owns the PullRequest, or empty when Bitbucket omits it.
+    destination_repository: []const u8 = "",
 };
 
 /// The Browser facts of one Repository. It holds no PullRequest data.
@@ -124,6 +126,25 @@ pub const RepositorySummary = struct {
     name: []const u8,
     /// Unix seconds, or null when Bitbucket omits the field or sends a malformed time.
     updated_on: ?i64,
+};
+
+/// A PullRequest lifecycle state, named as Bitbucket's `state` filter names it.
+pub const PullRequestState = enum { OPEN, MERGED, DECLINED, SUPERSEDED };
+
+/// The account roles that select Workspace PullRequests. Each value is an account UUID.
+pub const PullRequestParty = union(enum) {
+    author: []const u8,
+    reviewer: []const u8,
+    author_and_reviewer: struct { author: []const u8, reviewer: []const u8 },
+};
+
+/// Where Workspace PullRequests are read. Bitbucket has an author endpoint for a Workspace
+/// but no reviewer endpoint, so a reviewer scan needs the Repositories named.
+pub const PullRequestScope = union(enum) {
+    /// The Workspace author endpoint. `reviewer` narrows its results.
+    workspace_author: struct { author: []const u8, reviewer: ?[]const u8 = null },
+    /// One PullRequest list for each Repository. `slugs` are distinct and not empty.
+    repositories: struct { slugs: []const []const u8, party: PullRequestParty },
 };
 
 /// The commit pair identifying a PR's current diff revision. A comment whose
