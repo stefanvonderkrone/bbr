@@ -280,6 +280,8 @@ Never put a proxy in front of bbr for this check, and never set `http_proxy` or 
 A proxy with a trusted TLS-intercepting root decrypts the `Authorization` header.
 On Zig 0.16, a proxy that refuses one CONNECT gets the later requests in clear text.
 The probe log already shows each host and `credential_sent`, so this check needs no proxy.
+The brief names a logging proxy as one way to see each request host (brief.md line 29).
+This ticket uses the other way that line names, the probe log, so do not use the proxy.
 
 The research of ticket 01 predicts that a pasted image in a private Repository does not load with the Credential.
 Then I15 shows `failed`, and the hop lines show the status and the sign-in host.
