@@ -74,9 +74,9 @@ Run every command from the root of the checkout.
    The benchmark uses the default Profile, as `bbr` does without `--profile`.
    The Workspace comes from the Credential, so the Credential must select the `pr-webapp` Workspace.
 3. Make the output directory: `mkdir -p ~/m28-runs`.
-   Make sure that the local PullRequest file `~/m28-runs/pullrequests.txt` exists.
+   Make sure that the local PullRequest file `pullrequests.txt` in the folder that holds the repository checkout exists.
    It holds one PullRequest id per line, in run order. A `#` starts a comment.
-   `~/m28-runs/pullrequests-selection.md` records why each PullRequest is in the selection.
+   `pullrequests-selection.md` in the same folder records why each PullRequest is in the selection.
    Neither file goes into the repository.
 4. Record the date, the network label, the machine, and the macOS version.
    Get them with `date +%F`, `sysctl -n hw.model`, and `sw_vers -productVersion`.
@@ -138,7 +138,7 @@ caffeinate -i nohup tools/m28-baseline-run.sh run1 office-wired ~/m28-runs > ~/m
 ```
 
 The script takes the run label, the network label, and the output directory.
-It reads the PullRequest ids from `~/m28-runs/pullrequests.txt`.
+It reads the PullRequest ids from `pullrequests.txt` in the folder that holds the repository checkout.
 The variable `M28_PULLREQUESTS_FILE` or the option `--pullrequests <file>` names another file.
 The option comes before the labels and wins over the variable.
 A missing, empty, or malformed file stops the script with exit code `2` before the build.
@@ -429,8 +429,8 @@ The log shows `ConnectionRefused` for the dependency URLs.
 Every other step passes. So the failure comes from the environment, not from these changes.
 
 2026-11-02: Resolution of review finding M28-13. The operator chose option 3.
-The PullRequest ids moved to the local file `~/m28-runs/pullrequests.txt`, outside the repository.
-The selection table with its statistics moved to the local file `~/m28-runs/pullrequests-selection.md`.
+The PullRequest ids moved to the local file `pullrequests.txt` in the folder that holds the repository checkout, outside the repository.
+The selection table with its statistics moved to the local file `pullrequests-selection.md` in the same folder.
 The brief, the SPEC, and this ticket now name the PullRequests only as PullRequest A to PullRequest E.
 They keep the selection rule and the duration formulas, but no id and no per-PullRequest number.
 On 2026-11-02, an agent rewrote the branch history and force pushed the branch.

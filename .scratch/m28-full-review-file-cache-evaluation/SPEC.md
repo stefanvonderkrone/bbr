@@ -89,7 +89,7 @@ They are measurement words, not domain terms, so no glossary gets them.
 ### Benchmark PullRequests
 
 The benchmark uses the five PullRequests in `pr-webapp` from the brief.
-Their ids are in the local file `~/m28-runs/pullrequests.txt`, outside the repository.
+Their ids are in the local file `pullrequests.txt` in the folder that holds the repository checkout, outside the repository.
 `tools/m28-baseline-run.sh` reads that file. The letters A to E follow its order.
 
 | PullRequest | Reason |

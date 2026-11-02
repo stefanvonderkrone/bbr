@@ -1,6 +1,7 @@
 #!/bin/sh
 # Runs the M28 baseline on the PullRequests of a local file. Run it again to resume.
 # The PullRequest ids stay outside the repository, one id per line. A `#` starts a comment.
+# The default file is pullrequests.txt in the folder that holds the repository checkout.
 # The harness exits with 1 for a transient failure and 3 for a permanent one.
 # `zig build bench-file-cache` turns every failure into 1, so the script runs the binary.
 set -u
@@ -10,7 +11,7 @@ usage() {
 	exit 2
 }
 
-list=${M28_PULLREQUESTS_FILE:-$HOME/m28-runs/pullrequests.txt}
+list=${M28_PULLREQUESTS_FILE:-$(cd "$(dirname "$0")/../.." && pwd -P)/pullrequests.txt}
 if [ "${1:-}" = "--pullrequests" ]; then
 	[ "$#" -ge 2 ] || usage
 	list=$2

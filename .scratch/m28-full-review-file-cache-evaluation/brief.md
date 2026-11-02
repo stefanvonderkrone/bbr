@@ -48,8 +48,8 @@ The user made these decisions on 2026-10-30.
    The ranking used File count, changed lines, and binary File count from each diff.
    The diffs were deleted after the ranking.
    The PullRequest ids and their statistics are in a local file outside the repository.
-   `tools/m28-baseline-run.sh` reads the ids from `~/m28-runs/pullrequests.txt`.
-   `~/m28-runs/pullrequests-selection.md` keeps the selection table with its statistics.
+   `tools/m28-baseline-run.sh` reads the ids from `pullrequests.txt` in the folder that holds the repository checkout.
+   `pullrequests-selection.md` in the same folder keeps the selection table with its statistics.
 
 ## Benchmark PullRequests
 

@@ -87,7 +87,7 @@ def check(root):
                                for prefix, public in PUBLIC_PULL_REQUESTS):
                         error(path, f"line {number}: names the live PullRequest {match[0]}. "
                               "Keep live PullRequest ids and their statistics in a local file "
-                              "outside the repository, such as ~/m28-runs/pullrequests.txt")
+                              "outside the repository, such as pullrequests.txt next to the repository checkout")
         for number, line in enumerate(prose(text), 1):
             targets = [match[1] for match in LINK.finditer(line)]
             reference = REFERENCE.match(line)

@@ -50,7 +50,8 @@ class BaselineRunTest(unittest.TestCase):
         self.assert_stops_before_build(result, "is missing or unreadable")
 
     def test_missing_default_file_stops_before_build(self):
-        self.assert_stops_before_build(self.run_script("run1", "home"), "home/m28-runs/pullrequests.txt")
+        expected = f"{self.root.parent.resolve()}/pullrequests.txt"
+        self.assert_stops_before_build(self.run_script("run1", "home"), expected)
 
     def test_empty_file_stops_before_build(self):
         path = self.write("empty.txt", "# Only a comment\n\n   \n")
