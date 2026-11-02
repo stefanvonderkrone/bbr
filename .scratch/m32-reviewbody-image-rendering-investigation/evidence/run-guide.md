@@ -133,6 +133,11 @@ The summary prints these numbers:
 A probe line holds no URL, no Comment text, and no Credential.
 A host outside the known list shows as `other`.
 
+The probe log is the only tool that shows the request hosts.
+Never put a proxy in front of bbr, and never set `http_proxy` or `https_proxy` for a run.
+A proxy with a trusted TLS-intercepting root decrypts the `Authorization` header.
+On Zig 0.16, a proxy that refuses one CONNECT gets the later requests in clear text.
+
 ## Known gaps
 
 - A File Jump or a scroll does not free a kitty image in the terminal. bbr frees an image only when its rows leave the Buffer, on Session replacement, or when the preview closes.

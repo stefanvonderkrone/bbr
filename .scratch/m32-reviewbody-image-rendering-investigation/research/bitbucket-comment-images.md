@@ -328,10 +328,14 @@ The agent never runs them, because they use the operator's Credential.
 IMAGE='https://bitbucket.org/repo/<repohash>/images/<number>-<file>'
 
 # C4: with the Credential, no redirect.
-curl -sS -o /dev/null --max-redirs 0 \
-  -u "$BITBUCKET_USERNAME:$BITBUCKET_TOKEN" \
+# printf is a shell builtin, so the token never enters the argv of a process.
+NETRC="$TMPDIR/m32-c4.netrc"
+(umask 077 && printf 'machine bitbucket.org login %s password %s\n' \
+  "$BITBUCKET_USERNAME" "$BITBUCKET_TOKEN" > "$NETRC")
+curl -sS -o /dev/null --max-redirs 0 --netrc-file "$NETRC" \
   -w '%{http_code} %{redirect_url}\n' "$IMAGE" \
   | sed -E 's#(https://[^/ ]+)[^ ]*#\1#'
+rm -f "$NETRC"
 
 # C5: without the Credential, no redirect.
 curl -sS -o /dev/null --max-redirs 0 \

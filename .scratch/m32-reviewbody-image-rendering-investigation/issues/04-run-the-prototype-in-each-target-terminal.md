@@ -54,7 +54,8 @@ For the external-load key:
 For the Bitbucket check with I15:
 
 1. Pick a real PullRequest with a pasted screenshot in a Comment.
-2. Run the prototype against it through a logging proxy that records each request host.
+2. Run the prototype against it with `BBR_M32_PROBE_LOG` set and no proxy.
+   The probe log records each request host and `credential_sent`.
 3. Record each request host, its status, and whether it carried the Credential.
    Do not record a URL path, a query string, or Comment text.
 4. Work through the checklist of ticket 01, and record each answer.
@@ -74,7 +75,7 @@ Never store a screenshot of a real PullRequest in the repository.
 - [ ] The herdr steps are done inside Ghostty and inside one other kitty-protocol terminal.
 - [ ] The tmux steps are done with passthrough on and off.
 - [ ] The external-load check shows no request with the key off and no Credential with the key on.
-- [ ] The Bitbucket check shows every request host and that only Bitbucket hosts got the Credential.
+- [ ] The Bitbucket check shows every request host and that only `bitbucket.org` image path hops got the Credential.
 - [ ] Each item of the ticket 01 checklist has an answer.
 - [ ] The URL expiry check after one hour and one day is recorded.
 - [ ] No recorded text or screenshot holds a real image URL, Comment text, or Credential value.
@@ -256,12 +257,23 @@ Only the human runs this check, because it uses the Credential.
 4. Run `summarize` on the log. Each network image prints one line for each hop.
    A hop line names the host, the host class, the status, and `credential_sent`.
    A host outside the known list shows as `other`.
-5. Confirm that `credential_sent=true` appears only on `bitbucket_org` and `api_bitbucket_org` hops.
-6. Optional: the image client reads `https_proxy`. A logging proxy, such as `mitmdump`, can show each host.
-   The Zig TLS check must trust the proxy root for this. Record only the host column.
+5. Confirm that `credential_sent=true` appears only on `bitbucket_org` hops.
+6. Confirm that the summary shows `event=proxy result=direct`.
 7. Work through the checks C1 to C10 of ticket 01, and record each answer.
 8. Open the same PullRequest after one hour and after one day. Record whether the image still loads.
+
+Never put a proxy in front of bbr for this check, and never set `http_proxy` or `https_proxy`.
+A proxy with a trusted TLS-intercepting root decrypts the `Authorization` header.
+On Zig 0.16, a proxy that refuses one CONNECT gets the later requests in clear text.
+The probe log already shows each host and `credential_sent`, so this check needs no proxy.
 
 The research of ticket 01 predicts that a pasted image in a private Repository does not load with the Credential.
 Then I15 shows `failed`, and the hop lines show the status and the sign-in host.
 That result is evidence for ticket 05, not a prototype fault.
+
+### Change log of the run notes
+
+On 2026-11-02, the M32 prototype alignment run removed both proxy steps (M32I-10, M32P-7).
+The I15 check now uses only the probe log, which records each host and `credential_sent`.
+The C4 request in [bitbucket-comment-images.md](../research/bitbucket-comment-images.md) now reads the Credential from a `--netrc-file`.
+So the token is not in the argv of `curl`.
