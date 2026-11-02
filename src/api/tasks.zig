@@ -10,7 +10,7 @@ const ws = @import("workspaces.zig");
 pub const list_help =
     \\usage: bbr api list-tasks --repository SLUG --pull-request-id N [--state-filter RESOLVED|UNRESOLVED] [--pagelen N] [--page N] [--query Q] [--sort S] [--no-follow] [--limit N] [--json]
     \\
-;
+++ ws.pagelenHelp(bbr.bitbucket.max_pagelen.tasks);
 
 pub const get_help =
     \\usage: bbr api get-task --repository SLUG --pull-request-id N --task-id N [--json]
@@ -72,7 +72,7 @@ fn parse(args: []const []const u8, command: Command) !Parsed {
     const want_content = command == .create or command == .update;
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse return error.UnknownFlag;
-        if (command == .list and try ws.takePageFlag(&cur, f, &p.page)) continue;
+        if (command == .list and try ws.takePageFlag(&cur, f, &p.page, bbr.bitbucket.max_pagelen.tasks)) continue;
         _ = cur.next();
         if (std.mem.eql(u8, f.name, "repository")) {
             try setOption([]const u8, &p.repository, try arg.takeValue(&cur, f));
