@@ -196,8 +196,8 @@ The environment checks run first. The terminal reply check runs last.
    Result on a timeout: no image protocol. Stop.
 7. **Placement form.**
    Result for `TERM_PROGRAM=WezTerm`: direct placement, because WezTerm has no `U=1`. [S16]
-   Result for every other terminal: the prototype switch `BBR_M32_PLACEMENT` selects `direct` or `placeholder`.
-   The default is `direct`, because it is the vaxis path.
+   Result for every other terminal: direct placement, because it is the vaxis path.
+   This note planned a switch `BBR_M32_PLACEMENT` to select placeholders. The prototype builds no placeholders and no such switch (ticket 03).
 
 ### Result for each case
 
@@ -306,7 +306,7 @@ The prototype adds one pure function and one probe.
 
 - Input of the pure function: the environment map.
   It reads `TMUX`, `HERDR_ENV`, `TERM_PROGRAM`, and `TERM`.
-  It also reads the prototype switches `BBR_M32_TMUX_IMAGES`, `BBR_M32_PLACEMENT`, and `BBR_M32_IMAGE_PROTOCOL`.
+  It also reads the prototype switches `BBR_M32_TMUX_IMAGES` and `BBR_M32_PROTOCOL`.
 - Output of the pure function: one value of a union.
   - `plain`: send the probe.
   - `herdr`: send the probe.
@@ -315,9 +315,11 @@ The prototype adds one pure function and one probe.
 - Input of the probe: the result `plain` or `herdr`, the tty writer, and the Loop.
   The probe writes `ESC _ G i=31,s=1,v=1,a=q,t=d,f=24;AAAA ESC \ ESC [ c` and waits up to 1 second on `vx.query_futex`.
 - Output of the probe: `vx.caps.kitty_graphics`.
-- `BBR_M32_IMAGE_PROTOCOL=none` forces the text fallback, and `kitty` skips the probe.
+- `BBR_M32_PROTOCOL` takes `auto`, `kitty`, `iterm2`, or `none`. The default is `auto`.
+  `none` forces the text fallback, and `kitty` skips the probe.
   This lets the human test a terminal that the rule rejects.
-- `BBR_M32_PLACEMENT` takes `direct` or `placeholder`. The default is `direct`. WezTerm always gets `direct`.
+  bbr never selects `iterm2` itself.
+- Placement is always direct, because the prototype builds no placeholders (ticket 03).
 - Each decision writes one probe log line, for example `event=detect mux=herdr reply=yes placement=direct`.
 
 ### Passthrough wrapper format

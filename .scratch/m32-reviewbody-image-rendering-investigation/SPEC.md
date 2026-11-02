@@ -565,3 +565,6 @@ The human can change a choice at ticket 05.
   The protocol matrix section, the research note, and ticket 03 now mark the kitty placement rows of the tmux columns `not tested`.
   A tmux run uses two panes.
   The ticket 04 and run guide wording is left for the helper that edits them.
+- M32I-11: The terminal research note named `BBR_M32_IMAGE_PROTOCOL` and `BBR_M32_PLACEMENT`, but the prototype reads `BBR_M32_PROTOCOL` and has no placement switch.
+  The research note now uses the prototype names and values.
+  The I14 state in the run guide is left for the helper that edits the run guide.
