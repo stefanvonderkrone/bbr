@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 import sys
 
+from source_lines import zig_files
+
 ROOTS = ('"/repositories"', '"/workspaces"')
 BUILDERS = ("pathUrl(", "appendPath(", "repositoryEndpoint(")
 # A literal whose Workspace or Repository segment comes from outside it: a
@@ -15,10 +17,9 @@ FIX = "Use repositoryEndpoint, pathUrl, or appendPath in src/bitbucket/client.zi
 
 
 def violations(root):
-    for path in sorted((root / "src").rglob("*.zig")):
-        relative = path.relative_to(root)
+    for relative, lines in zig_files(root, ("src",), literals=True):
         in_test = False
-        for number, line in enumerate(path.read_text().splitlines(), 1):
+        for number, line in enumerate(lines, 1):
             if in_test:
                 in_test = line != "}"
                 continue
