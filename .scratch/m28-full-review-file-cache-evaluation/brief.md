@@ -47,8 +47,13 @@ The user made these decisions on 2026-10-30.
    The agent selected them on 2026-10-30 from the open and merged PullRequests that the user wrote.
    The ranking used File count, changed lines, and binary File count from each diff.
    The diffs were deleted after the ranking.
+   The PullRequest ids and their statistics are in a local file outside the repository.
+   `tools/m28-baseline-run.sh` reads the ids from `~/m28-runs/pullrequests.txt`.
+   `~/m28-runs/pullrequests-selection.md` keeps the selection table with its statistics.
 
 ## Benchmark PullRequests
+
+The letters A to E follow the run order in the local PullRequest file.
 
 | PullRequest | Reason |
 | --- | --- |

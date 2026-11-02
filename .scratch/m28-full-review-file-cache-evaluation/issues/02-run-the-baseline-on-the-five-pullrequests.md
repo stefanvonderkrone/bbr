@@ -28,7 +28,7 @@ Before run 1:
 
 1. Read `range_files` and `session_requests` in the `header` line of each PullRequest, as "Plan the runs" describes.
 2. Recompute the requests and the time of each PullRequest with the formulas in "Expected duration".
-3. Plan the run days with these numbers, not with the table values.
+3. Plan the run days with these numbers, not with the planning values.
 
 For each run:
 
@@ -36,7 +36,7 @@ For each run:
 2. Pick a run label, such as `run1`, and a network label, such as `office-wired` or `home-vpn`.
    The second run must use a different network condition from the first run.
 3. Start `tools/m28-baseline-run.sh` in the background, as "Start a run" describes.
-   The script runs PullRequest A to PullRequest E one after another.
+   The script runs the PullRequests of the local PullRequest file one after another.
 4. Watch the progress.
    If the script stops with exit code `1`, run the same start command again to resume it.
    If the script stops with exit code `3`, fix the cause first, as "Resume a run" describes.
@@ -74,6 +74,10 @@ Run every command from the root of the checkout.
    The benchmark uses the default Profile, as `bbr` does without `--profile`.
    The Workspace comes from the Credential, so the Credential must select the `pr-webapp` Workspace.
 3. Make the output directory: `mkdir -p ~/m28-runs`.
+   Make sure that the local PullRequest file `~/m28-runs/pullrequests.txt` exists.
+   It holds one PullRequest id per line, in run order. A `#` starts a comment.
+   `~/m28-runs/pullrequests-selection.md` records why each PullRequest is in the selection.
+   Neither file goes into the repository.
 4. Record the date, the network label, the machine, and the macOS version.
    Get them with `date +%F`, `sysctl -n hw.model`, and `sw_vers -productVersion`.
 5. Do not use `bbr` or another Bitbucket API client during a run.
@@ -96,10 +100,10 @@ zig build bench-file-cache -- remote pr-webapp <pull-request> --scenarios s1 --d
 ### Plan the runs
 
 Do this once before run 1.
-The duration table below uses planning values for W and L that nobody measured.
+"Expected duration" uses planning values for W and L that nobody measured.
 The `header` line of each PullRequest prints the real values.
 The harness prints the header after the Session load and the probe, before S1 starts.
-For each PullRequest, run the smoke test command with that PullRequest number:
+For each PullRequest in the local PullRequest file, run the smoke test command with its id:
 
 ```sh
 zig build bench-file-cache -- remote pr-webapp <pull-request> --scenarios s1 --dwell-ms 0 \
@@ -112,7 +116,7 @@ Read `files`, `range_files`, and `session_requests` from each header.
 Put them into the formulas in "Expected duration" as F, W, and L.
 
 You can also read the header of each PullRequest during run 1.
-But then the plan is late, because run 1 reaches PullRequest E last.
+But then the plan is late, because run 1 prints the last header near its end.
 
 No way exists to measure W or L without Bitbucket:
 
@@ -134,6 +138,10 @@ caffeinate -i nohup tools/m28-baseline-run.sh run1 office-wired ~/m28-runs > ~/m
 ```
 
 The script takes the run label, the network label, and the output directory.
+It reads the PullRequest ids from `~/m28-runs/pullrequests.txt`.
+The variable `M28_PULLREQUESTS_FILE` or the option `--pullrequests <file>` names another file.
+The option comes before the labels and wins over the variable.
+A missing, empty, or malformed file stops the script with exit code `2` before the build.
 First it runs `zig build install-bench-file-cache`.
 This builds the harness and installs it as `zig-out/bin/bbr-file-cache-bench`.
 Then it runs `zig-out/bin/bbr-file-cache-bench remote` for each PullRequest with these values.
@@ -261,19 +269,17 @@ So the time is the requests divided by 900 requests an hour, plus the dwell time
 The dwell time adds about F + 380 seconds.
 Each scenario whose `request_estimate` fits in the budget can also wait up to one hour before it starts.
 
-The table uses the planning values W = 5 and L = 4.
+Use the planning values W = 5 and L = 4 only until the headers give the real values.
 Nobody measured these values for the five PullRequests.
 "Plan the runs" tells how to read the real values before run 1.
-Recompute the table with them before you plan the run days.
+Compute the requests and the time of each PullRequest with them before you plan the run days.
 The formulas match `Scenario.requestEstimate` in `src/benchmark/file_cache.zig`, with 3 Session replacements of 20 File Jumps each in S7 and S8.
-
-The rows of this table named the benchmark PullRequests. They are not in the repository.
 
 One run of the five PullRequests sends the sum of the requests of each PullRequest.
 It takes the sum of their times, without the waits before scenarios.
 A segment restart repeats its requests.
-S1 to S6 of the largest PullRequest send most of its requests.
-So a crash late in S1 to S6 of the largest PullRequest can add most of its time.
+A crash late in S1 to S6 repeats up to the S1 to S6 `request_estimate` sum of that PullRequest.
+Divide that sum by 900 requests an hour to get the time that the crash can add.
 
 ### Read the output
 
@@ -393,7 +399,8 @@ The `Blocked by:` lines agree: 02 is blocked by 01, 03 by 02, and 04 by 03.
 The pull request of the M28 branch claims only ticket 01.
 
 2026-11-01: Review finding M28-13. Private PullRequest metadata is in the repository.
-`.scratch/m28-full-review-file-cache-evaluation/brief.md` lists the PullRequest numbers, File counts, binary File counts, changed lines, diff sizes, and the count of PullRequests that the user wrote.
+`.scratch/m28-full-review-file-cache-evaluation/brief.md` listed the PullRequest numbers and their statistics.
+The statistics were File counts, binary File counts, changed lines, diff sizes, and the count of the user's PullRequests.
 The "Benchmark PullRequests" table of the SPEC, the duration table of this ticket, and `tools/m28-baseline-run.sh` also name the PullRequests or their File counts.
 Evidence from local Git only, with no fetch:
 
@@ -420,3 +427,16 @@ The operator can choose one of these options:
 That test fetches Zig dependencies over the network, and the environment blocks the network.
 The log shows `ConnectionRefused` for the dependency URLs.
 Every other step passes. So the failure comes from the environment, not from these changes.
+
+2026-11-02: Resolution of review finding M28-13. The operator chose option 3.
+The PullRequest ids moved to the local file `~/m28-runs/pullrequests.txt`, outside the repository.
+The selection table with its statistics moved to the local file `~/m28-runs/pullrequests-selection.md`.
+The brief, the SPEC, and this ticket now name the PullRequests only as PullRequest A to PullRequest E.
+They keep the selection rule and the duration formulas, but no id and no per-PullRequest number.
+On 2026-11-02, an agent rewrote the branch history and force pushed the branch.
+Every commit after `origin/main` got the same scrub. The commits of `main` kept their hashes.
+`tools/m28-baseline-run.sh` now reads the ids from the local file and checks the file before the build.
+`tests/m28_baseline_run_test.py` runs a copy of the script with a stub `zig` and no network.
+It checks a missing, empty, and malformed file, and `zig build test` runs it.
+`tools/check_agent_docs.py` now fails on a PullRequest id in `.scratch/` prose outside inline code.
+It also fails on an id after `pr-webapp` or in a `remote` command, also in code.
