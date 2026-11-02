@@ -17,7 +17,8 @@ Run each step in a terminal with 30 rows, then repeat it in a terminal with 80 r
 2. Add at least two Drafts in Files far apart.
    Make sure that the PullRequest has at least one unresolved and one resolved Thread.
 3. Pick five Scroll Marks of different kinds.
-   For each one, press its track cell, and make sure that the DiffPane shows its Thread, Draft, or File header.
+   For each one, press its track cell, and make sure that the thumb then covers that cell.
+   Then find its Thread, Draft, or File header in the rows of that cell with `j` and `k`.
 4. Type a Buffer Search query with hits in several Files.
    Pick three hit marks, and make sure that each one leads to a real hit.
 5. Clear the query, and make sure that the hit marks go away.
@@ -34,7 +35,7 @@ Run each step in a terminal with 30 rows, then repeat it in a terminal with 80 r
 
 ## Acceptance criteria
 
-- [ ] Every checked mark leads to a real item of its kind, at 30 and at 80 rows.
+- [ ] Every checked mark sits in the track cell of a real item of its kind, at 30 and at 80 rows.
 - [ ] Every drag reaches the first and the last row of its scroll bar.
 - [ ] A drag past the window edges pins the scroll at the end.
 - [ ] The thumb and the marks follow File isolation, the Layout switch, and the resize.
@@ -141,9 +142,12 @@ Per step:
   `Enter` on that row opens the Thread, and its mark then covers the root ReviewCard and its Replies.
 - Step 3. A press on a mark cell off the thumb jumps the scroll.
   The thumb then covers the pressed cell.
-  The item of the mark must be in the visible DiffPane rows.
   The jump centers the pressed cell's first row when it can.
-  So the item can be some rows above or below the middle, because one cell can hold many rows.
+  One cell can hold many rows, so the item can be outside the visible rows.
+  This is the SPEC design, not a failure.
+  Move with `j` and `k` through the rows of the cell, and make sure that the item is there.
+  A press that shows the item at once is out of scope for M30.
+  Ticket 10 holds that request.
 - Step 4. The mouse does nothing while the Buffer Search input is open.
   Press `Enter` to accept the query before you press a hit mark.
   A Search Occurrence inside a closed Fold has no hit mark.
@@ -168,3 +172,15 @@ Per step:
 Under `## Completion`, record the bbr commit from `git rev-parse HEAD`, the `--version` output, the terminal program, and both terminal sizes.
 For ticket 08, record how readable the marks are in a crowded track.
 Record whether the thumb style hides the mark kinds, and whether the `━` marks crowd the border.
+
+## Comments
+
+### 2026-11-02 review finding M30-3
+
+The review found that a press on a Scroll Mark does not show the marked item on a long Buffer.
+A model of the press offset shows 1.8 percent of a cell at 30 rows and 20,000 Buffer rows.
+So the old step 3 and the first acceptance criterion asked for more than the design gives.
+The SPEC lists "A press on a Scroll Mark that jumps to the item of the mark" under Out of Scope.
+The brief asks only to compare each mark position with the real row of its item.
+The runner kept the SPEC and narrowed step 3 and the first criterion to the mark position.
+Ticket 10 records the jump to the item for triage.
