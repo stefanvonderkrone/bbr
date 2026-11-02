@@ -275,6 +275,14 @@ pub fn build(b: *std.Build) void {
     const yank_step = b.step("test-yank", "Run Presentation yank tests");
     yank_step.dependOn(&b.addRunArtifact(yank_tests).step);
 
+    const external_edit_tests = b.addTest(.{
+        .name = "external-edit-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"External Edit"},
+    });
+    const external_edit_test_step = b.step("test-external-edit", "Run External Edit lifecycle tests");
+    external_edit_test_step.dependOn(&b.addRunArtifact(external_edit_tests).step);
+
     const inline_tests = b.addTest(.{
         .name = "inline-markdown-tests",
         .root_module = exe.root_module,
