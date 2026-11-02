@@ -12,8 +12,10 @@ An ADR records the M32 image decision and its evidence.
 ## Scope
 
 - Add `docs/adr/<next free number>-<slug>.md`.
-  Check the number when this ticket runs, because the M28 spec plans ADR-0014.
+  Take the next free number when this ticket runs. The expected number is 0015, because M27 holds ADR-0014.
 - Write every section from the "Decision document" section of the spec.
+  Keep the ADR to the decision, the rules, and the reopen conditions.
+  Link the protocol matrix, the measurements, and the screenshots, and do not copy them.
 - Link the research notes of tickets 01 and 02.
   Link the evidence of ticket 04 and the answer of ticket 05.
 - Record the redirect finding from the spec: `StdHttpClient` keeps the Credential on a redirect to another host.
@@ -58,3 +60,8 @@ The ADR must record it in the "Decoding" section, with the decision of ticket 05
 
 On 2026-11-02, the M32 review fix run corrected the redirect fix in the scope (M32I-2 and M32I-14).
 The earlier text let a later run move the Credential into `privileged_headers`, which removes it from every request.
+
+On 2026-11-02, the M32 review fix run corrected the ADR plan (M32I-13).
+The operator assigned ADR-0015 to M32, and M27 holds ADR-0014.
+Take the next free number at run time, expected 0015.
+The ADR now has six short sections instead of 13.

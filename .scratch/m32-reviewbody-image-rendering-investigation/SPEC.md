@@ -436,22 +436,21 @@ In a terminal with no image protocol, bbr sends no image request.
 ## Decision document
 
 Ticket 06 writes the ADR at the next free number in `docs/adr/`.
-The M28 spec plans ADR-0014, so ticket 06 checks the number when it runs.
+ADR-0014 belongs to M27 (`0014-builtin-grammar-queries-come-from-nvim-treesitter.md`).
+The operator assigned ADR-0015 to M32.
+Ticket 06 takes the next free number when it runs, and expects 0015.
+
+The ADR records the decision, the rules, and the reopen conditions.
+It is not a research report.
+It links the protocol matrix, the measurements, and the screenshots in this directory, and does not copy them.
 The ADR has these sections:
 
-1. Context: the problem and a link to this spec.
+1. Context: the problem in a few sentences and a link to this spec.
 2. Decision: inline image, image preview, both, or text fallback only.
-3. Protocol support: the filled protocol matrix, or a link to it in ticket 04.
-4. Detection: the multiplexer detection rule and the capability query.
-5. Acquisition: the Bitbucket storage findings, the Credential host rule, the Bitbucket host list, the redirect rule, and the external-load key.
-6. Limits: the byte limit, the type list, the dimension limit, the concurrency limit, and the memory budget.
-7. Decoding: the selected decode path and the decoder safety evidence.
-8. Presentation: sizing, aspect ratio, the maximum rows, Reply indentation, the ReviewCard disclosure, scrolling, resize, and Overlays.
-9. Cache lifetime: when bbr keeps, frees, and transmits an image again.
-10. Fallback text: the final text for each state.
-11. Evidence: the measurements, the screenshot list, and links to tickets 04 and 05.
-12. Consequences: the AGENTS.md rules to add, the glossary terms, the vaxis changes, and the cost of the iTerm2 path.
-13. Reopen conditions: for example a new vaxis release or a new target terminal.
+3. Rules: the Credential host rule and the image path rule, the redirect rule, the external-load key, the image escape sequence rules, the limits, the type and decoder rules, the cache lifetime, and the fallback text.
+4. Consequences: the AGENTS.md rules to add, the glossary terms, and the vaxis changes.
+5. Reopen conditions: for example a new vaxis release, a new target terminal, or a Zig release that fixes the flate panic.
+6. Evidence: links to the research notes, tickets 04 and 05, and `evidence/`.
 
 The ADR holds no URL of a real image, no Comment text, and no Credential value.
 
@@ -564,7 +563,7 @@ The human can change a choice at ticket 05.
 9. Cache: memory only, for one Session. No disk cache.
 10. Starting inline size: the card content width, at most 12 rows, no upscale.
 11. Fallback: the M23 text, plus a short state that ticket 05 accepts or removes.
-12. Decision document: an ADR at the next free number, because M28 plans ADR-0014.
+12. Decision document: an ADR at the next free number, expected ADR-0015, because M27 holds ADR-0014.
 13. Relative references: the prototype shows the fallback until ticket 01 finds the base that Bitbucket uses.
 
 ## Comments
@@ -594,3 +593,6 @@ The human can change a choice at ticket 05.
   The new "Image escape sequences" section allows only bbr-made numbers and base64, and forbids `d=a` delete-all and fixed image ids.
 - M32I-6: The branch has no decision and no ADR. The new "Merge status" section says that the branch merges only as a research checkpoint, and that the PR body must say so.
 - M32I-12: Commit `a787b12` is outside the stated M32 scope. The commits stay in place. The "Where it lives" section records that the operator approved the deny rule on this branch, and why.
+- M32I-13: The ADR plan had 13 sections, which made the ADR a research report, and two lines said that M28 plans ADR-0014.
+  The plan now keeps the ADR to the decision, the rules, and the reopen conditions, and links the evidence.
+  ADR-0014 belongs to M27, and the operator assigned ADR-0015 to M32.
