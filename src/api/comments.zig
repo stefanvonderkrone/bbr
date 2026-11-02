@@ -14,9 +14,9 @@ pub const list_help =
     \\List comments (GET .../comments, follows pages). PR head is fetched
     \\automatically for outdated detection unless --no-head or explicit commits.
     \\--no-follow returns one page. --limit caps the number of comments fetched.
-    \\Page size defaults to 100. Flags can appear in any order.
+    \\Flags can appear in any order.
     \\
-;
+++ pages.pagelenHelp(bbr.bitbucket.max_pagelen.comments);
 
 pub const get_help =
     \\usage: bbr api get-comment --repository SLUG --pull-request-id N --comment-id N [--json]
@@ -155,7 +155,7 @@ fn parseList(args: []const []const u8) !ListArgs {
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse return error.UnknownFlag;
         if (try flags.take(&cur, f, false)) continue;
-        if (try pages.takePageFlag(&cur, f, &parsed.opts)) continue;
+        if (try pages.takePageFlag(&cur, f, &parsed.opts, bbr.bitbucket.max_pagelen.comments)) continue;
         _ = cur.next();
         if (std.mem.eql(u8, f.name, "source-commit")) {
             parsed.source = try arg.takeValue(&cur, f);
