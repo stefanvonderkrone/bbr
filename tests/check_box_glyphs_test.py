@@ -9,7 +9,9 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "tools/check_box_glyphs.py"
+TOOLS = Path(__file__).resolve().parents[1] / "tools"
+sys.path.insert(0, str(TOOLS))
+SCRIPT = TOOLS / "check_box_glyphs.py"
 spec = importlib.util.spec_from_file_location("check_box_glyphs", SCRIPT)
 checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
@@ -36,6 +38,7 @@ class BoxGlyphsTest(unittest.TestCase):
         (self.root / checker.PAINTERS[0]).write_text(
             'const lines = "─│━┃═║┄┆╴╵╼╽";\n'
             '// ╔╬\n'
+            'const width = 1; // ╭ starts the frame\n'
             'test "border fixture" {\n    const border = "╔╬";\n}\n',
             encoding="utf-8",
         )

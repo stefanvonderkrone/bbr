@@ -1,10 +1,11 @@
-"""Run with python3 tests/api_auth_cli_test.py zig-out/bin/bbr. No network access."""
+"""Run with zig build test-cli. No network access."""
 
-import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+
+from cli_env import cli_env
 
 
 binary = str(Path(sys.argv[1]).resolve())
@@ -21,13 +22,8 @@ def run(env, args, expected):
 
 
 with tempfile.TemporaryDirectory(prefix="bbr-api-auth-test-") as data_home:
-    env = dict(os.environ)
-    for key in list(env):
-        if key.startswith("BITBUCKET_") or key == "BBR_PROFILE" or key.lower().endswith("_proxy"):
-            del env[key]
-    env["XDG_DATA_HOME"] = data_home
     # A rejected proxy proves that credentials resolved without sending a request.
-    env["https_proxy"] = "socks5://unused.invalid"
+    env = cli_env(XDG_DATA_HOME=data_home, https_proxy="socks5://unused.invalid")
     resolved = b"bbr api whoami: InvalidProxyConfiguration"
     missing = b"bbr api whoami: MissingCredential"
     run(env, ["api", "whoami", "--json"], missing)

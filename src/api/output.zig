@@ -1,7 +1,7 @@
 //! Output helpers for `bbr api`: human lines by default, JSON with `--json`.
 //! Human output goes to stdout (scriptable); errors go to stderr via
 //! `std.debug.print` at call sites. stdout writes use the
-//! `stdout.writer(io, &buf).interface` pattern from `main.zig --version`.
+//! `stdout.writerStreaming(io, &buf).interface` pattern from `main.zig --version`.
 
 const std = @import("std");
 
@@ -21,7 +21,7 @@ pub fn printJson(init: std.process.Init, value: anytype) !void {
 /// Write optional raw file output before printing the JSON result to stdout.
 pub fn printJsonFile(init: std.process.Init, value: anytype, raw: []const u8, out_path: ?[]const u8) !void {
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
     try writeJsonFile(init.io, init.gpa, &stdout.interface, value, raw, out_path);
 }
 
@@ -39,7 +39,7 @@ fn writeJsonFile(io: std.Io, gpa: std.mem.Allocator, writer: *std.Io.Writer, val
 /// Print one line of text to stdout.
 pub fn printLine(init: std.process.Init, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
     try stdout.interface.print(fmt ++ "\n", args);
     try stdout.interface.flush();
 }
@@ -51,7 +51,7 @@ pub fn printRaw(
     out_path: ?[]const u8,
 ) !void {
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
     try stdout.interface.writeAll(raw);
     try stdout.interface.flush();
     if (out_path) |path| try writeFile(init.io, raw, path);
