@@ -67,8 +67,12 @@ So a fenced `js` block in Markdown uses the JavaScript BuiltInGrammar, also when
   After a new BuiltInGrammar, `tools/check_vendored_grammars.py` names each stale adapted host query and tells the maintainer to rerun `tools/vendor_grammar.py`.
 - The ReleaseSafe executable grows from 12,980,144 to 57,526,080 bytes.
   The parse tables of the new Grammars are almost all of the growth.
-- `TreeSitterHighlighter.init` prepares every query at startup.
-  In ReleaseSafe, it takes 422 ms after M27 and 28 ms before.
+- `TreeSitterHighlighter.init` prepared every query at startup until ticket 15.
+  In ReleaseSafe, it took 422 ms after M27 and 28 ms before.
+  On 2026-11-02, the operator chose lazy loading, and ticket 15 added it.
+  Now `init` prepares no query, and each BuiltInGrammar is prepared on its first use.
+  The first use of C++ takes about 87 ms, and the first use of Swift or C# takes about 64 ms.
+  The test "M27 grammar every BuiltInGrammar loads its queries" prepares every query, so CI still finds an invalid query.
   [The binary size record](../../.scratch/m27-zig-builtin-grammar/binary-size.md) has the method and the per-Grammar times.
 - New Captures map to the existing Theme roles through dotted-prefix rules in `Capture.init`.
   M27 adds no Theme color.

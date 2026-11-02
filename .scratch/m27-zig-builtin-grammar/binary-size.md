@@ -256,3 +256,37 @@ The `peak_bytes` value changed on several fixtures.
 For example, `highlight_json_2m` went from 35,287,234 to 80,154,088 bytes, and `highlight_css_2m` went from 119,695,066 to 96,568,552 bytes.
 `highlight_tsx_2m` printed two different values in the 3 after runs.
 This file does not explain these changes, and the SPEC does not ask for them.
+
+## Lazy preparation (ticket 15)
+
+On 2026-11-02, the operator chose lazy loading.
+Ticket 15 measured the change on the same host, with the same toolchain.
+
+- Before: commit `c5fb81d`. After: the ticket 15 change on top of `c5fb81d`.
+- A temporary patch added the case `m27_lazy_timing` to `src/benchmark/main.zig` on both sides.
+  The patch is not committed.
+- The case times 21 calls of `TreeSitterHighlighter.init` after 3 warm-up calls, and prints the median.
+- For each File type, the case creates 11 new highlighters.
+  It times the first highlight and the second highlight of a small fixture on each, and prints the medians.
+- `zig build -Doptimize=ReleaseSafe` built `bbr` and `bbr-bench` on each side.
+- The values are the medians of 3 runs of `bbr-bench m27_lazy_timing`.
+
+| Value | Before | After |
+| --- | --- | --- |
+| `TreeSitterHighlighter.init`, median | 423 ms | below 1 µs |
+| First highlight of a `.cpp` File | 0.07 ms | 87 ms |
+| First highlight of a `.swift` File | 0.07 ms | 64 ms |
+| First highlight of a `.cs` File | 0.07 ms | 64 ms |
+| First highlight of a `.md` File with `zig` and `js` fences | 0.13 ms | 22 ms |
+| First highlight of a `.js` File | 0.04 ms | 4 ms |
+| First highlight of a `.zig` File | 0.03 ms | 11 ms |
+| Later highlight of the same File, each type | 0.006 ms to 0.06 ms | 0.006 ms to 0.08 ms |
+| `zig-out/bin/bbr` bytes, ReleaseSafe | 57,549,040 | 57,531,904 |
+
+The `init` time is below the 28 ms of the build before M27, because `init` now prepares no query.
+The test "M27 lazy init prepares no BuiltInGrammar query" proves that `init` allocates nothing.
+The first use of a Grammar now pays the `ts_query_new` time that `init` paid before.
+These first-use times agree with the per-Grammar times above.
+The `.md` value includes the Markdown, Markdown inline, Zig, and JavaScript Grammars.
+`zig build test-builtin-grammars` took 126 s before and 31 s after, in Debug.
+The binary size and the `vendors/` size do not change, so they stay open.

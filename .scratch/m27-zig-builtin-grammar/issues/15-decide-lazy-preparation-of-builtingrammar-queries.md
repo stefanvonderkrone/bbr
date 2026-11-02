@@ -1,6 +1,6 @@
 # 15: Decide lazy preparation of BuiltInGrammar queries
 
-Status: needs-triage
+Status: resolved
 Blocked by: none
 Spec: [M27 spec](../SPEC.md)
 
@@ -49,3 +49,50 @@ The binary size and the `vendors/` size do not change with options 1 to 3.
 
 The agent recommends no option, because the decision changes the approved SPEC.
 The review named no cheap fix for `init` time that keeps every design decision.
+
+On 2026-11-02, the operator chose lazy loading.
+The agent takes option 2 because it is the lazy option that this ticket describes.
+Option 3 also defers the work, but it still prepares every query in each session.
+So the triage state went from `needs-triage` to `ready-for-agent`, and the agent claimed the ticket.
+Option 2 does not change the binary size or the `vendors/` size, so these costs stay open.
+
+## Completion
+
+The agent implemented option 2 on 2026-11-02.
+
+- `TreeSitterHighlighter.init` takes an `Io` and prepares no query.
+- `BuiltInPackages.get` prepares a BuiltInGrammar on its first use, as a host or as an Injection.
+  One `std.Io.Mutex` guards the slots, because highlight workers share them.
+- A failed preparation returns its error for that highlight and keeps no entry.
+  The next use tries again. The caller's failure path for a highlight error does not change.
+- An invalid query reports its diagnostic and fails the highlight, as the UserGrammar load does.
+  Before this change, it stopped bbr at startup.
+- The test "M27 grammar every BuiltInGrammar loads its queries" prepares every query, so CI still finds an invalid query.
+
+New tests in `src/highlight/tree_sitter_highlighter.zig`:
+
+- "M27 lazy init prepares no BuiltInGrammar query" failed on the old code with `error.OutOfMemory`.
+- "M27 lazy every BuiltInGrammar fixture highlights as after eager preparation" compares every fixture with eager preparation.
+  It also checks that the fixtures use all 29 BuiltInGrammars.
+- "M27 lazy a failed preparation fails only that highlight and the next use succeeds" fails each allocation of the HTML preparation in turn.
+- "M27 lazy concurrent first uses of one BuiltInGrammar give the eager output" runs 4 concurrent first uses of C++.
+
+`tools/check_guard_mutations.py` has the new mutations `m27-lazy-reuse` and `m27-lazy-init`. Both are caught.
+No mutation covers the mutex, because a test cannot detect a data race in a deterministic way.
+
+Measurements are in [binary-size.md](../binary-size.md#lazy-preparation-ticket-15).
+`init` went from 423 ms to below 1 µs in ReleaseSafe.
+The first use of C++ now takes 87 ms, and the first use of Swift or C# takes 64 ms.
+
+Still open:
+
+- The binary size (57.5 MB in ReleaseSafe) and the `vendors/` size (277 MB). Option 2 does not change them.
+- An invalid-query diagnostic during the TUI goes to `std.log`, as for a UserGrammar. Only a broken build can show it, because CI prepares every query.
+
+Checks:
+
+- `zig build test --summary all`: 32/32 steps, 1515/1515 tests passed.
+- `zig build test-builtin-grammars`: 99/99 tests passed in about 31 s. It took 126 s before.
+- `zig fmt --check build.zig src tests`: exit code 0.
+- `python3 tools/check_agent_docs.py`: pass.
+- `python3 tools/check_guard_mutations.py`: 10 mutations caught, baseline passes.
