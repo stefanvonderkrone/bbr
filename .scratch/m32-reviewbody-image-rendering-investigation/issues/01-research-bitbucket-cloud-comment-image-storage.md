@@ -47,13 +47,20 @@ Ticket 04 confirms the findings on a real PullRequest.
 The research note is [bitbucket-comment-images.md](../research/bitbucket-comment-images.md).
 
 - Q1 is `reported`. A pasted image becomes a `https://bitbucket.org/repo/<hash>/images/<n>-<file>` reference in `content.raw`.
-- Q2 is `reported`. Reports say that the Credential does not open an image in a private Repository. Only a browser session cookie works.
+- Q2 is `reported`. Reports say that an app password or OAuth does not open the image in a private Repository. No source tests an API token. Only a browser session cookie works.
 - Q2 also finds a redirect to a signed Amazon S3 URL that expires. The authored URL does not expire.
 - Q3 is `unknown` for the relative base. A Comment has no attachment form (`reported`).
-- Q4 keeps exactly `api.bitbucket.org` and `bitbucket.org`.
+- Q4 keeps exactly `api.bitbucket.org` and `bitbucket.org`. The image path never sends the Credential to `api.bitbucket.org`, and sends it to `bitbucket.org` only for `/repo/<segment>/images/<segment>`.
 - Spec choice 5 changes. The prototype allows the storage host `bbuseruploads.s3.amazonaws.com` only directly after a `bitbucket.org` hop, and never sends it the Credential.
 - Spec choice 3 keeps its two hosts. Ticket 05 drops `bitbucket.org` if ticket 04 shows that the Credential has no effect there.
 - The note holds the checks C1 to C10 for ticket 04, with the exact requests for the human. No agent sent these requests.
 
 Checks: `python3 tools/check_agent_docs.py` passes.
 Review: the runner read the note and its prototype consequences.
+
+## Comments
+
+On 2026-11-02, the M32 review fix run corrected the Q2 line (M32I-7).
+The earlier line said that the Credential does not open the image.
+The reports test only app passwords and OAuth, and the bbr Credential is an API token.
+The run also added the image path rule to the Q4 line (M32I-3).
