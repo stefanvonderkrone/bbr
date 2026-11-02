@@ -811,10 +811,10 @@ pub fn main(init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_
     const args = try init.minimal.args.toSlice(arena);
     if (args.len < 2) return usage();
     var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     const out = &stdout.interface;
     var notes_buffer: [1024]u8 = undefined;
-    var stderr = std.Io.File.stderr().writer(init.io, &notes_buffer);
+    var stderr = std.Io.File.stderr().writerStreaming(init.io, &notes_buffer);
 
     if (std.mem.eql(u8, args[1], "summarize")) {
         if (args.len < 3) return usage();
