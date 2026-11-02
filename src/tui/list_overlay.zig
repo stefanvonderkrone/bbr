@@ -14,6 +14,7 @@
 const std = @import("std");
 const zf = @import("zf");
 const bbr = @import("bbr");
+const search = @import("search.zig");
 
 const Allocator = std.mem.Allocator;
 const PullRequestSummary = bbr.bitbucket.PullRequestSummary;
@@ -86,17 +87,22 @@ pub const FuzzyList = struct {
 
     /// A query edit puts the cursor on the best match, so Enter never runs
     /// whatever lands under the old cursor row.
+    /// A full query takes no part of a scalar.
     fn appendQuery(self: *FuzzyList, bytes: []const u8) void {
-        for (bytes) |byte| {
-            if (self.query_len == self.query_buf.len) break;
-            self.query_buf[self.query_len] = byte;
-            self.query_len += 1;
+        var start: usize = 0;
+        while (start < bytes.len) {
+            const len = std.unicode.utf8ByteSequenceLength(bytes[start]) catch 1;
+            const end = @min(start + len, bytes.len);
+            if (self.query_len + end - start > self.query_buf.len) break;
+            @memcpy(self.query_buf[self.query_len..][0 .. end - start], bytes[start..end]);
+            self.query_len += end - start;
+            start = end;
         }
         self.selected = 0;
     }
 
     fn popQuery(self: *FuzzyList) void {
-        if (self.query_len > 0) self.query_len -= 1;
+        self.query_len = search.lastScalarStart(self.query());
         self.selected = 0;
     }
 
@@ -685,6 +691,17 @@ test "empty query matches every PR in order" {
     defer p.deinit();
     try testing.expectEqual(@as(usize, 3), p.list().matches().len);
     try testing.expectEqual(@as(u64, 10), chosenPullRequest(&p).?);
+}
+
+test "a query edit keeps whole scalars" {
+    var p = try testPicker(samplePrs());
+    defer p.deinit();
+    p.insert("aä", &.{});
+    p.backspace(&.{});
+    try testing.expectEqualStrings("a", p.list().query());
+    p.backspace(&.{});
+    p.insert("x" ** 255 ++ "ä", &.{});
+    try testing.expectEqual(@as(usize, 255), p.list().query().len);
 }
 
 test "a query narrows to fuzzy matches" {
