@@ -297,7 +297,8 @@ Ticket 03 adds a `summarize` script that prints, for each image and terminal:
 The prototype adds tests whose names start with `M32 image`.
 They run on `FakeHttpClient`, with no network and no Credential.
 
-- A request to a Bitbucket host carries the Credential.
+- A request to `https://bitbucket.org/repo/<segment>/images/<segment>` carries the Credential.
+- An image request to any other Bitbucket URL, `api.bitbucket.org` included, sends no request.
 - A request to any other host never carries the Credential.
 - A redirect from a Bitbucket host to another host drops the Credential at that hop.
 - With the external-load key off, bbr sends no request to an external host.
@@ -317,7 +318,13 @@ The ADR from ticket 06 keeps them or tightens them.
 ### Credential host rule
 
 - bbr sends the Credential only over `https`, and only to a host on the Bitbucket host list.
-- The prototype starts with the exact hosts `bitbucket.org` and `api.bitbucket.org`.
+- The Bitbucket host list holds the exact hosts `bitbucket.org` and `api.bitbucket.org`.
+- The image path is stricter, because a Comment author chooses the image URL.
+  It never sends the Credential to `api.bitbucket.org`.
+  It sends the Credential only to `https://bitbucket.org/repo/<segment>/images/<segment>`, with no query and no deeper segment.
+  It does so only if ticket 04 shows that the Credential has an effect on that path.
+  Otherwise the image path sends no Credential.
+  Every other Bitbucket URL on the image path sends no request.
 - Ticket 01 can add a host only with a source that shows Bitbucket owns and needs it.
 - A match is an exact host match. bbr never matches a suffix or a wildcard.
 - The image path follows each redirect itself.
@@ -520,7 +527,7 @@ The human can change a choice at ticket 05.
 
 1. Prototype location: the branch `m32-image-prototype`, not a scratch directory, because the situations need the real paint path.
 2. Config key: `[images] allow_external`, default `false`.
-3. Bitbucket host list: exact `bitbucket.org` and `api.bitbucket.org` until ticket 01 adds a host with evidence.
+3. Bitbucket host list: exact `bitbucket.org` and `api.bitbucket.org` until ticket 01 adds a host with evidence. The image path sends the Credential only to `https://bitbucket.org/repo/<segment>/images/<segment>`, and only if ticket 04 shows an effect.
 4. Redirects: the image path follows each hop itself and applies the host rule at each hop.
 5. A storage host that Bitbucket redirects to: not an external load when ticket 01 shows that Bitbucket controls it.
 6. LocalReview: bbr reads no Credential, so a Bitbucket-hosted image loads without it or falls back.
@@ -544,3 +551,7 @@ The human can change a choice at ticket 05.
 - M32I-2 and M32I-14: The redirect finding said that std strips only `privileged_headers`, which led to a fix that removes the Credential from every request.
   The spec now cites the Zig 0.16 lines, names `redirect_behavior = .unhandled` with a per-hop check as the fix, and names a loopback test in `src/http/std_client.zig` as the enforcement.
   The fix moved to the Credential transport ticket.
+- M32I-3: The Credential host rule let a Comment author choose an authenticated path on `bitbucket.org` and `api.bitbucket.org`.
+  The image path now never sends the Credential to `api.bitbucket.org`.
+  It sends the Credential only to `https://bitbucket.org/repo/<segment>/images/<segment>`, and only if ticket 04 shows an effect.
+  The research note Q4 and its consequences say the same.

@@ -216,11 +216,16 @@ So M32 does not cover them.
 
 The Bitbucket host list holds exact host names.
 It holds no wildcard and no suffix rule.
+The image path has its own rule, which is stricter than the host list.
 
 | Host | Reason it may get the Credential | Mark |
 | --- | --- | --- |
-| `api.bitbucket.org` | Every REST request goes to this host. The Credential exists for these requests. | `documented` [S16] |
-| `bitbucket.org` | It serves the authored image URL. Atlassian operates it. Ticket 04 must see whether the Credential has any effect here. | `documented` for ownership [S15][S18], `reported` for no effect [S6][S7] |
+| `api.bitbucket.org` | Every REST request goes to this host. The Credential exists for these requests. The image path never sends the Credential to this host, because the host is not in the image chain. | `documented` [S16] |
+| `bitbucket.org` | It serves the authored image URL. Atlassian operates it. The image path sends the Credential here only for the path `/repo/<segment>/images/<segment>`, and only if ticket 04 shows that the Credential has an effect. | `documented` for ownership [S15][S18], `reported` for no effect [S6][S7] |
+
+A Comment author chooses the image URL.
+So a rule that sends the Credential to any path on a Bitbucket host lets the author choose an authenticated request.
+The image path rule allows only the path form of a pasted image, with no query and no deeper segment.
 
 These hosts must never get the Credential:
 
@@ -232,10 +237,10 @@ These hosts must never get the Credential:
 | `altssh.bitbucket.org` | It serves SSH only. [S18] |
 | Every other host | The spec allows no host without evidence. |
 
-`bitbucket.org` is on the list only for the first hop of an image request.
-The reports say that the Credential does not open a private image there.
-If ticket 04 confirms that, ticket 05 removes `bitbucket.org` from the list.
-Then the list is only `api.bitbucket.org`, and an image request never carries the Credential.
+`bitbucket.org` is on the list only for the first hop of an image request, and only for the image path form.
+The reports say that an app password or OAuth does not open a private image there. No source tests an API token.
+If ticket 04 shows that the Credential has no effect, ticket 05 removes the image path from the rule.
+Then an image request never carries the Credential.
 
 ## Spec choices that the answers change
 
@@ -250,9 +255,10 @@ The answers change one choice and add a condition to another.
   It allows the host only as the target of a redirect from `bitbucket.org`.
   It never sends the Credential to it.
   Ticket 04 confirms the host, or ticket 05 removes the exception.
-- Choice 3 keeps its hosts, but gets a condition.
-  The prototype uses `bitbucket.org` and `api.bitbucket.org`.
-  If ticket 04 confirms that the Credential has no effect on `bitbucket.org`, ticket 05 removes `bitbucket.org`.
+- Choice 3 keeps its hosts for the API, but the image path gets a stricter rule.
+  The image path never sends the Credential to `api.bitbucket.org`.
+  It sends the Credential to `bitbucket.org` only for `/repo/<segment>/images/<segment>`.
+  If ticket 04 shows that the Credential has no effect there, ticket 05 removes that exception too.
 
 These choices do not change: 1, 2, 4, 6, 7, 8, 9, 10, 11, 12, and 13.
 Choice 6 matches the findings, because a LocalReview has no Credential.
@@ -266,11 +272,13 @@ So the value of an inline image depends on that check.
 ## Consequences for the prototype
 
 - **Host list.**
-  The Credential hosts are exactly `api.bitbucket.org` and `bitbucket.org`.
+  On the image path, the only Credential target is `https://bitbucket.org/repo/<segment>/images/<segment>`.
+  `api.bitbucket.org` never gets the Credential on the image path.
   The only storage host is exactly `bbuseruploads.s3.amazonaws.com`, and only directly after a `bitbucket.org` hop.
   Every other host is external.
 - **Credential on the first hop.**
-  In a RemoteReview, the prototype sends the Credential on the first hop to `bitbucket.org` over `https`.
+  In a RemoteReview, the prototype sends the Credential on the first hop to `bitbucket.org` over `https`, only for the image path form.
+  Every other Bitbucket URL on the image path sends no request.
   The host is first-party, so the Credential reaches no third party.
   Ticket 04 needs the response to this request.
   The prototype never sends the Credential on a later hop to another host.
