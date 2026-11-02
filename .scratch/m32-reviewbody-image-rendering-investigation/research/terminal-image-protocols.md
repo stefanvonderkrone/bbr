@@ -320,7 +320,7 @@ The prototype adds one pure function and one probe.
   This lets the human test a terminal that the rule rejects.
   bbr never selects `iterm2` itself.
 - Placement is always direct, because the prototype builds no placeholders (ticket 03).
-- Each decision writes one probe log line, for example `event=detect mux=herdr reply=yes placement=direct`.
+- Each decision writes one probe log line, for example `event=detect mux=herdr reply=kitty protocol=kitty passthrough=false probe_ms=12.000`.
 
 ### Passthrough wrapper format
 

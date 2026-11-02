@@ -27,12 +27,12 @@ For each column of the protocol matrix in the spec:
 2. Go through the situations R1 to R12.
    Take one screenshot of each situation.
    For R5, R7, R8, R9, and R11, take a screenshot before and after the change.
-3. Repeat the situations with the PNG path set to `f=100`.
-4. Open the fixture Review in Variant B, and go through R1, R4, R7, R8, and R9.
-5. Run `summarize` on the probe log, and copy its output into `## Completion`.
-6. Fill the matrix column with the observed results.
+   The prototype has one PNG path: it sends the PNG bytes to kitty with `f=100`.
+3. Open the fixture Review in Variant B, and go through R1, R4, R7, R8, and R9.
+4. Run `summarize` on the probe log, and copy its output into `## Completion`.
+5. Fill the matrix column with the observed results.
    Mark each cell that differs from ticket 02.
-7. Write down how readable each image is at the start size of 12 rows.
+6. Write down how readable each image is at the start size of 12 rows.
    If a different maximum makes the images clearly better, record that value and run R1 to R4 again with it.
 
 For herdr, also do these steps:
@@ -126,18 +126,14 @@ Run every command from `/Volumes/Work/t3-code/m32-image-prototype`.
 Replace `<column>` with the slug of the column.
 The slugs are `ghostty`, `kitty`, `wezterm`, `iterm2`, `tmux-ghostty`, `tmux-iterm2`, `herdr-ghostty`, `herdr-kitty`, and `apple-terminal`.
 
-For each column, run these three passes:
+For each column, run these two passes:
 
 ```sh
-# Pass 1: Variant A, PNG decode in bbr.
-BBR_M32_VARIANT=inline BBR_M32_PNG_PATH=zigimg \
-  BBR_M32_PROBE_LOG="$TMPDIR/m32-<column>-a-zigimg.log" tools/m32/fixture_review.sh
+# Pass 1: Variant A.
+BBR_M32_VARIANT=inline \
+  BBR_M32_PROBE_LOG="$TMPDIR/m32-<column>-a.log" tools/m32/fixture_review.sh
 
-# Pass 2: Variant A, PNG bytes to the terminal.
-BBR_M32_VARIANT=inline BBR_M32_PNG_PATH=f100 \
-  BBR_M32_PROBE_LOG="$TMPDIR/m32-<column>-a-f100.log" tools/m32/fixture_review.sh
-
-# Pass 3: Variant B, situations R1, R4, R7, R8, and R9 only.
+# Pass 2: Variant B, situations R1, R4, R7, R8, and R9 only.
 BBR_M32_VARIANT=preview \
   BBR_M32_PROBE_LOG="$TMPDIR/m32-<column>-b.log" tools/m32/fixture_review.sh
 ```
@@ -145,8 +141,12 @@ BBR_M32_VARIANT=preview \
 After each pass, run `summarize` on its log:
 
 ```sh
-python3 tools/m32/summarize.py --terminal <column> "$TMPDIR/m32-<column>-a-zigimg.log"
+python3 tools/m32/summarize.py --terminal <column> "$TMPDIR/m32-<column>-a.log"
 ```
+
+The prototype decodes no pixels, so the `BBR_M32_PNG_PATH` switch is gone.
+The "Limits and expected states" section of the run guide lists the state of each image.
+On kitty, I3 (JPEG) shows `unsupported`, and I7 (10-frame GIF) shows `too large`.
 
 Add these switches for each column:
 
@@ -154,8 +154,8 @@ Add these switches for each column:
 | --- | --- | --- |
 | Ghostty | A new Ghostty window. | None. |
 | kitty | A new kitty window. | None. |
-| WezTerm | A new WezTerm window. | None. Also run pass 3 with `BBR_M32_PROTOCOL=iterm2` to test OSC 1337. |
-| iTerm2 | A new iTerm2 window. | None for the kitty path. Also run pass 3 with `BBR_M32_PROTOCOL=iterm2` to test OSC 1337. |
+| WezTerm | A new WezTerm window. | None. Also run pass 2 with `BBR_M32_PROTOCOL=iterm2` to test OSC 1337. |
+| iTerm2 | A new iTerm2 window. | None for the kitty path. Also run pass 2 with `BBR_M32_PROTOCOL=iterm2` to test OSC 1337. On iTerm2, I3 shows in the preview, and I7 shows `too large`. |
 | tmux in Ghostty | See "tmux" below. | `BBR_M32_TMUX_IMAGES=1` |
 | tmux in iTerm2 | See "tmux" below. | `BBR_M32_TMUX_IMAGES=1` |
 | herdr in Ghostty | See "herdr" below. | None. |
@@ -189,7 +189,7 @@ Stop the server after the column with `tmux -L m32 kill-server`.
 1. Start herdr in Ghostty, then in the second kitty-protocol terminal.
 2. In a herdr pane, run `echo "$HERDR_ENV $TERM_PROGRAM"`, and record the output.
 3. Record whether `terminal.kitty_graphics` is on in your herdr configuration. It is on by default.
-4. Run the three passes.
+4. Run the two passes.
 5. Open a herdr popup over an image, then close it (R9).
 6. Scroll and resize, and look for stale image copies (R7, R8).
 7. Nested cases: run pass 1 in tmux inside a herdr pane, and in herdr inside a tmux session. Record what shows.
@@ -202,7 +202,8 @@ Stop the server after the column with `tmux -L m32 kill-server`.
 - How readable each image is at 12 rows. If another value is clearly better, rerun R1 to R4 with `BBR_M32_MAX_ROWS=<value>`, and record the value.
 - Any stale image copy, an image over a border, a rail, the Anchor Indicator, or the status, and any flicker.
 - The startup delay. bbr waits up to 1 second for the kitty query reply.
-- Whether an image returns after an External Edit (`Ctrl-e` in the Composer).
+- Whether an image returns after an External Edit (`Ctrl-e` in the Composer). The probe log has one `event=free` line with `reason=external_edit` for each sent image.
+- The `event=proxy` line. It must say `result=direct`. With `result=invalid`, every remote image shows `failed`.
 
 #### Screenshots
 
@@ -245,6 +246,11 @@ PY
 2. Run pass 1 with `BBR_M32_ALLOW_EXTERNAL=1`. I13 must show the image, and the server must print `authorization=no`.
 
 If I13 shows `failed` with the key on, the Zig TLS check probably does not trust the `mkcert` root. Record it.
+If the server does not reply in 20 seconds (`max_fetch_ms`), I13 shows `failed`, and the probe log has `status=timeout`.
+
+Only the fixture Review lets I13 reach `localhost:8443`.
+On a real PullRequest, `BBR_M32_ALLOW_EXTERNAL=1` loads only a public host name on port 443.
+bbr blocks an IP literal, `localhost`, a name without a dot, and every other port.
 
 #### Bitbucket check with I15
 
@@ -255,6 +261,8 @@ Only the human runs this check, because it uses the Credential.
 3. Start it on the PullRequest as you start bbr every day, with your normal Profile.
    Add `BBR_M32_PROBE_LOG="$TMPDIR/m32-i15.log"` before the command.
 4. Run `summarize` on the log. Each network image prints one line for each hop.
+   bbr sends the Credential only to `https://bitbucket.org/repo/<segment>/images/<segment>`.
+   Every other Bitbucket URL, `api.bitbucket.org` included, shows `blocked` and sends no request.
    A hop line names the host, the host class, the status, and `credential_sent`.
    A host outside the known list shows as `other`.
 5. Confirm that `credential_sent=true` appears only on `bitbucket_org` hops.
@@ -277,3 +285,9 @@ On 2026-11-02, the M32 prototype alignment run removed both proxy steps (M32I-10
 The I15 check now uses only the probe log, which records each host and `credential_sent`.
 The C4 request in [bitbucket-comment-images.md](../research/bitbucket-comment-images.md) now reads the Credential from a `--netrc-file`.
 So the token is not in the argv of `curl`.
+
+On 2026-11-02, the same run aligned the notes and the run guide with the hardened prototype at `da08e54`.
+The Variant A pass is one pass now, because the `BBR_M32_PNG_PATH` switch is gone.
+The run guide lists the `m32.Limits` values and the expected state of each image.
+It also names the Credential path rule, the external host rule, the `event=proxy` line, and `reason=external_edit`.
+I14 shows `failed` on the card, and its acquisition line has `status=relative` (M32I-11).

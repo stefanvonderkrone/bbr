@@ -78,7 +78,8 @@ On the M32 branch:
 ## Completion
 
 The prototype lives on the branch `m32-image-prototype`.
-Its last commit is `5d50146` (m32: log each image request hop and honor proxies).
+Its last commit is `da08e54` (m32: write the cell size under the Runtime lock).
+The build of this ticket ended at `5d50146`. The review fix commits after it are listed under "Hardening after the review".
 The branch never merges. Do not push it until the human wants to share it.
 
 ### Commits on `m32-image-prototype`
@@ -91,10 +92,37 @@ The branch never merges. Do not push it until the human wants to share it.
 - `e174b2a` m32: scan images per frame and document the run
 - `5d50146` m32: log each image request hop and honor proxies
 
+### Hardening after the review
+
+The M32 review found decoder crashes and Credential risks in `5d50146`.
+These commits fix them. Ticket 04 runs the prototype at `da08e54`.
+
+- `4f11f32` m32: send PNG bytes to kitty and drop zigimg PNG decode
+- `a6c0dee` m32: reject JPEG and GIF on kitty instead of decoding
+- `f9b80a6` m32: limit images to one frame before transmit
+- `35afdb9` m32: cap image entries and retained bytes per Session
+- `c69aea2` http: refuse an https request on a plain proxy fallback
+- `6cf853e` http: follow redirects without leaking Authorization
+- `ba24a6e` bitbucket: follow next links only on the API origin
+- `0d032b7` m32: send the Credential only to bitbucket.org image paths
+- `4ff1d3a` m32: test userinfo, port, and encoded host rejection
+- `3081887` m32: prove the Epoch check drops stale image results
+- `a4dec6d` m32: allow only public names on port 443 as external images
+- `1fdd4e1` m32: log the image proxy setup and send nothing on a bad one
+- `5caf6c5` m32: fail a remote image after max_fetch_ms
+- `1ef02bf` m32: delete tmux placements by id from a random id base
+- `8343b29` m32: free sent image ids when External Edit returns
+- `da08e54` m32: write the cell size under the Runtime lock
+
 ### What the prototype does
 
-- `src/tui/m32_image.zig` holds the terminal-free core. It sniffs the type, reads the header dimensions, applies the limits, follows each redirect itself, and writes the probe log.
-- The Credential host rule uses exactly `bitbucket.org` and `api.bitbucket.org`.
+- `src/tui/m32_image.zig` holds the terminal-free core. It sniffs the type, reads the header dimensions, checks the file structure, applies the limits, follows each redirect itself, and writes the probe log.
+- bbr decodes no pixels. `admit` checks the header and the file structure with no allocation. The terminal gets the original file bytes.
+- kitty gets only PNG, with `f=100`. A JPEG or a GIF on kitty shows `unsupported`. iTerm2 gets PNG, JPEG, and GIF bytes unchanged.
+- The limits are the defaults of `m32.Limits`: `max_body_bytes` 10 MiB, `max_side_px` 8192, `max_total_px` 33,177,600, `max_frames` 1, `max_entries` 64, `max_retained_bytes` 128 MiB, and `max_fetch_ms` 20,000. A multi-frame GIF or an APNG shows `too large`.
+- The Credential goes only to `https://bitbucket.org/repo/<segment>/images/<segment>`. Every other Bitbucket URL, `api.bitbucket.org` included, is blocked.
+- `BBR_M32_ALLOW_EXTERNAL=1` loads only a public host name on port 443. Only the fixture Review lets I13 reach `localhost:8443`.
+- The switches are `BBR_M32_VARIANT`, `BBR_M32_PROTOCOL`, `BBR_M32_TMUX_IMAGES`, `BBR_M32_MAX_ROWS`, `BBR_M32_ALLOW_EXTERNAL`, `BBR_M32_I13_URL`, and `BBR_M32_PROBE_LOG`. The `BBR_M32_PNG_PATH` switch is gone.
 - The storage host `bbuseruploads.s3.amazonaws.com` loads only directly after a `bitbucket.org` hop. It never gets the Credential. This follows the change to spec choice 5 in ticket 01.
 - A redirect to `id.atlassian.com` or `auth.atlassian.com` ends as `failed`.
 - `src/tui/m32_term.zig` holds the detection, the kitty transmit and placement, the tmux passthrough wrapper, and the OSC 1337 adapter.
@@ -122,6 +150,7 @@ These side effects remain:
 ### Cost of the iTerm2 path and of tmux passthrough
 
 - tmux passthrough is small. bbr wraps each kitty chunk in the tmux passthrough and adds `q=2`. Placement is direct, with a saved and restored cursor inside the wrapper.
+- Through the passthrough, bbr deletes only its own placements by id (`d=i`), never `d=a`. Each process starts its ids at a random base.
 - tmux placement is correct only for a pane at the top-left of the window. A correct placement needs the pane offset or Unicode placeholders.
 - Unicode placeholders are not built. The estimate is medium: a table of 297 diacritics and placeholder cells in `render.zig`.
 - So the run cannot test the kitty placement path that the research selects for tmux.
@@ -135,7 +164,8 @@ These side effects remain:
 
 ### First measurement
 
-These numbers come from a Debug run of the core on the generated files, not from a terminal.
+These numbers come from a Debug run of the core at `5d50146` on the generated files, not from a terminal.
+The zigimg decode path is gone since `4f11f32` and `a6c0dee`, so the decode times and the 32 MB payload no longer apply.
 
 - I1 to I12 give the expected result. I9 gives `failed`, I10 and I12 give `too large`, and I11 gives `unsupported`.
 - Decode takes about 170 ms for I2, 0.9 s for I3, and 1.45 s for I7. zigimg decodes all 10 GIF frames, so I7 is slow.
@@ -147,12 +177,13 @@ The Zig 0.16 flate decoder panics with an integer overflow in `Decompress.peekBi
 The input is a PNG with complete chunks and valid CRCs, but a short deflate stream.
 zigimg calls this decoder, so the `zigimg` path can crash bbr. The panic occurs in Debug and in `ReleaseSafe`.
 The `f100` path does not decode in bbr, so it does not crash.
+Since `4f11f32`, bbr sends every PNG with `f=100` and calls no decoder.
 `tools/m32/generate_images.py` writes `extra-I9-valid-chunks.png`, which shows the panic.
 The fixture Review does not use this file, and the generated I9 does not cause the panic.
 
 ### Checks
 
-On `m32-image-prototype` at `5d50146`:
+On `m32-image-prototype` at `5d50146` (the alignment run did not rerun them at `da08e54`):
 
 - `zig fmt --check build.zig src tests` passes.
 - `zig build` passes.
@@ -180,3 +211,8 @@ Then the human copies the first `summarize` output here and sets this ticket to 
 
 On 2026-11-02, the M32 review fix run added the tmux coverage limit to the cost section (M32I-4).
 The earlier ticket 04 text kept one tmux pane, which hides the pane leak that the brief wants the tmux test to find.
+
+On 2026-11-02, the M32 prototype alignment run updated this ticket to the hardened prototype at `da08e54`.
+It named the last commit, listed the review fix commits, and replaced the old limits, states, and switches.
+The `BBR_M32_PNG_PATH` switch and the zigimg decode path are gone.
+The Credential host rule now names only the `bitbucket.org` image path.
