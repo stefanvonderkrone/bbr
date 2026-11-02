@@ -1,4 +1,4 @@
-"""Run with python3 tests/auth_cli_test.py zig-out/bin/bbr. No network access."""
+"""Run with zig build test-cli. No network access."""
 
 import os
 from pathlib import Path
@@ -8,6 +8,8 @@ import sys
 import tempfile
 import termios
 import time
+
+from cli_env import cli_env
 
 
 binary = str(Path(sys.argv[1]).resolve())
@@ -77,11 +79,7 @@ def check_terminal(env, token_lines, expected):
 
 
 with tempfile.TemporaryDirectory(prefix="bbr-auth-test-") as data_home:
-    env = dict(os.environ)
-    for key in list(env):
-        if key.startswith("BITBUCKET_") or key == "BBR_PROFILE":
-            del env[key]
-    env["XDG_DATA_HOME"] = data_home
+    env = cli_env(XDG_DATA_HOME=data_home)
 
     # Global Profile errors must fail before an auth command can report success.
     for command in ("login", "status", "logout"):

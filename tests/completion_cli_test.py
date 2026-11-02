@@ -1,27 +1,18 @@
-"""Run with python3 tests/completion_cli_test.py zig-out/bin/bbr. No network access."""
+"""Run with zig build test-cli. No network access."""
 
-import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 
+from cli_env import cli_env
+
 
 binary = str(Path(sys.argv[1]).resolve())
 
 
-def clean_env(data_home):
-    """Return an environment without Credential or proxy overrides, using the test data directory."""
-    env = dict(os.environ)
-    for key in list(env):
-        if key.startswith("BITBUCKET_") or key == "BBR_PROFILE" or key.lower().endswith("_proxy"):
-            del env[key]
-    env["XDG_DATA_HOME"] = data_home
-    return env
-
-
 with tempfile.TemporaryDirectory(prefix="bbr-completion-test-") as data_home:
-    env = clean_env(data_home)
+    env = cli_env(XDG_DATA_HOME=data_home)
 
     for shell, marker, flags in (
         ("bash", b"complete -F _bbr", (b"--pull-request-id", b"--profile", b"--concurrency")),
