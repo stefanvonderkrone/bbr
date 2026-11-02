@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fail when Zig source uses stdout() or stderr() other than for a streaming writer or a handle.
+"""Fail when Zig source uses stdout() or stderr() other than for a streaming writer or a handle comparison.
 
-An alias such as `const out = stdout();` could make a positional writer out of sight of this check,
-so every use must be `.writerStreaming(` or `.handle`. `zig fmt`, run by `zig build test`, removes
-spaces inside the call chain.
+An alias such as `const out = stdout();`, or a File built from `stdout().handle`, could make a
+positional writer out of sight of this check. So every use must be `.writerStreaming(`, or
+`.handle` as one side of `==` or `!=`. `zig fmt`, run by `zig build test`, removes spaces inside
+the call chain.
 """
 
 from pathlib import Path
@@ -12,18 +13,31 @@ import sys
 
 from source_lines import zig_files
 
-OTHER_USE = re.compile(r"\b(stdout|stderr)\(\)(?!\.writerStreaming\(|\.handle\b)")
+USE = re.compile(r"(?:\bstd\.Io\.File\.)?\b(stdout|stderr)\(\)(\.writerStreaming\(|\.handle\b)?")
+COMPARISON_BEFORE = re.compile(r"[=!]=\s*$")
+COMPARISON_AFTER = re.compile(r"^\s*[=!]=")
+
+
+def allowed(line, match):
+    if match.group(2) == ".writerStreaming(":
+        return True
+    if match.group(2) == ".handle":
+        return bool(COMPARISON_BEFORE.search(line[: match.start()]) or COMPARISON_AFTER.match(line[match.end() :]))
+    return False
 
 
 def violations(root):
     for relative, lines in zig_files(root, ("src",), literals=False):
         for number, line in enumerate(lines, 1):
-            for match in OTHER_USE.finditer(line):
+            for match in USE.finditer(line):
+                if allowed(line, match):
+                    continue
                 stream = match.group(1)
                 yield (
-                    f"{relative}:{number}: use {stream}() only as {stream}().writerStreaming( or {stream}().handle. "
+                    f"{relative}:{number}: use {stream}() only as {stream}().writerStreaming( "
+                    f"or as {stream}().handle in a == or != comparison. "
                     f"File.writer writes at absolute file offsets and overwrites a redirected file, "
-                    f"and an alias of {stream}() hides such a writer from this check."
+                    f"and an alias or a File built from the handle hides such a writer from this check."
                 )
 
 
@@ -34,7 +48,7 @@ def main():
         print(message, file=sys.stderr)
     if found:
         return 1
-    print("Every stdout() and stderr() use is a streaming writer or a handle.")
+    print("Every stdout() and stderr() use is a streaming writer or a handle comparison.")
     return 0
 
 

@@ -39,8 +39,21 @@ class StdioWritersTest(unittest.TestCase):
                 self.assertEqual(len(list(checker.violations(self.root))), 1)
 
     def test_a_handle_comparison_is_allowed(self):
-        self.source.write_text("const same = file.handle == std.Io.File.stdout().handle;\n", encoding="utf-8")
+        self.source.write_text(
+            "const same = file.handle == std.Io.File.stdout().handle;\n"
+            "const other = std.Io.File.stderr().handle != file.handle;\n",
+            encoding="utf-8",
+        )
         self.assertEqual(list(checker.violations(self.root)), [])
+
+    def test_a_file_built_from_the_handle_is_rejected(self):
+        for line in (
+            "const f: std.Io.File = .{ .handle = std.Io.File.stdout().handle, .flags = .{ .nonblocking = false } };",
+            "const h = std.Io.File.stderr().handle;",
+        ):
+            with self.subTest(line=line):
+                self.source.write_text(line + "\n", encoding="utf-8")
+                self.assertEqual(len(list(checker.violations(self.root))), 1)
 
     def test_streaming_writers_and_comments_are_allowed(self):
         self.source.write_text(
