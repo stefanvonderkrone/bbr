@@ -114,6 +114,28 @@ class AgentDocsTest(unittest.TestCase):
         self.write("AGENTS.md", "Text[^note].\n\n[^note]: [Reference](docs/code-navigation.md)\n")
         self.assertEqual(checker.check(self.root), [])
 
+    def test_live_pull_request_ids_in_scratch_fail(self):
+        self.write(".scratch/feature/brief.md",
+                   "| `repo` #99 | merged | 7 |\n"
+                   "See https://bitbucket.org/team/repo/pull-requests/77.\n")
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("brief.md: line 1: names the live PullRequest #99", errors)
+        self.assertIn("brief.md: line 2: names the live PullRequest pull-requests/77", errors)
+        self.assertIn("local file outside the repository", errors)
+
+    def test_pull_request_ids_in_scratch_commands_fail(self):
+        self.write(".scratch/feature/guide.md",
+                   "```sh\nzig build bench-file-cache -- remote pr-webapp 99 --scenarios s1\n```\n")
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("guide.md: line 2: names the live PullRequest remote pr-webapp 99", errors)
+
+    def test_code_and_public_pull_requests_in_scratch_pass(self):
+        self.write(".scratch/feature/brief.md", "Use `#534668`, `pull request #1541`, and `remote pr-webapp <id>` as examples.\n")
+        self.write(".scratch/m23-comment-thread-markdown-presentation-implementation/README.md",
+                   "https://bitbucket.org/team/repo/pull-requests/2425\n")
+        self.write("docs/agents/notes.md", "The upstream PR #98 is outside .scratch.\n")
+        self.assertEqual(checker.check(self.root), [])
+
 
 if __name__ == "__main__":
     unittest.main()

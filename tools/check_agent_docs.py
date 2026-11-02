@@ -14,6 +14,16 @@ TYPES = {"research", "prototype", "grilling", "task", "implementation"}
 FIELD = re.compile(r"^(?:\*\*)?([\w ]+):(?:\*\*)?\s*(.*?)\s*$")
 LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 REFERENCE = re.compile(r"^\s{0,3}\[(?!\^)[^\]\n]+\]:\s*(<[^>]+>|\S+)")
+PULL_REQUEST = re.compile(r"(?<![\w&/#])#(\d+)\b|pull-?requests/(\d+)", re.I)
+# Commands and file names often sit in code, so these forms count in code too.
+PULL_REQUEST_COMMAND = re.compile(r"pr-webapp`?\s+#?(\d+)\b|\bremote\s+[\w.-]+\s+(\d+)\b")
+# Public PullRequest ids that a .scratch file may name, with the reason.
+PUBLIC_PULL_REQUESTS = {
+    (".scratch/m23-comment-thread-markdown-presentation-implementation", "2425"):
+        "the agreed M23 test PullRequest for published evidence",
+    (".scratch/m26-credential-login-logout/issues/13-docs-and-completion-evidence.md", "12"):
+        "a pull request of the public bbr GitHub repository",
+}
 
 
 def prose(text):
@@ -68,7 +78,17 @@ def check(root):
         if not path.is_file():
             error(path, "missing agent document")
             continue
-        for number, line in enumerate(prose(path.read_text()), 1):
+        text = path.read_text()
+        if path.is_relative_to(root / ".scratch"):
+            for number, (line, raw) in enumerate(zip(prose(text), text.splitlines()), 1):
+                matches = [*PULL_REQUEST.finditer(line), *PULL_REQUEST_COMMAND.finditer(raw)]
+                for match in matches:
+                    if not any(path.is_relative_to(root / prefix) and (match[1] or match[2]) == public
+                               for prefix, public in PUBLIC_PULL_REQUESTS):
+                        error(path, f"line {number}: names the live PullRequest {match[0]}. "
+                              "Keep live PullRequest ids and their statistics in a local file "
+                              "outside the repository, such as ~/m28-runs/pullrequests.txt")
+        for number, line in enumerate(prose(text), 1):
             targets = [match[1] for match in LINK.finditer(line)]
             reference = REFERENCE.match(line)
             if reference:
