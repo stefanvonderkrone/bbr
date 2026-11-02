@@ -34,6 +34,13 @@ M32 makes a recorded decision, not a feature.
 A later milestone implements the selected behavior.
 M32 changes no production code on the M32 branch.
 
+### Merge status
+
+The M32 branch has no decision and no ADR yet.
+Tickets 04 and 05 are `ready-for-human`, and ticket 06 waits for ticket 05.
+So the branch merges into main only as a research checkpoint, not as a complete M32.
+The PR body must say that the branch is a research checkpoint, that no decision and no ADR exist, and that tickets 04 to 06 stay open.
+
 ## User Stories
 
 1. As a reviewer, I want to see a pasted screenshot in bbr, so that I do not open a browser.
@@ -581,3 +588,4 @@ The human can change a choice at ticket 05.
   The I14 state in the run guide is left for the helper that edits the run guide.
 - M32I-9: The security rules had no rule for the bytes in an image escape sequence or for shared tmux state.
   The new "Image escape sequences" section allows only bbr-made numbers and base64, and forbids `d=a` delete-all and fixed image ids.
+- M32I-6: The branch has no decision and no ADR. The new "Merge status" section says that the branch merges only as a research checkpoint, and that the PR body must say so.
