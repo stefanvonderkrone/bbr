@@ -43,6 +43,9 @@ For herdr, also do these steps:
 4. Record whether `terminal.kitty_graphics` was on.
 
 For tmux, run it once with `allow-passthrough on` and once with it off.
+Use two panes side by side in the tmux window, with bbr in the right pane.
+The prototype builds no Unicode placeholders, so mark the kitty placement cells of the tmux columns `not tested`: the rows `U=1`, scroll, resize, Overlay, and selected path.
+Record whether the image leaks into the left pane.
 
 For the external-load key:
 
@@ -180,7 +183,10 @@ tmux -L m32 set -g allow-passthrough on
 tmux -L m32 set -g allow-passthrough off
 ```
 
-Keep one pane in the window, because placement is correct only for a pane at the top-left.
+Use two panes side by side in the tmux window, with bbr in the right pane.
+The prototype builds no Unicode placeholders, so mark the kitty placement cells of the tmux columns `not tested`: the rows `U=1`, scroll, resize, Overlay, and selected path.
+Record whether the image leaks into the left pane.
+bbr deletes only its own placements by id, from a random base id, so it never clears the images of the left pane.
 Also run pass 1 without `BBR_M32_TMUX_IMAGES`, and confirm that bbr shows the M23 text.
 Stop the server after the column with `tmux -L m32 kill-server`.
 
@@ -291,3 +297,6 @@ The Variant A pass is one pass now, because the `BBR_M32_PNG_PATH` switch is gon
 The run guide lists the `m32.Limits` values and the expected state of each image.
 It also names the Credential path rule, the external host rule, the `event=proxy` line, and `reason=external_edit`.
 I14 shows `failed` on the card, and its acquisition line has `status=relative` (M32I-11).
+
+On 2026-11-02, the same run replaced "Keep one pane" with the two-pane tmux wording (M32I-4).
+One pane hides the pane leak that the brief wants the tmux test to find.

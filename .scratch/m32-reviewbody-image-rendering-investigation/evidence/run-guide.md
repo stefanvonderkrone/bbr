@@ -181,7 +181,10 @@ On Zig 0.16, a proxy that refuses one CONNECT gets the later requests in clear t
 ## Known gaps
 
 - A File Jump or a scroll does not free a kitty image in the terminal. bbr frees an image only when its rows leave the Buffer, on Session replacement, or when the preview closes.
-- tmux placement is correct only for a pane at the top-left of the window. Use one pane in the tmux window.
+- tmux placement is correct only for a pane at the top-left of the window.
+  Use two panes side by side in the tmux window, with bbr in the right pane.
+  The prototype builds no Unicode placeholders, so mark the kitty placement cells of the tmux columns `not tested`: the rows `U=1`, scroll, resize, Overlay, and selected path.
+  Record whether the image leaks into the left pane.
 - Card rows reserve no image rows until bbr knows the image size. The layout moves once for each image.
 - Quit waits for running image requests, at most `max_fetch_ms` (20 seconds).
 - I13 needs a certificate that the system trusts. A self-signed certificate gives `failed`.
