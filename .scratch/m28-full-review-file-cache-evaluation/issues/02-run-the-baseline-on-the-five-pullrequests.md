@@ -1,372 +1,109 @@
-# 02: Run the baseline on the five PullRequests
+# 02: Run the footprint benchmark on the largest PullRequest
 
-Status: ready-for-human
+Status: resolved
 Blocked by: 01
 Spec: [M28 spec](../SPEC.md)
 
 ## What to build
 
-A human runs the benchmark from ticket 01 on the five PullRequests in `pr-webapp`.
-The human runs it twice, on different days and under different network conditions.
-This ticket needs the user's Credential and live network access, so an agent cannot run it.
+A human runs scenario S1 of the benchmark from ticket 01 once on PullRequest A in `pr-webapp`.
+This run is the footprint run.
+It needs the operator's Credential and live network access.
 
-The runs measure only the current LRU with its default budget of 256 MiB.
-Do not run any candidate policy in this ticket.
+The run measures only the current LRU with its default budget of 256 MiB.
+S1 reads every File once and reports `full_review_bytes`, the memory that a full Review needs.
+Ticket 03 applies the footprint rule of the spec to that number.
 
-No baseline exists yet. The M28 order is fixed:
+## Method change on 2026-11-02
 
-1. A human does the live runs of this ticket.
-2. Ticket 03 decides on the recorded results.
-3. Ticket 04 then writes the ADR with the next free ADR number.
+The operator replaced the full baseline with the footprint run on 2026-11-02.
+The full baseline was two runs of S1 to S8 on five PullRequests, on different days and networks.
+Each run took 15 to 50 hours, and the operator judged that cost too high.
+The section "Method change on 2026-11-02" of the [M28 spec](../SPEC.md) gives the reason.
 
-The pull request of the M28 branch claims only ticket 01.
-It holds no baseline and no ADR.
-
-## Steps
-
-Before run 1:
-
-1. Read `range_files` and `session_requests` in the `header` line of each PullRequest, as "Plan the runs" describes.
-2. Recompute the requests and the time of each PullRequest with the formulas in "Expected duration".
-3. Plan the run days with these numbers, not with the planning values.
-
-For each run:
-
-1. Prepare the checkout, the Credential, and the output directory, as "Prepare" describes.
-2. Pick a run label, such as `run1`, and a network label, such as `office-wired` or `home-vpn`.
-   The second run must use a different network condition from the first run.
-3. Start `tools/m28-baseline-run.sh` in the background, as "Start a run" describes.
-   The script runs the PullRequests of the local PullRequest file one after another.
-4. Watch the progress.
-   If the script stops with exit code `1`, run the same start command again to resume it.
-   If the script stops with exit code `3`, fix the cause first, as "Resume a run" describes.
-5. If a PullRequest result has `failures` above `0`, run that PullRequest again.
-6. Copy the checkpoint files of the run into `## Completion` in this ticket.
-
-After both runs:
-
-1. Run the `summarize` mode on the checkpoint files of both runs.
-2. Copy its outcome into `## Completion`.
-3. If the outcome is `Inconclusive`, do a third run on a third day under a third network condition.
-   Then run `summarize` on all three runs.
-
-## Method changes
-
-- S4 starts with a process restart, so its Review Search is cold.
-  Before, S4 ran after S1 had admitted every File, so it sent no request, and stop rule 3 could not fire.
-  The SPEC records this change as choice 15.
-- The request estimate of a scenario is now an upper bound of its requests.
-  Each File Jump and each Session load can fetch the whole Enrichment Range, not one File.
-  The estimate also counts the requests of each Session load.
-  The header prints `range_files` and `session_requests`, and each scenario line prints `request_estimate`.
-  The SPEC records this change as choice 16.
+The run guide of the full baseline is obsolete, so this ticket no longer holds it.
+The duration tables and the two-run plan are obsolete too.
+The Git history of this file keeps the old guide.
+Use it only if the footprint rule decides nothing and the full baseline runs again.
 
 ## Run guide
 
-Use this guide with the steps above.
-Run every command from the root of the checkout.
+Run every command from the root of a clean checkout.
+The header key `bbr_version` must not end with `.dirty`.
 
-### Prepare
-
-1. Check out the commit that contains the resume changes in a clean checkout.
-   The header key `bbr_version` must not end with `.dirty`.
-2. Run `bbr auth status`. It must exit with `0`.
-   The benchmark uses the default Profile, as `bbr` does without `--profile`.
-   The Workspace comes from the Credential, so the Credential must select the `pr-webapp` Workspace.
-3. Make the output directory: `mkdir -p ~/m28-runs`.
-   Make sure that the local PullRequest file `pullrequests.txt` in the folder that holds the repository checkout exists.
-   It holds one PullRequest id per line, in run order. A `#` starts a comment.
-   `pullrequests-selection.md` in the same folder records why each PullRequest is in the selection.
-   Neither file goes into the repository.
-4. Record the date, the network label, the machine, and the macOS version.
-   Get them with `date +%F`, `sysctl -n hw.model`, and `sw_vers -productVersion`.
-5. Do not use `bbr` or another Bitbucket API client during a run.
-   Other requests use the same hourly Bitbucket limit, and the request window does not see them.
-6. Connect the Mac to power and keep the lid open.
-   `caffeinate -i` blocks only idle sleep. A closed lid still puts the Mac to sleep.
-
-### Optional smoke test
-
-This test shows that the Credential and the network work. Do not record its output.
-Use the run output directory, so the request window counts the smoke test requests.
-The smoke test writes its own checkpoint file, `smoke-<pull-request>-s1.txt`.
-The `summarize` command in this guide does not match that file name.
+1. Run `bbr auth status`. It must exit with `0`.
+   The Credential must select the `pr-webapp` Workspace.
+2. Make an output directory outside the repository, such as `mkdir -p ~/m28-runs`.
+3. Build and install the harness with `zig build install-bench-file-cache`.
+4. Run S1 on PullRequest A. Read its id from the local file `pullrequests.txt`, outside the repository.
 
 ```sh
-zig build bench-file-cache -- remote pr-webapp <pull-request> --scenarios s1 --dwell-ms 0 \
-  --run-label smoke --network-label smoke --output-dir ~/m28-runs
+zig-out/bin/bbr-file-cache-bench remote pr-webapp <pull-request> --scenarios s1 \
+  --run-label footprint --network-label <network> --output-dir ~/m28-runs
 ```
 
-### Plan the runs
-
-Do this once before run 1.
-"Expected duration" uses planning values for W and L that nobody measured.
-The `header` line of each PullRequest prints the real values.
-The harness prints the header after the Session load and the probe, before S1 starts.
-For each PullRequest in the local PullRequest file, run the smoke test command with its id:
-
-```sh
-zig build bench-file-cache -- remote pr-webapp <pull-request> --scenarios s1 --dwell-ms 0 \
-  --run-label smoke --network-label smoke --output-dir ~/m28-runs
-```
-
-When the `header` line appears, press Ctrl-C.
-The header costs about L + 2W + 5 requests, so the five headers cost much less than the hourly budget.
-Read `files`, `range_files`, and `session_requests` from each header.
-Put them into the formulas in "Expected duration" as F, W, and L.
-
-You can also read the header of each PullRequest during run 1.
-But then the plan is late, because run 1 prints the last header near its end.
-
-No way exists to measure W or L without Bitbucket:
-
-- W comes from the Buffer of the loaded Session at the fixed Frame of 200 × 50 cells.
-  The Buffer has rows for the Comments of the PullRequest, and only Bitbucket has the Comments.
-  A local clone gives the Git diff, but Bitbucket can show another diff, for example for renames and binary Files.
-  A harness mode that builds a Session from a local diff is also new code, not a small change.
-- L is the requests of one Session load.
-  `session.loadWith` sends one request each for the PullRequest, the account, and the raw diff.
-  The Comment requests add one request per Comment page.
-  Only Bitbucket knows the Comment count, so L needs Bitbucket.
-
-### Start a run
-
-Start the run detached from the terminal:
-
-```sh
-caffeinate -i nohup tools/m28-baseline-run.sh run1 office-wired ~/m28-runs > ~/m28-runs/run1.log 2>&1 & echo $! > ~/m28-runs/run1.pid
-```
-
-The script takes the run label, the network label, and the output directory.
-It reads the PullRequest ids from `pullrequests.txt` in the folder that holds the repository checkout.
-The variable `M28_PULLREQUESTS_FILE` or the option `--pullrequests <file>` names another file.
-The option comes before the labels and wins over the variable.
-A missing, empty, or malformed file stops the script with exit code `2` before the build.
-First it runs `zig build install-bench-file-cache`.
-This builds the harness and installs it as `zig-out/bin/bbr-file-cache-bench`.
-Then it runs `zig-out/bin/bbr-file-cache-bench remote` for each PullRequest with these values.
-The script runs the binary, not `zig build bench-file-cache`, because `zig build` gives every failure exit code `1` or `2`.
-
-The harness exits with one of these codes:
-
-- `0`: the PullRequest is finished.
-- `1`: a transient failure. A rerun can succeed, for example after a network outage.
-  The script waits 15 minutes and runs the PullRequest again.
-  After 6 failed attempts for one PullRequest, the script stops with exit code `1`.
-- `3`: a permanent failure. A rerun fails in the same way.
-  The script stops at once with exit code `3` and prints `m28: #<pull-request> failed permanently, stop`.
-
-The last log line before that message names the error, for example `error: CheckpointMismatch`.
-These errors are permanent:
-
-- A wrong option or an invalid Credential: `InvalidArguments`, `MissingCredential`, `Unauthorized`, `Forbidden`, `NotFound`, `BadRequest`, `Conflict`.
-- A Bitbucket response that the harness cannot read: `UnexpectedStatus`, `MalformedResponse`.
-- A run file problem: `RunInProgress`, `CheckpointMismatch`, `InvalidCheckpoint`.
-- A changed PullRequest: `FileCountChanged`.
-- A harness defect: `UnsupportedCommand`, `ScenarioStalled`, `ReviewSearchUnavailable`, `ReplacementFailed`.
-
-These errors are transient: `RetriesExhausted`, `Timeout`, `RateLimited`, `ServerError`, `OutOfMemory`, and every error from the operating system, such as a full disk.
-
-Use the same run label for every PullRequest of one run, for example `run1`, `run2`, and `run3`.
-`summarize` groups the lines by the run label.
-A label must not contain a space or `=`.
-
-The script keeps the other options at their defaults.
-The defaults are `--cache-max-bytes 268435456`, `--dwell-ms 1000`, `--seed 28`, `--query return`, `--second-query const`, and `--hourly-request-budget 900`.
-
-### Watch the progress
-
-- Follow the log with `tail -f ~/m28-runs/run1.log`.
-- A `wait reason=` line tells why the harness waits and when it continues.
-  `reason=window` is the per-request gate.
-  `reason=scenario` waits before a scenario.
-  `reason=retry` is a backoff after a failed request.
-- Count the finished scenarios with `grep -c '^scenario=' ~/m28-runs/run1-*-all.txt`.
-  A finished PullRequest has 8.
-- Check that the run is alive with `ps -p "$(cat ~/m28-runs/run1.pid)"`.
-
-### Stop a run
-
-```sh
-kill -- -"$(cat ~/m28-runs/run1.pid)"
-```
-
-The shell gives the background job its own process group.
-This command stops every process of the group: `caffeinate`, the script, and the benchmark.
-
-### Resume a run
-
-After a crash, a kill, a reboot, or exit code `1`, run the same start command again.
-After exit code `3`, fix the cause first, then run the same start command again:
-
-- `CheckpointMismatch`: use the options of the first start.
-- `RunInProgress`: stop the other harness.
-- `MissingCredential`, `Unauthorized`, or `Forbidden`: fix the Credential, as "Prepare" describes.
-- `FileCountChanged`: the PullRequest changed during the run.
-  Record it under `## Comments`, and set this ticket to `needs-info`.
-- A harness defect or another permanent error: record it under `## Comments`, and set this ticket to `needs-info`.
-
-- A finished PullRequest sends no request. The harness prints its stored lines.
-- An unfinished PullRequest starts again at its first unfinished segment.
-  The selected scenarios among S1 to S6 form one segment. S7 and S8 are one segment each.
-- A segment that stops in the middle starts again at its first scenario.
-  So a restart repeats the requests of that segment.
-- The OS releases the lock on the output directory when the process ends.
-- `requests.log` keeps the request window, so the resumed run stays inside the hourly budget.
-
-Use the same run label, network label, and output directory.
-A different network label stops the run with `checkpoint mismatch key=network_label`.
-
-### Run one PullRequest again
-
-A checkpoint with a `check` line is finished, and a rerun sends no request for it.
-To run a PullRequest again, rename its checkpoint file, for example to `run1-<pull-request>-all.txt.invalid`.
-Then run the same start command again.
-Do not delete `requests.log`.
-
-### Split a long run
-
-Resume makes a split rarely necessary.
-If you must split a run, use exactly these two parts on the same day and network, with the same run label:
-
-```sh
-zig build bench-file-cache -- remote pr-webapp <pull-request> --run-label run1 --network-label office-wired \
-  --output-dir ~/m28-runs --scenarios s1,s2,s3
-zig build bench-file-cache -- remote pr-webapp <pull-request> --run-label run1 --network-label office-wired \
-  --output-dir ~/m28-runs --scenarios s4,s5,s6,s7,s8
-```
-
-Each part has its own checkpoint file, such as `run1-<pull-request>-s1-s2-s3.txt`.
-Add these files to the `summarize` command.
-S2 needs S1, and S7 and S8 need S1 or S4, so the harness refuses other splits.
-In the second part, S4 starts in a new process, so its fetches are cold fetches, not refetches.
-Record each split under `## Completion`.
-
-### Expected duration
-
-These numbers are estimates. Nobody measured them.
-
-The formulas use three values of a PullRequest:
-
-- F is the File count, the header key `files`.
-- W is the largest Enrichment Range in Files, the header key `range_files`.
-- L is the requests of one Session load, the header key `session_requests`.
-
-The upper bound applies when no File stays in the LRU.
-It is the sum of the `request_estimate` values of S1 to S8, plus the start and the probe.
-The start sends L + 2W requests, and the probe sends 5 requests.
-So the upper bound is 16F + 778W + 8L + 5 requests.
-
-The lower bound applies when every File stays in the LRU:
-
-- S1 sends 2F requests, and S4 sends L + 2F requests.
-- S7 and S8 each send 3 × (L + 2 × min(F, 21W)) requests.
-- S2, S3, S5, and S6 send no request.
-- The start and the probe add L + 2W + 5 requests.
-
-The request window allows 900 requests in one hour.
-So the time is the requests divided by 900 requests an hour, plus the dwell time.
-The dwell time adds about F + 380 seconds.
-Each scenario whose `request_estimate` fits in the budget can also wait up to one hour before it starts.
-
-Use the planning values W = 5 and L = 4 only until the headers give the real values.
-Nobody measured these values for the five PullRequests.
-"Plan the runs" tells how to read the real values before run 1.
-Compute the requests and the time of each PullRequest with them before you plan the run days.
-The formulas match `Scenario.requestEstimate` in `src/benchmark/file_cache.zig`, with 3 Session replacements of 20 File Jumps each in S7 and S8.
-
-One run of the five PullRequests sends the sum of the requests of each PullRequest.
-It takes the sum of their times, without the waits before scenarios.
-A segment restart repeats its requests.
-A crash late in S1 to S6 repeats up to the S1 to S6 `request_estimate` sum of that PullRequest.
-Divide that sum by 900 requests an hour to get the time that the crash can add.
-
-### Read the output
-
-Each PullRequest prints these lines:
-
-- One `header` line with `bbr_version`, `state`, `files`, `range_files`, `session_requests`, `probe_ms`, and the Frame size `cols` and `rows`.
-- One `scenario=sN` line for each scenario.
-- One `check` line with `not_found_sides` and `hunk_mismatch_files`.
-
-The checkpoint file `~/m28-runs/<run-label>-<pull-request>-all.txt` holds the same lines and one `progress` line.
-The checkpoint files are the results of the run.
-
-Look for these values:
-
-- `failures` must be `0` on every scenario line. If not, run that PullRequest again.
-- `requests` counts attempts. `rate_limited` counts the attempts with a `429` response. Record the count.
-- `range_files` in the header is the largest Enrichment Range in Files at the fixed Frame.
-  `session_requests` in the header is the largest number of requests of one Session load.
-  The request estimate uses both values.
-- `request_estimate` is the upper bound of the requests of the scenario.
-  A `requests` value above `request_estimate` means that the estimate failed.
-  Then the scenario can wait inside a measured span. Record the scenario and both values under `## Comments`.
-- `retries` counts the attempts that the harness retried.
-- `paused_ms` is the time in which the harness waited, and the latencies exclude it.
-- `paced_samples` counts the Visible Actions with a harness wait in their span.
-- `refetches` above `0` in S5 or S6 is a delay.
-- `hits`, `cold_fetches`, and `refetches` classify the Visible Actions.
-  A File Jump to a File whose fetch is still in flight is a fetch, not a hit.
-- `enrichments` counts every File Enrichment of the scenario, also the speculative ones outside a span.
-  `enrichment_refetches` counts those for an admitted File, and `speculative_enrichments` counts the speculative ones.
-  A File that the prefetch refetched before the File Jump counts as a hit, so `cache_hit_rate` can be high while `enrichment_refetches` is high too.
-- `added_delay_p95_ms` above `300` on any scenario line other than S4 is a delay.
-- S4 starts with a restart, so its Review Search acquires every File again.
-  Its `added_delay_p95_ms` is its full latency, and the stop rule ignores it.
-  `summarize` compares the S4 `complete_result_ms` with the S6 `complete_result_ms` instead.
-- `low_samples=true` means fewer than 20 refetch samples. The p95 is then the maximum.
-- For a merged PullRequest, `not_found_sides` and `hunk_mismatch_files` must be `0`. If not, record the PullRequest. Ticket 03 decides how to use it.
-- A line `error=unsupported_command` or an error such as `ScenarioStalled` stops the run with exit code `3`.
-  Record the error under `## Comments`, and set this ticket to `needs-info`.
-
-The log also holds these notes:
-
-- `resume skip=` names the finished scenarios that a resumed run skips.
-- `segment done=` names a finished segment.
-- `give_up attempts=8` means that one request failed 8 times.
-  The harness keeps the checkpoint and exits with code `1`, and the script runs the PullRequest again.
-- `m28: #<pull-request> failed attempt <n> of 6 with exit code 1, retry in 900 s` is a transient failure.
-- `m28: #<pull-request> failed permanently, stop` follows an exit code `3`.
-  The line before it names the error. "Resume a run" tells what to do.
-- `checkpoint mismatch key=<key>` means that an option differs from the checkpoint.
-  The harness exits with code `3`. Use the options of the first start.
-- `another harness uses this output directory` means that a second harness runs.
-  The harness exits with code `3`. Stop one of them.
-
-### Summarize
-
-After both runs, give the checkpoint files of both runs to `summarize`. Use absolute paths.
-
-```sh
-zig build bench-file-cache -- summarize ~/m28-runs/run1-*-all.txt ~/m28-runs/run2-*-all.txt
-```
-
-It prints one line for each run and then `outcome=No delay`, `outcome=Delay`, or `outcome=Inconclusive`.
-The `scenarios=` key names each scenario that shows a delay.
-`restart_review_search` names the restart Review Search delay.
-A line such as `run_label=run1 incomplete pull_request=<pull-request> missing=s7` names the first gap of an incomplete run.
-The gap is `missing=check`, `missing=<scenario>`, or `reason=failures scenario=<scenario>`.
-An incomplete run gives `outcome=Inconclusive scenarios=none`, so run that PullRequest again before a third run.
-For `Inconclusive` without an `incomplete` line, do a third run with the run label `run3`, then give all three runs to `summarize`.
-
-### Record
-
-Paste every checkpoint file and the `summarize` output under `## Completion`.
-The output holds no source text, File path, query text, Comment text, or URL.
-Check this before you paste it.
+The run keeps the defaults `--cache-max-bytes 268435456` and `--dwell-ms 1000`.
+It prints one `header` line, one `scenario=s1` line, and one `check` line.
+A `failures` value above `0` makes the result invalid. Run it again.
+Record the `header` line without the PullRequest id and the File count under `## Completion`.
+Also record the `scenario=s1` line and the `check` line.
+Do not copy the checkpoint file into the repository, because its name holds the PullRequest id.
 
 ## Acceptance criteria
 
-- [ ] Two runs on different days and network conditions cover all five PullRequests and all scenarios S1 to S8.
-- [ ] Each run records its date, network label, bbr commit, machine, and macOS version.
-- [ ] Each PullRequest header shows the state, the File count, and `probe_ms`.
-- [ ] For every merged PullRequest, the `not_found` side count and the Hunk mismatch File count are zero.
-      If not, the result names the PullRequest, and ticket 03 decides how to use it.
-- [ ] No PullRequest result has `failures` above `0`.
-- [ ] The `summarize` outcome for the runs is recorded.
-- [ ] A third run exists when the first two runs are `Inconclusive`.
-- [ ] The recorded output holds no source text, File path, query text, Comment text, or URL.
+- [x] One run of S1 on PullRequest A with the default budget exists.
+- [x] The run records its date, network label, and bbr commit.
+- [x] The header shows the state, the File count, and `probe_ms`.
+- [x] For the merged PullRequest A, the `not_found` side count and the Hunk mismatch File count are zero.
+- [x] The result has `failures=0`.
+- [x] The recorded output holds no PullRequest id, File count, source text, File path, query text, Comment text, or URL.
+
+## Completion
+
+The operator's agent ran the footprint run on 2026-11-02, from 17:45 to 18:00 CET.
+
+- Network label: `home-office-vpn-wired`.
+- bbr version: `2026.11.2-0+ge5d60b6f8b3d`.
+- Command: `bbr-file-cache-bench remote pr-webapp <PullRequest A> --scenarios s1 --run-label footprint --network-label home-office-vpn-wired`, with an output directory outside the repository.
+- Options: the default budget of 256 MiB and the default dwell time of 1,000 ms.
+
+Header, without the PullRequest id and the File count:
+
+```text
+state=MERGED range_files=26 session_requests=4 probe_ms=590.9 cols=200 rows=50
+```
+
+Result:
+
+```text
+scenario=s1 samples=592 hits=587 cold_fetches=5 refetches=0 latency_median_ms=350.7 latency_p95_ms=1469.3 added_delay_p95_ms=0.0 requests=663 request_estimate=1238 src_requests=663 failures=0 rate_limited=0 request_median_ms=312.3 request_p95_ms=473.2 retries=6 paused_ms=3532.9 paced_samples=4 enrichments=589 enrichment_refetches=0 speculative_enrichments=589 peak_retained_bytes=35373616 retained_bytes=35373616 full_review_bytes=35373616 peak_rss_bytes=855785472 cache_hit_rate=1.000 low_samples=true
+```
+
+Check:
+
+```text
+not_found_sides=0 hunk_mismatch_files=0
+```
+
+The 6 retries were `HttpConnectionClosing` errors.
+Each one succeeded on its first retry.
+The raw run files stay in a local folder outside the repository, because their names hold the PullRequest id.
+The File count of PullRequest A stays in those files too.
+
+Derived facts:
+
+- The full Review needs 35,373,616 bytes, which is 33.7 MiB and 13% of the 256 MiB budget.
+- `peak_retained_bytes` equals `full_review_bytes`, so the LRU evicted no File during S1.
+- A cold full fetch of PullRequest A costs 663 requests.
+  That number is below the Bitbucket limit of 1,000 requests for each user in a rolling hour.
+- `range_files` is 26, not the planning value 5.
+- `low_samples=true` because S1 had no refetch sample. With no eviction, no refetch was possible.
+- `peak_rss_bytes` is 855,785,472 bytes, which is 816 MiB.
+  The File cache explains at most 33.7 MiB of it.
+  [Ticket 05](05-explain-the-peak-rss-of-the-footprint-run.md) asks for a measurement.
+
+Changed paths: this ticket and [the M28 spec](../SPEC.md).
+No code changed.
 
 ## Comments
 

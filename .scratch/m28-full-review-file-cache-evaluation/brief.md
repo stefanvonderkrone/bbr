@@ -51,6 +51,9 @@ The user made these decisions on 2026-10-30.
    `tools/m28-baseline-run.sh` reads the ids from `pullrequests.txt` in the folder that holds the repository checkout.
    `pullrequests-selection.md` in the same folder keeps the selection table with its statistics.
 
+On 2026-11-02, the operator replaced the two runs with one footprint run on PullRequest A.
+Choice 17 of the [M28 spec](SPEC.md) records the reason.
+
 ## Benchmark PullRequests
 
 The letters A to E follow the run order in the local PullRequest file.

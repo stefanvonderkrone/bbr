@@ -25,10 +25,34 @@ So nobody knows if the reviewer waits for them.
 M28 makes a measured decision, not a new cache.
 
 1. Ticket 01 adds an opt-in benchmark that drives the real Presentation against live Bitbucket.
-2. A human runs the benchmark twice on five PullRequests, on different days and networks.
-3. A human applies the stop rule to the results.
-4. If no workflow shows a delay, an ADR records "no change", and M28 ends.
-5. If a workflow shows a delay, M28 compares the candidate policies and picks the smallest one that removes the delay.
+2. A human runs scenario S1 once on the largest PullRequest. This run is the footprint run.
+3. A human applies the footprint rule from the "Stop rule" section to the result.
+4. If the full Review is well below the budget, an ADR records "no change", and M28 ends.
+5. If not, a human runs the full baseline, and the delay rule decides.
+   If a workflow shows a delay, M28 compares the candidate policies and picks the smallest one that removes the delay.
+
+## Method change on 2026-11-02
+
+The operator replaced the full baseline with the footprint run on 2026-11-02.
+The full baseline was two runs of S1 to S8 on five PullRequests.
+Each run took 15 to 50 hours.
+The operator judged that the full baseline was not worth its cost.
+
+The footprint run is scenario S1 on PullRequest A, the PullRequest with the most Files and the most changed lines.
+S1 reads every File once and reports `full_review_bytes`.
+That number is the memory that a full Review needs.
+If it is far below the budget, the LRU never evicts a File.
+Then S2, S3, S5, and S6 cannot refetch a File, so they cannot show a delay.
+
+The footprint run does not measure S4, S7, and S8.
+Session replacement and a process restart discard all File content at every budget.
+Only a carry-over memory cache or a disk cache removes those refetches.
+[M17 ticket 09](../m17-diff-blob-highlighting-completeness/issues/09-decide-persistent-file-cache.md) rejected a disk cache without workflow evidence of a delay.
+So the M28 ADR keeps a reported cold-start delay as a reopen condition.
+
+The sections "Runs and network conditions" and "Stop rule" give the current method.
+Each section keeps the old text under a heading that ends with "(history)".
+The harness, `summarize`, and `tools/m28-baseline-run.sh` stay in the tree as tools for a reopened decision.
 
 The benchmark output holds only metadata and numbers.
 It never holds source content, File paths, query text, Comment text, or Credential values.
@@ -91,6 +115,7 @@ They are measurement words, not domain terms, so no glossary gets them.
 The benchmark uses the five PullRequests in `pr-webapp` from the brief.
 Their ids are in the local file `pullrequests.txt` in the folder that holds the repository checkout, outside the repository.
 `tools/m28-baseline-run.sh` reads that file. The letters A to E follow its order.
+Since 2026-11-02, the footprint run uses only PullRequest A.
 
 | PullRequest | Reason |
 | --- | --- |
@@ -399,14 +424,33 @@ They never hold the Credential token.
 
 ### Runs and network conditions
 
-The baseline is two runs of all five PullRequests with the current default budget.
-The two runs are on different days.
-They also use different network conditions, for example a wired office network and a home network over VPN.
-Each run records its network label and its `probe_ms`.
-A PullRequest result with `failures` above 0 is invalid, and the human runs that PullRequest again.
-[Ticket 02](issues/02-run-the-baseline-on-the-five-pullrequests.md) has the run guide.
+The footprint run is one run of scenario S1 on PullRequest A with the default budget of 256 MiB.
+The run records its network label and its `probe_ms`.
+A result with `failures` above 0 is invalid, and the human runs it again.
+[Ticket 02](issues/02-run-the-baseline-on-the-five-pullrequests.md) has the run guide and the result.
+
+#### Full baseline (history)
+
+Until 2026-11-02, the baseline was two runs of all five PullRequests with the current default budget.
+The two runs were on different days.
+They also used different network conditions, for example a wired office network and a home network over VPN.
+The operator replaced the full baseline with the footprint run.
+The section "Method change on 2026-11-02" gives the reason.
 
 ## Stop rule
+
+Since 2026-11-02, the footprint rule decides M28.
+The LRU stays when `full_review_bytes` of the largest PullRequest is well below the budget.
+The LRU then never evicts a File, so no File Jump and no Review Search refetches after an eviction.
+The outcome is "No delay", ticket 03 records it, and ticket 04 records "no change" in an ADR.
+
+If `full_review_bytes` nears or exceeds the budget, the footprint rule decides nothing.
+The human then runs the full baseline, and the delay rule below decides.
+
+### Delay rule of the full baseline (history)
+
+Until 2026-11-02, this rule was the stop rule.
+It applies again only when the footprint rule decides nothing.
 
 A run shows a delay when one of these conditions is true for one PullRequest:
 
@@ -507,7 +551,7 @@ A ticket for work that never happens would block the spec.
 So the tickets for the comparison and the policy do not exist yet.
 
 When ticket 03 records the outcome "Delay", ticket 03 writes these tickets.
-It numbers them from 05 and adds them to the `Blocked by:` line of ticket 04.
+It numbers them from the next free number and adds them to the `Blocked by:` line of ticket 04.
 
 - Compare the remaining candidates on the five PullRequests (`ready-for-agent` for the harness options, `ready-for-human` for the runs).
 - Decide the policy from the comparison (`ready-for-human`).
@@ -733,3 +777,8 @@ The human can change a choice at ticket 03.
     The estimate counts the production Enrichment Range for each File Jump and Session load, and the observed Session-load requests.
     An estimate of one File for each File Jump was too low after the Enrichment Range arrived.
     The budget stays 900 requests an hour.
+17. The footprint run replaces the full baseline.
+    The operator made this choice on 2026-11-02.
+    The full baseline cost 15 to 50 hours for each run.
+    S1 on the largest PullRequest gives `full_review_bytes`, the memory need of a full Review.
+    A full Review well below the budget means that the LRU never evicts, so no refetch scenario can show a delay.
