@@ -1,6 +1,6 @@
 # 04: Record the M28 decision in an ADR
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 03
 Spec: [M28 spec](../SPEC.md)
 
@@ -17,10 +17,13 @@ This ticket then waits for them.
 - Add `docs/adr/<next free number>-<slug>.md` with the decision.
   Use the next free ADR number when this ticket runs. M27 keeps ADR-0014.
   Name the decision: no change, a revised LRU, a full-Review memory cache, or an opt-in disk cache.
-- State the evidence in the ADR: the five PullRequests, the run dates and network labels, and the numbers that decide.
+- State this evidence in the ADR:
+  the PullRequest, the run date and network label, and the numbers that decide.
+  Since 2026-11-02, the evidence is the footprint run on PullRequest A, not runs on five PullRequests.
   Link tickets 02 and 03.
   Include no source text, File path, query text, or Comment text.
 - State in the ADR why the 300 ms threshold meets the reopen condition of M17 ticket 09.
+  With the footprint rule, state how the M28 evidence relates to that reopen condition.
 - If the decision is "no change", state the conditions that reopen the decision.
 - If the decision changes the policy, mark ADR-0010 as replaced in part by the new ADR.
   Otherwise, leave ADR-0010 unchanged.
@@ -31,13 +34,13 @@ This ticket then waits for them.
 
 ## Acceptance criteria
 
-- [ ] The ADR names one decision from the four valid decisions.
-- [ ] The ADR states the evidence and links tickets 02 and 03.
-- [ ] The ADR holds no source text, File path, query text, or Comment text.
-- [ ] The ADR states the reopen conditions, or the replaced part of ADR-0010.
-- [ ] `TODO.md` matches the decision.
-- [ ] `README.md` and the glossaries match the decision.
-- [ ] `python3 tools/check_agent_docs.py` passes.
+- [x] The ADR names one decision from the four valid decisions.
+- [x] The ADR states the evidence and links tickets 02 and 03.
+- [x] The ADR holds no source text, File path, query text, or Comment text.
+- [x] The ADR states the reopen conditions, or the replaced part of ADR-0010.
+- [x] `TODO.md` matches the decision.
+- [x] `README.md` and the glossaries match the decision.
+- [x] `python3 tools/check_agent_docs.py` passes.
 
 ## Required checks
 
@@ -54,3 +57,21 @@ The merge plan for all branches records this choice.
 The order is fixed. A human does the live runs of ticket 02. Ticket 03 then decides on the recorded results.
 Only then does this ticket write the ADR, with the next free ADR number at that time.
 The pull request of the M28 branch claims only ticket 01.
+
+## Completion
+
+[ADR-0016](../../../docs/adr/0016-file-cache-stays-a-session-only-lru.md) records the decision "no change".
+The number is 0016, because M27 holds ADR-0014 and M32 holds ADR-0015 on unmerged branches.
+On 2026-11-02, `docs/adr/` on this branch, on `origin/m27-zig-builtin-grammar`, and on `origin/m32-reviewbody-image-rendering-investigation` had no ADR-0016.
+
+- The ADR states the decision and the evidence of the footprint run.
+  It also states the reason for the method change and the reopen conditions.
+- The ADR names PullRequest A only by its letter. It holds no PullRequest id and no File count.
+- `tools/check_agent_docs.py` now scans `docs/adr/` for live PullRequest ids, like `.scratch/`.
+- ADR-0010 stays unchanged, because the cache policy does not change.
+- `README.md` and the glossaries stay unchanged for the same reason.
+- `TODO.md` checks the M28 lines that the evidence proves and marks the two comparison lines as not needed.
+- `docs/code-navigation.md` names the benchmark as a tool for a reopened decision.
+
+Checks: `python3 tools/check_agent_docs.py` passes. `zig build test --summary all` and `zig fmt --check build.zig src tests` pass.
+Changed paths: `docs/adr/0016-file-cache-stays-a-session-only-lru.md`, `TODO.md`, `docs/code-navigation.md`, the M28 spec, and this ticket.

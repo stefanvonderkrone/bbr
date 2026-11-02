@@ -1,6 +1,6 @@
 # M28 Full-Review File cache evaluation
 
-Status: ready-for-agent
+Status: resolved
 Milestone: M28
 
 The [M28 brief](brief.md) records the approved decisions.
@@ -782,3 +782,20 @@ The human can change a choice at ticket 03.
     The full baseline cost 15 to 50 hours for each run.
     S1 on the largest PullRequest gives `full_review_bytes`, the memory need of a full Review.
     A full Review well below the budget means that the LRU never evicts, so no refetch scenario can show a delay.
+
+## Completion
+
+Every ticket of this spec that counts toward completion is resolved on 2026-11-02.
+
+- [Ticket 01](issues/01-add-the-file-cache-benchmark.md) added the benchmark.
+- [Ticket 02](issues/02-run-the-baseline-on-the-five-pullrequests.md) holds the footprint run on PullRequest A.
+- [Ticket 03](issues/03-decide-whether-the-current-lru-delays-the-reviewer.md) records the outcome `No delay` and the decision "no change".
+- [Ticket 04](issues/04-record-the-m28-decision-in-an-adr.md) wrote [ADR-0016](../../docs/adr/0016-file-cache-stays-a-session-only-lru.md).
+- [Ticket 05](issues/05-explain-the-peak-rss-of-the-footprint-run.md) is a research ticket about the peak RSS. It does not block this spec.
+
+The footprint rule decides.
+A full Review of PullRequest A needs 35,373,616 bytes, which is 13% of the 256 MiB budget.
+The LRU evicted no File, and the run had no refetch.
+The candidate comparison and the conditional tickets are not needed.
+
+Checks: `python3 tools/check_agent_docs.py`, `zig build test --summary all`, and `zig fmt --check build.zig src tests` pass.

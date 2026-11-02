@@ -343,18 +343,20 @@ replacement. It does not implement one before the evidence supports a design.
 - [ ] Test hostile fixtures for filesystem and network access, infinite work, excessive memory, crashes, malformed Spans, and protocol corruption. Do not call an unconfined helper process a sandbox.
 - [ ] Record the decision in an ADR. Specify the bundle and trust migration, target support, fallback behavior, and removal policy for native UserGrammars. If neither option gives useful confinement at acceptable cost, retain M17's explicit native-code warning.
 
-## M28 - Full-Review File cache evaluation  ·  M/L  ·  needs M17/M21
+## M28 - Full-Review File cache evaluation  ·  M/L  ·  needs M17/M21  ·  ✅ done
 Decide whether large Reviews need a full-Review File cache in memory or on disk. M17 keeps a
 Session-only, byte-budgeted LRU for inactive File Enrichment. M21 can reacquire evicted content
 while Review Search scans the complete Review. Keep that policy unless measured workflows justify
 the memory, storage, and invalidation cost of a replacement.
 
-- [ ] Select several large real PullRequests with different File counts, total old/new content sizes, change shapes, and text/binary mixes. Record only metadata and measurements. Do not store source content in benchmark output.
-- [ ] Add an opt-in benchmark that measures the existing LRU during sequential review, non-sequential File navigation, first Review Search, query edits, Overlay reopen, Session replacement, and process restart. Record first-result and complete-result latency, refetch count, request count, failures, `429` responses, peak memory, retained memory, and cache hit rate.
-- [ ] Compare the existing LRU with a full-Review in-memory cache. Measure representative and worst observed memory use. Define a hard bound and the behavior when one Review exceeds it.
-- [ ] Compare both memory policies with a disk cache. Define source-code retention, file permissions, cleanup, size limits, ReviewIdentity and commit invalidation, atomic writes, corruption recovery, format migration, and behavior when the cache is unavailable.
-- [ ] Choose the smallest policy that removes measured user delay without unsafe or unbounded retention. The valid decision is a full-Review memory cache, an opt-in disk cache, a revised LRU, or no change.
-- [ ] Record the decision and evidence in an ADR. If the decision changes the cache, implement the policy behind `[files.cache]` and add deterministic eviction, invalidation, corruption, failure, and Session Epoch tests.
+- [x] Select several large real PullRequests with different File counts, total old/new content sizes, change shapes, and text/binary mixes. Record only metadata and measurements. Do not store source content in benchmark output.
+- [x] Add an opt-in benchmark that measures the existing LRU during sequential review, non-sequential File navigation, first Review Search, query edits, Overlay reopen, Session replacement, and process restart. Record first-result and complete-result latency, refetch count, request count, failures, `429` responses, peak memory, retained memory, and cache hit rate.
+- [ ] Compare the existing LRU with a full-Review in-memory cache. Measure representative and worst observed memory use. Define a hard bound and the behavior when one Review exceeds it. Not needed, because ADR-0016 records "no change" and decision 1 of the M28 brief skips the comparison. The footprint run measured the full-Review need of the largest PullRequest at 33.7 MiB.
+- [ ] Compare both memory policies with a disk cache. Define source-code retention, file permissions, cleanup, size limits, ReviewIdentity and commit invalidation, atomic writes, corruption recovery, format migration, and behavior when the cache is unavailable. Not needed, because ADR-0016 records "no change" and decision 1 of the M28 brief skips the comparison.
+- [x] Choose the smallest policy that removes measured user delay without unsafe or unbounded retention. The valid decision is a full-Review memory cache, an opt-in disk cache, a revised LRU, or no change. The decision is no change.
+- [x] Record the decision and evidence in an ADR. If the decision changes the cache, implement the policy behind `[files.cache]` and add deterministic eviction, invalidation, corruption, failure, and Session Epoch tests. ADR-0016 records no change, so no policy work follows.
+
+M28 verification: the operator replaced the full baseline with one S1 footprint run on 2026-11-02. A full Review of the largest PullRequest needs 13% of the 256 MiB budget, so the LRU never evicts a File of that Review. `.scratch/m28-full-review-file-cache-evaluation/` holds the evidence. Ticket 05 asks why the peak RSS was 816 MiB.
 
 ## M29 - Comment Overview  ·  M  ·  needs M15/M21
 Add one place to inspect and navigate every authored item in the current Review with its scope

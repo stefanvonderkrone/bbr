@@ -15,7 +15,7 @@ These paths identify implementation entry points in the current checkout.
 | Shell completions | [`src/completion.zig`](../src/completion.zig) generates completion scripts from the API registry. |
 | Markdown, search, Selection, and terminal rendering | [Presentation entry points](../src/tui/IMPLEMENTATION.md#code-entry-points) map the semantic model, row projection, interaction owner, and terminal adapters. |
 | Specifications and tickets | [Issue discovery](./agents/issue-tracker.md#when-a-skill-says-fetch-the-relevant-ticket) explains how to search `.scratch/` and follow feature maps. |
-| Tests | [`build.zig`](../build.zig) defines the test gates. `zig build --help` lists the available targets. `zig build test-cli` runs the Python CLI checks. `zig build test` includes those checks and the full hermetic suite. `zig build test` also compiles every benchmark executable. `zig build bench-file-cache` runs the opt-in M28 File cache benchmark against Bitbucket. `zig build install-bench-file-cache` installs its binary for `tools/m28-baseline-run.sh`. |
+| Tests | [`build.zig`](../build.zig) defines the test gates. `zig build --help` lists the available targets. `zig build test-cli` runs the Python CLI checks. `zig build test` includes those checks and the full hermetic suite. `zig build test` also compiles every benchmark executable. `zig build bench-file-cache` runs the opt-in M28 File cache benchmark against Bitbucket. [ADR-0016](adr/0016-file-cache-stays-a-session-only-lru.md) keeps it as a tool for a reopened File cache decision. `zig build install-bench-file-cache` installs its binary for `tools/m28-baseline-run.sh`. |
 
 ## Seams
 
