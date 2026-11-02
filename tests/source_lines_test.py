@@ -56,6 +56,8 @@ class ZigCodeWithoutLiteralsTest(unittest.TestCase):
 
 NO_ZIG_SOURCE = {
     "check_agent_docs.py": "reads the Markdown agent documents, not Zig source",
+    "check_guard_mutations.py": "replaces an exact snippet in a scratch copy of the raw Zig source, so it needs the comments",
+    "check_vendored_grammars.py": "hashes the vendored Grammar files and parses the ZON manifest, not Zig code lines",
 }
 RAW_READS = ("read_text(", "read_bytes(", "open(", ".splitlines()")
 
