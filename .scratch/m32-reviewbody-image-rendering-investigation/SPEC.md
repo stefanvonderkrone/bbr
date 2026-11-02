@@ -141,6 +141,12 @@ A cell holds `yes`, `no`, `partial`, or `unknown`, and a note.
 | vaxis 0.6.0 path works without change | | | | | | | | | |
 | Selected path for the prototype | | | | | | | | | |
 
+The prototype builds no kitty Unicode placeholders, and the research selects placeholders for tmux.
+So the kitty placement rows of the tmux columns are `not tested` in the run.
+These are the rows `kitty Unicode placeholders (U=1)`, `Image stays correct after a scroll`, `Image stays correct after a resize`, `No stale image copy after an Overlay closes`, and `Selected path for the prototype`.
+Ticket 05 does not decide tmux image support from this run.
+A tmux run uses two panes, so the run shows the known pane leak of a direct placement.
+
 The "No protocol" column also covers every terminal that bbr cannot identify.
 Ticket 04 adds one column for each other kitty-protocol terminal that the human uses for the herdr test.
 Sixel is not a target.
@@ -555,3 +561,7 @@ The human can change a choice at ticket 05.
   The image path now never sends the Credential to `api.bitbucket.org`.
   It sends the Credential only to `https://bitbucket.org/repo/<segment>/images/<segment>`, and only if ticket 04 shows an effect.
   The research note Q4 and its consequences say the same.
+- M32I-4: The prototype builds no Unicode placeholders, so the run cannot test the selected tmux path.
+  The protocol matrix section, the research note, and ticket 03 now mark the kitty placement rows of the tmux columns `not tested`.
+  A tmux run uses two panes.
+  The ticket 04 and run guide wording is left for the helper that edits them.

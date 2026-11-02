@@ -134,6 +134,10 @@ The columns are the SPEC columns.
 - A placeholder image belongs to its text cells. [S1]
   An Overlay that paints over the cells hides the image, and no delete command is necessary.
 - Entering the alternate screen clears all images in it. [S1]
+- The prototype builds no Unicode placeholders (ticket 03).
+  So the hands-on run cannot test the selected tmux path.
+  In the tmux columns, these rows are `not tested` for kitty placement: `kitty Unicode placeholders (U=1)`, `Image stays correct after a scroll`, `Image stays correct after a resize`, `No stale image copy after an Overlay closes`, and `Selected path for the prototype`.
+  A tmux run uses two panes, so the run shows the known pane leak of a direct placement. [S31]
   Ghostty keeps image storage separate for each screen. [S12]
   So External Edit leaves the alternate screen and enters it again, and bbr must transmit its images again.
 - Sixel is not a target.

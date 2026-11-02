@@ -124,6 +124,12 @@ These side effects remain:
 - tmux passthrough is small. bbr wraps each kitty chunk in the tmux passthrough and adds `q=2`. Placement is direct, with a saved and restored cursor inside the wrapper.
 - tmux placement is correct only for a pane at the top-left of the window. A correct placement needs the pane offset or Unicode placeholders.
 - Unicode placeholders are not built. The estimate is medium: a table of 297 diacritics and placeholder cells in `render.zig`.
+- So the run cannot test the kitty placement path that the research selects for tmux.
+  Ticket 04 marks the kitty placement cells of the tmux columns `not tested`.
+  These are the rows `kitty Unicode placeholders (U=1)`, `Image stays correct after a scroll`, `Image stays correct after a resize`, `No stale image copy after an Overlay closes`, and `Selected path for the prototype`.
+  Ticket 05 does not decide tmux image support from this run.
+- A tmux run uses two panes side by side, with bbr in the right pane.
+  So the run shows the known leak of a direct placement into the other pane.
 - The OSC 1337 adapter is about 60 lines. It works only in the image preview. bbr writes the image once after the frame and forces a full repaint when the preview closes.
 - Inline OSC 1337 needs reserved cells and a full resend after each move. It fights the vaxis diff renderer, so the prototype does not build it. The card shows `inline needs kitty`.
 
@@ -171,3 +177,6 @@ One criterion stays open: Variant A and Variant B both show I1 in one kitty-prot
 Agents must not start bbr, so no agent ran the prototype in a terminal.
 The human does this check first in ticket 04, as its notes say.
 Then the human copies the first `summarize` output here and sets this ticket to `resolved`.
+
+On 2026-11-02, the M32 review fix run added the tmux coverage limit to the cost section (M32I-4).
+The earlier ticket 04 text kept one tmux pane, which hides the pane leak that the brief wants the tmux test to find.
