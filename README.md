@@ -305,8 +305,8 @@ to restore ordinary terminal mouse handling, or configure `vertical_scroll_rows`
 count. Terminals commonly use Shift or Option as a terminal-dependent bypass for native selection
 while mouse reporting is enabled.
 
-The File Tree, the DiffPane, and the Review Search Results list show a scroll bar when their rows
-do not fit. A left press in a scroll bar track off the thumb jumps to that position. A press in the
+The File Tree, the DiffPane, the Review Search Results list, and the help show a scroll bar when
+their rows do not fit. A left press in a scroll bar track off the thumb jumps to that position. A press in the
 track also starts a Scroll Drag. While you hold the button, the thumb follows the pointer row, also
 outside the track. A drag past a track end stops at the first or the last row. The release, any
 other mouse event, and any key end the Scroll Drag. The wheel over a track does nothing. Use the

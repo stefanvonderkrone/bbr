@@ -408,6 +408,7 @@ Without a thumb, the track cell has the hit result that it has today.
 
 1. With an Overlay, the Overlay captures the input as today.
    Review Search checks `list_track` before its list and Preview rects.
+   The help Overlay checks only its body track (decision 10).
    Other Overlays have no scroll bar target.
 2. Without an Overlay, the Selected Version targets come first, as today.
 3. Then the Sidebar track and the DiffPane track.
