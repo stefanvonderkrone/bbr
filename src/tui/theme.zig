@@ -204,6 +204,15 @@ pub const Theme = struct {
         return self.resolveStyle(style);
     }
 
+    /// A key in the help Overlay: the blue accent in bold on the Overlay
+    /// background.
+    pub fn helpKeyStyle(self: Theme) Style {
+        var style = self.picker;
+        style.fg = self.accent;
+        style.bold = true;
+        return style;
+    }
+
     /// A Scroll Mark off the thumb. Every mark keeps the Pane border
     /// background, so it never paints a band in the border.
     pub fn scrollMarkStyle(self: Theme, mark: view.ScrollMark) Style {

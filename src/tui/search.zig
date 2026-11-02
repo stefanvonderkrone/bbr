@@ -453,6 +453,81 @@ fn equalScalar(query: Query, needle: u21, candidate: u21) bool {
     return if (query.case_sensitive) needle == candidate else fold(needle) == fold(candidate);
 }
 
+pub fn containsLiteral(query: Query, text: []const u8) bool {
+    const text_view = std.unicode.Utf8View.init(text) catch return false;
+    if (query.scalars.len == 0) return true;
+    var starts = text_view.iterator();
+    while (starts.i < text.len) {
+        var candidate = starts;
+        var matched = true;
+        for (query.scalars) |needle| {
+            const scalar = candidate.nextCodepoint() orelse {
+                matched = false;
+                break;
+            };
+            if (!equalScalar(query, needle, scalar)) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+        _ = starts.nextCodepoint();
+    }
+    return false;
+}
+
+test "literal text matching shares Buffer Search Unicode smart case without source identities" {
+    for ([_]struct { needle: []const u8, text: []const u8, matches: bool }{
+        .{ .needle = "", .text = "anything", .matches = true },
+        .{ .needle = "äω", .text = "xÄΩy", .matches = true },
+        .{ .needle = "Äω", .text = "xÄΩy", .matches = false },
+        .{ .needle = "ÄΩ", .text = "xÄΩy", .matches = true },
+        .{ .needle = "a.a", .text = "ababa.a", .matches = true },
+        .{ .needle = "a.a", .text = "ababa", .matches = false },
+        .{ .needle = "ab", .text = "aab", .matches = true },
+        .{ .needle = "ab", .text = "ab\xff", .matches = false },
+        .{ .needle = "", .text = "\xff", .matches = false },
+    }) |case| {
+        var query = try Query.init(std.testing.allocator, case.needle);
+        defer query.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.matches, containsLiteral(query, case.text));
+    }
+}
+
+/// The start of the last scalar. A last byte that ends no valid sequence is a
+/// scalar of its own, so invalid text loses one byte at a time.
+pub fn lastScalarStart(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var start = text.len - 1;
+    while (start > 0 and text.len - start < 4 and text[start] & 0xC0 == 0x80) start -= 1;
+    const len = std.unicode.utf8ByteSequenceLength(text[start]) catch return text.len - 1;
+    return if (start + len == text.len) start else text.len - 1;
+}
+
+test "lastScalarStart steps back one scalar, or one byte of invalid text" {
+    try std.testing.expectEqual(@as(usize, 0), lastScalarStart(""));
+    try std.testing.expectEqual(@as(usize, 1), lastScalarStart("aä"));
+    try std.testing.expectEqual(@as(usize, 1), lastScalarStart("a😀"));
+    try std.testing.expectEqual(@as(usize, 1), lastScalarStart("a\xc3"));
+    try std.testing.expectEqual(@as(usize, 2), lastScalarStart("a\x80\x80"));
+}
+
+pub fn wordStart(text: []const u8) usize {
+    var word_start: usize = 0;
+    var previous_whitespace = true;
+    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+    while (iterator.nextCodepointSlice()) |bytes| {
+        const scalar = std.unicode.utf8Decode(bytes) catch unreachable;
+        const whitespace = switch (scalar) {
+            0x0009...0x000D, 0x0020, 0x0085, 0x00A0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
+            else => false,
+        };
+        if (!whitespace and previous_whitespace) word_start = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr);
+        previous_whitespace = whitespace;
+    }
+    return word_start;
+}
+
 fn scanLiteral(
     allocator: std.mem.Allocator,
     query: Query,
