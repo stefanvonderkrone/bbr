@@ -73,10 +73,11 @@ Header, without the PullRequest id and the File count:
 state=MERGED range_files=26 session_requests=4 probe_ms=590.9 cols=200 rows=50
 ```
 
-Result:
+Result, with only the keys that the decision needs: bytes, requests, and latency.
+The keys that count Files or File Jumps stay in the local run files, because they show the File count.
 
 ```text
-scenario=s1 samples=592 hits=587 cold_fetches=5 refetches=0 latency_median_ms=350.7 latency_p95_ms=1469.3 added_delay_p95_ms=0.0 requests=663 request_estimate=1238 src_requests=663 failures=0 rate_limited=0 request_median_ms=312.3 request_p95_ms=473.2 retries=6 paused_ms=3532.9 paced_samples=4 enrichments=589 enrichment_refetches=0 speculative_enrichments=589 peak_retained_bytes=35373616 retained_bytes=35373616 full_review_bytes=35373616 peak_rss_bytes=855785472 cache_hit_rate=1.000 low_samples=true
+scenario=s1 refetches=0 latency_median_ms=350.7 latency_p95_ms=1469.3 added_delay_p95_ms=0.0 requests=663 failures=0 rate_limited=0 request_median_ms=312.3 request_p95_ms=473.2 retries=6 peak_retained_bytes=35373616 retained_bytes=35373616 full_review_bytes=35373616 peak_rss_bytes=855785472 cache_hit_rate=1.000 low_samples=true
 ```
 
 Check:
