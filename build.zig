@@ -231,6 +231,8 @@ pub fn build(b: *std.Build) void {
     version_integration.setCwd(b.path("."));
     const release_validation = b.addSystemCommand(&.{ "sh", "tests/release_validation_test.sh" });
     release_validation.setCwd(b.path("."));
+    const m28_baseline_run = b.addSystemCommand(&.{"python3"});
+    m28_baseline_run.addFileArg(b.path("tests/m28_baseline_run_test.py"));
     const xdg_reads = b.addSystemCommand(&.{"python3"});
     xdg_reads.addFileArg(b.path("tools/check_xdg_reads.py"));
     xdg_reads.addDirectoryArg(b.path("."));
@@ -426,6 +428,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&version_command.step);
     test_step.dependOn(&version_integration.step);
     test_step.dependOn(&release_validation.step);
+    test_step.dependOn(&m28_baseline_run.step);
     test_step.dependOn(&xdg_reads.step);
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&run_lifecycle_test.step);
