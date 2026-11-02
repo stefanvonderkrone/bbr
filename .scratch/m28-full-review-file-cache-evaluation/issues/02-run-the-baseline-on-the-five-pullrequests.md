@@ -178,3 +178,5 @@ Every commit after `origin/main` got the same scrub. The commits of `main` kept 
 It checks a missing, empty, and malformed file, and `zig build test` runs it.
 `tools/check_agent_docs.py` now fails on a PullRequest id in `.scratch/` prose outside inline code.
 It also fails on an id after `pr-webapp` or in a `remote` command, also in code.
+
+2026-11-02: S4 alone ran on PullRequest A from 19:28 to 21:32 CET. The cold Review Search did not complete, and the operator stopped it. [The Review Search bug](../../review-search-cold-projection/issues/01-a-cold-review-search-on-a-large-review-never-completes.md) records the evidence. ADR-0016 records the effect on the decision.

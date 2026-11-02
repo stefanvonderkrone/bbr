@@ -23,6 +23,8 @@ The [M28 spec](../../.scratch/m28-full-review-file-cache-evaluation/SPEC.md) fir
 
 The run does not measure S4, S7, and S8. Session replacement and a process restart discard all File content at every budget. Only a carry-over memory cache or a disk cache would remove those refetches. [M17 ticket 09](../../.scratch/m17-diff-blob-highlighting-completeness/issues/09-decide-persistent-file-cache.md) keeps a disk cache out until workflow measurements show a material delay. The footprint run did not test the 300 ms threshold of the M28 brief for a restart or a Session replacement. The operator accepted that gap, and the third reopen condition covers it. The footprint run also does not meet the M17 reopen condition, so a disk cache stays out.
 
+The operator then ran S4 alone on the same PullRequest on 2026-11-02. The cold Review Search did not complete in 2 hours, and the operator stopped it. The process used one CPU core at 100%, and the request rate fell from about 50 to 0 per minute. CPU samples show repeated `SearchProjection.create` work. So the cold start is slow because of CPU work in Review Search, not because of refetches. A disk cache would only hide that work after the first search, so it stays out. [The Review Search bug](../../.scratch/review-search-cold-projection/issues/01-a-cold-review-search-on-a-large-review-never-completes.md) records the evidence. After its fix, run S4 again and apply the reopen conditions.
+
 ## Reopen conditions
 
 Reopen this decision when one of these conditions is true:
