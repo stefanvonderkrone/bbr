@@ -77,12 +77,20 @@ They are not decisions.
 - vaxis 0.6.0 has no iTerm2 inline image protocol, no Sixel, and no tmux passthrough.
   vaxis 0.6.0 has no kitty Unicode placeholder support.
 - `StdHttpClient.send` passes every request header as a `std.http` `extra_headers` entry.
-  It follows up to three redirects for a request without a body.
-  `std.http.Client` keeps `extra_headers` on a redirect to another domain.
-  It strips only `privileged_headers`.
+  It lets std follow up to three redirects for a request without a body.
+  std follows a redirect inside `receiveHead` (Zig 0.16 `std/http/Client.zig:1182-1195`).
+  std keeps `extra_headers` on a redirect to another domain (`Client.zig:821-824`).
+  It also keeps them on a redirect from `https` to `http`.
   So a request with the Credential that gets a redirect to another host sends the Credential to that host.
   The image path must not use this behavior.
-  Ticket 06 also records this finding for the existing API requests.
+- Moving the Credential into `privileged_headers` is not a fix.
+  std strips `privileged_headers` on a redirect to another domain (`Client.zig:1238-1248`).
+  But `sendHead` never writes `privileged_headers` (`Client.zig:990-1073`, where only `extra_headers` is written at 1067-1073).
+  So the Credential then reaches no request, and every Bitbucket API call fails with 401.
+- The fix is `redirect_behavior = .unhandled` and a loop in bbr that follows each hop.
+  The loop checks the scheme and the host at each hop.
+  The [Credential transport ticket](../credential-transport-hardening/issues/01-port-the-http-credential-fixes-to-main.md) owns this fix for the existing API requests.
+  Ticket 06 links that ticket.
 - `StdHttpClient.send` reads the whole response body with no size limit.
   The image path needs a byte limit while it reads.
 
@@ -469,7 +477,7 @@ The ADR proposes at least these new rules for the implementation milestone:
 
 | Rule | Proposed enforcement |
 | --- | --- |
-| Only a Bitbucket Host gets the Credential, also after a redirect. | A test on `FakeHttpClient` with a redirect to another host. |
+| Only a Bitbucket Host gets the Credential, also after a redirect. | A loopback server test in `src/http/std_client.zig` that sends `authorization` to `localhost`, redirects to `127.0.0.1`, and asserts that the second connection has no `authorization` line. A `FakeHttpClient` test cannot enforce this rule, because std follows the redirect inside `receiveHead` and `FakeHttpClient` replaces `StdHttpClient` completely. |
 | bbr sends no request to an external host while `allow_external` is `false`. | A test on `FakeHttpClient` that counts external requests. |
 | An image body above the byte limit stops the read. | A test with a body one byte above the limit. |
 
@@ -493,7 +501,7 @@ The prototype tests use these seams:
 - Image upload or image authoring in the Composer.
 - Image dimension attributes such as `{width=640}`. M23 found no Cloud Comment guarantee.
 - Product reference previews. M31 owns them.
-- A change to the existing API redirect behavior. Ticket 06 records the finding for a later milestone.
+- A change to the existing API redirect behavior. The [Credential transport ticket](../credential-transport-hardening/issues/01-port-the-http-credential-fixes-to-main.md) owns it, and ticket 06 links it.
 
 ## Further Notes
 
@@ -533,3 +541,6 @@ The human can change a choice at ticket 05.
   It fails when a `build.zig` step is not denied, unless the step is hermetic.
   It also fails when a rule in `opencode.jsonc` decides no listed command, so the deletion of any one rule fails the check.
   The `AGENTS.md` row names each form that the check does not cover.
+- M32I-2 and M32I-14: The redirect finding said that std strips only `privileged_headers`, which led to a fix that removes the Credential from every request.
+  The spec now cites the Zig 0.16 lines, names `redirect_behavior = .unhandled` with a per-hop check as the fix, and names a loopback test in `src/http/std_client.zig` as the enforcement.
+  The fix moved to the Credential transport ticket.

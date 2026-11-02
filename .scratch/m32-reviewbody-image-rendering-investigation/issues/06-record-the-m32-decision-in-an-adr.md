@@ -17,7 +17,10 @@ An ADR records the M32 image decision and its evidence.
 - Link the research notes of tickets 01 and 02.
   Link the evidence of ticket 04 and the answer of ticket 05.
 - Record the redirect finding from the spec: `StdHttpClient` keeps the Credential on a redirect to another host.
-  State that a later milestone must fix it for the existing API requests.
+  State the fix: `redirect_behavior = .unhandled`, and a loop in bbr that checks the scheme and the host at each hop.
+  State that moving the Credential into `privileged_headers` is not a fix, because Zig 0.16 `sendHead` never writes that field (`std/http/Client.zig:990-1073`).
+  State that the enforcement is a loopback server test in `src/http/std_client.zig`, not a `FakeHttpClient` test.
+  Link the [Credential transport ticket](../../credential-transport-hardening/issues/01-port-the-http-credential-fixes-to-main.md), which owns the fix for the existing API requests.
 - Propose the glossary terms from the "Glossary changes" section of the spec that the decision keeps.
   Do not change a glossary in this ticket.
 - Propose the new AGENTS.md rules from the spec that the decision keeps.
@@ -33,7 +36,7 @@ An ADR records the M32 image decision and its evidence.
 - [ ] The ADR has every section that the spec names.
 - [ ] The ADR names one decision and links the evidence of tickets 01, 02, 04, and 05.
 - [ ] The ADR holds no real image URL, no Comment text, and no Credential value.
-- [ ] The ADR records the redirect finding and the follow-up.
+- [ ] The ADR records the redirect finding, the `.unhandled` fix, the `privileged_headers` trap, and the link to the Credential transport ticket.
 - [ ] `TODO.md` has the new milestone with `needs M32`, or the ADR states why no milestone follows.
 - [ ] Every M32 line in `TODO.md` is checked or has a note.
 - [ ] `python3 tools/check_agent_docs.py` passes.
@@ -52,3 +55,6 @@ Check the number again when this ticket runs, and use the next free number if 00
 
 Ticket 03 found a decoder panic in the Zig 0.16 flate decoder on the `zigimg` path.
 The ADR must record it in the "Decoding" section, with the decision of ticket 05.
+
+On 2026-11-02, the M32 review fix run corrected the redirect fix in the scope (M32I-2 and M32I-14).
+The earlier text let a later run move the Credential into `privileged_headers`, which removes it from every request.
