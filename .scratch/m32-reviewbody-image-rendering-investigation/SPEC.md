@@ -596,3 +596,5 @@ The human can change a choice at ticket 05.
 - M32I-13: The ADR plan had 13 sections, which made the ADR a research report, and two lines said that M28 plans ADR-0014.
   The plan now keeps the ADR to the decision, the rules, and the reopen conditions, and links the evidence.
   ADR-0014 belongs to M27, and the operator assigned ADR-0015 to M32.
+- M32I-8: The Zig 0.16 flate panic also reaches UserGrammar `readArchive`. Ticket 06 now names every production flate caller and links the [UserGrammar flate ticket](../user-grammar-archive-decoder-panic/issues/01-stop-the-flate-panic-in-readarchive.md).
+- M32I-1, M32I-15: The [Credential transport ticket](../credential-transport-hardening/issues/01-port-the-http-credential-fixes-to-main.md) owns the pre-existing redirect, proxy, and `next` link fixes, outside the M32 decision chain.

@@ -23,6 +23,12 @@ An ADR records the M32 image decision and its evidence.
   State that moving the Credential into `privileged_headers` is not a fix, because Zig 0.16 `sendHead` never writes that field (`std/http/Client.zig:990-1073`).
   State that the enforcement is a loopback server test in `src/http/std_client.zig`, not a `FakeHttpClient` test.
   Link the [Credential transport ticket](../../credential-transport-hardening/issues/01-port-the-http-credential-fixes-to-main.md), which owns the fix for the existing API requests.
+- Record the Zig 0.16 flate panic in the decoder rules of the ADR.
+  Treat in-process decoding of untrusted compressed data as unsafe on Zig 0.16.
+  Name every production caller of `std.compress.flate` when this ticket runs.
+  On 2026-11-02, the only production decompression caller is `readArchive` in `src/highlight/user_grammar.zig`.
+  `src/highlight/user_grammar.zig:934-935` compresses only in a test, and no production code calls zigimg.
+  Link the [UserGrammar flate ticket](../../user-grammar-archive-decoder-panic/issues/01-stop-the-flate-panic-in-readarchive.md), which owns the `readArchive` fix.
 - Propose the glossary terms from the "Glossary changes" section of the spec that the decision keeps.
   Do not change a glossary in this ticket.
 - Propose the new AGENTS.md rules from the spec that the decision keeps.
@@ -38,6 +44,7 @@ An ADR records the M32 image decision and its evidence.
 - [ ] The ADR has every section that the spec names.
 - [ ] The ADR names one decision and links the evidence of tickets 01, 02, 04, and 05.
 - [ ] The ADR holds no real image URL, no Comment text, and no Credential value.
+- [ ] The ADR names every production `std.compress.flate` caller and links the UserGrammar flate ticket.
 - [ ] The ADR records the redirect finding, the `.unhandled` fix, the `privileged_headers` trap, and the link to the Credential transport ticket.
 - [ ] `TODO.md` has the new milestone with `needs M32`, or the ADR states why no milestone follows.
 - [ ] Every M32 line in `TODO.md` is checked or has a note.
@@ -65,3 +72,7 @@ On 2026-11-02, the M32 review fix run corrected the ADR plan (M32I-13).
 The operator assigned ADR-0015 to M32, and M27 holds ADR-0014.
 Take the next free number at run time, expected 0015.
 The ADR now has six short sections instead of 13.
+
+On 2026-11-02, the M32 review fix run added the production flate callers to the scope (M32I-8).
+A `ReleaseSafe` probe with the `readArchive` calls panicked on a gzip stream that lost 11 bytes.
+The UserGrammar flate ticket holds the evidence.
