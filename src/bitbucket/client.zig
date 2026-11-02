@@ -3311,7 +3311,7 @@ test "Repository paths percent-encode the Workspace and the Repository slug and 
     const repository = base_url ++ "/repositories/ws%2Fx/a%2F..%2Fb%3Fx%25y%23z";
 
     try testing.expectError(error.NotFound, bb.listPullRequests(a, slug, .{ .source_branch = "main" }));
-    try testing.expect(std.mem.startsWith(u8, fake.lastUrl().?, repository ++ "/pullrequests?pagelen=50&state=OPEN&q="));
+    try testing.expect(std.mem.startsWith(u8, fake.lastUrl().?, repository ++ "/pullrequests?pagelen=50&q="));
     try testing.expectError(error.NotFound, bb.getPullRequest(a, slug, 7));
     try testing.expectEqualStrings(repository ++ "/pullrequests/7", fake.lastUrl().?);
     try testing.expectError(error.NotFound, bb.getCommentsRaw(a, slug, 7));
