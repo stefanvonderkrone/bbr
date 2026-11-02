@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(search_unicode);
     var frame_paint_context = try frame_paint.Context.init(init.gpa);
     defer frame_paint_context.deinit(init.gpa);
-    var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null);
+    var tree_sitter_highlighter = TreeSitterHighlighter.init(init.gpa, init.io, null);
     defer tree_sitter_highlighter.deinit();
     const highlight_benchmarks = [_]struct { name: []const u8, context: highlight.Context }{
         .{ .name = "highlight_javascript_4k", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.js", .content = highlight_javascript_4k } },

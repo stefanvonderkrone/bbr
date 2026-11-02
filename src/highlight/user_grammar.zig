@@ -1133,13 +1133,13 @@ test "M27 grammar a UserGrammar for .zig takes precedence over the Zig BuiltInGr
     const TreeSitterHighlighter = @import("tree_sitter_highlighter.zig").TreeSitterHighlighter;
     const source = "const answer = 1;\n";
 
-    var built_in = try TreeSitterHighlighter.init(testing.allocator, null);
+    var built_in = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer built_in.deinit();
     const zig_result = try built_in.highlighter().highlight(testing.allocator, "src/a.zig", source);
     defer testing.allocator.free(zig_result.spans);
     try testing.expectEqual(.keyword, zig_result.spans[0].capture.role);
 
-    var preferred = try TreeSitterHighlighter.init(testing.allocator, &registry);
+    var preferred = TreeSitterHighlighter.init(testing.allocator, testing.io, &registry);
     defer preferred.deinit();
     const user_result = try preferred.highlighter().highlight(testing.allocator, "src/a.zig", source);
     defer testing.allocator.free(user_result.spans);

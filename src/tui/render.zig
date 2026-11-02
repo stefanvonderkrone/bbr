@@ -4363,7 +4363,7 @@ test "M23 highlighting selected Suggestion Preview uses shared syntax and retain
     while (command == .enrich_file) command = state.takeCommand().?;
     const job = command.highlight_code;
     try testing.expectEqualStrings("before.js", job.path);
-    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     try state.dispatch(.{ .code_highlight_completed = job.execute(highlighter.highlighter()) });
     const after = state.projection();
@@ -4420,7 +4420,7 @@ test "M23 highlighting published Frame renders real syntax through wrapping Sele
     drawReview(a, win, state.projection().review.?, theme_dark, 0);
     try testing.expectEqualStrings("c", win.readCell(x, y).?.char.grapheme);
     try testing.expectEqual(theme_dark.context.fg, win.readCell(x, y).?.style.fg);
-    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const job = state.takeCommand().?.highlight_code;
     try state.dispatch(.{ .code_highlight_completed = job.execute(highlighter.highlighter()) });

@@ -282,7 +282,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         try grammar_data_store.validateOverrideNames(grammar_overrides);
         grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity);
     }
-    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null);
+    var tree_sitter_highlighter = TreeSitterHighlighter.init(gpa, init.io, if (grammar_registry) |*registry| registry else null);
     defer tree_sitter_highlighter.deinit();
 
     app.run(.{
@@ -383,7 +383,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         try grammar_data_store.validateOverrideNames(grammar_overrides);
         grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity);
     }
-    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null);
+    var tree_sitter_highlighter = TreeSitterHighlighter.init(gpa, init.io, if (grammar_registry) |*registry| registry else null);
     defer tree_sitter_highlighter.deinit();
     try app.run(.{
         .io = init.io,

@@ -35,32 +35,55 @@ const GrammarSource = struct {
     injections_query: []const u8 = "",
 };
 
-const BuiltInPackages = [std.meta.tags(grammar_match.BuiltInGrammar).len]RuntimePackage;
+/// Prepares each BuiltInGrammar on its first use, because preparing all of them takes about 0.4 s.
+/// Highlight workers share the packages, so the mutex guards every slot.
+/// A prepared package never changes or moves until `deinit`.
+const BuiltInPackages = struct {
+    allocator: Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    slots: [std.meta.tags(BuiltInGrammar).len]?RuntimePackage = @splat(null),
+
+    /// A failed preparation leaves the slot empty, so the next use tries again.
+    fn get(self: *BuiltInPackages, grammar: BuiltInGrammar) !*const RuntimePackage {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const slot = &self.slots[@intFromEnum(grammar)];
+        if (slot.*) |*package| return package;
+        slot.* = try prepare(self.allocator, grammar);
+        return &slot.*.?;
+    }
+
+    fn deinit(self: *BuiltInPackages) void {
+        for (&self.slots) |*slot| {
+            if (slot.*) |*package| package.deinit();
+        }
+    }
+};
+
+fn prepare(allocator: Allocator, grammar: BuiltInGrammar) !RuntimePackage {
+    const source = grammarSource(grammar) orelse return error.MissingBuiltInGrammar;
+    var diagnostic: predicate_mod.Diagnostic = undefined;
+    return RuntimePackage.init(allocator, source.language, source.query, source.locals_query, source.injections_query, &diagnostic) catch |err| {
+        if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidInjectionQuery or err == error.InvalidPredicate) diagnostic.report();
+        return err;
+    };
+}
+
 const max_injection_depth = 4;
 const default_priority = predicate_mod.default_priority;
 
 pub const TreeSitterHighlighter = struct {
-    registry: ?*user_grammar.Registry = null,
-    packages: BuiltInPackages = undefined,
-    package_count: usize = 0,
+    registry: ?*user_grammar.Registry,
+    packages: BuiltInPackages,
 
-    pub fn init(allocator: Allocator, registry: ?*user_grammar.Registry) !TreeSitterHighlighter {
-        var self: TreeSitterHighlighter = .{ .registry = registry };
-        errdefer self.deinit();
-        inline for (std.meta.tags(grammar_match.BuiltInGrammar)) |grammar| {
-            const source = grammarSource(grammar) orelse return error.MissingBuiltInGrammar;
-            var diagnostic: predicate_mod.Diagnostic = undefined;
-            self.packages[self.package_count] = RuntimePackage.init(allocator, source.language, source.query, source.locals_query, source.injections_query, &diagnostic) catch |err| {
-                if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidInjectionQuery or err == error.InvalidPredicate) diagnostic.report();
-                return err;
-            };
-            self.package_count += 1;
-        }
-        return self;
+    /// `allocator` must be thread-safe, because highlight workers prepare BuiltInGrammars with it.
+    pub fn init(allocator: Allocator, io: std.Io, registry: ?*user_grammar.Registry) TreeSitterHighlighter {
+        return .{ .registry = registry, .packages = .{ .allocator = allocator, .io = io } };
     }
 
     pub fn deinit(self: *TreeSitterHighlighter) void {
-        for (self.packages[0..self.package_count]) |*package| package.deinit();
+        self.packages.deinit();
         self.* = undefined;
     }
 
@@ -86,7 +109,7 @@ pub const TreeSitterHighlighter = struct {
 
     fn highlightBuiltIn(self: *TreeSitterHighlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
         const selected = grammar_match.selectBuiltIn(path, content) orelse return .{ .spans = &.{} };
-        return highlightWithPackage(result_allocator, scratch_allocator, &self.packages[@intFromEnum(selected)], &self.packages, content, null);
+        return highlightWithPackage(result_allocator, scratch_allocator, try self.packages.get(selected), &self.packages, content, null);
     }
 };
 
@@ -122,7 +145,7 @@ fn highlightWithQueryLimit(allocator: Allocator, grammar_language: *const c.TSLa
     return highlightWithPackage(allocator, allocator, &package, null, content, match_limit);
 }
 
-fn highlightWithPackage(result_allocator: Allocator, scratch_allocator: Allocator, package: *const RuntimePackage, built_ins: ?*const BuiltInPackages, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
+fn highlightWithPackage(result_allocator: Allocator, scratch_allocator: Allocator, package: *const RuntimePackage, built_ins: ?*BuiltInPackages, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
     const intervals = try collectCaptureIntervals(scratch_allocator, package, built_ins, content, match_limit);
     defer scratch_allocator.free(intervals);
     const spans = try mergeCaptureIntervals(scratch_allocator, content, intervals);
@@ -149,7 +172,7 @@ const Layer = struct {
 };
 
 /// `built_ins` is null for a UserGrammar, so it never hosts an Injection.
-fn collectCaptureIntervals(allocator: Allocator, package: *const RuntimePackage, built_ins: ?*const BuiltInPackages, content: []const u8, match_limit: ?u32) ![]CaptureInterval {
+fn collectCaptureIntervals(allocator: Allocator, package: *const RuntimePackage, built_ins: ?*BuiltInPackages, content: []const u8, match_limit: ?u32) ![]CaptureInterval {
     if (content.len > std.math.maxInt(u32)) return error.FileTooLarge;
     if (!std.unicode.utf8ValidateSlice(content)) return error.InvalidUtf8;
     const parser = c.ts_parser_new() orelse return error.ParserInitFailed;
@@ -243,7 +266,7 @@ const CombinedRanges = struct {
 fn collectInjectionLayers(
     allocator: Allocator,
     layers: *std.ArrayList(Layer),
-    packages: *const BuiltInPackages,
+    packages: *BuiltInPackages,
     injection: InjectionQuery,
     parent: Layer,
     tree: *c.TSTree,
@@ -290,16 +313,17 @@ fn collectInjectionLayers(
         } else {
             ranges.clearRetainingCapacity();
             try appendContentRanges(allocator, &ranges, node, settings, parent, content, lines);
-            try appendLayer(allocator, layers, &packages[@intFromEnum(grammar)], ranges.items, parent.depth + 1);
+            try appendLayer(allocator, layers, packages, grammar, ranges.items, parent.depth + 1);
         }
     }
     if (c.ts_query_cursor_did_exceed_match_limit(cursor)) return error.QueryMatchLimitExceeded;
-    for (combined.items) |group| try appendLayer(allocator, layers, &packages[@intFromEnum(group.grammar)], group.ranges.items, parent.depth + 1);
+    for (combined.items) |group| try appendLayer(allocator, layers, packages, group.grammar, group.ranges.items, parent.depth + 1);
 }
 
 /// Sorts and joins the ranges, because a combined layer can collect them out of order.
-fn appendLayer(allocator: Allocator, layers: *std.ArrayList(Layer), package: *const RuntimePackage, ranges: []c.TSRange, depth: u8) !void {
+fn appendLayer(allocator: Allocator, layers: *std.ArrayList(Layer), packages: *BuiltInPackages, grammar: BuiltInGrammar, ranges: []c.TSRange, depth: u8) !void {
     if (ranges.len == 0) return;
+    const package = try packages.get(grammar);
     std.mem.sort(c.TSRange, ranges, {}, rangeLessThan);
     var count: usize = 1;
     for (ranges[1..]) |range| {
@@ -553,7 +577,7 @@ test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
     }};
     var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build");
     defer registry.deinit();
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, &registry);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, &registry);
     defer highlighter.deinit();
 
     const built_in = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = 1;\n");
@@ -564,7 +588,7 @@ test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
 }
 
 test "JavaScript tracer produces ordered non-overlapping Captures" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = \"yes\";\n");
     defer {
@@ -578,7 +602,7 @@ test "JavaScript tracer produces ordered non-overlapping Captures" {
 }
 
 test "JavaScript BuiltInGrammar executes conditional Captures" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "Widget widget SCREAM console require other\n");
     defer freeResult(result);
@@ -598,7 +622,7 @@ test "JavaScript BuiltInGrammar rejects built-in Captures for local bindings" {
         \\require("x");
         \\function g(require) { require("y"); }
     ;
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
     defer freeResult(result);
@@ -628,7 +652,7 @@ test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed loc
         \\}
         \\console; require();
     ;
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     for ([_][]const u8{ "src/a.js", "src/a.ts", "src/a.tsx" }) |path| {
         const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
@@ -650,7 +674,7 @@ test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed loc
 
 test "TypeScript BuiltInGrammars track optional parameter locals" {
     const source = "function f(console?: unknown) { console; }\nconsole;\n";
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     for ([_][]const u8{ "src/a.ts", "src/a.tsx" }) |path| {
         const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
@@ -664,7 +688,7 @@ test "TypeScript BuiltInGrammars track optional parameter locals" {
 
 test "local filtering keeps UTF-8 byte offsets" {
     const source = "function f(console) { const π = 0; console; }\nconsole;\n";
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
     defer freeResult(result);
@@ -680,7 +704,7 @@ test "TypeScript and TSX BuiltInGrammars load their queries" {
         .{ .path = "src/a.ts", .source = "interface User { name: string }\n" },
         .{ .path = "src/a.tsx", .source = "const App = () => <main>Hello</main>;\n" },
     };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
@@ -699,7 +723,7 @@ test "remaining BuiltInGrammars load their queries and produce Captures" {
         .{ .path = "data.json", .source = "{\"ready\": true}\n" },
         .{ .path = "config.yaml", .source = "ready: true\n" },
     };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
@@ -710,48 +734,50 @@ test "remaining BuiltInGrammars load their queries and produce Captures" {
     }
 }
 
+/// Each BuiltInGrammar is a host or an Injection in at least one fixture.
+const builtin_fixtures = [_]struct { path: []const u8, source: []const u8 }{
+    .{ .path = "valid.js", .source = "const answer = value ?? 42;\nconsole.log(answer);\n" },
+    .{ .path = "invalid.js", .source = "function broken( { return console.\n" },
+    .{ .path = "minified.js", .source = "const f=(x)=>x?{value:x}:null;console.log(f(1));\n" },
+    .{ .path = "predicates.js", .source = "Widget widget SCREAM console require other\n" },
+    .{ .path = "nested.ts", .source = "interface Box<T> { value: T }\nconst box: Box<string> = { value: 'x' };\n" },
+    .{ .path = "component.tsx", .source = "const App = ({name}: {name: string}) => <main className=\"card\">{name}</main>;\n" },
+    .{ .path = "style.css", .source = ".card:hover { color: rgb(1, 2, 3); }\n" },
+    .{ .path = "main.go", .source = "package main\nfunc main() { println(\"hello\") }\n" },
+    .{ .path = "run.sh", .source = "#!/bin/bash\nname=world\necho \"hello ${name}\"\n" },
+    .{ .path = "data.json", .source = "{\"nested\": {\"ready\": true}, \"items\": [1, 2]}\n" },
+    .{ .path = "config.yaml", .source = "service:\n  enabled: true\n  ports: [80, 443]\n" },
+    .{ .path = "main.zig", .source = zig_fixture },
+    .{ .path = "point.c", .source = c_fixture },
+    .{ .path = "box.cpp", .source = cpp_fixture },
+    .{ .path = "point.h", .source = c_header_fixture },
+    .{ .path = "main.rs", .source = rust_fixture },
+    .{ .path = "main.odin", .source = odin_fixture },
+    .{ .path = "Greeter.java", .source = java_fixture },
+    .{ .path = "Greeter.kt", .source = kotlin_fixture },
+    .{ .path = "build.gradle", .source = groovy_fixture },
+    .{ .path = "Greeter.cs", .source = c_sharp_fixture },
+    .{ .path = "scripts/run", .source = python_fixture },
+    .{ .path = "lib/add.rb", .source = ruby_fixture },
+    .{ .path = "App.swift", .source = swift_fixture },
+    .{ .path = "query.sql", .source = sql_fixture },
+    .{ .path = "Cargo.toml", .source = toml_fixture },
+    .{ .path = "docker/Dockerfile", .source = dockerfile_fixture },
+    .{ .path = "Makefile", .source = make_fixture },
+    .{ .path = "index.html", .source = html_fixture },
+    .{ .path = "logo.svg", .source = xml_fixture },
+    .{ .path = "README.md", .source = markdown_fixture },
+    .{ .path = "index.php", .source = php_fixture },
+    .{ .path = "page.php", .source = php_heredoc_fixture },
+    .{ .path = "link.php", .source = php_split_tag_fixture },
+};
+
 test "interval merge matches byte planes for every BuiltInGrammar fixture" {
-    const cases = [_]struct { path: []const u8, source: []const u8 }{
-        .{ .path = "valid.js", .source = "const answer = value ?? 42;\nconsole.log(answer);\n" },
-        .{ .path = "invalid.js", .source = "function broken( { return console.\n" },
-        .{ .path = "minified.js", .source = "const f=(x)=>x?{value:x}:null;console.log(f(1));\n" },
-        .{ .path = "predicates.js", .source = "Widget widget SCREAM console require other\n" },
-        .{ .path = "nested.ts", .source = "interface Box<T> { value: T }\nconst box: Box<string> = { value: 'x' };\n" },
-        .{ .path = "component.tsx", .source = "const App = ({name}: {name: string}) => <main className=\"card\">{name}</main>;\n" },
-        .{ .path = "style.css", .source = ".card:hover { color: rgb(1, 2, 3); }\n" },
-        .{ .path = "main.go", .source = "package main\nfunc main() { println(\"hello\") }\n" },
-        .{ .path = "run.sh", .source = "#!/bin/bash\nname=world\necho \"hello ${name}\"\n" },
-        .{ .path = "data.json", .source = "{\"nested\": {\"ready\": true}, \"items\": [1, 2]}\n" },
-        .{ .path = "config.yaml", .source = "service:\n  enabled: true\n  ports: [80, 443]\n" },
-        .{ .path = "main.zig", .source = zig_fixture },
-        .{ .path = "point.c", .source = c_fixture },
-        .{ .path = "box.cpp", .source = cpp_fixture },
-        .{ .path = "point.h", .source = c_header_fixture },
-        .{ .path = "main.rs", .source = rust_fixture },
-        .{ .path = "main.odin", .source = odin_fixture },
-        .{ .path = "Greeter.java", .source = java_fixture },
-        .{ .path = "Greeter.kt", .source = kotlin_fixture },
-        .{ .path = "build.gradle", .source = groovy_fixture },
-        .{ .path = "Greeter.cs", .source = c_sharp_fixture },
-        .{ .path = "scripts/run", .source = python_fixture },
-        .{ .path = "lib/add.rb", .source = ruby_fixture },
-        .{ .path = "App.swift", .source = swift_fixture },
-        .{ .path = "query.sql", .source = sql_fixture },
-        .{ .path = "Cargo.toml", .source = toml_fixture },
-        .{ .path = "docker/Dockerfile", .source = dockerfile_fixture },
-        .{ .path = "Makefile", .source = make_fixture },
-        .{ .path = "index.html", .source = html_fixture },
-        .{ .path = "logo.svg", .source = xml_fixture },
-        .{ .path = "README.md", .source = markdown_fixture },
-        .{ .path = "index.php", .source = php_fixture },
-        .{ .path = "page.php", .source = php_heredoc_fixture },
-        .{ .path = "link.php", .source = php_split_tag_fixture },
-    };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
-    for (cases) |case| {
+    for (builtin_fixtures) |case| {
         const grammar = grammar_match.selectBuiltIn(case.path, case.source).?;
-        const package = &highlighter.packages[@intFromEnum(grammar)];
+        const package = try highlighter.packages.get(grammar);
         const intervals = try collectCaptureIntervals(testing.allocator, package, &highlighter.packages, case.source, null);
         defer testing.allocator.free(intervals);
         const expected = try spansFromBytePlanes(testing.allocator, case.source, intervals);
@@ -763,15 +789,99 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
 }
 
 test "M27 grammar every BuiltInGrammar loads its queries" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
-    try testing.expectEqual(std.meta.tags(BuiltInGrammar).len, highlighter.package_count);
     inline for (comptime std.meta.tags(BuiltInGrammar)) |grammar| {
-        const package = &highlighter.packages[@intFromEnum(grammar)];
+        const package = try highlighter.packages.get(grammar);
         try testing.expect(c.ts_query_pattern_count(package.highlight.query) > 0);
         const injections: ?[]const u8 = grammar.entry().injections;
         try testing.expectEqual(injections != null, package.injection != null);
     }
+}
+
+test "M27 lazy init prepares no BuiltInGrammar query" {
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var highlighter = TreeSitterHighlighter.init(failing.allocator(), testing.io, null);
+    defer highlighter.deinit();
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+fn eagerHighlighter() !TreeSitterHighlighter {
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
+    errdefer highlighter.deinit();
+    for (std.meta.tags(BuiltInGrammar)) |grammar| _ = try highlighter.packages.get(grammar);
+    return highlighter;
+}
+
+test "M27 lazy every BuiltInGrammar fixture highlights as after eager preparation" {
+    var eager = try eagerHighlighter();
+    defer eager.deinit();
+    var used: std.EnumSet(BuiltInGrammar) = .initEmpty();
+    for (builtin_fixtures) |case| {
+        const expected = try eager.highlighter().highlight(testing.allocator, case.path, case.source);
+        defer freeResult(expected);
+        var lazy = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
+        defer lazy.deinit();
+        const actual = try lazy.highlighter().highlight(testing.allocator, case.path, case.source);
+        defer freeResult(actual);
+        try testing.expectEqualDeep(expected.spans, actual.spans);
+        for (lazy.packages.slots, 0..) |slot, index| {
+            if (slot != null) used.insert(@enumFromInt(index));
+        }
+    }
+    try testing.expectEqual(std.meta.tags(BuiltInGrammar).len, used.count());
+}
+
+test "M27 lazy a failed preparation fails only that highlight and the next use succeeds" {
+    var eager = try eagerHighlighter();
+    defer eager.deinit();
+    const expected = try eager.highlighter().highlight(testing.allocator, "index.html", html_fixture);
+    defer freeResult(expected);
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = fail_index });
+        var lazy = TreeSitterHighlighter.init(failing.allocator(), testing.io, null);
+        defer lazy.deinit();
+        try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        if (lazy.highlighter().highlight(testing.allocator, "index.html", html_fixture)) |result| {
+            freeResult(result);
+            break;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+        failing.fail_index = std.math.maxInt(usize);
+        const retried = try lazy.highlighter().highlight(testing.allocator, "index.html", html_fixture);
+        defer freeResult(retried);
+        try testing.expectEqualDeep(expected.spans, retried.spans);
+    }
+    try testing.expect(fail_index > 0);
+}
+
+test "M27 lazy concurrent first uses of one BuiltInGrammar give the eager output" {
+    var eager = try eagerHighlighter();
+    defer eager.deinit();
+    const expected = try eager.highlighter().highlight(testing.allocator, "box.cpp", cpp_fixture);
+    defer freeResult(expected);
+    var lazy = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
+    defer lazy.deinit();
+    const highlight = struct {
+        fn run(highlighter: bbr.highlight.Highlighter) anyerror!bbr.highlight.HighlightResult {
+            return highlighter.highlight(testing.allocator, "box.cpp", cpp_fixture);
+        }
+    }.run;
+    var futures: [4]std.Io.Future(anyerror!bbr.highlight.HighlightResult) = undefined;
+    for (&futures, 0..) |*future, started| {
+        future.* = testing.io.concurrent(highlight, .{lazy.highlighter()}) catch {
+            for (futures[0..started]) |*running| {
+                if (running.cancel(testing.io)) |result| freeResult(result) else |_| {}
+            }
+            return error.SkipZigTest;
+        };
+    }
+    var results: [futures.len]anyerror!bbr.highlight.HighlightResult = undefined;
+    for (&futures, &results) |*future, *result| result.* = future.await(testing.io);
+    defer for (results) |result| {
+        if (result) |ok| freeResult(ok) else |_| {}
+    };
+    for (results) |result| try testing.expectEqualDeep(expected.spans, (try result).spans);
 }
 
 test "M27 grammar every BuiltInGrammar ABI is compatible with the vendored runtime" {
@@ -849,7 +959,7 @@ const zig_fixture =
 ;
 
 test "M27 grammar Zig fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/main.zig", zig_fixture);
     defer freeResult(result);
@@ -1106,10 +1216,10 @@ test "M27 grammar every Capture name in the M13 queries keeps its role" {
         .{ "variable.parameter", .variable },
     };
     var seen = [_]bool{false} ** golden.len;
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     for ([_]grammar_match.BuiltInGrammar{ .javascript, .typescript, .tsx, .css, .go, .bash, .json, .yaml }) |grammar| {
-        const package = &highlighter.packages[@intFromEnum(grammar)];
+        const package = try highlighter.packages.get(grammar);
         next_name: for (package.capture_names, package.captures) |name, capture| {
             for (golden, &seen) |entry, *found| {
                 const golden_name, const role = entry;
@@ -1251,7 +1361,7 @@ const argument_name_injection =
 ;
 
 test "M27 injection highlights CSS in a JavaScript template string" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, template_css_injection);
     const source = "const s = `a { color: red; }`;\n";
@@ -1265,7 +1375,7 @@ test "M27 injection highlights CSS in a JavaScript template string" {
 }
 
 test "M27 injection combined ranges form one injected tree" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const source = "[`a`, `{}`];\n";
 
@@ -1283,10 +1393,10 @@ test "M27 injection combined ranges form one injected tree" {
 }
 
 test "M27 injection without include-children leaves child node ranges to the host" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
-    const host_number = packageCapture(&highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.javascript)], "number");
-    const json_number = packageCapture(&highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.json)], "number");
+    const host_number = packageCapture(try highlighter.packages.get(.javascript), "number");
+    const json_number = packageCapture(try highlighter.packages.get(.json), "number");
     try testing.expect(!std.meta.eql(host_number, json_number));
     const source = "const a = [1];\n";
     const array_injection =
@@ -1305,7 +1415,7 @@ test "M27 injection without include-children leaves child node ranges to the hos
 }
 
 test "M27 injection offset moves the range and an invalid offset drops only its Injection" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query,
         \\((string) @injection.content (#set! injection.language "css") (#set! injection.include-children) (#offset! @injection.content 0 1 0 -1))
@@ -1323,12 +1433,12 @@ test "M27 injection offset moves the range and an invalid offset drops only its 
 }
 
 test "M27 injection an offset that ends inside a UTF-8 sequence drops its Injection" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const source = "<a title=\"${x}é\">t</a>\n";
     const value_start = std.mem.indexOf(u8, source, "${").?;
     const value_end = std.mem.indexOf(u8, source, "\">").?;
-    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
+    const html = try highlighter.packages.get(.html);
     const intervals = try collectCaptureIntervals(testing.allocator, html, &highlighter.packages, source, null);
     defer testing.allocator.free(intervals);
     for (intervals) |interval| {
@@ -1346,7 +1456,7 @@ test "M27 injection an offset that ends inside a UTF-8 sequence drops its Inject
 }
 
 test "M27 injection depth stops at 4 for a self-injecting query" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     try useJavaScriptQueries(&highlighter,
         \\(program (expression_statement (parenthesized_expression "(" @keyword)))
@@ -1366,7 +1476,7 @@ test "M27 injection depth stops at 4 for a self-injecting query" {
 }
 
 test "M27 injection a deeper layer wins at equal priority" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     try useJavaScriptQueries(&highlighter,
         \\(identifier) @variable
@@ -1416,7 +1526,7 @@ fn highlightNanoseconds(highlighter: *TreeSitterHighlighter, path: []const u8, s
 }
 
 test "M27 injection a large fenced Zig block costs about as much as the same Zig File" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     var markdown: std.ArrayList(u8) = .empty;
     defer markdown.deinit(testing.allocator);
@@ -1434,7 +1544,7 @@ test "M27 injection a large fenced Zig block costs about as much as the same Zig
 }
 
 test "M27 injection a combined PHP text layer costs about as much as the same HTML File" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     var source: std.ArrayList(u8) = .empty;
     defer source.deinit(testing.allocator);
@@ -1475,7 +1585,7 @@ test "M27 injection merged Spans match the byte planes for random overlapping in
 }
 
 test "M27 injection resolves a captured Grammar name" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, argument_name_injection);
     const source = "f(\"text/javascript\", `x(1)`);\n";
@@ -1486,7 +1596,7 @@ test "M27 injection resolves a captured Grammar name" {
 }
 
 test "M27 injection an unknown Grammar name gives no Injection and no failure" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const source = "f(\"nope\", `a { color: red; }`);\nconst s = `b { }`;\n";
     const plain = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
@@ -1540,7 +1650,7 @@ test "M27 injection ignores UserGrammars" {
     var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build");
     defer registry.deinit();
     try testing.expectEqualStrings("fixture", registry.matchName("injection.css", "").?);
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, &registry);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, &registry);
     defer highlighter.deinit();
     try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, template_css_injection);
 
@@ -1549,7 +1659,7 @@ test "M27 injection ignores UserGrammars" {
     defer freeResult(result);
     try expectRoleAt(result, source, "color", .property);
     try testing.expectEqual(
-        packageCapture(&highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.css)], "property"),
+        packageCapture(try highlighter.packages.get(.css), "property"),
         captureOver(result, source, std.mem.indexOf(u8, source, "color").?).?,
     );
 }
@@ -1560,11 +1670,11 @@ test "M27 injection Spans stay ordered and inside their layer ranges" {
         .{ .injections = template_javascript_injection ++ "\n((template_string (string_fragment) @injection.content) (#set! injection.language \"css\") (#set! injection.combined))", .source = "[`a`, `{}`];\n[`é`, `y\n{ color: red }`];\n" },
         .{ .injections = "((template_string) @injection.content (#set! injection.language \"css\") (#set! injection.include-children) (#offset! @injection.content 0 1 0 -1))", .source = "f(`a { color: red; }`, `é {}`);\n" },
     };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     for (cases) |case| {
         try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, case.injections);
-        const package = &highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.javascript)];
+        const package = try highlighter.packages.get(.javascript);
         const intervals = try collectCaptureIntervals(testing.allocator, package, &highlighter.packages, case.source, null);
         defer testing.allocator.free(intervals);
         var injected: usize = 0;
@@ -1598,7 +1708,7 @@ test "M27 injection Spans stay ordered and inside their layer ranges" {
 }
 
 test "M27 injection a nested Injection stays out of the gaps between its parent layer ranges" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query,
         \\((template_string (string_fragment) @injection.content) (#set! injection.language "javascript") (#set! injection.combined))
@@ -1607,7 +1717,7 @@ test "M27 injection a nested Injection stays out of the gaps between its parent 
     const source = "[`f(1,`, `2)`];\n";
     const gap_start = std.mem.indexOf(u8, source, "`, `").?;
     const gap_end = gap_start + "`, `".len;
-    const package = &highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.javascript)];
+    const package = try highlighter.packages.get(.javascript);
     const intervals = try collectCaptureIntervals(testing.allocator, package, &highlighter.packages, source, null);
     defer testing.allocator.free(intervals);
     var nested: usize = 0;
@@ -1626,9 +1736,9 @@ test "M27 injection a nested Injection stays out of the gaps between its parent 
 fn useJavaScriptQueries(highlighter: *TreeSitterHighlighter, highlight_query: []const u8, locals_query: []const u8, injections_query: []const u8) !void {
     var diagnostic: predicate_mod.Diagnostic = undefined;
     const replacement = try RuntimePackage.init(testing.allocator, language(.javascript).?, highlight_query, locals_query, injections_query, &diagnostic);
-    const package = &highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.javascript)];
-    package.deinit();
-    package.* = replacement;
+    const slot = &highlighter.packages.slots[@intFromEnum(BuiltInGrammar.javascript)];
+    if (slot.*) |*package| package.deinit();
+    slot.* = replacement;
 }
 
 fn packageCapture(package: *const RuntimePackage, name: []const u8) bbr.highlight.Capture {
@@ -1744,7 +1854,7 @@ test "M27 grammar GrammarMatch selects C for .c and C++ for headers" {
 }
 
 test "M27 grammar C fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/point.c", c_fixture);
     defer freeResult(result);
@@ -1762,7 +1872,7 @@ test "M27 grammar C fixture has comment, string, keyword, function, and type rol
 }
 
 test "M27 grammar C field declaration proves has-ancestor and not-has-ancestor" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/point.c", c_fixture);
     defer freeResult(result);
@@ -1774,7 +1884,7 @@ test "M27 grammar C field declaration proves has-ancestor and not-has-ancestor" 
 }
 
 test "M27 grammar C++ fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/box.cpp", cpp_fixture);
     defer freeResult(result);
@@ -1789,7 +1899,7 @@ test "M27 grammar C++ fixture has comment, string, keyword, function, and type r
 }
 
 test "M27 grammar C++ gets the include and comment Captures from the inherited C query" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/box.cpp", cpp_fixture);
     defer freeResult(result);
@@ -1800,7 +1910,7 @@ test "M27 grammar C++ gets the include and comment Captures from the inherited C
 }
 
 test "M27 grammar C++ gives a pure C header the roles that C gives a .c File" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const header = try highlighter.highlighter().highlight(testing.allocator, "include/point.h", c_header_fixture);
     defer freeResult(header);
@@ -1827,7 +1937,7 @@ test "M27 grammar C++ gives a pure C header the roles that C gives a .c File" {
 }
 
 test "M27 grammar Rust fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/main.rs", rust_fixture);
     defer freeResult(result);
@@ -1842,7 +1952,7 @@ test "M27 grammar Rust fixture has comment, string, keyword, function, and type 
 }
 
 test "M27 grammar Odin fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/main.odin", odin_fixture);
     defer freeResult(result);
@@ -1902,7 +2012,7 @@ const java_fixture =
 ;
 
 test "M27 grammar Java fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/Greeter.java", java_fixture);
     defer freeResult(result);
@@ -1928,7 +2038,7 @@ const kotlin_fixture =
 ;
 
 test "M27 grammar Kotlin fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/Greeter.kt", kotlin_fixture);
     defer freeResult(result);
@@ -1955,7 +2065,7 @@ const groovy_fixture =
 ;
 
 test "M27 grammar Groovy fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "build.gradle", groovy_fixture);
     defer freeResult(result);
@@ -1982,7 +2092,7 @@ const c_sharp_fixture =
 ;
 
 test "M27 grammar C# fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/Greeter.cs", c_sharp_fixture);
     defer freeResult(result);
@@ -1998,7 +2108,7 @@ test "M27 grammar C# fixture has comment, string, keyword, function, and type ro
 }
 
 test "M27 grammar C# namespace module Capture has the type role" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/Greeter.cs", c_sharp_fixture);
     defer freeResult(result);
@@ -2044,7 +2154,7 @@ const python_fixture =
 ;
 
 test "M27 grammar Python fixture has shebang, comment, string, keyword, function, and constant roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "scripts/run", python_fixture);
     defer freeResult(result);
@@ -2071,7 +2181,7 @@ const ruby_fixture =
 ;
 
 test "M27 grammar Ruby fixture has comment, string, keyword, function, and constant roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "lib/add.rb", ruby_fixture);
     defer freeResult(result);
@@ -2098,7 +2208,7 @@ const swift_fixture =
 ;
 
 test "M27 grammar Swift fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "Sources/App.swift", swift_fixture);
     defer freeResult(result);
@@ -2121,7 +2231,7 @@ const sql_fixture =
 ;
 
 test "M27 grammar SQL fixture has comment, string, keyword, function, and type roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "db/migrations/001_users.sql", sql_fixture);
     defer freeResult(result);
@@ -2187,7 +2297,7 @@ test "M27 grammar GrammarMatch selects TOML, Dockerfile, and Make" {
 }
 
 test "M27 grammar TOML fixture has comment, string, keyword, property, and constant roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "Cargo.toml", toml_fixture);
     defer freeResult(result);
@@ -2200,7 +2310,7 @@ test "M27 grammar TOML fixture has comment, string, keyword, property, and const
 }
 
 test "M27 grammar Dockerfile fixture has comment, string, keyword, and property roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "Dockerfile", dockerfile_fixture);
     defer freeResult(result);
@@ -2215,7 +2325,7 @@ test "M27 grammar Dockerfile fixture has comment, string, keyword, and property 
 }
 
 test "M27 grammar Make fixture has comment, string, keyword, and function roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "Makefile", make_fixture);
     defer freeResult(result);
@@ -2268,7 +2378,7 @@ test "M27 grammar docker and make ReviewBody fences highlight with the new Built
     };
     for (cases) |case| try testing.expectEqualStrings(case.path["review.".len..], bbr.highlight.grammar_name.extension(case.fence).?);
 
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const dockerfile = try highlighter.highlighter().highlight(testing.allocator, "review.dockerfile", dockerfile_fixture);
     defer freeResult(dockerfile);
@@ -2309,7 +2419,7 @@ test "M27 grammar GrammarMatch selects HTML and XML" {
 }
 
 test "M27 grammar HTML fixture has tag, property, string, and comment roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.html", html_fixture);
     defer freeResult(result);
@@ -2323,7 +2433,7 @@ test "M27 grammar HTML fixture has tag, property, string, and comment roles" {
 }
 
 test "M27 grammar XML fixture has tag, property, string, and comment roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "assets/logo.svg", xml_fixture);
     defer freeResult(result);
@@ -2336,12 +2446,12 @@ test "M27 grammar XML fixture has tag, property, string, and comment roles" {
 }
 
 test "M27 injection HTML script and style content get JavaScript and CSS Spans" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.html", html_fixture);
     defer freeResult(result);
-    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
-    const css = &highlighter.packages[@intFromEnum(BuiltInGrammar.css)];
+    const javascript = try highlighter.packages.get(.javascript);
+    const css = try highlighter.packages.get(.css);
 
     try expectSpan(result, 3, 8, 11, "keyword");
     try testing.expectEqual(packageCapture(javascript, "keyword"), captureOver(result, html_fixture, std.mem.indexOf(u8, html_fixture, "let").?).?);
@@ -2351,11 +2461,11 @@ test "M27 injection HTML script and style content get JavaScript and CSS Spans" 
 }
 
 test "M27 injection HTML style attribute value gets CSS Spans" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.html", html_fixture);
     defer freeResult(result);
-    const css = &highlighter.packages[@intFromEnum(BuiltInGrammar.css)];
+    const css = try highlighter.packages.get(.css);
 
     // tree-sitter-css parses a bare declaration as a selector, so `color` gets the CSS tag Capture, as in Neovim.
     try expectSpan(result, 2, 19, 24, "tag");
@@ -2369,12 +2479,12 @@ test "M27 injection HTML script type selects JavaScript or JSON" {
         \\<script type="importmap">{"imports": {}}</script>
         \\
     ;
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.html", source);
     defer freeResult(result);
-    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
-    const json = &highlighter.packages[@intFromEnum(BuiltInGrammar.json)];
+    const javascript = try highlighter.packages.get(.javascript);
+    const json = try highlighter.packages.get(.json);
 
     try expectSpan(result, 1, 31, 34, "keyword");
     try testing.expectEqual(packageCapture(javascript, "keyword"), captureOver(result, source, std.mem.indexOf(u8, source, "let a").?).?);
@@ -2386,7 +2496,7 @@ test "M27 injection HTML script type selects JavaScript or JSON" {
 }
 
 test "M27 grammar a highlight pattern without Captures produces no Span and no failure" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     try useJavaScriptQueries(&highlighter, "(identifier)\n(number) @number", "", "");
     const source = "let n = 1;\n";
@@ -2454,11 +2564,11 @@ test "M27 grammar GrammarMatch selects Markdown and no path selects Markdown inl
 }
 
 test "M27 grammar Markdown fixture has keyword, punctuation, and string roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
     defer freeResult(result);
-    const markdown = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown)];
+    const markdown = try highlighter.packages.get(.markdown);
 
     try expectSpan(result, 4, 0, 7, "keyword");
     try testing.expectEqual(packageCapture(markdown, "markup.heading.1"), markdownCaptureAt(result, 4, 0).?);
@@ -2470,11 +2580,11 @@ test "M27 grammar Markdown fixture has keyword, punctuation, and string roles" {
 }
 
 test "M27 injection Markdown inline gives inline code and links the string role and keeps emphasis default" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
     defer freeResult(result);
-    const inline_package = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown_inline)];
+    const inline_package = try highlighter.packages.get(.markdown_inline);
 
     try expectSpan(result, 6, 4, 10, "string");
     try testing.expectEqual(packageCapture(inline_package, "markup.raw"), markdownCaptureAt(result, 6, 4).?);
@@ -2487,23 +2597,23 @@ test "M27 injection Markdown inline gives inline code and links the string role 
 }
 
 test "M27 injection Markdown pipe table cells get Markdown inline Spans" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
     defer freeResult(result);
-    const inline_package = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown_inline)];
+    const inline_package = try highlighter.packages.get(.markdown_inline);
 
     try expectSpan(result, 33, 2, 5, "string");
     try testing.expectEqual(packageCapture(inline_package, "markup.raw"), markdownCaptureAt(result, 33, 2).?);
 }
 
 test "M27 injection Markdown fenced zig and js blocks get Zig and JavaScript Spans" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
     defer freeResult(result);
-    const zig = &highlighter.packages[@intFromEnum(BuiltInGrammar.zig)];
-    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
+    const zig = try highlighter.packages.get(.zig);
+    const javascript = try highlighter.packages.get(.javascript);
 
     try expectSpan(result, 11, 0, 5, "keyword");
     try testing.expectEqual(packageCapture(zig, "keyword"), markdownCaptureAt(result, 11, 0).?);
@@ -2512,11 +2622,11 @@ test "M27 injection Markdown fenced zig and js blocks get Zig and JavaScript Spa
 }
 
 test "M27 injection Markdown fenced block with an unknown info string has no injected Spans" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
     defer freeResult(result);
-    const markdown = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown)];
+    const markdown = try highlighter.packages.get(.markdown);
 
     var line_spans: usize = 0;
     for (result.spans) |span| if (span.line == 19) {
@@ -2529,12 +2639,12 @@ test "M27 injection Markdown fenced block with an unknown info string has no inj
 }
 
 test "M27 injection Markdown fenced block in a block quote has no injected Span on the quote marker" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
     defer freeResult(result);
-    const markdown = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown)];
-    const zig = &highlighter.packages[@intFromEnum(BuiltInGrammar.zig)];
+    const markdown = try highlighter.packages.get(.markdown);
+    const zig = try highlighter.packages.get(.zig);
 
     try expectSpan(result, 23, 0, 2, "punctuation");
     try testing.expectEqual(packageCapture(markdown, "punctuation.special"), markdownCaptureAt(result, 23, 0).?);
@@ -2544,11 +2654,11 @@ test "M27 injection Markdown fenced block in a block quote has no injected Span 
 }
 
 test "M27 injection Markdown HTML block and inline HTML get HTML Spans" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
     defer freeResult(result);
-    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
+    const html = try highlighter.packages.get(.html);
 
     try expectSpan(result, 26, 1, 4, "tag");
     try testing.expectEqual(packageCapture(html, "tag"), markdownCaptureAt(result, 26, 1).?);
@@ -2559,12 +2669,12 @@ test "M27 injection Markdown HTML block and inline HTML get HTML Spans" {
 }
 
 test "M27 injection Markdown YAML and TOML front matter get YAML and TOML Spans" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const yaml_result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
     defer freeResult(yaml_result);
-    const yaml = &highlighter.packages[@intFromEnum(BuiltInGrammar.yaml)];
-    const toml = &highlighter.packages[@intFromEnum(BuiltInGrammar.toml)];
+    const yaml = try highlighter.packages.get(.yaml);
+    const toml = try highlighter.packages.get(.toml);
 
     try expectSpan(yaml_result, 2, 0, 5, "property");
     try testing.expectEqual(packageCapture(yaml, "property"), markdownCaptureAt(yaml_result, 2, 0).?);
@@ -2616,12 +2726,12 @@ test "M27 injection Markdown fenced js block uses the JavaScript BuiltInGrammar 
     var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build");
     defer registry.deinit();
     try testing.expectEqualStrings("fixture", registry.matchName("injection.js", "").?);
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, &registry);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, &registry);
     defer highlighter.deinit();
 
     const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
     defer freeResult(result);
-    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
+    const javascript = try highlighter.packages.get(.javascript);
     try expectSpan(result, 15, 0, 3, "keyword");
     try testing.expectEqual(packageCapture(javascript, "keyword"), markdownCaptureAt(result, 15, 0).?);
 }
@@ -2664,7 +2774,7 @@ test "M27 grammar GrammarMatch selects PHP" {
 }
 
 test "M27 grammar PHP fixture has comment, string, keyword, function, and variable roles" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_fixture);
     defer freeResult(result);
@@ -2679,12 +2789,12 @@ test "M27 grammar PHP fixture has comment, string, keyword, function, and variab
 }
 
 test "M27 injection PHP text around the PHP code gets HTML Spans and the PHP code gets none" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_fixture);
     defer freeResult(result);
-    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
-    const php = &highlighter.packages[@intFromEnum(BuiltInGrammar.php)];
+    const html = try highlighter.packages.get(.html);
+    const php = try highlighter.packages.get(.php);
 
     try expectSpan(result, 1, 1, 4, "tag");
     try testing.expectEqual(packageCapture(html, "tag"), captureOver(result, php_fixture, std.mem.indexOf(u8, php_fixture, "div").?).?);
@@ -2698,22 +2808,22 @@ test "M27 injection PHP text around the PHP code gets HTML Spans and the PHP cod
 }
 
 test "M27 injection PHP script reaches JavaScript through the HTML Injection" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_fixture);
     defer freeResult(result);
-    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
+    const javascript = try highlighter.packages.get(.javascript);
 
     try expectSpan(result, 9, 8, 11, "keyword");
     try testing.expectEqual(packageCapture(javascript, "keyword"), captureOver(result, php_fixture, std.mem.indexOf(u8, php_fixture, "let").?).?);
 }
 
 test "M27 injection PHP heredoc with the closing name HTML gets HTML Spans" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_heredoc_fixture);
     defer freeResult(result);
-    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
+    const html = try highlighter.packages.get(.html);
 
     try expectSpan(result, 3, 1, 3, "tag");
     try testing.expectEqual(packageCapture(html, "tag"), captureOver(result, php_heredoc_fixture, std.mem.indexOf(u8, php_heredoc_fixture, "em").?).?);
@@ -2722,11 +2832,11 @@ test "M27 injection PHP heredoc with the closing name HTML gets HTML Spans" {
 }
 
 test "M27 injection PHP joins the HTML text around PHP code into one combined HTML tree" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_split_tag_fixture);
     defer freeResult(result);
-    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
+    const html = try highlighter.packages.get(.html);
 
     try expectSpan(result, 1, 15, 19, "keyword");
     try expectSpan(result, 1, 28, 29, "string");

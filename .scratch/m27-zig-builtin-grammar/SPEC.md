@@ -307,7 +307,8 @@ The Lua pattern translation handles the classes `%a`, `%d`, `%l`, `%s`, `%u`, `%
 It also handles their upper-case complements, `%` escapes, sets, anchors, and the lazy `-` quantifier.
 A `%b`, `%f`, or back reference stops the adaptation.
 The adaptation escapes the result for a query string literal.
-RE2 then compiles it through `query_regex.zig`, so an invalid translation fails `TreeSitterHighlighter.init`.
+RE2 then compiles it through `query_regex.zig`, so an invalid translation fails the first use of its BuiltInGrammar.
+The test "M27 grammar every BuiltInGrammar loads its queries" prepares every query, so CI finds an invalid translation.
 
 Each removal leaves a comment at its place, such as `; bbr: removed (#set! conceal "")`.
 These comments are the adaptation record.
@@ -554,9 +555,13 @@ The anonymous imports are `<name>_highlights` and `<name>_injections`.
 `grammarSource` in `tree_sitter_highlighter.zig` keeps an exhaustive switch, so a new enum tag without a source is a compile error.
 The `extern fn tree_sitter_<name>` declarations use the manifest `.symbol`.
 
-`TreeSitterHighlighter.init` still prepares every BuiltInGrammar query at startup.
-So an invalid query still fails at startup and in every test that creates the adapter.
-Ticket 12 measures the time of `TreeSitterHighlighter.init`.
+Ticket 15 changed this section on 2026-11-02, after the operator chose lazy loading.
+`TreeSitterHighlighter.init` prepares no BuiltInGrammar query.
+`BuiltInPackages.get` prepares a BuiltInGrammar on its first use, as a host or as an Injection.
+A mutex guards the packages, because highlight workers share them.
+A failed preparation fails only that highlight and keeps no entry, so the next use tries again.
+The test "M27 grammar every BuiltInGrammar loads its queries" prepares every query, so CI still finds an invalid query.
+Ticket 12 measures the time of `TreeSitterHighlighter.init`, and ticket 15 measures the time of the first use.
 
 ## Binary size measurement
 
@@ -614,7 +619,7 @@ Ticket 12 adds these rules to the table in `AGENTS.md`:
 | --- | --- |
 | Every vendored Grammar file has a manifest checksum. The build never generates or downloads a Grammar source. | `tools/check_vendored_grammars.py`, run by `zig build test`. |
 | An adapted query is the exact output of `tools/adapt_queries.py` from the raw nvim-treesitter queries. Every removed form leaves a `; bbr:` comment, and an unknown predicate stops the adaptation. | `tools/check_vendored_grammars.py`, run by `zig build test`. The tests in `tests/adapt_queries_test.py`. |
-| Every BuiltInGrammar loads its highlight query and its injection query at startup. | The test "M27 grammar every BuiltInGrammar loads its queries" in `src/highlight/tree_sitter_highlighter.zig`. |
+| Every BuiltInGrammar query is valid. `TreeSitterHighlighter.init` prepares no query. `BuiltInPackages.get` prepares a BuiltInGrammar on its first use, under its mutex, and reuses it after that. A failed preparation fails only that highlight, keeps no entry, and the next use tries again. | The tests "M27 grammar every BuiltInGrammar loads its queries", "M27 lazy init prepares no BuiltInGrammar query", "M27 lazy every BuiltInGrammar fixture highlights as after eager preparation", "M27 lazy a failed preparation fails only that highlight and the next use succeeds", and "M27 lazy concurrent first uses of one BuiltInGrammar give the eager output" in `src/highlight/tree_sitter_highlighter.zig`. The mutations `m27-lazy-reuse` and `m27-lazy-init` in `tools/check_guard_mutations.py`. |
 | Every BuiltInGrammar ABI lies in the vendored runtime range and equals the manifest `.abi`. | The test "M27 grammar every BuiltInGrammar ABI is compatible with the vendored runtime". |
 | A new BuiltInGrammar is one arm of `grammarSource` and one row of the GrammarMatch table, equal to its manifest entry. | The exhaustive switch in `grammarSource` (compile error). The test "M27 grammar the GrammarMatch table equals the manifest". |
 | Injection stays inside `TreeSitterHighlighter`, and only BuiltInGrammars take part. Injected Spans are ordered, line-relative, and inside their layer ranges. | The tests "M27 injection Spans stay ordered and inside their layer ranges" and "M27 injection ignores UserGrammars". |
@@ -755,7 +760,6 @@ It does not gate the hermetic suite.
 - Injection hosts other than Markdown, Markdown inline, HTML, and PHP.
 - `locals.scm` for the new BuiltInGrammars.
 - New Theme colors, bold, or italic for Markdown emphasis.
-- Lazy preparation of BuiltInGrammar queries.
 - Case-insensitive GrammarMatch rules.
 - Automatic updates of the vendored Grammars.
 

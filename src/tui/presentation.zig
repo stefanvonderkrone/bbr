@@ -105,7 +105,7 @@ test "M23 highlighting RemoteReview outdated Reply Suggestions use authored cont
                 try testing.expect(job != null);
                 try testing.expectEqualStrings("before.js", job.?.path);
                 try testing.expectEqualStrings(if (kind == 0) "const reply = 1;\n" else "const draft = 2;\n", job.?.content);
-                var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+                var highlighter = @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, testing.io, null);
                 defer highlighter.deinit();
                 try state.dispatch(.{ .code_highlight_completed = job.?.execute(highlighter.highlighter()) });
                 try testing.expect(state.projection().review_search.?.code_highlights[kind].spans.len > 0);
@@ -524,7 +524,7 @@ test "M23 highlighting uses real GrammarMatch shebang fallback and retains autho
     defer store.deinit();
     var state = try codeTestPresentation(testing.allocator, store.store(), &.{"> ```python extra\n> #!/bin/bash\n> echo hi\n> ```"}, 0, 40);
     defer state.deinit();
-    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const before = state.projection().review.?.frame;
     const job = state.takeCommand().?.highlight_code;
@@ -555,7 +555,7 @@ test "M27 grammar a fenced zig block in a ReviewBody gets Zig Spans" {
     defer store.deinit();
     var state = try codeTestPresentation(testing.allocator, store.store(), &.{"```zig\nconst x = \"y\"; // why\n```"}, 0, 40);
     defer state.deinit();
-    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const job = state.takeCommand().?.highlight_code;
     try testing.expectEqualStrings("review.zig", job.path);
@@ -572,7 +572,7 @@ test "M27 injection a fenced html block in a ReviewBody gets HTML and injected J
     defer store.deinit();
     var state = try codeTestPresentation(testing.allocator, store.store(), &.{"```html\n<p>x</p><script>let n = 1;</script>\n```"}, 0, 40);
     defer state.deinit();
-    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, testing.io, null);
     defer highlighter.deinit();
     const job = state.takeCommand().?.highlight_code;
     try testing.expectEqualStrings("review.html", job.path);
