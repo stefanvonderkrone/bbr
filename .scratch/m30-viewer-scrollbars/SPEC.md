@@ -317,7 +317,6 @@ pub fn project(
     total: usize,
     row_marks: []const RowMark,
     hits: []const frame.ProjectedSourceRange,
-    hits_sorted: bool,
 ) ![]const ?view.ScrollMark;
 ```
 
@@ -329,7 +328,7 @@ It returns an empty slice when `extent == 0` or `total <= extent`.
 3. A cell takes a row mark when the cell is empty or the mark outranks the cell's mark.
 4. A cell takes `buffer_search_hit` when a hit has a `visual_row` in the cell's rows.
    The cell's rows run from `cellFirstRow(cell)` to `cellFirstRow(cell + 1)`, or to `total` for the last cell.
-   With `hits_sorted`, one binary search per cell finds the answer.
+   The hits are sorted by `visual_row`, so one binary search per cell finds the answer.
 5. A hit or a row mark at or past `total` is ignored.
 
 `render.drawReview` calls `project` with the render scratch allocator.
