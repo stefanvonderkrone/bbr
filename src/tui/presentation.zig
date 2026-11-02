@@ -31061,10 +31061,19 @@ test "M30 scrollbar a Review Search entry click and a double click behave as bef
     try testing.expect(presentation.projection().review_search == null);
 }
 
-/// The Review Search list fixture for its bar, and the Pane fixture for a
-/// Pane bar.
+/// The Review Search list fixture for its bar, the Pane fixture with the help
+/// open for the help bar, and the Pane fixture for a Pane bar.
 fn m30BarState(store: *bbr.review.InMemoryStore, bar: frame_mod.ScrollBar) !Presentation {
-    return if (bar == .review_search_list) m30ReviewSearchState(store, m30_search_geometries[0], false) else m30DragState(store, true);
+    switch (bar) {
+        .review_search_list => return m30ReviewSearchState(store, m30_search_geometries[0], false),
+        .help => {
+            var presentation = try m30DragState(store, true);
+            errdefer presentation.deinit();
+            try presentation.dispatch(.{ .action = .help });
+            return presentation;
+        },
+        .sidebar, .diff_pane => return m30DragState(store, true),
+    }
 }
 
 test "M30 scrollbar a press off the thumb and a drag that move the scroll repaint each bar" {
