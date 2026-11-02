@@ -22603,6 +22603,225 @@ test "empty source Lines count and yank has no trailing newline" {
     try testing.expectEqualStrings("\nnew second", command.copy_clipboard.text);
 }
 
+fn moveToRecoverySource(presentation: *Presentation, path: []const u8, version: SelectedVersion, number: u32) !void {
+    const review = presentation.projection().review.?;
+    for (review.frame.visual_rows, 0..) |row, index| {
+        const line = frame_mod.selectedSource(row, version) orelse continue;
+        const file_index = review.buffer.fileIndexForRow(row.buffer_index) orelse continue;
+        if (!std.mem.eql(u8, review.diff.files[file_index].displayPath(), path)) continue;
+        if ((if (version == .old) line.old_no else line.new_no) != number) continue;
+        try moveToRow(presentation, index);
+        return;
+    }
+    return error.SourceLineNotFound;
+}
+
+fn refreshRecoverySession(presentation: *Presentation, session: *Session) !void {
+    try presentation.dispatch(.{ .action = .refresh });
+    const load = presentation.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(presentation, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = session },
+    } });
+}
+
+test "Review recovery refresh keeps the source path version line and cursor viewport offset" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]SelectedVersion{ .new, .old }) |version| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testWideSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 12 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        if (version == .old) try dispatchView(&presentation, .{ .action = .select_old_version });
+        const number: u32 = if (version == .old) 3 else 20;
+        try moveToRecoverySource(&presentation, "wide.zig", version, number);
+        try presentation.dispatch(.{ .action = .center });
+        const before = presentation.projection().review.?;
+        const offset = before.navigation.cursor - before.navigation.scroll;
+        try testing.expect(offset > 0);
+        const epoch = before.session_epoch;
+
+        const replacement = try testWideSession(testing.allocator, 1);
+        replacement.threads = try bbr.review.buildThreads(replacement.arena.allocator(), &.{.{
+            .id = 99,
+            .author = "Author",
+            .body = "new Review-level Comment",
+            .scope = .review,
+        }});
+        try refreshRecoverySession(&presentation, replacement);
+
+        const after = presentation.projection().review.?;
+        try testing.expect(after.session_epoch != epoch);
+        try testing.expectEqual(version, after.selected_version);
+        const row = after.frame.visual_rows[after.navigation.cursor];
+        const line = frame_mod.selectedSource(row, version) orelse return error.SourceLocationLost;
+        try testing.expectEqual(@as(?u32, number), if (version == .old) line.old_no else line.new_no);
+        const file_index = after.buffer.fileIndexForRow(row.buffer_index).?;
+        try testing.expectEqualStrings("wide.zig", after.diff.files[file_index].displayPath());
+        try testing.expectEqual(offset, after.navigation.cursor - after.navigation.scroll);
+    };
+}
+
+test "Review recovery refresh retains a removed Line while the new version stays selected" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try moveToRecoverySource(&presentation, "b.zig", .old, 1);
+    try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);
+
+    try refreshRecoverySession(&presentation, try testTwoFileSession(testing.allocator, 1));
+
+    const after = presentation.projection().review.?;
+    const line = frame_mod.selectedSource(after.frame.visual_rows[after.navigation.cursor], .old) orelse return error.SourceLocationLost;
+    try testing.expectEqualStrings("old b", line.text);
+    try testing.expectEqual(SelectedVersion.new, after.selected_version);
+}
+
+test "Review recovery LocalReview refresh retains the source Line" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.initLocal(1, "main", "feature"), .session = try testLocalSession(testing.allocator) },
+    });
+    defer presentation.deinit();
+    try moveToRecoverySource(&presentation, "a.zig", .new, 1);
+
+    try refreshRecoverySession(&presentation, try testLocalSession(testing.allocator));
+
+    const after = presentation.projection().review.?;
+    const line = frame_mod.selectedSource(after.frame.visual_rows[after.navigation.cursor], .new) orelse return error.SourceLocationLost;
+    try testing.expectEqualStrings("new", line.text);
+}
+
+test "Review recovery a missing Comment falls back to its File header" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCommentSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try cursorToCommentCard(&presentation, 99);
+
+    try refreshRecoverySession(&presentation, try testSession(testing.allocator, 1, 'a'));
+
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .file);
+    try testing.expectEqualStrings("a.zig", owner.file.displayPath());
+}
+
+test "Review recovery refresh follows the path when Files change order" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 6) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try moveToRecoverySource(&presentation, "3.zig", .new, 1);
+    try presentation.dispatch(.{ .action = .center });
+    const before = presentation.projection().review.?.navigation;
+    const replacement = try testManyFileSession(testing.allocator, 1, 6);
+    const files = try replacement.arena.allocator().dupe(bbr.diff.File, replacement.diff.files);
+    const preceding = files[2];
+    files[2] = files[3];
+    files[3] = preceding;
+    replacement.diff.files = files;
+
+    try refreshRecoverySession(&presentation, replacement);
+
+    const after = presentation.projection().review.?;
+    const row = after.frame.visual_rows[after.navigation.cursor];
+    const line = frame_mod.selectedSource(row, .new) orelse return error.SourceLocationLost;
+    try testing.expectEqual(@as(?u32, 1), line.new_no);
+    try testing.expectEqualStrings("new 3", line.text);
+    const file_index = after.buffer.fileIndexForRow(row.buffer_index).?;
+    try testing.expectEqual(@as(usize, 2), file_index);
+    try testing.expectEqualStrings("3.zig", after.diff.files[file_index].displayPath());
+    try testing.expectEqual(before.cursor - before.scroll, after.navigation.cursor - after.navigation.scroll);
+}
+
+test "Review recovery a missing source line falls back to its File header" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    const replacement = try testTwoFileSession(testing.allocator, 1);
+    replacement.diff = try bbr.diff.parse(replacement.arena.allocator(),
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old a
+        \\+new a
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -2 +2 @@
+        \\-old b
+        \\+new b
+    );
+
+    try refreshRecoverySession(&presentation, replacement);
+
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .file);
+    try testing.expectEqualStrings("b.zig", owner.file.displayPath());
+}
+
+test "Review recovery a missing File uses the initial navigation reset" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+
+    try refreshRecoverySession(&presentation, try testSession(testing.allocator, 1, 'a'));
+
+    const navigation = presentation.projection().review.?.navigation;
+    try testing.expectEqual(@as(usize, 0), navigation.cursor);
+    try testing.expectEqual(@as(usize, 0), navigation.scroll);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .file);
+    try testing.expectEqualStrings("a.zig", owner.file.displayPath());
+}
+
+test "Review recovery refresh retains a published Comment cursor by CommentId" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCommentSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try cursorToCommentCard(&presentation, 99);
+    const previous_cursor = presentation.projection().review.?.navigation.cursor;
+    const replacement = try testCommentSession(testing.allocator, 1);
+    const comments = try replacement.arena.allocator().dupe(bbr.review.Comment, &.{
+        .{ .id = 88, .author = "Author", .body = "new Review-level Comment", .scope = .review },
+        replacement.threads[0].root.*,
+    });
+    replacement.threads = try bbr.review.buildThreads(replacement.arena.allocator(), comments);
+
+    try refreshRecoverySession(&presentation, replacement);
+
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .comment and owner.comment.id == 99 and owner.comment.part == .header);
+    try testing.expect(presentation.projection().review.?.navigation.cursor != previous_cursor);
+}
+
 test "M23 acceptance same Review refresh expires search and Selection in both layouts and Review modes" {
     for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
@@ -28517,6 +28736,196 @@ fn completeNextDisclosureBuild(presentation: *Presentation) !void {
 fn cursorOwner(presentation: *Presentation) frame_mod.RowOwner {
     const review = presentation.projection().review.?;
     return review.frame.visual_rows[review.navigation.cursor].owner;
+}
+
+test "Review recovery ctrl-c hides a terminal error Overlay and X reopens it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "failed root" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testSession(testing.allocator, 1, 'a'));
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    try testing.expect(!presentation.projection().shutting_down);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    const shown = presentation.projection().submission_tree.?;
+    try testing.expect(shown.completion.? == .partial);
+    try testing.expectEqual(SubmissionItemState.failed, shown.items[0].state);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+fn testReviewRecoveryHide(paused: bool, key_stroke: keymap_mod.KeyStroke) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const command_id = post.post_draft.command_id;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    if (paused) {
+        store.fail_next_checkpoint = true;
+        try presentation.dispatch(.{ .post_draft_completed = .{
+            .command_id = command_id,
+            .operation_id = operation_id,
+            .identity = .init(key),
+            .temp_id = 1,
+            .outcome = .{ .posted = 99 },
+        } });
+        try testing.expect(presentation.projection().submission.?.persistence_paused);
+    }
+
+    try presentation.dispatch(.{ .key = key_stroke });
+    try testing.expect(presentation.projection().submission_tree == null);
+    try testing.expect(!presentation.projection().shutting_down);
+    try testing.expectEqual(operation_id, presentation.projection().submission.?.operation_id);
+    try testing.expect((try locks.locks().tryAcquire(key.storeKey())) == null);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const run = (try store.store().activeSubmission(arena.allocator())).?;
+    try testing.expectEqual(operation_id, run.operation_id);
+    try testing.expectEqual(@as(?bbr.review.TempId, 1), run.current_temp_id);
+    try testing.expect((try store.store().load(arena.allocator(), key.storeKey()))[0].state == .submitting);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    const shown = presentation.projection().submission_tree.?;
+    try testing.expectEqual(operation_id, shown.operation_id);
+    try testing.expect(shown.completion == null);
+    try testing.expectEqual(paused, presentation.projection().submission.?.persistence_paused);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "Review recovery Escape hides an active Overlay without cancelling its run" {
+    try testReviewRecoveryHide(false, .{ .codepoint = keymap_mod.special.escape });
+}
+
+test "Review recovery ctrl-c hides an active Overlay without cancelling its run" {
+    try testReviewRecoveryHide(false, .{ .codepoint = 'c', .mods = .{ .ctrl = true } });
+}
+
+test "Review recovery Escape hides a checkpoint-paused Overlay without releasing ownership" {
+    try testReviewRecoveryHide(true, .{ .codepoint = keymap_mod.special.escape });
+}
+
+test "Review recovery ctrl-c hides a checkpoint-paused Overlay without releasing ownership" {
+    try testReviewRecoveryHide(true, .{ .codepoint = 'c', .mods = .{ .ctrl = true } });
+}
+
+test "Review recovery active Enter navigates without granting mutation authority" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    for ([_]u21{ 'e', 'a', 'D', 'X' }) |codepoint| try presentation.dispatch(.{ .key = .{ .codepoint = codepoint } });
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expect(presentation.projection().reanchor == null);
+    try testing.expect(presentation.projection().delete_confirmation == null);
+    try testing.expect(presentation.takeCommand() == null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expectEqual(ActionError.draft_submission_in_flight, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expect(presentation.projection().delete_confirmation == null);
+    try testing.expectEqual(ActionError.draft_submission_in_flight, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try testing.expect(presentation.projection().reanchor == null);
+    try testing.expectEqual(ActionError.draft_submission_in_flight, presentation.projection().action_error.?);
+    try testing.expectEqual(operation_id, presentation.projection().submission.?.operation_id);
+    try testing.expect((try locks.locks().tryAcquire(key.storeKey())) == null);
+}
+
+fn testReviewRecoveryPosted(resolved: bool) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "published", .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } } });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const command_id = post.post_draft.command_id;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .command_id = command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .posted = 99 },
+    } });
+    const load = presentation.takeCommand().?.load_session;
+    const fetched = try testCommentSession(testing.allocator, 1);
+    const threads = try fetched.arena.allocator().dupe(bbr.review.Thread, fetched.threads);
+    threads[0].resolved = resolved;
+    fetched.threads = threads;
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = fetched },
+    } });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 0), (try store.store().load(arena.allocator(), key.storeKey())).len);
+    try testing.expectEqual(SubmissionItemState.posted, presentation.projection().submission_tree.?.items[0].state);
+    if (resolved) for (presentation.projection().review.?.frame.visual_rows) |row| {
+        try testing.expect(row.owner != .comment or row.owner.comment.id != 99);
+    };
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    while (presentation.commands.items.len > 0) {
+        try testing.expect(presentation.commands.items[0] == .build_buffer_disclosure);
+        try completeDisclosureBuild(&presentation);
+    }
+    try testing.expect(presentation.projection().submission_tree == null);
+    try testing.expect(presentation.projection().action_error == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .comment and owner.comment.id == 99 and owner.comment.part == .header);
+}
+
+test "Review recovery terminal posted Enter finds the fetched Comment after Draft reconciliation" {
+    try testReviewRecoveryPosted(false);
+}
+
+test "Review recovery terminal posted Enter reveals a fetched Comment in a collapsed resolved Thread" {
+    try testReviewRecoveryPosted(true);
 }
 
 test "Enter in the terminal Submission Overlay jumps to the Draft and X shows the Overlay again" {
