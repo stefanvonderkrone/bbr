@@ -378,7 +378,7 @@ pub fn listBrowserPullRequests(allocator: std.mem.Allocator, client: bbr.bitbuck
 fn loadPullRequests(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, repository: []const u8) !browser.PullRequestsOutcome {
     const summaries = try browser.PullRequestSummaries.create(allocator);
     errdefer summaries.destroy();
-    summaries.prs = try client.listOpenPullRequestSummaries(summaries.arena.allocator(), repository);
+    summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
     return .{ .loaded = summaries };
 }
 

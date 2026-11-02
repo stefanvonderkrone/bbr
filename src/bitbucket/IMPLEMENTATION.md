@@ -131,7 +131,7 @@ Sources: [Atlassian's mention API guide](https://support.atlassian.com/bitbucket
 ### Browser list participant fields
 
 This shape is unproven. No live check has run yet.
-`Client.listOpenPullRequestSummaries` asks for `participants.approved` and `participants.state` in the `fields` filter of the PullRequest list.
+`Client.listPullRequests` asks for `participants.approved` and `participants.state` in the `fields` filter of the PullRequest list, because `partialFields` derives the filter from `PrSummaryJson`.
 The adapter counts an approval for each participant with `approved = true`.
 It counts a changes-requested state for each participant with `state = "changes_requested"`.
 The Comment list ignores some `fields` additions, as the Outdated Comments section shows, so the PullRequest list can do the same.

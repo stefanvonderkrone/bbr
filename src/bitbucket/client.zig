@@ -275,20 +275,8 @@ pub const Client = struct {
         return self.listPages(allocator, types.RepositorySummary, RepositorySummaryPage, dupeRepositorySummary, deinitRepositorySummary, .{}, url, .{}, null, false);
     }
 
-    /// Every open PullRequest Summary of one Repository, with approval and changes-requested counts.
-    /// A failed page fails the whole list. Free the result with `deinitSummaries`.
-    pub fn listOpenPullRequestSummaries(self: Client, allocator: Allocator, repo_slug: []const u8) ![]PullRequestSummary {
-        const url = try self.repositoryEndpoint(allocator, repo_slug, "{s}", .{open_pull_request_summaries_query});
-        defer allocator.free(url);
-        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url, .{}, null, false);
-    }
-
     fn repositorySummariesUrl(self: Client, allocator: Allocator) ![]u8 {
-        var url: std.ArrayList(u8) = .empty;
-        defer url.deinit(allocator);
-        try appendPath(allocator, &url, "/repositories", &.{self.cred.workspace});
-        try url.appendSlice(allocator, repository_summaries_query);
-        return url.toOwnedSlice(allocator);
+        return pathUrl(allocator, "/repositories", &.{self.cred.workspace}, "?pagelen={d}&sort=-updated_on&fields=" ++ comptime partialFields(RepositorySummaryPage), .{max_pagelen.repositories});
     }
 
     /// The live shape check behind `bbr check-browser`. It reads the raw pages of both Browser lists,
@@ -311,13 +299,13 @@ pub const Client = struct {
             allocator.free(shape.repository);
             shape.repository = try allocator.dupe(u8, repositories[0].slug);
         }
-        const pull_requests_url = try self.repositoryEndpoint(allocator, shape.repository, "{s}", .{open_pull_request_summaries_query});
-        defer allocator.free(pull_requests_url);
-        if (try self.missingShapeField(allocator, pull_requests_url, &pull_request_summary_fields, &shape.participants)) |field| {
+        const pull_requests_list = try self.repositoryPullRequestList(allocator, shape.repository, .{}, .{});
+        defer allocator.free(pull_requests_list.url);
+        if (try self.missingShapeField(allocator, pull_requests_list.url, &pull_request_summary_fields, &shape.participants)) |field| {
             shape.missing = .{ .list = .pull_requests, .field = field };
             return shape;
         }
-        const pull_requests = try self.listOpenPullRequestSummaries(allocator, shape.repository);
+        const pull_requests = try self.listPullRequests(allocator, shape.repository, .{});
         defer deinitSummaries(allocator, pull_requests);
         shape.pull_requests = pull_requests.len;
         for (pull_requests) |pull_request| {
@@ -2526,23 +2514,13 @@ const PrSummaryJson = struct {
 
 const PrListPage = NumberedPage(PrSummaryJson);
 
-// Without `next` in a `fields` filter, Bitbucket drops the page link and the list stops after one page.
+/// The fields that `checkBrowserShape` requires in each list value.
 const repository_summary_fields = [_][]const u8{ "slug", "name", "updated_on" };
-const repository_summaries_query = "?pagelen=100&sort=-updated_on&fields=next" ++ fieldsFilter(&repository_summary_fields, &.{});
 const pull_request_summary_fields = [_][]const u8{
     "id",                  "title",              "state",                   "draft", "updated_on",
     "author.display_name", "source.branch.name", "destination.branch.name",
 };
 const participant_fields = [_][]const u8{ "approved", "state" };
-const open_pull_request_summaries_query = "/pullrequests?pagelen=50&state=OPEN&fields=next" ++
-    fieldsFilter(&pull_request_summary_fields, &participant_fields);
-
-fn fieldsFilter(comptime fields: []const []const u8, comptime participant: []const []const u8) []const u8 {
-    var filter: []const u8 = "";
-    for (fields) |field| filter = filter ++ ",values." ++ field;
-    for (participant) |field| filter = filter ++ ",values.participants." ++ field;
-    return filter;
-}
 
 /// The result of `Client.checkBrowserShape`. `repository` names the checked Repository.
 pub const BrowserShape = struct {
@@ -5934,10 +5912,8 @@ test "review followups commits prefer linked display name and retain raw-only au
     try testing.expectEqualStrings("Display Author", items[2].author);
 }
 
-const m24_repositories_url = "https://api.bitbucket.org/2.0/repositories/check24?pagelen=100&sort=-updated_on&fields=next,values.slug,values.name,values.updated_on";
-const m24_pull_requests_url = "https://api.bitbucket.org/2.0/repositories/check24/pr-webapp/pullrequests?pagelen=50&state=OPEN" ++
-    "&fields=next,values.id,values.title,values.state,values.draft,values.updated_on,values.author.display_name," ++
-    "values.source.branch.name,values.destination.branch.name,values.participants.approved,values.participants.state";
+const m24_repositories_url = "https://api.bitbucket.org/2.0/repositories/check24?pagelen=100&sort=-updated_on&fields=values.slug,values.name,values.updated_on,next";
+const m24_pull_requests_url = "https://api.bitbucket.org/2.0/repositories/check24/pr-webapp/pullrequests?pagelen=50&state=OPEN" ++ pull_request_fields;
 const m24_repository_pages = [_]@import("../http/fake_client.zig").Canned{
     .{ .body =
     \\{"values":[{"slug":"pr-webapp","name":"PR Webapp","updated_on":"2026-10-29T09:26:40+00:00"},{"slug":"api","name":"API","updated_on":"2024-02-29T23:59:59Z"}],"next":"https://api.bitbucket.org/2.0/repositories/check24?page=2"}
@@ -5983,7 +5959,7 @@ test "M24 acquisition Repository Summaries follow every page in order with the B
 
 test "M24 acquisition open PullRequest Summaries count approvals and changes-requested participants" {
     var fake: FakeHttpClient = .{ .responses = &m24_pull_request_pages };
-    const items = try Client.init(fake.httpClient(), testCredential()).listOpenPullRequestSummaries(testing.allocator, "pr-webapp");
+    const items = try Client.init(fake.httpClient(), testCredential()).listPullRequests(testing.allocator, "pr-webapp", .{});
     defer deinitSummaries(testing.allocator, items);
     try testing.expectEqual(@as(usize, 2), fake.call_count);
     try testing.expectEqualStrings(m24_pull_requests_url, fake.urlAt(0).?);
@@ -6028,7 +6004,7 @@ test "M24 acquisition a missing or malformed update time gives null" {
         const bb = Client.init(fake.httpClient(), testCredential());
         const repositories = try bb.listRepositorySummaries(testing.allocator);
         defer deinitRepositorySummaries(testing.allocator, repositories);
-        const pull_requests = try bb.listOpenPullRequestSummaries(testing.allocator, "r");
+        const pull_requests = try bb.listPullRequests(testing.allocator, "r", .{});
         defer deinitSummaries(testing.allocator, pull_requests);
         try testing.expectEqual(case.expected, repositories[0].updated_on);
         try testing.expectEqual(case.expected, pull_requests[0].updated_on);
@@ -6045,7 +6021,7 @@ fn m24ListCount(allocator: Allocator, bb: Client, list: M24List) !usize {
             return items.len;
         },
         .pull_requests => {
-            const items = try bb.listOpenPullRequestSummaries(allocator, "pr-webapp");
+            const items = try bb.listPullRequests(allocator, "pr-webapp", .{});
             defer deinitSummaries(allocator, items);
             return items.len;
         },
