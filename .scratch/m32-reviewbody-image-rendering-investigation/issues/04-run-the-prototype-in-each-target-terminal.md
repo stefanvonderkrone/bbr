@@ -285,6 +285,43 @@ The research of ticket 01 predicts that a pasted image in a private Repository d
 Then I15 shows `failed`, and the hop lines show the status and the sign-in host.
 That result is evidence for ticket 05, not a prototype fault.
 
+### Prototype findings not fixed
+
+The M32 prototype fix run left two review findings open on purpose.
+
+- M32P-16, the `postEvent` part. The review asked bbr to release the job and the slot when `postEvent` fails.
+  `postEvent` fails only when its task is cancelled (vaxis `Loop.zig:112`, `queue.zig:42-47`).
+  `app.zig` never cancels an image task. Quit waits for each image task (`app.zig:209`), and `max_fetch_ms` now bounds that wait.
+  The human sees nothing from this path.
+  Decision: no fix, because the path cannot happen.
+  The External Edit part of M32P-16 is fixed in `8343b29`.
+- M32P-9, the DNS part. A public name that resolves to a private address still loads with `BBR_M32_ALLOW_EXTERNAL=1`.
+  std http resolves the name itself, so a check before the request can be bypassed.
+  The human run uses public hosts only.
+  Decision: record it for the production design.
+
+M32P-15 has a fix in `da08e54`, but no test proves the absence of the race.
+The build has no thread sanitizer step, and no single-threaded test can show the race.
+
+The human run depends on these prototype fix commits, from `git log --oneline 5d50146..da08e54`:
+
+- `4f11f32` m32: send PNG bytes to kitty and drop zigimg PNG decode (M32P-1)
+- `a6c0dee` m32: reject JPEG and GIF on kitty instead of decoding (M32P-2)
+- `f9b80a6` m32: limit images to one frame before transmit (M32P-3, M32P-13)
+- `35afdb9` m32: cap image entries and retained bytes per Session (M32P-5, M32P-6)
+- `c69aea2` http: refuse an https request on a plain proxy fallback (M32P-4)
+- `6cf853e` http: follow redirects without leaking Authorization (X-2)
+- `ba24a6e` bitbucket: follow next links only on the API origin (M32I-15, X-2)
+- `0d032b7` m32: send the Credential only to bitbucket.org image paths (M32I-3)
+- `4ff1d3a` m32: test userinfo, port, and encoded host rejection (M32P-8)
+- `3081887` m32: prove the Epoch check drops stale image results (M32P-12)
+- `a4dec6d` m32: allow only public names on port 443 as external images (M32P-9)
+- `1fdd4e1` m32: log the image proxy setup and send nothing on a bad one (M32P-10)
+- `5caf6c5` m32: fail a remote image after max_fetch_ms (M32P-11)
+- `1ef02bf` m32: delete tmux placements by id from a random id base (M32P-14)
+- `8343b29` m32: free sent image ids when External Edit returns (M32P-16)
+- `da08e54` m32: write the cell size under the Runtime lock (M32P-15)
+
 ### Change log of the run notes
 
 On 2026-11-02, the M32 prototype alignment run removed both proxy steps (M32I-10, M32P-7).
@@ -300,3 +337,5 @@ I14 shows `failed` on the card, and its acquisition line has `status=relative` (
 
 On 2026-11-02, the same run replaced "Keep one pane" with the two-pane tmux wording (M32I-4).
 One pane hides the pane leak that the brief wants the tmux test to find.
+
+On 2026-11-02, the same run added "Prototype findings not fixed" with the M32P-16 and M32P-9 decisions and the fix commits.
