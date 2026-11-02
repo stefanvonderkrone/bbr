@@ -12,7 +12,7 @@ pub const help =
     \\List commits on a pull request or reachable from a revision.
     \\A range includes commits reachable from --to but not from --from.
     \\
-;
+++ ws.pagelenHelp(bbr.bitbucket.max_pagelen.commits);
 
 const Parsed = struct {
     repository: ?[]const u8 = null,
@@ -31,7 +31,7 @@ fn parse(args: []const []const u8) !Parsed {
     var p: Parsed = .{};
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse return error.UnknownFlag;
-        if (try ws.takePageFlag(&cur, f, &p.page)) continue;
+        if (try ws.takePageFlag(&cur, f, &p.page, bbr.bitbucket.max_pagelen.commits)) continue;
         _ = cur.next();
         if (std.mem.eql(u8, f.name, "repository")) {
             try setOption([]const u8, &p.repository, try arg.takeValue(&cur, f));
