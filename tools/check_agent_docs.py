@@ -14,7 +14,7 @@ TYPES = {"research", "prototype", "grilling", "task", "implementation"}
 FIELD = re.compile(r"^(?:\*\*)?([\w ]+):(?:\*\*)?\s*(.*?)\s*$")
 LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 REFERENCE = re.compile(r"^\s{0,3}\[(?!\^)[^\]\n]+\]:\s*(<[^>]+>|\S+)")
-QUOTED = re.compile(r'"([^"\n]+)"')
+QUOTED = re.compile(r'(?<!step )"([^"\n]+)"')
 ZIG_FILE = re.compile(r"in `([^`\n]+\.zig)`")
 
 

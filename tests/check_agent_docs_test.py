@@ -118,7 +118,8 @@ class AgentDocsTest(unittest.TestCase):
         self.write("src/a.zig", 'test "first" {}\ntest "second" {}\n')
         self.write("AGENTS.md", "| Rule | Enforcement |\n| --- | --- |\n"
                    '| One. | The tests "first" and "second" in `src/a.zig`. |\n'
-                   '| Two. | The block in `src/a.zig`. The test "second". |\n')
+                   '| Two. | The block in `src/a.zig`. The test "second". |\n'
+                   '| Three. | The CI step "Lint the tree" runs `src/a.zig`. |\n')
         self.assertEqual(checker.check(self.root), [])
 
     def test_rule_table_test_drift_fails(self):
