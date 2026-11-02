@@ -10,14 +10,22 @@
     "bash": {
       "bbr": "deny",
       "bbr *": "deny",
-      "zig build run": "deny",
-      "zig build run *": "deny",
-      "zig-out/bin/bbr": "deny",
-      "zig-out/bin/bbr *": "deny",
-      "./zig-out/bin/bbr": "deny",
-      "./zig-out/bin/bbr *": "deny",
-      "/*/bin/bbr": "deny",
-      "/*/bin/bbr *": "deny"
+      "*/bbr": "deny",
+      "*/bbr *": "deny",
+      "*=* bbr": "deny",
+      "*=* bbr *": "deny",
+      "timeout * bbr": "deny",
+      "timeout * bbr *": "deny",
+      "*sh -c *bbr*": "deny",
+      "*bbr-file-acquisition-bench*": "deny",
+      "*zig build run": "deny",
+      "*zig build run *": "deny",
+      "*zig build * run": "deny",
+      "*zig build * run *": "deny",
+      "*zig build *check*": "deny",
+      "*zig build *bench-file-acquisition*": "deny",
+      "*zig run *": "deny",
+      "python3 tests/*_test.py zig-out/bin/bbr": "allow"
     }
   },
   "mcp": {

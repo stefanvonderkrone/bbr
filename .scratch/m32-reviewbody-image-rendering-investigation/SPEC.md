@@ -523,3 +523,13 @@ The human can change a choice at ticket 05.
 11. Fallback: the M23 text, plus a short state that ticket 05 accepts or removes.
 12. Decision document: an ADR at the next free number, because M28 plans ADR-0014.
 13. Relative references: the prototype shows the fallback until ticket 01 finds the base that Bitbucket uses.
+
+## Comments
+
+### 2026-11-02 review fixes
+
+- M32I-5: The live-run denial missed the `zig build` steps that read the Credential, `zig run`, option and prefix forms, and `sh -c`.
+  `tools/check_live_run_denial.py` now lists those forms in `DENIED`.
+  It fails when a `build.zig` step is not denied, unless the step is hermetic.
+  It also fails when a rule in `opencode.jsonc` decides no listed command, so the deletion of any one rule fails the check.
+  The `AGENTS.md` row names each form that the check does not cover.
