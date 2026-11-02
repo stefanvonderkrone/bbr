@@ -689,6 +689,9 @@ They do not gate the hermetic suite.
 6. [Document M30 and verify the integrated suite](issues/06-document-m30-and-verify-the-integrated-suite.md)
 7. [Run the live M30 outside check](issues/07-run-the-live-m30-outside-check.md)
 8. [Decide on a separate mark column](issues/08-decide-on-a-separate-mark-column.md)
+9. [Fix the M30 review findings](issues/09-fix-the-m30-review-findings.md)
+10. [Jump to the item of a pressed Scroll Mark](issues/10-jump-to-the-item-of-a-pressed-scroll-mark.md)
+11. [Scroll the help Overlay with the wheel](issues/11-scroll-the-help-overlay-with-the-wheel.md)
 
 ## Out of Scope
 
