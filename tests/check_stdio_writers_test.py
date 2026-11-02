@@ -46,6 +46,30 @@ class StdioWritersTest(unittest.TestCase):
         )
         self.assertEqual(list(checker.violations(self.root)), [])
 
+    def test_zig_fmt_line_breaks_keep_a_valid_use_valid(self):
+        self.source.write_text(
+            "const same = file.handle ==\n"
+            "    std.Io.File.stdout().handle;\n"
+            "var w = std.Io.File.stdout()\n"
+            "    .writerStreaming(io, &buf);\n"
+            "const other = std.Io.File.stderr().handle\n"
+            "    != file.handle;\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(list(checker.violations(self.root)), [])
+
+    def test_zig_fmt_line_breaks_do_not_hide_a_bad_use(self):
+        for text, line in (
+            ("var w = std.Io.File.stdout()\n    .writer(io, &buf);\n", 1),
+            ("const same = file.handle ==\n    std.Io.File.stderr().writer(io, &buf);\n", 2),
+            ("const a = 1;\nconst out = std.Io.File.stdout();\n", 2),
+        ):
+            with self.subTest(text=text):
+                self.source.write_text(text, encoding="utf-8")
+                found = list(checker.violations(self.root))
+                self.assertEqual(len(found), 1)
+                self.assertIn(f"src/main.zig:{line}:", found[0])
+
     def test_a_file_built_from_the_handle_is_rejected(self):
         for line in (
             "const f: std.Io.File = .{ .handle = std.Io.File.stdout().handle, .flags = .{ .nonblocking = false } };",

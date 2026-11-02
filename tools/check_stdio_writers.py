@@ -13,32 +13,36 @@ import sys
 
 from source_lines import zig_files
 
-USE = re.compile(r"(?:\bstd\.Io\.File\.)?\b(stdout|stderr)\(\)(\.writerStreaming\(|\.handle\b)?")
+# The patterns run over the whole file, so `\s` also matches the line breaks that zig fmt keeps
+# after `==` and before a field access.
+USE = re.compile(r"(?:\bstd\s*\.\s*Io\s*\.\s*File\s*\.\s*)?\b(stdout|stderr)\(\)(\s*\.\s*writerStreaming\(|\s*\.\s*handle\b)?")
 COMPARISON_BEFORE = re.compile(r"[=!]=\s*$")
-COMPARISON_AFTER = re.compile(r"^\s*[=!]=")
+COMPARISON_AFTER = re.compile(r"\s*[=!]=")
 
 
-def allowed(line, match):
-    if match.group(2) == ".writerStreaming(":
+def allowed(code, match):
+    member = (match.group(2) or "").replace(" ", "").replace("\n", "")
+    if member == ".writerStreaming(":
         return True
-    if match.group(2) == ".handle":
-        return bool(COMPARISON_BEFORE.search(line[: match.start()]) or COMPARISON_AFTER.match(line[match.end() :]))
+    if member == ".handle":
+        return bool(COMPARISON_BEFORE.search(code, 0, match.start()) or COMPARISON_AFTER.match(code, match.end()))
     return False
 
 
 def violations(root):
     for relative, lines in zig_files(root, ("src",), literals=False):
-        for number, line in enumerate(lines, 1):
-            for match in USE.finditer(line):
-                if allowed(line, match):
-                    continue
-                stream = match.group(1)
-                yield (
-                    f"{relative}:{number}: use {stream}() only as {stream}().writerStreaming( "
-                    f"or as {stream}().handle in a == or != comparison. "
-                    f"File.writer writes at absolute file offsets and overwrites a redirected file, "
-                    f"and an alias or a File built from the handle hides such a writer from this check."
-                )
+        code = "\n".join(lines)
+        for match in USE.finditer(code):
+            if allowed(code, match):
+                continue
+            stream = match.group(1)
+            number = code.count("\n", 0, match.start(1)) + 1
+            yield (
+                f"{relative}:{number}: use {stream}() only as {stream}().writerStreaming( "
+                f"or as {stream}().handle in a == or != comparison. "
+                f"File.writer writes at absolute file offsets and overwrites a redirected file, "
+                f"and an alias or a File built from the handle hides such a writer from this check."
+            )
 
 
 def main():
