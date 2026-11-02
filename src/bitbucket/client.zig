@@ -1025,16 +1025,12 @@ pub const Client = struct {
         switch (filter.scope) {
             .workspace_author => |scope| {
                 if (scope.author.len == 0 or scope.reviewer != null and scope.reviewer.?.len == 0) return error.BadRequest;
-                var endpoint: std.ArrayList(u8) = .empty;
-                defer endpoint.deinit(allocator);
-                try endpoint.appendSlice(allocator, base_url ++ "/workspaces/");
-                try percentEncodeInto(allocator, &endpoint, self.cred.workspace);
-                try endpoint.appendSlice(allocator, "/pullrequests/");
-                try percentEncodeInto(allocator, &endpoint, scope.author);
+                const endpoint = try pathUrl(allocator, "/workspaces", &.{ self.cred.workspace, "pullrequests", scope.author }, "", .{});
+                defer allocator.free(endpoint);
                 // Bitbucket answers a smaller page faster, and a MERGED page of 50 takes seconds.
                 pagelen = @intCast(@max(1, @min(opts.limit orelse max_pagelen.pull_requests, max_pagelen.pull_requests)));
                 try firsts.ensureUnusedCapacity(allocator, 1);
-                firsts.appendAssumeCapacity((try pullRequestListUrl(allocator, endpoint.items, .{ .states = filter.states, .reviewer = scope.reviewer }, .{ .pagelen = pagelen, .query = filter.query })).url);
+                firsts.appendAssumeCapacity((try pullRequestListUrl(allocator, endpoint, .{ .states = filter.states, .reviewer = scope.reviewer }, .{ .pagelen = pagelen, .query = filter.query })).url);
             },
             .repositories => |scope| {
                 const author: ?[]const u8, const reviewer: ?[]const u8 = switch (scope.party) {
@@ -1046,7 +1042,7 @@ pub const Client = struct {
                 for ([_]?[]const u8{ author, reviewer }) |value| if (value) |uuid| if (uuid.len == 0) return error.BadRequest;
                 try firsts.ensureTotalCapacityPrecise(allocator, scope.slugs.len);
                 for (scope.slugs) |slug| {
-                    const endpoint = try self.repositoryEndpoint(allocator, slug, "/pullrequests");
+                    const endpoint = try self.repositoryEndpoint(allocator, slug, "/pullrequests", .{});
                     defer allocator.free(endpoint);
                     firsts.appendAssumeCapacity((try pullRequestListUrl(allocator, endpoint, .{ .states = filter.states, .author = author, .reviewer = reviewer }, .{ .pagelen = pagelen, .query = filter.query })).url);
                 }
