@@ -4054,7 +4054,6 @@ const Published = struct {
     draft_mutation_generation: u64 = 0,
     pending_draft_mutation: ?u64 = null,
     card_destination_generation: u64 = 0,
-    /// The jump to a ReviewCard that waits for its Buffer build.
     pending_card_destination: ?u64 = null,
     pending_review_location: ?ReviewLocation = null,
     buffer_search: BufferSearchState,
@@ -7468,8 +7467,6 @@ pub const Presentation = struct {
 
     fn landOnCard(self: *Presentation, published: *Published, row: usize) void {
         published.pending_review_location = null;
-        // The cursor leaves the Buffer Search match. A restore of the saved
-        // disclosures could hide the card again, so the current ones stay.
         if (published.buffer_search.active != null) {
             published.buffer_search.active = null;
             if (published.buffer_search.saved_disclosures) |baseline| baseline.release();

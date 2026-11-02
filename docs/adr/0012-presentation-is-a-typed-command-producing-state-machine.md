@@ -78,7 +78,9 @@ Published review
 └── Session-specific status
 ```
 
-Reviewer preferences cross Session replacement: layout, scope, and `show_resolved`. Session-relative state does not: navigation, Selection, expanded Folds, isolated File, Composer, Leader, Count, and Session-specific status reset when replacement commits.
+Reviewer preferences cross Session replacement: layout, scope, and `show_resolved`. Switching Reviews resets navigation. Refresh and Reconciliation of the same Review retain the reading location where the new Session can represent it. Presentation matches source by File path, version, and Line number. It matches a ReviewCard by Draft or Comment identity and authored offset. It retains the cursor's viewport offset where geometry permits. If the exact location is absent, navigation falls back to the matching File header. If the File is absent, navigation keeps the initial reset.
+
+Selection, search, unrelated expanded Folds, isolated File, Composer, Leader, Count, and Session-specific status reset when replacement commits. Restoration uses candidate-owned identities rather than pointers or File indexes from the previous Session. A location that needs lazy File Enrichment can wait at its File header until the normal acquisition completes. Explicit navigation cancels that pending restoration. A terminal acquisition failure leaves the File-header fallback. Restoration adds no retry policy or second acquisition path.
 
 Rendering receives only a borrowed immutable Projection. It cannot retain pointers across `dispatch`, and it cannot access mutable Session, PendingReview, navigation, ArenaRing, worker, or Durable Operation state.
 
@@ -113,6 +115,7 @@ Session replacement invalidates only Session-bound projection work. It does not 
 
 - File Enrichment carries Session Epoch and is rejected after its Session is replaced.
 - Submission carries an OperationId and Repository-qualified PullRequest identity. It continues posting and persisting after its originating Session is replaced.
+- Escape and ctrl-c hide the Submission Overlay without cancelling Submission, releasing its lock, or changing its durable checkpoints. Enter navigates to the selected Draft or its posted Comment. These reading Actions do not grant mutation rights. The retained Overlay remains available through the Submission Action.
 - Submission progress always persists against its original PullRequest. Visible modal/projection changes additionally depend on which Session is current.
 - When another PullRequest becomes current, remove the old PullRequest's blocking submission modal and show a non-blocking global status identifying the PullRequest being submitted. Completion likewise produces a PullRequest-qualified global result.
 - Only one Submission is active globally for now. Another PullRequest may be reviewed, but attempting another Submission reports which PullRequest is already submitting.
