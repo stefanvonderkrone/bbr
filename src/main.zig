@@ -587,7 +587,7 @@ fn checkBrowserRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bit
     const shape = try bb.checkBrowserShape(gpa, repo);
     defer shape.deinit(gpa);
     var buffer: [1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     const complete = try printBrowserShape(&stdout.interface, shape);
     try stdout.interface.flush();
     if (!complete) std.process.exit(1);
@@ -820,7 +820,7 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
         },
     };
     var buffer: [512]u8 = undefined;
-    var stderr = std.Io.File.stderr().writer(init.io, &buffer);
+    var stderr = std.Io.File.stderr().writerStreaming(init.io, &buffer);
     try bbr.startup.describe(outcome, &stderr.interface);
     try stderr.interface.flush();
 }
