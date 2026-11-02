@@ -300,8 +300,8 @@ pub const Projection = struct {
     focus: PaneFocus = .diff,
     selected_version: SelectedVersion = .new,
     version_title_targets: VersionTitleTargets = .{},
+    /// Sorted by visual row.
     search_ranges: []const ProjectedSourceRange = &.{},
-    search_ranges_sorted: bool = false,
     buffer_search_active: ?usize = null,
     buffer_search_ranges: bool = false,
     code_highlights: []const @import("code_highlighting.zig").View = &.{},
