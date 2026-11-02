@@ -57,6 +57,10 @@ class ZigCodeWithoutLiteralsTest(unittest.TestCase):
 NO_ZIG_SOURCE = {
     "check_agent_docs.py": "reads the Markdown agent documents, not Zig source",
 }
+# A checker here reads Zig source through zig_files and also reads a file that is not Zig source.
+NON_ZIG_READS = {
+    "check_live_run_denial.py": "reads the opencode.jsonc permission rules, which are not Zig source",
+}
 RAW_READS = ("read_text(", "read_bytes(", "open(", ".splitlines()")
 
 
@@ -67,7 +71,7 @@ def checker_problems(path):
         f"tools/{path.name}: read Zig source only with source_lines.zig_files, which drops comments outside literals. "
         f"A checker that reads no Zig source goes in NO_ZIG_SOURCE in tests/source_lines_test.py with its reason."
     )
-    problems = [f"{fix} It calls {raw}" for raw in RAW_READS if raw in text]
+    problems = [] if path.name in NON_ZIG_READS else [f"{fix} It calls {raw}" for raw in RAW_READS if raw in text]
     if "from source_lines import zig_files" not in text:
         problems.append(f"{fix} It does not import zig_files.")
     return problems
@@ -75,8 +79,9 @@ def checker_problems(path):
 
 class CheckersTest(unittest.TestCase):
     def test_every_zig_checker_reads_lines_through_source_lines(self):
-        for name in NO_ZIG_SOURCE:
-            self.assertTrue((TOOLS / name).is_file(), f"NO_ZIG_SOURCE names tools/{name}, which does not exist.")
+        for table, names in (("NO_ZIG_SOURCE", NO_ZIG_SOURCE), ("NON_ZIG_READS", NON_ZIG_READS)):
+            for name in names:
+                self.assertTrue((TOOLS / name).is_file(), f"{table} names tools/{name}, which does not exist.")
         for path in sorted(TOOLS.glob("check_*.py")):
             if path.name in NO_ZIG_SOURCE:
                 continue

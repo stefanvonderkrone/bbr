@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 import sys
 
+from source_lines import zig_files
+
 # Earlier milestone tickets started bbr this way with the operator's Credential.
 DENIED = [
     "zig-out/bin/bbr demo",
@@ -69,7 +71,8 @@ HERMETIC_STEPS = {"bench", "bench-buffer-search"}
 
 
 def build_steps(root):
-    return re.findall(r'b\.step\("([^"]+)"', (root / "build.zig").read_text())
+    _, lines = next(zig_files(root, ("build.zig",), literals=True))
+    return [step for line in lines for step in re.findall(r'b\.step\("([^"]+)"', line)]
 
 
 def bash_rules(root):
