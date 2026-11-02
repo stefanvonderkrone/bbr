@@ -31061,6 +31061,32 @@ test "M30 scrollbar a Review Search entry click and a double click behave as bef
     try testing.expect(presentation.projection().review_search == null);
 }
 
+/// The Review Search list fixture for its bar, and the Pane fixture for a
+/// Pane bar.
+fn m30BarState(store: *bbr.review.InMemoryStore, bar: frame_mod.ScrollBar) !Presentation {
+    return if (bar == .review_search_list) m30ReviewSearchState(store, m30_search_geometries[0], false) else m30DragState(store, true);
+}
+
+test "M30 scrollbar a press off the thumb and a drag that move the scroll repaint each bar" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    for (std.meta.tags(frame_mod.ScrollBar)) |bar| {
+        var presentation = try m30BarState(&store, bar);
+        defer presentation.deinit();
+        const track = m30Scroll(&presentation, bar).track;
+
+        const before_press = presentation.projection().revision;
+        try m30Left(&presentation, track.x, track.y + track.height - 1, .press);
+        try testing.expect(m30Scroll(&presentation, bar).offset > 0);
+        try testing.expect(!std.meta.eql(before_press, presentation.projection().revision));
+
+        const before_drag = presentation.projection().revision;
+        try m30Left(&presentation, track.x, track.y, .drag);
+        try testing.expectEqual(@as(usize, 0), m30Scroll(&presentation, bar).offset);
+        try testing.expect(!std.meta.eql(before_drag, presentation.projection().revision));
+    }
+}
+
 /// The published row marks are the row marks of the published visual rows.
 fn expectPublishedRowMarks(frame: frame_mod.Projection) !void {
     const expected = try scroll_marks.rowMarks(testing.allocator, frame.buffer, frame.visual_rows);
