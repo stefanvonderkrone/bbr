@@ -86,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     if (first) |argument| {
         if (std.mem.eql(u8, argument, "--version")) {
             var output_buffer: [128]u8 = undefined;
-            var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+            var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
             try stdout.interface.print("bbr {s}\n", .{build_options.version});
             return stdout.interface.flush();
         }
@@ -192,7 +192,7 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void
         const path_index: usize = if (std.mem.eql(u8, args.items[0], "update")) 2 else 1;
         if (args.items.len <= path_index) return usage();
         var output_buffer: [4096]u8 = undefined;
-        var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+        var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
         const previewed_digest = try grammar_cli.writeCandidateReport(gpa, init.io, args.items[path_index], &stdout.interface);
         try stdout.interface.writeAll("Trust this exact bundle? [y/N] ");
         try stdout.interface.flush();
@@ -204,7 +204,7 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void
         if (approved) interactive_digest = previewed_digest;
     }
     var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     grammar_cli.run(gpa, init.io, init.environ_map, args.items, interactive_digest, &stdout.interface) catch |err| {
         std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
         return err;
@@ -835,7 +835,7 @@ fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt
     defer if (original) |term| std.posix.tcsetattr(fd, .NOW, term) catch {};
 
     var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &output_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &output_buffer);
     try stdout.interface.writeAll(prompt);
     try stdout.interface.flush();
     defer if (original != null) {
@@ -1203,7 +1203,7 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     const token_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_TOKEN") != null) "env" else "file";
     const workspace_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_WORKSPACE") != null) "env" else "file";
     var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     stdout.interface.print("profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
         owned.profile, owned.username, email_src, token_src, owned.workspace, workspace_src, uuid,
     }) catch {

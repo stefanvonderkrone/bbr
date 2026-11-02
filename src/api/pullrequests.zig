@@ -7,10 +7,34 @@ const out = @import("output.zig");
 const ws = @import("workspaces.zig");
 
 pub const list_help =
-    \\usage: bbr api list-pull-requests --repository SLUG [--state OPEN|MERGED|DECLINED|SUPERSEDED] [--source-branch NAME] [--pagelen N] [--page N] [--query Q] [--sort S] [--no-follow] [--limit N] [--json]
+    \\usage: bbr api list-pull-requests --repository SLUG [--state OPEN|MERGED|DECLINED|SUPERSEDED] [--source-branch NAME]
+    \\      [--pagelen N] [--page N] [--query Q] [--sort S] [--no-follow] [--concurrency N] [--limit N] [--json]
     \\
     \\List pull requests (GET .../pullrequests).
-    \\Follow pages by default. --no-follow returns one page. --limit caps the total.
+    \\--state ignores letter case. The default is OPEN.
+    \\
+++ ws.pagingHelp(bbr.bitbucket.max_pagelen.pull_requests);
+
+pub const workspace_list_help =
+    \\usage: bbr api list-workspace-pull-requests --author UUID [--reviewer UUID]
+    \\      [--state OPEN|MERGED|DECLINED|SUPERSEDED ...] [--query Q] [--concurrency N] [--limit N] [--json]
+    \\   or: bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author UUID --reviewer UUID)
+    \\      --repository SLUG ... [--state OPEN|MERGED|DECLINED|SUPERSEDED ...] [--query Q]
+    \\      [--concurrency N] [--limit N] [--json]
+    \\
+    \\List PullRequests in the selected Workspace that one account authored or reviews.
+    \\--author and --reviewer take account UUIDs.
+    \\Without --repository, --author is required. The command reads the Workspace author endpoint,
+    \\and --reviewer filters its results. Rows keep the Bitbucket order, and paging stops at --limit.
+    \\Bitbucket has no reviewer endpoint, so a scan with only --reviewer needs --repository.
+    \\Repeat --repository to name each Repository to scan. Supply --author, --reviewer, or both.
+    \\Rows follow the given Repository order, then the Bitbucket order in each Repository.
+    \\A repeated Repository is scanned once.
+    \\Repeat --state to select several states. --state ignores letter case. The default is OPEN.
+    \\--query is a Bitbucket q expression. The command joins it to its own filter with AND.
+++ ws.concurrency_help ++
+    \\--limit caps the total. A failed request fails the complete list, unless all its rows
+    \\come after the first --limit rows. HTTP 429 is not retried.
     \\
 ;
 
@@ -68,7 +92,7 @@ pub const commit_list_help =
     \\The Pull Request Commit Links app must exist. Bitbucket installs it when someone
     \\selects 'Go to pull request' on a commit's details page.
     \\
-;
+++ ws.pagelenHelp(bbr.bitbucket.max_pagelen.commit_pull_requests);
 
 pub const whoami_help =
     \\usage: bbr api whoami [--json]
@@ -91,10 +115,18 @@ pub const set_verdict_help =
     \\
 ;
 
+fn parseState(text: []const u8) !bbr.bitbucket.PullRequestState {
+    for (std.enums.values(bbr.bitbucket.PullRequestState)) |state| {
+        if (std.ascii.eqlIgnoreCase(@tagName(state), text)) return state;
+    }
+    return error.BadRequest;
+}
+
 const ListArgs = struct {
     repository: []const u8,
     filter: bbr.bitbucket.ListOptions,
     page: bbr.bitbucket.PageOptions,
+    concurrency: usize,
 };
 
 fn parseList(args: []const []const u8) !ListArgs {
@@ -102,15 +134,19 @@ fn parseList(args: []const []const u8) !ListArgs {
     var repository: ?[]const u8 = null;
     var filter: bbr.bitbucket.ListOptions = .{};
     var page: bbr.bitbucket.PageOptions = .{};
+    var concurrency: ?usize = null;
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse break;
-        if (try ws.takePageFlag(&cur, f, &page)) continue;
-        if (std.mem.eql(u8, f.name, "repository")) {
+        if (try ws.takePageFlag(&cur, f, &page, bbr.bitbucket.max_pagelen.pull_requests)) continue;
+        if (std.mem.eql(u8, f.name, "concurrency")) {
+            _ = cur.next();
+            try ws.takeConcurrency(&cur, f, &concurrency);
+        } else if (std.mem.eql(u8, f.name, "repository")) {
             _ = cur.next();
             repository = try arg.takeValue(&cur, f);
         } else if (std.mem.eql(u8, f.name, "state")) {
             _ = cur.next();
-            filter.state = try arg.takeValue(&cur, f);
+            filter.state = try parseState(try arg.takeValue(&cur, f));
         } else if (std.mem.eql(u8, f.name, "source-branch")) {
             _ = cur.next();
             filter.source_branch = try arg.takeValue(&cur, f);
@@ -121,18 +157,19 @@ fn parseList(args: []const []const u8) !ListArgs {
         .repository = repository orelse return error.MissingRequired,
         .filter = filter,
         .page = page,
+        .concurrency = concurrency orelse ws.default_concurrency,
     };
 }
 
-fn listPullRequests(allocator: std.mem.Allocator, bb: bbr.bitbucket.Client, args: []const []const u8) ![]bbr.bitbucket.PullRequestSummary {
+fn listPullRequests(allocator: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client, args: []const []const u8) ![]bbr.bitbucket.PullRequestSummary {
     const parsed = try parseList(args);
-    return bb.listPullRequestsPage(allocator, parsed.repository, parsed.filter, parsed.page);
+    return bb.listPullRequestsPage(io, allocator, parsed.repository, parsed.filter, parsed.page, ws.effectiveConcurrency(parsed.concurrency, std.Thread.getCpuCount()));
 }
 
 pub fn runList(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
-    const items = try listPullRequests(arena.allocator(), bb, args);
+    const items = try listPullRequests(arena.allocator(), init.io, bb, args);
     try printSummaries(init, items, json);
 }
 
@@ -145,6 +182,78 @@ fn printSummaries(init: std.process.Init, items: []const bbr.bitbucket.PullReque
         });
         try out.printLine(init, "ok: {d} pull request(s)", .{items.len});
     }
+}
+
+const WorkspaceListArgs = struct {
+    filter: bbr.bitbucket.WorkspacePullRequestFilter,
+    options: bbr.bitbucket.WorkspacePullRequestOptions,
+};
+
+/// The returned Repository slugs are owned by `allocator`.
+fn parseWorkspaceList(allocator: std.mem.Allocator, args: []const []const u8) !WorkspaceListArgs {
+    var cur: arg.Cursor = .{ .args = args };
+    var author: ?[]const u8 = null;
+    var reviewer: ?[]const u8 = null;
+    var slugs: std.ArrayList([]const u8) = .empty;
+    errdefer slugs.deinit(allocator);
+    var states: std.EnumSet(bbr.bitbucket.PullRequestState) = .empty;
+    var query: ?[]const u8 = null;
+    var limit: ?usize = null;
+    var concurrency: ?usize = null;
+    while (cur.next()) |text| {
+        const f = arg.splitFlag(text) orelse return error.UnknownFlag;
+        if (std.mem.eql(u8, f.name, "author")) {
+            try arg.setOption([]const u8, &author, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "reviewer")) {
+            try arg.setOption([]const u8, &reviewer, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "repository")) {
+            const slug = try arg.takeValue(&cur, f);
+            if (slug.len == 0) return error.BadRequest;
+            for (slugs.items) |seen| {
+                if (std.mem.eql(u8, seen, slug)) break;
+            } else try slugs.append(allocator, slug);
+        } else if (std.mem.eql(u8, f.name, "state")) {
+            states.insert(try parseState(try arg.takeValue(&cur, f)));
+        } else if (std.mem.eql(u8, f.name, "query")) {
+            try arg.setOption([]const u8, &query, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "limit")) {
+            try arg.setOption(usize, &limit, try arg.parseUsize(try arg.takeValue(&cur, f)));
+        } else if (std.mem.eql(u8, f.name, "concurrency")) {
+            try ws.takeConcurrency(&cur, f, &concurrency);
+        } else return error.UnknownFlag;
+    }
+    for ([_]?[]const u8{ author, reviewer, query }) |value| if (value) |text| if (text.len == 0) return error.BadRequest;
+    const scope: bbr.bitbucket.PullRequestScope = if (slugs.items.len == 0)
+        .{ .workspace_author = .{ .author = author orelse return error.MissingRequired, .reviewer = reviewer } }
+    else blk: {
+        const party: bbr.bitbucket.PullRequestParty = if (author) |author_uuid|
+            if (reviewer) |reviewer_uuid| .{ .author_and_reviewer = .{ .author = author_uuid, .reviewer = reviewer_uuid } } else .{ .author = author_uuid }
+        else
+            .{ .reviewer = reviewer orelse return error.MissingRequired };
+        break :blk .{ .repositories = .{ .slugs = try slugs.toOwnedSlice(allocator), .party = party } };
+    };
+    return .{
+        .filter = .{ .scope = scope, .states = if (states.count() == 0) .initOne(.OPEN) else states, .query = query },
+        .options = .{ .limit = limit, .concurrency = concurrency orelse ws.default_concurrency },
+    };
+}
+
+fn listWorkspacePullRequests(allocator: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client, args: []const []const u8) ![]bbr.bitbucket.PullRequestSummary {
+    var parsed = try parseWorkspaceList(allocator, args);
+    defer if (parsed.filter.scope == .repositories) allocator.free(parsed.filter.scope.repositories.slugs);
+    parsed.options.concurrency = ws.effectiveConcurrency(parsed.options.concurrency, std.Thread.getCpuCount());
+    return bb.listWorkspacePullRequests(io, allocator, parsed.filter, parsed.options);
+}
+
+pub fn runListWorkspace(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const items = try listWorkspacePullRequests(arena.allocator(), init.io, bb, args);
+    if (json) return out.printJson(init, items);
+    for (items) |pr| try out.printLine(init, "{s}#{d} [{s}{s}] {s} ({s} -> {s})", .{
+        pr.destination_repository, pr.id, pr.state, if (pr.draft) " draft" else "", pr.title, pr.source_branch, pr.destination_branch,
+    });
+    try out.printLine(init, "ok: {d} pull request(s)", .{items.len});
 }
 
 pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
@@ -319,7 +428,7 @@ fn listCommitPullRequests(a: std.mem.Allocator, bb: bbr.bitbucket.Client, args: 
     while (cur.peek()) |text| {
         const f = arg.splitFlag(text) orelse return error.UnknownFlag;
         if (std.mem.eql(u8, f.name, "query") or std.mem.eql(u8, f.name, "sort")) return error.UnknownFlag;
-        if (try ws.takePageFlag(&cur, f, &page)) continue;
+        if (try ws.takePageFlag(&cur, f, &page, bbr.bitbucket.max_pagelen.commit_pull_requests)) continue;
         _ = cur.next();
         if (std.mem.eql(u8, f.name, "repository")) {
             try arg.setOption([]const u8, &repository, try arg.takeValue(&cur, f));
@@ -472,7 +581,7 @@ test "list-pull-requests parses interleaved filters and page controls in both va
     for (cases) |args| {
         const parsed = try parseList(args);
         try std.testing.expectEqualStrings("repository", parsed.repository);
-        try std.testing.expectEqualStrings("MERGED", parsed.filter.state);
+        try std.testing.expectEqual(.MERGED, parsed.filter.state);
         try std.testing.expectEqualStrings("feature", parsed.filter.source_branch.?);
         try std.testing.expectEqual(@as(u32, 10), parsed.page.pagelen.?);
         try std.testing.expectEqual(@as(u32, 3), parsed.page.page.?);
@@ -482,7 +591,7 @@ test "list-pull-requests parses interleaved filters and page controls in both va
         try std.testing.expectEqual(@as(usize, 12), parsed.page.limit.?);
     }
     const defaults = try parseList(&.{ "--repository", "repository" });
-    try std.testing.expectEqualStrings("OPEN", defaults.filter.state);
+    try std.testing.expectEqual(.OPEN, defaults.filter.state);
     try std.testing.expect(defaults.filter.source_branch == null);
     try std.testing.expectEqual(bbr.bitbucket.PageOptions{}, defaults.page);
 }
@@ -491,12 +600,15 @@ test "list-pull-requests rejects invalid page controls before HTTP" {
     var fake: bbr.http.FakeHttpClient = .{};
     const bb = testClient(&fake);
     const a = std.testing.allocator;
-    try std.testing.expectError(error.MissingRequired, listPullRequests(a, bb, &.{"--no-follow"}));
-    try std.testing.expectError(error.MissingValue, listPullRequests(a, bb, &.{ "--repository=repository", "--page" }));
-    try std.testing.expectError(error.InvalidNumber, listPullRequests(a, bb, &.{ "--repository=repository", "--pagelen=-1" }));
-    try std.testing.expectError(error.InvalidNumber, listPullRequests(a, bb, &.{ "--repository=repository", "--limit=bad" }));
-    try std.testing.expectError(error.UnknownFlag, listPullRequests(a, bb, &.{ "--repository=repository", "--no-follow=false" }));
-    try std.testing.expectError(error.UnknownFlag, listPullRequests(a, bb, &.{ "--repository=repository", "--unknown" }));
+    try std.testing.expectError(error.MissingRequired, listPullRequests(a, std.testing.io, bb, &.{"--no-follow"}));
+    try std.testing.expectError(error.MissingValue, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--page" }));
+    try std.testing.expectError(error.InvalidNumber, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--pagelen=-1" }));
+    try std.testing.expectError(error.InvalidNumber, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--pagelen=51" }));
+    try std.testing.expectError(error.InvalidNumber, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--limit=bad" }));
+    try std.testing.expectError(error.UnknownFlag, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--no-follow=false" }));
+    try std.testing.expectError(error.UnknownFlag, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--unknown" }));
+    try std.testing.expectError(error.BadRequest, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--state=closed" }));
+    try std.testing.expectError(error.BadRequest, listPullRequests(a, std.testing.io, bb, &.{ "--repository=repository", "--state=" }));
     try std.testing.expectEqual(@as(usize, 0), fake.call_count);
 }
 
@@ -526,7 +638,7 @@ test "list-pull-requests sends filters and page controls and does not follow wit
     };
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
     const a = std.testing.allocator;
-    const items = try listPullRequests(a, testClient(&fake), &.{
+    const items = try listPullRequests(a, std.testing.io, testClient(&fake), &.{
         "--page=3",     "--repository=repository", "--query=title=\"Review\"", "--state=MERGED",
         "--pagelen=10", "--source-branch=feature", "--sort=-id",               "--no-follow",
     });
@@ -536,9 +648,29 @@ test "list-pull-requests sends filters and page controls and does not follow wit
     const url = fake.lastUrl().?;
     try std.testing.expect(std.mem.startsWith(u8, url, bbr.bitbucket.base_url ++ "/repositories/workspace/repository/pullrequests?"));
     for ([_][]const u8{
-        "pagelen=10",                                                              "page=3", "state=MERGED", "sort=-id",
-        "q=source.branch.name%3D%22feature%22%20AND%20%28title%3D%22Review%22%29",
+        "pagelen=10",                                                                                           "page=3", "sort=-id",
+        "q=state%3D%22MERGED%22%20AND%20source.branch.name%3D%22feature%22%20AND%20%28title%3D%22Review%22%29",
     }) |part| try std.testing.expect(std.mem.indexOf(u8, url, part) != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "state=") == null);
+}
+
+test "list-pull-requests sends the PullRequest maximum --pagelen of 50" {
+    var fake: bbr.http.FakeHttpClient = .{ .body = "{\"values\":[]}" };
+    const items = try listPullRequests(std.testing.allocator, std.testing.io, testClient(&fake), &.{ "--repository=repository", "--pagelen", "50", "--no-follow" });
+    defer bbr.bitbucket.deinitSummaries(std.testing.allocator, items);
+    try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+    try std.testing.expect(std.mem.indexOf(u8, fake.lastUrl().?, "pagelen=50") != null);
+}
+
+test "list-pull-requests accepts a state in any letter case and sends it in uppercase" {
+    for ([_][]const u8{ "open", "Merged", "DECLINED", "superseded" }, [_][]const u8{ "OPEN", "MERGED", "DECLINED", "SUPERSEDED" }) |given, sent| {
+        var fake: bbr.http.FakeHttpClient = .{ .body = "{\"values\":[]}" };
+        const items = try listPullRequests(std.testing.allocator, std.testing.io, testClient(&fake), &.{ "--repository=repository", "--state", given });
+        defer bbr.bitbucket.deinitSummaries(std.testing.allocator, items);
+        const state = try std.mem.concat(std.testing.allocator, u8, &.{ "state=", sent });
+        defer std.testing.allocator.free(state);
+        try std.testing.expect(std.mem.indexOf(u8, fake.lastUrl().?, state) != null);
+    }
 }
 
 test "list-pull-requests limit stops HTTP paging and defaults still follow next" {
@@ -548,13 +680,13 @@ test "list-pull-requests limit stops HTTP paging and defaults still follow next"
     };
     const a = std.testing.allocator;
     var limited: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    const capped = try listPullRequests(a, testClient(&limited), &.{ "--limit=1", "--repository=repository" });
+    const capped = try listPullRequests(a, std.testing.io, testClient(&limited), &.{ "--limit=1", "--repository=repository" });
     defer bbr.bitbucket.deinitSummaries(a, capped);
     try std.testing.expectEqual(@as(usize, 1), capped.len);
     try std.testing.expectEqual(@as(usize, 1), limited.call_count);
 
     var following: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    const all = try listPullRequests(a, testClient(&following), &.{ "--repository=repository", "--page=3" });
+    const all = try listPullRequests(a, std.testing.io, testClient(&following), &.{ "--repository=repository", "--page=3" });
     defer bbr.bitbucket.deinitSummaries(a, all);
     try std.testing.expectEqual(@as(usize, 3), all.len);
     try std.testing.expectEqual(@as(usize, 2), following.call_count);
@@ -562,6 +694,51 @@ test "list-pull-requests limit stops HTTP paging and defaults still follow next"
         bbr.bitbucket.base_url ++ "/repositories/workspace/repository/pullrequests?page=4",
         following.urlAt(1).?,
     );
+}
+
+test "list-workspace-pull-requests rejects invalid options before HTTP" {
+    var fake: bbr.http.FakeHttpClient = .{ .body = "{\"values\":[]}" };
+    const bb = testClient(&fake);
+    for ([_]struct { args: []const []const u8, err: anyerror }{
+        .{ .args = &.{}, .err = error.MissingRequired },
+        .{ .args = &.{ "--state=OPEN", "--limit=2" }, .err = error.MissingRequired },
+        .{ .args = &.{"--reviewer={a}"}, .err = error.MissingRequired },
+        .{ .args = &.{ "--repository=sample", "--repository=other" }, .err = error.MissingRequired },
+        .{ .args = &.{ "--author={a}", "--repository=" }, .err = error.BadRequest },
+        .{ .args = &.{ "--author={a}", "--state=opened" }, .err = error.BadRequest },
+        .{ .args = &.{ "--author={a}", "--state", "CLOSED" }, .err = error.BadRequest },
+        .{ .args = &.{ "--author={a}", "--author={b}" }, .err = error.BadRequest },
+        .{ .args = &.{ "--author={a}", "--reviewer={a}", "--reviewer", "{b}" }, .err = error.BadRequest },
+        .{ .args = &.{ "--author={a}", "--reviewer=" }, .err = error.BadRequest },
+        .{ .args = &.{ "--reviewer={a}", "--repository=sample", "--concurrency=0" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--author={a}", "--limit=bad" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--reviewer={a}", "--repository=sample", "--page=2" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--author={a}", "--no-follow" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--reviewer={a}", "--repository" }, .err = error.MissingValue },
+    }) |case| try std.testing.expectError(case.err, listWorkspacePullRequests(std.testing.allocator, std.Io.failing, bb, case.args));
+    try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+    const repeated = try listWorkspacePullRequests(std.testing.allocator, std.Io.failing, bb, &.{ "--author={a}", "--author={a}", "--state=Merged", "--state=MERGED", "--state", "open", "--state", "OPEN" });
+    defer bbr.bitbucket.deinitSummaries(std.testing.allocator, repeated);
+    try std.testing.expect(std.mem.startsWith(u8, fake.lastUrl().?, bbr.bitbucket.base_url ++ "/workspaces/workspace/pullrequests/%7Ba%7D?pagelen=50&state=OPEN&state=MERGED&fields="));
+}
+
+test "list-workspace-pull-requests accepts --concurrency with or without --repository" {
+    for ([_][]const []const u8{
+        &.{ "--author={a}", "--concurrency=2" },
+        &.{ "--author={a}", "--repository=sample", "--concurrency=2" },
+    }, [_][]const u8{
+        bbr.bitbucket.base_url ++ "/workspaces/workspace/pullrequests/%7Ba%7D?",
+        bbr.bitbucket.base_url ++ "/repositories/workspace/sample/pullrequests?",
+    }) |args, prefix| {
+        var fake: bbr.http.FakeHttpClient = .{ .body = "{\"values\":[]}" };
+        const items = try listWorkspacePullRequests(std.testing.allocator, std.testing.io, testClient(&fake), args);
+        defer bbr.bitbucket.deinitSummaries(std.testing.allocator, items);
+        try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+        try std.testing.expect(std.mem.startsWith(u8, fake.lastUrl().?, prefix));
+    }
+    var fake: bbr.http.FakeHttpClient = .{};
+    try std.testing.expectError(error.InvalidNumber, listWorkspacePullRequests(std.testing.allocator, std.Io.failing, testClient(&fake), &.{ "--author={a}", "--concurrency=0" }));
+    try std.testing.expectEqual(@as(usize, 0), fake.call_count);
 }
 
 test "set-verdict rejects a spoofed uuid before HTTP" {

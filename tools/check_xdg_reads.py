@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 import sys
 
+from source_lines import zig_files
+
 OWNER = Path("src/xdg.zig")
 VARIABLES = ('"XDG_CONFIG_HOME"', '"XDG_DATA_HOME"', '"XDG_STATE_HOME"')
 FIX = {
@@ -16,12 +18,11 @@ TEST_START = re.compile(r"^test\b.*\{\s*$")
 
 
 def violations(root):
-    for path in sorted((root / "src").rglob("*.zig")):
-        relative = path.relative_to(root)
+    for relative, lines in zig_files(root, ("src",), literals=True):
         if relative == OWNER:
             continue
         in_test = False
-        for number, line in enumerate(path.read_text().splitlines(), 1):
+        for number, line in enumerate(lines, 1):
             if in_test:
                 in_test = line != "}"
                 continue
