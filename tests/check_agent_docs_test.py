@@ -129,6 +129,13 @@ class AgentDocsTest(unittest.TestCase):
         errors = "\n".join(checker.check(self.root))
         self.assertIn("guide.md: line 2: names the live PullRequest remote pr-webapp 99", errors)
 
+    def test_pull_request_ids_in_adrs_fail(self):
+        self.write("docs/adr/0001-decision.md",
+                   "The run used `bbr-file-cache-bench remote pr-webapp 99 --scenarios s1` on #98.\n")
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("0001-decision.md: line 1: names the live PullRequest remote pr-webapp 99", errors)
+        self.assertIn("0001-decision.md: line 1: names the live PullRequest #98", errors)
+
     def test_code_and_public_pull_requests_in_scratch_pass(self):
         self.write(".scratch/feature/brief.md", "Use `#534668`, `pull request #1541`, and `remote pr-webapp <id>` as examples.\n")
         self.write(".scratch/m23-comment-thread-markdown-presentation-implementation/README.md",

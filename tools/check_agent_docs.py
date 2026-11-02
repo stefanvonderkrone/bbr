@@ -71,7 +71,7 @@ def check(root):
         errors.append(f"{path.relative_to(root)}: {message}")
 
     documents = {root / "AGENTS.md", root / "GLOSSARY-MAP.md", root / "docs/code-navigation.md"}
-    for pattern in ("docs/agents/*.md", "src/**/GLOSSARY.md", "src/**/IMPLEMENTATION.md",
+    for pattern in ("docs/agents/*.md", "docs/adr/*.md", "src/**/GLOSSARY.md", "src/**/IMPLEMENTATION.md",
                     ".scratch/**/*.md", ".agents/skills/**/*.md"):
         documents.update(root.glob(pattern))
     for path in sorted(documents):
@@ -79,7 +79,8 @@ def check(root):
             error(path, "missing agent document")
             continue
         text = path.read_text()
-        if path.is_relative_to(root / ".scratch"):
+        # An ADR records benchmark evidence, so it gets the same check as the tracker.
+        if path.is_relative_to(root / ".scratch") or path.is_relative_to(root / "docs/adr"):
             for number, (line, raw) in enumerate(zip(prose(text), text.splitlines()), 1):
                 matches = [*PULL_REQUEST.finditer(line), *PULL_REQUEST_COMMAND.finditer(raw)]
                 for match in matches:
