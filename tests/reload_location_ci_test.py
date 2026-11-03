@@ -35,7 +35,15 @@ def main():
     }
 
     def git(*args):
-        return subprocess.check_output(["git", *args], cwd=repo, env=git_env, text=True)
+        return subprocess.check_output(
+            [
+                "git", "-c", "user.name=Verification", "-c", "user.email=verify@example.invalid",
+                "-c", "commit.gpgsign=false", *args,
+            ],
+            cwd=repo,
+            env=git_env,
+            text=True,
+        )
 
     def commit():
         git("add", "notes.txt", "sample.txt")
