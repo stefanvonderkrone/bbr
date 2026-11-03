@@ -20,9 +20,22 @@ def main():
 
     state = json.loads((evidence / "instance.json").read_text())
     repo = Path(state["scratch"]) / "repo"
+    git_env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(Path(state["scratch"]) / "home"),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_KEY_0": "user.useConfigOnly",
+        "GIT_CONFIG_VALUE_0": "true",
+        "GIT_CONFIG_KEY_1": "commit.gpgsign",
+        "GIT_CONFIG_VALUE_1": "true",
+        "GIT_CONFIG_KEY_2": "gpg.program",
+        "GIT_CONFIG_VALUE_2": "false",
+    }
 
     def git(*args):
-        return subprocess.check_output(["git", *args], cwd=repo, text=True)
+        return subprocess.check_output(["git", *args], cwd=repo, env=git_env, text=True)
 
     def commit():
         git("add", "notes.txt", "sample.txt")

@@ -22913,6 +22913,140 @@ fn refreshRecoverySession(presentation: *Presentation, session: *Session) !void 
     } });
 }
 
+test "Review recovery a completed Submission permits a later batch" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "first batch" });
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .submission_locks = locks.locks() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    var post = state.takeCommand().?;
+    const command_id = post.post_draft.command_id;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try state.dispatch(.{ .post_draft_completed = .{
+        .command_id = command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .posted = 99 },
+    } });
+    const load = state.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testCommentSession(testing.allocator, 1) },
+    } });
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try state.dispatch(.{ .action = .review_comment });
+    try state.dispatch(.{ .composer = .{ .insert = try TextChunk.init("second batch") } });
+    try state.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&state);
+    try testing.expectEqual(@as(usize, 1), state.projection().review.?.drafts.len);
+    try state.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    try testing.expect(state.projection().submission != null);
+    const next = state.takeCommand().?.post_draft;
+    defer next.destroy();
+    try testing.expectEqualStrings("second batch", next.draft.body);
+}
+
+test "Review recovery active Enter survives a Layout rebuild" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 10, .kind = .comment, .body = "active", .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } } });
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .submission_locks = locks.locks() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    var post = state.takeCommand().?;
+    post.deinit();
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try dispatchView(&state, .{ .action = .toggle_layout });
+    try state.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    while (state.commands.items.len > 0) {
+        try testing.expect(state.commands.items[0] == .build_buffer_disclosure);
+        try completeDisclosureBuild(&state);
+    }
+    try testing.expect(state.projection().action_error == null);
+    const owner = cursorOwner(&state);
+    try testing.expect(owner == .draft and owner.draft.id == 10);
+    try state.dispatch(.{ .action = .edit_review_item });
+    try testing.expect(state.projection().composer == null);
+    try testing.expectEqual(ActionError.draft_submission_in_flight, state.projection().action_error.?);
+}
+
+test "Review recovery restored File Tree markers agree with the active File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer state.deinit();
+    try moveToRecoverySource(&state, "b.zig", .new, 1);
+    try refreshRecoverySession(&state, try testTwoFileSession(testing.allocator, 1));
+    try testing.expectEqual(@as(?usize, 1), state.published.?.activeFile());
+    const tree = state.projection().review.?.frame.file_tree;
+    try testing.expectEqual(@as(usize, 1), tree.entries[tree.cursor].identity.file);
+    for (tree.entries) |entry| if (entry.identity == .file)
+        try testing.expectEqual(entry.identity.file == 1, entry.active);
+}
+
+test "Review recovery old rename paths do not inherit an added File version" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const initial = try testSession(testing.allocator, 1, 'a');
+    initial.diff = try bbr.diff.parse(initial.arena.allocator(),
+        \\diff --git a/a.zig b/b.zig
+        \\similarity index 50%
+        \\rename from a.zig
+        \\rename to b.zig
+        \\--- a/a.zig
+        \\+++ b/b.zig
+        \\@@ -1 +1 @@
+        \\-old renamed
+        \\+new renamed
+    );
+    try initial.initializeEnrichment();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = initial },
+    });
+    defer state.deinit();
+    try dispatchView(&state, .{ .action = .select_old_version });
+    try moveToRecoverySource(&state, "b.zig", .old, 1);
+    const replacement = try testTwoFileSession(testing.allocator, 1);
+    replacement.diff = try bbr.diff.parse(replacement.arena.allocator(),
+        \\diff --git a/a.zig b/a.zig
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/a.zig
+        \\@@ -0,0 +1 @@
+        \\+new added
+        \\diff --git a/a.zig b/b.zig
+        \\similarity index 50%
+        \\rename from a.zig
+        \\rename to b.zig
+        \\--- a/a.zig
+        \\+++ b/b.zig
+        \\@@ -1 +1 @@
+        \\-old renamed
+        \\+new renamed
+    );
+    try replacement.initializeEnrichment();
+    try refreshRecoverySession(&state, replacement);
+    try testing.expectEqual(@as(?usize, 1), state.published.?.activeFile());
+    try testing.expectEqual(SelectedVersion.old, state.projection().review.?.selected_version);
+}
+
 test "Review recovery refresh keeps the source path version line and cursor viewport offset" {
     for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]SelectedVersion{ .new, .old }) |version| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
