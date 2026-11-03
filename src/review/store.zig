@@ -904,6 +904,12 @@ pub const InMemoryStore = struct {
                 while (i < self.entries.items.len) {
                     const entry = self.entries.items[i];
                     if (RemoteReviewIdentity.eql(entry.key, key) and submissionItemIndex(run.items, entry.draft.local_id) != null and entry.draft.state == .posted) {
+                        for (self.entries.items) |*reply| {
+                            if (!RemoteReviewIdentity.eql(reply.key, key)) continue;
+                            const parent = reply.draft.parent orelse continue;
+                            if (parent == .draft and parent.draft == entry.draft.local_id)
+                                reply.draft.parent = .{ .comment = entry.draft.state.posted };
+                        }
                         _ = self.entries.orderedRemove(i);
                     } else {
                         i += 1;
@@ -1608,6 +1614,35 @@ test "clean Submission completion removes posted Drafts and closes the run" {
     const drafts = try store.load(arena.allocator(), key);
     try testing.expectEqual(@as(usize, 1), drafts.len);
     try testing.expectEqual(@as(TempId, 2), drafts[0].local_id);
+}
+
+test "clean Submission completion remaps surviving Replies before removing their posted parents" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    const other = testReviewKey(8);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "parent" });
+    try store.put(key, .{ .local_id = 4, .kind = .comment, .body = "omitted posted parent", .state = .{ .posted = 904 } });
+    const operation_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "later Reply", .parent = .{ .draft = 1 } });
+    try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "nested Reply", .parent = .{ .draft = 2 } });
+    try store.put(key, .{ .local_id = 5, .kind = .comment, .body = "omitted Reply", .parent = .{ .draft = 4 } });
+    try store.put(other, .{ .local_id = 2, .kind = .comment, .body = "other Review", .parent = .{ .draft = 1 } });
+    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+    try store.completeSubmission(operation_id, key, .clean);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const review = try store.loadReview(arena.allocator(), key);
+    try testing.expect(review.getConst(1) == null);
+    try testing.expectEqualDeep(draft_mod.Parent{ .comment = 900 }, review.getConst(2).?.parent.?);
+    try testing.expect(review.getConst(2).?.state == .draft);
+    try testing.expectEqualDeep(draft_mod.Parent{ .draft = 2 }, review.getConst(3).?.parent.?);
+    try testing.expectEqualDeep(draft_mod.Parent{ .draft = 4 }, review.getConst(5).?.parent.?);
+    const other_drafts = try store.load(arena.allocator(), other);
+    try testing.expectEqualDeep(draft_mod.Parent{ .draft = 1 }, other_drafts[0].parent.?);
+    try testing.expect((try store.activeSubmission(arena.allocator())) == null);
 }
 
 test "partial Submission completion keeps outcomes for repair" {

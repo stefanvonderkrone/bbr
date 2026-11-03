@@ -1205,6 +1205,25 @@ pub const SqliteStore = struct {
             if (c.sqlite3_step(dirty) != c.SQLITE_ROW) return error.Step;
             if (columnInt(dirty, 0) != 0) return error.SubmissionNotClean;
 
+            var remap: ?*c.sqlite3_stmt = null;
+            const remap_sql =
+                \\UPDATE drafts AS reply SET parent_kind=2, parent_id=parent.state_id
+                \\ FROM drafts AS parent JOIN submission_run_items AS item
+                \\   ON item.operation_id=?1 AND item.temp_id=parent.local_id
+                \\ WHERE parent.workspace=?2 AND parent.repository=?3 AND parent.pr_id=?4
+                \\   AND parent.state_kind=2
+                \\   AND reply.workspace=parent.workspace AND reply.repository=parent.repository
+                \\   AND reply.pr_id=parent.pr_id AND reply.parent_kind=1
+                \\   AND reply.parent_id=parent.local_id;
+            ;
+            if (c.sqlite3_prepare_v2(self.db, remap_sql, -1, &remap, null) != c.SQLITE_OK) return error.Prepare;
+            defer _ = c.sqlite3_finalize(remap);
+            bindInt(remap, 1, @intCast(operation_id));
+            bindText(remap, 2, key.workspace);
+            bindText(remap, 3, key.repository);
+            bindInt(remap, 4, @intCast(key.pull_request_id));
+            if (c.sqlite3_step(remap) != c.SQLITE_DONE) return error.Step;
+
             var remove: ?*c.sqlite3_stmt = null;
             const remove_sql =
                 \\DELETE FROM drafts
@@ -1983,6 +2002,49 @@ test "Submission checkpoint survives closing and reopening the database" {
     try testing.expect((try store.activeSubmission(arena.allocator())) == null);
     const after_completion = try store.load(arena.allocator(), key);
     try testing.expectEqual(@as(usize, 0), after_completion.len);
+}
+
+test "SQLite clean completion durably remaps surviving Replies and rolls back a failed removal" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/reply-parent.db", .{&tmp.sub_path}, 0);
+    const key = testReviewKey(7);
+    const other = testReviewKey(8);
+    {
+        var sqlite = try SqliteStore.open(path);
+        defer sqlite.deinit();
+        const store = sqlite.store();
+        try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "parent" });
+        try store.put(key, .{ .local_id = 4, .kind = .comment, .body = "omitted posted parent", .state = .{ .posted = 904 } });
+        const operation_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+        try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "later Reply", .parent = .{ .draft = 1 } });
+        try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "nested Reply", .parent = .{ .draft = 2 } });
+        try store.put(key, .{ .local_id = 5, .kind = .comment, .body = "omitted Reply", .parent = .{ .draft = 4 } });
+        try store.put(other, .{ .local_id = 2, .kind = .comment, .body = "other Review", .parent = .{ .draft = 1 } });
+        try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+        try sqlite.exec("CREATE TRIGGER fail_removal BEFORE DELETE ON drafts BEGIN SELECT RAISE(ABORT, 'test failure'); END;");
+        try testing.expectError(error.Step, store.completeSubmission(operation_id, key, .clean));
+        const unchanged = try store.loadReview(arena.allocator(), key);
+        try testing.expectEqual(@as(CommentId, 900), unchanged.getConst(1).?.state.posted);
+        try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, unchanged.getConst(2).?.parent.?);
+        try testing.expect((try store.activeSubmission(arena.allocator())) != null);
+        try sqlite.exec("DROP TRIGGER fail_removal;");
+        try store.completeSubmission(operation_id, key, .clean);
+    }
+    var reopened = try SqliteStore.open(path);
+    defer reopened.deinit();
+    const store = reopened.store();
+    const review = try store.loadReview(arena.allocator(), key);
+    try testing.expect(review.getConst(1) == null);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .comment = 900 }, review.getConst(2).?.parent.?);
+    try testing.expect(review.getConst(2).?.state == .draft);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 2 }, review.getConst(3).?.parent.?);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 4 }, review.getConst(5).?.parent.?);
+    const other_drafts = try store.load(arena.allocator(), other);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, other_drafts[0].parent.?);
+    try testing.expect((try store.activeSubmission(arena.allocator())) == null);
 }
 
 test "a rejected SQLite Submission checkpoint rolls back its completed outcome" {

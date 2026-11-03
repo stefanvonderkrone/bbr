@@ -22954,6 +22954,59 @@ fn refreshRecoverySession(presentation: *Presentation, session: *Session) !void 
 
 const RecoveryDraftTiming = enum { after_close, clean_inspection, active_inspection };
 
+test "Review recovery a Reply created during active inspection keeps its published parent" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "first batch" });
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .submission_locks = locks.locks() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    var post = state.takeCommand().?;
+    const command_id = post.post_draft.command_id;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try dispatchView(&state, .{ .action = .toggle_layout });
+    try state.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(cursorOwner(&state) == .draft);
+    try state.dispatch(.{ .key = .{ .codepoint = 'r', .text = "r" } });
+    try testing.expect(state.projection().composer != null);
+    try state.dispatch(.{ .composer = .{ .insert = try TextChunk.init("second batch Reply") } });
+    try state.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&state);
+    try state.dispatch(.{ .post_draft_completed = .{
+        .command_id = command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .posted = 99 },
+    } });
+    const load = state.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testCommentSession(testing.allocator, 1) },
+    } });
+    const drafts = state.projection().review.?.drafts;
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .comment = 99 }, drafts[0].parent.?);
+    try state.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try state.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    try testing.expect(state.projection().action_error == null);
+    try testing.expect(state.projection().submission != null);
+    var reply = state.takeCommand().?;
+    defer reply.deinit();
+    try testing.expectEqualStrings("second batch Reply", reply.post_draft.draft.body);
+    try testing.expectEqual(@as(?bbr.review.CommentId, 99), reply.post_draft.parent);
+}
+
 fn testReviewRecoveryLaterBatch(close: keymap_mod.KeyStroke, timing: RecoveryDraftTiming) !void {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
