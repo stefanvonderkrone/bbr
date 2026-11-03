@@ -1,6 +1,6 @@
 # Add framed Panes and the Sidebar File Tree
 
-Status: ready-for-human
+Status: resolved
 
 ## What to build
 
@@ -18,3 +18,9 @@ Present the Sidebar and DiffPane as focused tiled Panes and replace the flat Fil
 ## Blocked by
 
 - [15 — Establish the atomic Presentation Frame](15-establish-the-atomic-presentation-frame.md)
+
+## Completion
+
+Commit `aeaa872` (`presentation: add framed file tree navigation`, 2026-08-07) on `main` implements this ticket.
+TODO.md marks M15 done.
+On 2026-11-03 the operator asked to close this ticket, which still showed `ready-for-human`.

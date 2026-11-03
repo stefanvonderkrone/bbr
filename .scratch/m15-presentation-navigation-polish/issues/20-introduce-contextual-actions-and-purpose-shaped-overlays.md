@@ -1,6 +1,6 @@
 # Introduce contextual Actions and purpose-shaped Overlays
 
-Status: ready-for-human
+Status: resolved
 
 ## What to build
 
@@ -21,3 +21,9 @@ Resolve keys to precise semantic Actions using the current Interaction Context: 
 - [16 — Carry CommentScope end to end](16-carry-commentscope-end-to-end.md)
 - [18 — Unify review-content disclosures](18-unify-review-content-disclosures.md)
 - [19 — Add framed Panes and the Sidebar File Tree](19-add-framed-panes-and-the-sidebar-file-tree.md)
+
+## Completion
+
+Commit `0c6229e` (`presentation: add contextual actions and overlays`, 2026-08-07) on `main` implements this ticket.
+TODO.md marks M15 done.
+On 2026-11-03 the operator asked to close this ticket, which still showed `ready-for-human`.

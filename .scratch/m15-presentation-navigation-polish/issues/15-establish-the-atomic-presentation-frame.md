@@ -1,6 +1,6 @@
 # Establish the atomic Presentation Frame
 
-Status: ready-for-human
+Status: resolved
 
 ## What to build
 
@@ -18,3 +18,9 @@ Introduce the Presentation-owned frame boundary that all later M15 behavior can 
 ## Blocked by
 
 None - can start immediately
+
+## Completion
+
+Commit `78db0b8` (`presentation: establish atomic frame`, 2026-08-06) on `main` implements this ticket.
+TODO.md marks M15 done.
+On 2026-11-03 the operator asked to close this ticket, which still showed `ready-for-human`.

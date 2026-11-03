@@ -1,6 +1,6 @@
 # Add keyboard-parity mouse navigation
 
-Status: ready-for-human
+Status: resolved
 
 ## What to build
 
@@ -18,3 +18,9 @@ Add default-on, configurable mouse navigation as an adapter over existing semant
 ## Blocked by
 
 - [20 — Introduce contextual Actions and purpose-shaped Overlays](20-introduce-contextual-actions-and-purpose-shaped-overlays.md)
+
+## Completion
+
+Commit `8e7cba8` (`presentation: add keyboard-parity mouse navigation`, 2026-08-07) on `main` implements this ticket.
+TODO.md marks M15 done.
+On 2026-11-03 the operator asked to close this ticket, which still showed `ready-for-human`.

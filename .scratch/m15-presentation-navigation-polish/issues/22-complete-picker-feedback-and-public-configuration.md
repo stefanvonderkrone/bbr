@@ -1,6 +1,6 @@
 # Complete Picker feedback and public configuration
 
-Status: ready-for-human
+Status: resolved
 
 ## What to build
 
@@ -20,3 +20,9 @@ Finish M15's visible loading feedback and public configuration as one coherent p
 - [17 — Project Markdown ReviewCards](17-project-markdown-reviewcards.md)
 - [20 — Introduce contextual Actions and purpose-shaped Overlays](20-introduce-contextual-actions-and-purpose-shaped-overlays.md)
 - [21 — Add keyboard-parity mouse navigation](21-add-keyboard-parity-mouse-navigation.md)
+
+## Completion
+
+Commit `b98d917` (`presentation: complete picker feedback and configuration`, 2026-08-07) on `main` implements this ticket.
+TODO.md marks M15 done.
+On 2026-11-03 the operator asked to close this ticket, which still showed `ready-for-human`.

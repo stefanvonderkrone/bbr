@@ -1,6 +1,6 @@
 # Project Markdown ReviewCards
 
-Status: ready-for-human
+Status: resolved
 
 ## What to build
 
@@ -18,3 +18,9 @@ Project unchanged Comment and Draft bytes into bounded, terminal-native ReviewCa
 ## Blocked by
 
 - [15 — Establish the atomic Presentation Frame](15-establish-the-atomic-presentation-frame.md)
+
+## Completion
+
+Commit `2f341e0` (`presentation: project markdown review cards`, 2026-08-06) on `main` implements this ticket.
+TODO.md marks M15 done.
+On 2026-11-03 the operator asked to close this ticket, which still showed `ready-for-human`.

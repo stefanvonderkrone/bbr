@@ -1,6 +1,6 @@
 # Carry CommentScope end to end
 
-Status: ready-for-human
+Status: resolved
 
 ## What to build
 
@@ -18,3 +18,9 @@ Make `CommentScope` exhaustive for every root Comment and Draft across Review, p
 ## Blocked by
 
 - [15 — Establish the atomic Presentation Frame](15-establish-the-atomic-presentation-frame.md)
+
+## Completion
+
+Commit `935e348` (`review: carry comment scope end to end`, 2026-08-06) on `main` implements this ticket.
+TODO.md marks M15 done.
+On 2026-11-03 the operator asked to close this ticket, which still showed `ready-for-human`.

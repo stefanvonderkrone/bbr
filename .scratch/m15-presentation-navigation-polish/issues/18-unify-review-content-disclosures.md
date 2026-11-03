@@ -1,6 +1,6 @@
 # Unify review-content disclosures
 
-Status: ready-for-human
+Status: resolved
 
 ## What to build
 
@@ -19,3 +19,9 @@ Replace global and one-way visibility controls with one persistent disclosure la
 
 - [16 — Carry CommentScope end to end](16-carry-commentscope-end-to-end.md)
 - [17 — Project Markdown ReviewCards](17-project-markdown-reviewcards.md)
+
+## Completion
+
+Commit `ee88277` (`presentation: unify review content disclosures`, 2026-08-06) on `main` implements this ticket.
+TODO.md marks M15 done.
+On 2026-11-03 the operator asked to close this ticket, which still showed `ready-for-human`.
