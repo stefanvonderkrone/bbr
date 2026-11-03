@@ -218,7 +218,7 @@ pub const fixed_sections = [_]FixedSection{
         .{ .keys = "L", .description = "outcome unknown: link existing Comment" },
         .{ .keys = "A", .description = "abandon recovery, or decide later" },
         .{ .keys = "p", .description = "open PullRequest Picker" },
-        .{ .keys = "q esc ctrl-c", .description = "hide Overlay without stopping Submission" },
+        .{ .keys = "q esc ctrl-c", .description = "close Overlay without stopping Submission" },
     } },
     // `applyDeleteConfirmationInput` callers in `applyKey`
     .{ .title = "Delete Confirmation", .entries = &.{
