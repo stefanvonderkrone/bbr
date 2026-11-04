@@ -2394,7 +2394,7 @@ const DisclosureTarget = struct {
     add: SearchDisclosureSet = .{},
     remove: ?buffer_mod.DisclosureKey = null,
 
-    // Search-owned keys are a retained baseline plus at most three additions.
+    // Search-owned keys are a retained baseline plus at most four additions.
     // Unknown provenance conservatively queues a worker instead of scanning keys.
     fn matchesKeys(self: DisclosureTarget, keys: *const DisclosureKeys) bool {
         var added: SearchDisclosureSet = .{};
@@ -4392,6 +4392,29 @@ const Published = struct {
         self.disclosure_inputs_current = true;
     }
 
+    /// Mirror a clean Submission completion in the store, which moves each
+    /// Reply of a posted run item to its CommentId. The posted Draft keeps its
+    /// card through the ParentIndex alias until Reconciliation replaces it.
+    fn remapPostedReplies(self: *Published, run: []const bbr.review.TempId, source: *const bbr.review.PendingReview) void {
+        var changed = false;
+        for (self.review.drafts.items) |*draft| {
+            const parent = draft.parent orelse continue;
+            if (parent != .draft or std.mem.indexOfScalar(bbr.review.TempId, run, parent.draft) == null) continue;
+            const posted = source.getConst(parent.draft) orelse continue;
+            if (posted.state != .posted) continue;
+            draft.parent = .{ .comment = posted.state.posted };
+            changed = true;
+        }
+        if (!changed) return;
+        const inputs = DisclosureInputs.create(self) catch {
+            self.disclosure_inputs_current = false;
+            return;
+        };
+        self.disclosure_inputs.release();
+        self.disclosure_inputs = inputs;
+        self.disclosure_inputs_current = true;
+    }
+
     fn prepareDraft(
         self: *Published,
         store: bbr.review.PendingReviewStore,
@@ -5239,6 +5262,7 @@ const DurableSubmission = struct {
     pending_persistence: ?PendingPersistence = null,
     pending_wait_retry: ?WaitSubmission = null,
     posted_any: bool = false,
+    run_start: usize = 0,
     recovery_source_commit: ?BoundedText(64) = null,
     observed_source_commit: ?BoundedText(64) = null,
     source_changed: bool = false,
@@ -5315,6 +5339,7 @@ const DurableSubmission = struct {
         durable.pending_persistence = null;
         durable.pending_wait_retry = null;
         durable.posted_any = false;
+        durable.run_start = 0;
         durable.recovery_source_commit = null;
         durable.observed_source_commit = null;
         durable.source_changed = false;
@@ -5349,6 +5374,7 @@ const DurableSubmission = struct {
         const command = try PostDraft.create(allocator, durable.key, draft.*, post);
         errdefer command.destroy();
         const remaining = durable.machine.order[durable.machine.idx..];
+        durable.run_start = durable.machine.idx;
         const items = try durable.arena.allocator().alloc(bbr.review.SubmissionRunItem, remaining.len);
         for (remaining, items) |temp_id, *item| {
             const participant = durable.review.getConst(temp_id) orelse return error.DraftNotFound;
@@ -6776,6 +6802,14 @@ pub const Presentation = struct {
         self.recovery = null;
         self.submission_result = result;
         self.action_error = null;
+        if (result.completion == .clean) if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, notice.key)) {
+            const run_ids = arena.allocator().alloc(bbr.review.TempId, run.items.len) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            for (run.items, run_ids) |item, *id| id.* = item.temp_id;
+            published.remapPostedReplies(run_ids, &review);
+        };
     }
 
     fn queueRecoveryCheck(self: *Presentation, durable: *DurableSubmission) void {
@@ -10579,6 +10613,8 @@ pub const Presentation = struct {
             .finished => |finished| {
                 self.recordVisibleTransition(durable, finished.transition);
                 if (self.submission_tree) |tree| tree.finish(durable, finished.result.completion);
+                if (finished.result.completion == .clean) if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key))
+                    published.remapPostedReplies(durable.machine.order[durable.run_start..], &durable.review);
                 const reconcile = durable.posted_any and !self.shutdown_requested and self.replacement == null and
                     (if (self.published) |published| OwnedReviewIdentity.eql(published.key, durable.key) else false);
                 const key = durable.key;
@@ -10827,6 +10863,7 @@ pub const Presentation = struct {
         if (self.submission_tree) |tree| tree.finish(durable, completion);
         if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key)) {
             published.setDraftState(temp_id, outcome.draftState());
+            if (completion == .clean) published.remapPostedReplies(durable.machine.order[durable.run_start..], &durable.review);
             if (self.submission_tree) |tree| tree.refresh(&published.review);
         };
         const reconcile = outcome == .posted and !self.shutdown_requested and self.replacement == null and
@@ -12944,7 +12981,7 @@ fn addSearchDisclosure(allocator: Allocator, keys: *std.ArrayList(buffer_mod.Dis
 }
 
 const SearchDisclosureSet = struct {
-    items: [3]buffer_mod.DisclosureKey = undefined,
+    items: [4]buffer_mod.DisclosureKey = undefined,
     len: usize = 0,
 
     fn append(self: *SearchDisclosureSet, key: buffer_mod.DisclosureKey) void {
@@ -24388,6 +24425,29 @@ test "M21 kernel search indexes cover Draft chains and release every failed allo
     try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .review_card = .{ .draft = 13 } }, opposite.items[1]);
 }
 
+test "a Reply in a resolved outdated Thread keeps its ReviewCard disclosure" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testDisclosureSession(testing.allocator, 1);
+    const a = session.arena.allocator();
+    const comments = try a.alloc(bbr.review.Comment, 3);
+    comments[0] = .{ .id = 1, .author = "Ada", .body = "root", .resolved = true, .state = .outdated, .anchor = .{ .path = "a.txt", .from = 99 } };
+    comments[1] = .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "reply" };
+    comments[2] = .{ .id = 3, .author = "Cy", .body = "gone", .state = .outdated, .anchor = .{ .path = "gone.txt", .from = 1 } };
+    session.threads = try bbr.review.buildThreads(a, comments);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const reply = published.search_projection.body_disclosures.get(.{ .comment = 2 }).?;
+    try testing.expectEqual(@as(usize, 4), reply.len);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .outdated_file = &published.session.diff.files[0] }, reply.items[0]);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey.outdated_review, reply.items[1]);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .resolved_thread = 1 }, reply.items[2]);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .review_card = .{ .comment = 2 } }, reply.items[3]);
+}
+
 test "M21 kernel search lookup uses its retained Frame after owner tables change" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -30674,6 +30734,46 @@ test "final successful POST completes clean, releases ownership, and reconciles 
     try testing.expectEqual(@as(usize, 0), (try store.store().load(arena.allocator(), key.storeKey())).len);
     var reacquired = (try locks.locks().tryAcquire(key.storeKey())).?;
     reacquired.release();
+}
+
+test "clean completion moves visible Replies to the posted CommentId like the store" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    // A Reply that joins after the run starts stays outside the run.
+    const reply: bbr.review.Draft = .{ .local_id = 2, .kind = .comment, .body = "later Reply", .parent = .{ .draft = 1 } };
+    try store.store().put(key.storeKey(), reply);
+    const published = presentation.published.?;
+    try published.review.addExisting(published.review_arena.allocator(), reply);
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+    try testing.expect(presentation.takeCommand().?.load_session.cause == .reconciliation);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const stored = try store.store().loadReview(arena.allocator(), key.storeKey());
+    const expected: bbr.review.draft.Parent = .{ .comment = 900 };
+    try testing.expectEqualDeep(expected, stored.getConst(2).?.parent.?);
+    try testing.expectEqualDeep(expected, published.review.getConst(2).?.parent.?);
+    try testing.expectEqualDeep(expected, published.disclosure_inputs.drafts[1].parent.?);
 }
 
 test "retryable POST rejection waits and reissues without checkpointing an outcome" {

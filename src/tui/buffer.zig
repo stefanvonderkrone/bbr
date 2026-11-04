@@ -1307,7 +1307,13 @@ const Weave = struct {
         const owner: review_card.Owner = .{ .draft = d.local_id };
         const ancestry = try indentation.state(w.a, depth);
         const states = [_]?[]const u8{
-            if (d.state == .outcome_unknown) "outcome unknown" else if (d.state == .posted) "posted" else null,
+            switch (d.state) {
+                .draft => null,
+                .submitting => "submitting",
+                .posted => "posted",
+                .failed => "failed",
+                .outcome_unknown => "outcome unknown",
+            },
             if (d.kind == .suggestion) "suggestion" else null,
         };
         const parsed = try review_card.ReviewBody.parseWithMentions(w.a, d.body, w.opts.mention_names);
@@ -2302,13 +2308,16 @@ test "submitting Draft parents retain separate readable card trees and Active Pa
     const buf = try buildWithComments(a, .{ .files = &.{} }, .unified, &.{}, .{ .drafts = &drafts });
     var roots: [2]*const review_card.Card = undefined;
     var count: usize = 0;
+    var root_bodies: usize = 0;
     for (buf.rows) |row| if (row == .draft) {
         const card = row.draft.card.?;
         try testing.expect(!row.draft.sibling_below);
         try testing.expect(row.draft.rails == null);
+        if (card.parent == null and row.draft.part == .body) root_bodies += 1;
         if (row.draft.part == .header and card.parent == null) {
             roots[count] = card;
             count += 1;
+            try testing.expectEqualStrings("draft (submitting)", row.draft.plain_label.?);
             try testing.expectEqual(@as(usize, 0), card.depth);
             const path = try buf.activePath(a, card.rows.start);
             try testing.expectEqual(card, path.by_depth[0].?);
@@ -2316,6 +2325,7 @@ test "submitting Draft parents retain separate readable card trees and Active Pa
         }
     };
     try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(usize, 2), root_bodies);
     const path = try buf.activePath(a, roots[1].rows.start);
     try testing.expect(!path.holds(roots[0]));
 }

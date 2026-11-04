@@ -2018,12 +2018,15 @@ test "SQLite clean completion durably remaps surviving Replies and rolls back a 
         const store = sqlite.store();
         try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "parent" });
         try store.put(key, .{ .local_id = 4, .kind = .comment, .body = "omitted posted parent", .state = .{ .posted = 904 } });
-        const operation_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+        try store.put(key, .{ .local_id = 6, .kind = .comment, .body = "second parent" });
+        const operation_id = try store.beginSubmission(key, "source", &.{ .{ .temp_id = 1, .parent = null }, .{ .temp_id = 6, .parent = null } });
         try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "later Reply", .parent = .{ .draft = 1 } });
         try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "nested Reply", .parent = .{ .draft = 2 } });
         try store.put(key, .{ .local_id = 5, .kind = .comment, .body = "omitted Reply", .parent = .{ .draft = 4 } });
+        try store.put(key, .{ .local_id = 7, .kind = .comment, .body = "second Reply", .parent = .{ .draft = 6 } });
         try store.put(other, .{ .local_id = 2, .kind = .comment, .body = "other Review", .parent = .{ .draft = 1 } });
-        try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+        try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 6);
+        try store.checkpointSubmission(operation_id, key, 6, .{ .posted = 906 }, null);
         try sqlite.exec("CREATE TRIGGER fail_removal BEFORE DELETE ON drafts BEGIN SELECT RAISE(ABORT, 'test failure'); END;");
         try testing.expectError(error.Step, store.completeSubmission(operation_id, key, .clean));
         const unchanged = try store.loadReview(arena.allocator(), key);
@@ -2038,6 +2041,8 @@ test "SQLite clean completion durably remaps surviving Replies and rolls back a 
     const store = reopened.store();
     const review = try store.loadReview(arena.allocator(), key);
     try testing.expect(review.getConst(1) == null);
+    try testing.expect(review.getConst(6) == null);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .comment = 906 }, review.getConst(7).?.parent.?);
     try testing.expectEqualDeep(bbr.review.draft.Parent{ .comment = 900 }, review.getConst(2).?.parent.?);
     try testing.expect(review.getConst(2).?.state == .draft);
     try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 2 }, review.getConst(3).?.parent.?);

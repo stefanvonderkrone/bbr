@@ -1624,18 +1624,23 @@ test "clean Submission completion remaps surviving Replies before removing their
     const other = testReviewKey(8);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "parent" });
     try store.put(key, .{ .local_id = 4, .kind = .comment, .body = "omitted posted parent", .state = .{ .posted = 904 } });
-    const operation_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+    try store.put(key, .{ .local_id = 6, .kind = .comment, .body = "second parent" });
+    const operation_id = try store.beginSubmission(key, "source", &.{ .{ .temp_id = 1, .parent = null }, .{ .temp_id = 6, .parent = null } });
     try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "later Reply", .parent = .{ .draft = 1 } });
     try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "nested Reply", .parent = .{ .draft = 2 } });
     try store.put(key, .{ .local_id = 5, .kind = .comment, .body = "omitted Reply", .parent = .{ .draft = 4 } });
+    try store.put(key, .{ .local_id = 7, .kind = .comment, .body = "second Reply", .parent = .{ .draft = 6 } });
     try store.put(other, .{ .local_id = 2, .kind = .comment, .body = "other Review", .parent = .{ .draft = 1 } });
-    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 6);
+    try store.checkpointSubmission(operation_id, key, 6, .{ .posted = 906 }, null);
     try store.completeSubmission(operation_id, key, .clean);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const review = try store.loadReview(arena.allocator(), key);
     try testing.expect(review.getConst(1) == null);
+    try testing.expect(review.getConst(6) == null);
+    try testing.expectEqualDeep(draft_mod.Parent{ .comment = 906 }, review.getConst(7).?.parent.?);
     try testing.expectEqualDeep(draft_mod.Parent{ .comment = 900 }, review.getConst(2).?.parent.?);
     try testing.expect(review.getConst(2).?.state == .draft);
     try testing.expectEqualDeep(draft_mod.Parent{ .draft = 2 }, review.getConst(3).?.parent.?);
