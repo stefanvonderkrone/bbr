@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,10 +53,28 @@ def main():
     def position(screen):
         return tuple(map(int, re.search(r"Local review.*?([0-9]+)/([0-9]+)", screen).groups()))
 
+    def cursor(screen):
+        match = re.search(r"Local review.*?([0-9]+)/[0-9]+", screen)
+        return int(match.group(1)) if match else None
+
+    # tmux accepts keys before bbr paints them, so poll for the moved cursor.
+    def capture_when(label, ready):
+        deadline = time.monotonic() + 15
+        while True:
+            screen = control("capture", label)
+            if ready(cursor(screen)):
+                return screen
+            if time.monotonic() > deadline:
+                raise AssertionError(screen)
+            time.sleep(0.1)
+
     try:
         control("doctor")
-        control("keys", "]", "j", "j")
-        before = control("capture", "reload-source-before")
+        start = cursor(capture_when("reload-source-start", lambda line: line is not None))
+        control("keys", "]")
+        jumped = cursor(capture_when("reload-source-jump", lambda line: line not in (None, start)))
+        control("keys", "j", "j")
+        before = capture_when("reload-source-before", lambda line: line == jumped + 2)
         assert "sample.txt · Changes" in before, before
         old_cursor, old_total = position(before)
         (repo / "notes.txt").write_text("VERIFY_NOTES\nVERIFY_RELOAD\n")

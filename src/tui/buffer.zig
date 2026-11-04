@@ -2314,6 +2314,11 @@ test "submitting Draft parents retain separate readable card trees and Active Pa
         try testing.expect(!row.draft.sibling_below);
         try testing.expect(row.draft.rails == null);
         if (card.parent == null and row.draft.part == .body) root_bodies += 1;
+        if (row.draft.part == .header) {
+            var top = card;
+            while (top.parent) |parent| top = parent;
+            try testing.expectEqual(top, card.root);
+        }
         if (row.draft.part == .header and card.parent == null) {
             roots[count] = card;
             count += 1;
