@@ -125,3 +125,20 @@ Return and Sort:
 
 When all checks pass, add `## Completion` with the results, the Workspace, and the commit.
 Then set this ticket and the SPEC to `Status: resolved`.
+
+### Partial result on 2026-11-04
+
+The operator ran the check at commit `151352c` on the Credential Workspace.
+The Workspace has more than 300 Repositories.
+The check stays open, because step B4 failed and the request count is postponed.
+
+- Shape check: pass. `bbr check-browser <repo-slug>` exits 0. Its approval and changes-requested totals match the web UI.
+- The open-PullRequest count matches the web UI filters Open and Draft together. The API state `OPEN` includes Drafts, and the Browser shows no Draft marker.
+- Startup B1 to B3: pass. Each `bbr detect` line matches the TUI outcome.
+- Startup B4: fail. `q` in the Detecting Frame sometimes waits with "shutting down…". [Ticket 10](10-quit-in-the-detecting-frame-waits-for-the-detect-request.md) records it.
+- Browser timing: cached rows show at once. `time` gives about 3 s for each run, with the shutdown and the reaction time included.
+- The Summary Cache file has mode `-rw-------` and holds no URL, no description, and no Credential.
+- A fast `q` after the first rows left no Summary Cache file. [Ticket 11](11-a-fast-quit-drops-the-summary-cache-save.md) records it.
+- Request count: postponed. It needs a logging proxy.
+- Return with `b` and both Sort changes: pass.
+- The operator asked for a Browser rework. M25 owns it in [M25 ticket 01](../../m25-browser-navigation-finding-recents-settings/issues/01-rework-the-browser-into-repository-and-pullrequest-views.md).
