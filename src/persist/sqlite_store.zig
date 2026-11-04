@@ -58,11 +58,11 @@ const subtree_cte =
     \\
 ;
 
-fn bindSubtreeScope(stmt: ?*c.sqlite3_stmt, key: RemoteReviewIdentity, root_temp_id: TempId) void {
-    bindText(stmt, 1, key.workspace);
-    bindText(stmt, 2, key.repository);
-    bindInt(stmt, 3, @intCast(key.pull_request_id));
-    bindInt(stmt, 4, @intCast(root_temp_id));
+fn bindSubtreeScope(self: *SqliteStore, stmt: ?*c.sqlite3_stmt, key: RemoteReviewIdentity, root_temp_id: TempId) void {
+    bindText(self, stmt, 1, key.workspace);
+    bindText(self, stmt, 2, key.repository);
+    bindInt(self, stmt, 3, @intCast(key.pull_request_id));
+    bindInt(self, stmt, 4, @intCast(root_temp_id));
 }
 
 const schema_v1 =
@@ -87,25 +87,46 @@ const schema_v1 =
 
 pub const SqliteStore = struct {
     db: *c.sqlite3,
+    diagnostic: bbr.diagnostics.Handle = .{},
+
+    fn native(self: *SqliteStore, result: c_int, phase: bbr.diagnostic.Phase, comptime source: std.builtin.SourceLocation) c_int {
+        const primary = result & 0xff;
+        if (primary != c.SQLITE_OK and primary != c.SQLITE_ROW and primary != c.SQLITE_DONE) {
+            _ = self.diagnostic.failure(phase, .{ .sqlite = .{ .result = primary, .extended = c.sqlite3_extended_errcode(self.db) } }, source);
+        }
+        return result;
+    }
 
     /// Open (creating if needed) the database at `path`, a NUL-terminated path or
     /// `":memory:"`. Applies pending migrations before returning.
     pub fn open(path: [:0]const u8) SqliteError!SqliteStore {
+        return openDiagnostic(path, .{});
+    }
+
+    pub fn openDiagnostic(path: [:0]const u8, diagnostic: bbr.diagnostics.Handle) SqliteError!SqliteStore {
         var db: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE;
-        if (c.sqlite3_open_v2(path.ptr, &db, flags, null) != c.SQLITE_OK) {
+        const result = c.sqlite3_open_v2(path.ptr, &db, flags, null);
+        if (result != c.SQLITE_OK) {
+            _ = diagnostic.failure(.open, .{ .sqlite = .{ .result = result, .extended = if (db) |d| c.sqlite3_extended_errcode(d) else result } }, @src());
             if (db) |d| _ = c.sqlite3_close(d);
             return error.Open;
         }
-        var self: SqliteStore = .{ .db = db.? };
-        errdefer _ = c.sqlite3_close(self.db);
+        var self: SqliteStore = .{ .db = db.?, .diagnostic = diagnostic };
+        errdefer self.close();
         try self.migrate();
         return self;
     }
 
     pub fn deinit(self: *SqliteStore) void {
-        _ = c.sqlite3_close(self.db);
+        self.close();
         self.* = undefined;
+    }
+
+    fn close(self: *SqliteStore) void {
+        const result = c.sqlite3_close(self.db);
+        if (result != c.SQLITE_OK)
+            _ = self.diagnostic.failure(.close, .{ .sqlite = .{ .result = result, .extended = result } }, @src());
     }
 
     pub fn store(self: *SqliteStore) PendingReviewStore {
@@ -272,17 +293,17 @@ pub const SqliteStore = struct {
 
     fn userVersion(self: *SqliteStore) SqliteError!i64 {
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "PRAGMA user_version;", -1, &stmt, null) != c.SQLITE_OK)
+        if (self.native(c.sqlite3_prepare_v2(self.db, "PRAGMA user_version;", -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
-        return switch (c.sqlite3_step(stmt)) {
+        defer _ = self.native(c.sqlite3_finalize(stmt), .finalize, @src());
+        return switch (self.native(c.sqlite3_step(stmt), .step, @src())) {
             c.SQLITE_ROW => c.sqlite3_column_int64(stmt, 0),
             else => error.Step,
         };
     }
 
     fn exec(self: *SqliteStore, sql: [*:0]const u8) SqliteError!void {
-        if (c.sqlite3_exec(self.db, sql, null, null, null) != c.SQLITE_OK) return error.Exec;
+        if (self.native(c.sqlite3_exec(self.db, sql, null, null, null), .exec, @src()) != c.SQLITE_OK) return error.Exec;
     }
 
     // --- vtable -------------------------------------------------------------
@@ -313,11 +334,11 @@ pub const SqliteStore = struct {
         var resolved: ?bbr.review.ReviewRepositoryId = null;
         for (aliases) |alias| {
             var query: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "SELECT repository_id FROM review_repository_aliases WHERE alias=?;", -1, &query, null) != c.SQLITE_OK)
+            if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT repository_id FROM review_repository_aliases WHERE alias=?;", -1, &query, null), .prepare, @src()) != c.SQLITE_OK)
                 return error.Prepare;
-            defer _ = c.sqlite3_finalize(query);
-            bindText(query, 1, alias);
-            switch (c.sqlite3_step(query)) {
+            defer _ = self.native(c.sqlite3_finalize(query), .finalize, @src());
+            bindText(self, query, 1, alias);
+            switch (self.native(c.sqlite3_step(query), .step, @src())) {
                 c.SQLITE_ROW => {
                     const id: bbr.review.ReviewRepositoryId = @intCast(c.sqlite3_column_int64(query, 0));
                     if (resolved != null and resolved.? != id) return error.RepositoryIdentityConflict;
@@ -329,18 +350,18 @@ pub const SqliteStore = struct {
         }
 
         const repository_id = resolved orelse blk: {
-            if (c.sqlite3_exec(self.db, "INSERT INTO review_repositories DEFAULT VALUES;", null, null, null) != c.SQLITE_OK)
+            if (self.native(c.sqlite3_exec(self.db, "INSERT INTO review_repositories DEFAULT VALUES;", null, null, null), .exec, @src()) != c.SQLITE_OK)
                 return error.Exec;
             break :blk @as(bbr.review.ReviewRepositoryId, @intCast(c.sqlite3_last_insert_rowid(self.db)));
         };
         for (aliases) |alias| {
             var insert: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO review_repository_aliases(alias, repository_id) VALUES (?,?);", -1, &insert, null) != c.SQLITE_OK)
+            if (self.native(c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO review_repository_aliases(alias, repository_id) VALUES (?,?);", -1, &insert, null), .prepare, @src()) != c.SQLITE_OK)
                 return error.Prepare;
-            defer _ = c.sqlite3_finalize(insert);
-            bindText(insert, 1, alias);
-            bindInt(insert, 2, @intCast(repository_id));
-            if (c.sqlite3_step(insert) != c.SQLITE_DONE) return error.Step;
+            defer _ = self.native(c.sqlite3_finalize(insert), .finalize, @src());
+            bindText(self, insert, 1, alias);
+            bindInt(self, insert, 2, @intCast(repository_id));
+            if (self.native(c.sqlite3_step(insert), .step, @src()) != c.SQLITE_DONE) return error.Step;
         }
         try self.exec("COMMIT;");
         return repository_id;
@@ -352,23 +373,23 @@ pub const SqliteStore = struct {
         errdefer self.exec("ROLLBACK;") catch {};
 
         var query: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT next_id FROM draft_temp_ids WHERE workspace=? AND repository=? AND pr_id=?;", -1, &query, null) != c.SQLITE_OK)
+        if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT next_id FROM draft_temp_ids WHERE workspace=? AND repository=? AND pr_id=?;", -1, &query, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
-        defer _ = c.sqlite3_finalize(query);
-        bindText(query, 1, key.workspace);
-        bindText(query, 2, key.repository);
-        bindInt(query, 3, @intCast(key.pull_request_id));
-        const reserved: TempId = switch (c.sqlite3_step(query)) {
+        defer _ = self.native(c.sqlite3_finalize(query), .finalize, @src());
+        bindText(self, query, 1, key.workspace);
+        bindText(self, query, 2, key.repository);
+        bindInt(self, query, 3, @intCast(key.pull_request_id));
+        const reserved: TempId = switch (self.native(c.sqlite3_step(query), .step, @src())) {
             c.SQLITE_ROW => @intCast(c.sqlite3_column_int64(query, 0)),
             c.SQLITE_DONE => blk: {
                 var maximum: ?*c.sqlite3_stmt = null;
-                if (c.sqlite3_prepare_v2(self.db, "SELECT COALESCE(MAX(local_id),0)+1 FROM drafts WHERE workspace=? AND repository=? AND pr_id=?;", -1, &maximum, null) != c.SQLITE_OK)
+                if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT COALESCE(MAX(local_id),0)+1 FROM drafts WHERE workspace=? AND repository=? AND pr_id=?;", -1, &maximum, null), .prepare, @src()) != c.SQLITE_OK)
                     return error.Prepare;
-                defer _ = c.sqlite3_finalize(maximum);
-                bindText(maximum, 1, key.workspace);
-                bindText(maximum, 2, key.repository);
-                bindInt(maximum, 3, @intCast(key.pull_request_id));
-                if (c.sqlite3_step(maximum) != c.SQLITE_ROW) return error.Step;
+                defer _ = self.native(c.sqlite3_finalize(maximum), .finalize, @src());
+                bindText(self, maximum, 1, key.workspace);
+                bindText(self, maximum, 2, key.repository);
+                bindInt(self, maximum, 3, @intCast(key.pull_request_id));
+                if (self.native(c.sqlite3_step(maximum), .step, @src()) != c.SQLITE_ROW) return error.Step;
                 break :blk @intCast(c.sqlite3_column_int64(maximum, 0));
             },
             else => return error.Step,
@@ -379,13 +400,13 @@ pub const SqliteStore = struct {
             \\INSERT INTO draft_temp_ids(workspace,repository,pr_id,next_id) VALUES (?,?,?,?)
             \\ON CONFLICT(workspace,repository,pr_id) DO UPDATE SET next_id=excluded.next_id;
         ;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &upsert, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(upsert);
-        bindText(upsert, 1, key.workspace);
-        bindText(upsert, 2, key.repository);
-        bindInt(upsert, 3, @intCast(key.pull_request_id));
-        bindInt(upsert, 4, @intCast(reserved + 1));
-        if (c.sqlite3_step(upsert) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &upsert, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(upsert), .finalize, @src());
+        bindText(self, upsert, 1, key.workspace);
+        bindText(self, upsert, 2, key.repository);
+        bindInt(self, upsert, 3, @intCast(key.pull_request_id));
+        bindInt(self, upsert, 4, @intCast(reserved + 1));
+        if (self.native(c.sqlite3_step(upsert), .step, @src()) != c.SQLITE_DONE) return error.Step;
         try self.exec("COMMIT;");
         return reserved;
     }
@@ -406,27 +427,27 @@ pub const SqliteStore = struct {
             \\ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
         ;
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
+        if (self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(stmt), .finalize, @src());
 
-        bindInt(stmt, 1, @intCast(key.pull_request_id));
-        bindInt(stmt, 2, @intCast(d.local_id));
-        bindInt(stmt, 3, @intFromEnum(d.kind));
-        bindInt(stmt, 4, @intFromEnum(d.target));
+        bindInt(self, stmt, 1, @intCast(key.pull_request_id));
+        bindInt(self, stmt, 2, @intCast(d.local_id));
+        bindInt(self, stmt, 3, @intFromEnum(d.kind));
+        bindInt(self, stmt, 4, @intFromEnum(d.target));
 
         // parent: kind 0 none / 1 draft / 2 comment.
         if (d.parent) |p| switch (p) {
             .draft => |t| {
-                bindInt(stmt, 5, 1);
-                bindInt(stmt, 6, @intCast(t));
+                bindInt(self, stmt, 5, 1);
+                bindInt(self, stmt, 6, @intCast(t));
             },
             .comment => |cid| {
-                bindInt(stmt, 5, 2);
-                bindInt(stmt, 6, @intCast(cid));
+                bindInt(self, stmt, 5, 2);
+                bindInt(self, stmt, 6, @intCast(cid));
             },
         } else {
-            bindInt(stmt, 5, 0);
-            bindNull(stmt, 6);
+            bindInt(self, stmt, 5, 0);
+            bindNull(self, stmt, 6);
         }
 
         const root_scope = if (d.parent == null) d.effectiveScope() else null;
@@ -437,81 +458,81 @@ pub const SqliteStore = struct {
         // Inline scope retains the legacy anchor columns so v6 data migrates
         // losslessly. File scope uses path plus its authored source commit.
         if (inline_anchor) |a| {
-            bindText(stmt, 7, a.path);
-            bindOptU32(stmt, 8, a.from);
-            bindOptU32(stmt, 9, a.to);
-            bindOptText(stmt, 10, a.commit);
-            bindOptU32(stmt, 15, a.start_from);
-            bindOptU32(stmt, 16, a.start_to);
+            bindText(self, stmt, 7, a.path);
+            bindOptU32(self, stmt, 8, a.from);
+            bindOptU32(self, stmt, 9, a.to);
+            bindOptText(self, stmt, 10, a.commit);
+            bindOptU32(self, stmt, 15, a.start_from);
+            bindOptU32(self, stmt, 16, a.start_to);
         } else {
             if (root_scope) |scope| switch (scope) {
-                .file => |file| bindText(stmt, 7, file.path),
-                else => bindNull(stmt, 7),
-            } else bindNull(stmt, 7);
-            bindNull(stmt, 8);
-            bindNull(stmt, 9);
-            bindNull(stmt, 10);
-            bindNull(stmt, 15);
-            bindNull(stmt, 16);
+                .file => |file| bindText(self, stmt, 7, file.path),
+                else => bindNull(self, stmt, 7),
+            } else bindNull(self, stmt, 7);
+            bindNull(self, stmt, 8);
+            bindNull(self, stmt, 9);
+            bindNull(self, stmt, 10);
+            bindNull(self, stmt, 15);
+            bindNull(self, stmt, 16);
         }
 
-        bindText(stmt, 11, d.body);
+        bindText(self, stmt, 11, d.body);
 
         // state: 0 draft / 1 submitting / 2 posted(id) / 3 failed(err) / 4 outcome unknown.
         switch (d.state) {
             .draft => {
-                bindInt(stmt, 12, 0);
-                bindNull(stmt, 13);
-                bindNull(stmt, 14);
+                bindInt(self, stmt, 12, 0);
+                bindNull(self, stmt, 13);
+                bindNull(self, stmt, 14);
             },
             .submitting => {
-                bindInt(stmt, 12, 1);
-                bindNull(stmt, 13);
-                bindNull(stmt, 14);
+                bindInt(self, stmt, 12, 1);
+                bindNull(self, stmt, 13);
+                bindNull(self, stmt, 14);
             },
             .posted => |id| {
-                bindInt(stmt, 12, 2);
-                bindInt(stmt, 13, @intCast(id));
-                bindNull(stmt, 14);
+                bindInt(self, stmt, 12, 2);
+                bindInt(self, stmt, 13, @intCast(id));
+                bindNull(self, stmt, 14);
             },
             .failed => |e| {
-                bindInt(stmt, 12, 3);
-                bindNull(stmt, 13);
-                bindText(stmt, 14, @errorName(e));
+                bindInt(self, stmt, 12, 3);
+                bindNull(self, stmt, 13);
+                bindText(self, stmt, 14, @errorName(e));
             },
             .outcome_unknown => {
-                bindInt(stmt, 12, 4);
-                bindNull(stmt, 13);
-                bindNull(stmt, 14);
+                bindInt(self, stmt, 12, 4);
+                bindNull(self, stmt, 13);
+                bindNull(self, stmt, 14);
             },
         }
-        bindText(stmt, 17, key.workspace);
-        bindText(stmt, 18, key.repository);
+        bindText(self, stmt, 17, key.workspace);
+        bindText(self, stmt, 18, key.repository);
         if (d.snapshot) |snapshot| {
-            bindText(stmt, 19, snapshot.text);
-            bindInt(stmt, 20, @intCast(snapshot.selection_start));
-            bindInt(stmt, 21, @intCast(snapshot.selection_len));
+            bindText(self, stmt, 19, snapshot.text);
+            bindInt(self, stmt, 20, @intCast(snapshot.selection_start));
+            bindInt(self, stmt, 21, @intCast(snapshot.selection_len));
         } else {
-            bindNull(stmt, 19);
-            bindNull(stmt, 20);
-            bindNull(stmt, 21);
+            bindNull(self, stmt, 19);
+            bindNull(self, stmt, 20);
+            bindNull(self, stmt, 21);
         }
         if (root_scope) |scope| {
-            bindInt(stmt, 22, switch (scope) {
+            bindInt(self, stmt, 22, switch (scope) {
                 .review => 0,
                 .file => 1,
                 .@"inline" => 2,
             });
             switch (scope) {
-                .file => |file| bindText(stmt, 23, file.source_commit),
-                else => bindNull(stmt, 23),
+                .file => |file| bindText(self, stmt, 23, file.source_commit),
+                else => bindNull(self, stmt, 23),
             }
         } else {
-            bindNull(stmt, 22);
-            bindNull(stmt, 23);
+            bindNull(self, stmt, 22);
+            bindNull(self, stmt, 23);
         }
 
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_step(stmt), .step, @src()) != c.SQLITE_DONE) return error.Step;
         try self.exec("COMMIT;");
     }
 
@@ -525,14 +546,14 @@ pub const SqliteStore = struct {
         if (try self.draftMutationLocked(key, edit.temp_id, null)) return error.DraftLocked;
 
         var query: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT kind, parent_kind, parent_id, state_kind FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &query, null) != c.SQLITE_OK)
+        if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT kind, parent_kind, parent_id, state_kind FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &query, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
-        defer _ = c.sqlite3_finalize(query);
-        bindText(query, 1, key.workspace);
-        bindText(query, 2, key.repository);
-        bindInt(query, 3, @intCast(key.pull_request_id));
-        bindInt(query, 4, @intCast(edit.temp_id));
-        switch (c.sqlite3_step(query)) {
+        defer _ = self.native(c.sqlite3_finalize(query), .finalize, @src());
+        bindText(self, query, 1, key.workspace);
+        bindText(self, query, 2, key.repository);
+        bindInt(self, query, 3, @intCast(key.pull_request_id));
+        bindInt(self, query, 4, @intCast(edit.temp_id));
+        switch (self.native(c.sqlite3_step(query), .step, @src())) {
             c.SQLITE_ROW => {},
             c.SQLITE_DONE => return error.DraftNotFound,
             else => return error.Step,
@@ -553,16 +574,16 @@ pub const SqliteStore = struct {
 
         // A changed body is a new attempt, so a confirmed failure resets.
         var update: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "UPDATE drafts SET body=?, state_kind=?, state_err=NULL WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &update, null) != c.SQLITE_OK)
+        if (self.native(c.sqlite3_prepare_v2(self.db, "UPDATE drafts SET body=?, state_kind=?, state_err=NULL WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &update, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
-        defer _ = c.sqlite3_finalize(update);
-        bindText(update, 1, edit.body);
-        bindInt(update, 2, 0);
-        bindText(update, 3, key.workspace);
-        bindText(update, 4, key.repository);
-        bindInt(update, 5, @intCast(key.pull_request_id));
-        bindInt(update, 6, @intCast(edit.temp_id));
-        if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.Step;
+        defer _ = self.native(c.sqlite3_finalize(update), .finalize, @src());
+        bindText(self, update, 1, edit.body);
+        bindInt(self, update, 2, 0);
+        bindText(self, update, 3, key.workspace);
+        bindText(self, update, 4, key.repository);
+        bindInt(self, update, 5, @intCast(key.pull_request_id));
+        bindInt(self, update, 6, @intCast(edit.temp_id));
+        if (self.native(c.sqlite3_step(update), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.DraftNotFound;
         try self.exec("COMMIT;");
     }
@@ -579,14 +600,14 @@ pub const SqliteStore = struct {
         if (try self.draftMutationLocked(key, reanchor.temp_id, null)) return error.DraftLocked;
 
         var query: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT kind, parent_kind, state_kind, scope_kind FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &query, null) != c.SQLITE_OK)
+        if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT kind, parent_kind, state_kind, scope_kind FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &query, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
-        defer _ = c.sqlite3_finalize(query);
-        bindText(query, 1, key.workspace);
-        bindText(query, 2, key.repository);
-        bindInt(query, 3, @intCast(key.pull_request_id));
-        bindInt(query, 4, @intCast(reanchor.temp_id));
-        switch (c.sqlite3_step(query)) {
+        defer _ = self.native(c.sqlite3_finalize(query), .finalize, @src());
+        bindText(self, query, 1, key.workspace);
+        bindText(self, query, 2, key.repository);
+        bindInt(self, query, 3, @intCast(key.pull_request_id));
+        bindInt(self, query, 4, @intCast(reanchor.temp_id));
+        switch (self.native(c.sqlite3_step(query), .step, @src())) {
             c.SQLITE_ROW => {},
             c.SQLITE_DONE => return error.DraftNotFound,
             else => return error.Step,
@@ -610,28 +631,28 @@ pub const SqliteStore = struct {
             \\ state_kind=0, state_id=NULL, state_err=NULL
             \\ WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;
         ;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &update, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(update);
-        bindText(update, 1, reanchor.anchor.path);
-        bindOptU32(update, 2, reanchor.anchor.from);
-        bindOptU32(update, 3, reanchor.anchor.to);
-        bindOptU32(update, 4, reanchor.anchor.start_from);
-        bindOptU32(update, 5, reanchor.anchor.start_to);
-        bindOptText(update, 6, reanchor.anchor.commit);
+        if (self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &update, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(update), .finalize, @src());
+        bindText(self, update, 1, reanchor.anchor.path);
+        bindOptU32(self, update, 2, reanchor.anchor.from);
+        bindOptU32(self, update, 3, reanchor.anchor.to);
+        bindOptU32(self, update, 4, reanchor.anchor.start_from);
+        bindOptU32(self, update, 5, reanchor.anchor.start_to);
+        bindOptText(self, update, 6, reanchor.anchor.commit);
         if (reanchor.snapshot) |snapshot| {
-            bindText(update, 7, snapshot.text);
-            bindInt(update, 8, @intCast(snapshot.selection_start));
-            bindInt(update, 9, @intCast(snapshot.selection_len));
+            bindText(self, update, 7, snapshot.text);
+            bindInt(self, update, 8, @intCast(snapshot.selection_start));
+            bindInt(self, update, 9, @intCast(snapshot.selection_len));
         } else {
-            bindNull(update, 7);
-            bindNull(update, 8);
-            bindNull(update, 9);
+            bindNull(self, update, 7);
+            bindNull(self, update, 8);
+            bindNull(self, update, 9);
         }
-        bindText(update, 10, key.workspace);
-        bindText(update, 11, key.repository);
-        bindInt(update, 12, @intCast(key.pull_request_id));
-        bindInt(update, 13, @intCast(reanchor.temp_id));
-        if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.Step;
+        bindText(self, update, 10, key.workspace);
+        bindText(self, update, 11, key.repository);
+        bindInt(self, update, 12, @intCast(key.pull_request_id));
+        bindInt(self, update, 13, @intCast(reanchor.temp_id));
+        if (self.native(c.sqlite3_step(update), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.DraftNotFound;
         try self.exec("COMMIT;");
     }
@@ -647,14 +668,14 @@ pub const SqliteStore = struct {
         errdefer self.exec("ROLLBACK;") catch {};
 
         var root: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT parent_kind, parent_id FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &root, null) != c.SQLITE_OK)
+        if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT parent_kind, parent_id FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &root, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
-        defer _ = c.sqlite3_finalize(root);
-        bindText(root, 1, key.workspace);
-        bindText(root, 2, key.repository);
-        bindInt(root, 3, @intCast(key.pull_request_id));
-        bindInt(root, 4, @intCast(deletion.root_temp_id));
-        switch (c.sqlite3_step(root)) {
+        defer _ = self.native(c.sqlite3_finalize(root), .finalize, @src());
+        bindText(self, root, 1, key.workspace);
+        bindText(self, root, 2, key.repository);
+        bindInt(self, root, 3, @intCast(key.pull_request_id));
+        bindInt(self, root, 4, @intCast(deletion.root_temp_id));
+        switch (self.native(c.sqlite3_step(root), .step, @src())) {
             c.SQLITE_ROW => {},
             c.SQLITE_DONE => return error.DraftNotFound,
             else => return error.Step,
@@ -683,10 +704,10 @@ pub const SqliteStore = struct {
             \\   WHERE r.workspace=?1 AND r.repository=?2 AND r.pr_id=?3 AND r.state=0
             \\     AND i.temp_id IN (SELECT local_id FROM subtree)));
         ;
-        if (c.sqlite3_prepare_v2(self.db, survey_sql, -1, &survey, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(survey);
-        bindSubtreeScope(survey, key, deletion.root_temp_id);
-        if (c.sqlite3_step(survey) != c.SQLITE_ROW) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, survey_sql, -1, &survey, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(survey), .finalize, @src());
+        bindSubtreeScope(self, survey, key, deletion.root_temp_id);
+        if (self.native(c.sqlite3_step(survey), .step, @src()) != c.SQLITE_ROW) return error.Step;
         if (columnInt(survey, 0) != @as(i64, @intCast(deletion.cascade.len))) return error.DraftCascadeConflict;
         if (columnInt(survey, 3) != 0) return error.DraftLocked;
         if (columnInt(survey, 2) != 0) return error.DraftLocked;
@@ -695,14 +716,14 @@ pub const SqliteStore = struct {
         // Equal counts alone would accept a cascade naming other Drafts, so
         // every confirmed member must also be in the recomputed closure.
         var member: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, subtree_cte ++ "SELECT EXISTS(SELECT 1 FROM subtree WHERE local_id=?5);", -1, &member, null) != c.SQLITE_OK)
+        if (self.native(c.sqlite3_prepare_v2(self.db, subtree_cte ++ "SELECT EXISTS(SELECT 1 FROM subtree WHERE local_id=?5);", -1, &member, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
-        defer _ = c.sqlite3_finalize(member);
-        bindSubtreeScope(member, key, deletion.root_temp_id);
+        defer _ = self.native(c.sqlite3_finalize(member), .finalize, @src());
+        bindSubtreeScope(self, member, key, deletion.root_temp_id);
         for (deletion.cascade) |temp_id| {
-            if (c.sqlite3_reset(member) != c.SQLITE_OK) return error.Step;
-            bindInt(member, 5, @intCast(temp_id));
-            if (c.sqlite3_step(member) != c.SQLITE_ROW) return error.Step;
+            if (self.native(c.sqlite3_reset(member), .reset, @src()) != c.SQLITE_OK) return error.Step;
+            bindInt(self, member, 5, @intCast(temp_id));
+            if (self.native(c.sqlite3_step(member), .step, @src()) != c.SQLITE_ROW) return error.Step;
             if (columnInt(member, 0) == 0) return error.DraftCascadeConflict;
         }
 
@@ -719,24 +740,24 @@ pub const SqliteStore = struct {
             \\ ON CONFLICT(workspace,repository,pr_id)
             \\ DO UPDATE SET next_id=MAX(next_id, excluded.next_id);
         ;
-        if (c.sqlite3_prepare_v2(self.db, floor_sql, -1, &floor, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(floor);
-        bindText(floor, 1, key.workspace);
-        bindText(floor, 2, key.repository);
-        bindInt(floor, 3, @intCast(key.pull_request_id));
-        if (c.sqlite3_step(floor) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, floor_sql, -1, &floor, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(floor), .finalize, @src());
+        bindText(self, floor, 1, key.workspace);
+        bindText(self, floor, 2, key.repository);
+        bindInt(self, floor, 3, @intCast(key.pull_request_id));
+        if (self.native(c.sqlite3_step(floor), .step, @src()) != c.SQLITE_DONE) return error.Step;
 
         var delete: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &delete, null) != c.SQLITE_OK)
+        if (self.native(c.sqlite3_prepare_v2(self.db, "DELETE FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &delete, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
-        defer _ = c.sqlite3_finalize(delete);
+        defer _ = self.native(c.sqlite3_finalize(delete), .finalize, @src());
         for (deletion.cascade) |temp_id| {
-            if (c.sqlite3_reset(delete) != c.SQLITE_OK) return error.Step;
-            bindText(delete, 1, key.workspace);
-            bindText(delete, 2, key.repository);
-            bindInt(delete, 3, @intCast(key.pull_request_id));
-            bindInt(delete, 4, @intCast(temp_id));
-            if (c.sqlite3_step(delete) != c.SQLITE_DONE) return error.Step;
+            if (self.native(c.sqlite3_reset(delete), .reset, @src()) != c.SQLITE_OK) return error.Step;
+            bindText(self, delete, 1, key.workspace);
+            bindText(self, delete, 2, key.repository);
+            bindInt(self, delete, 3, @intCast(key.pull_request_id));
+            bindInt(self, delete, 4, @intCast(temp_id));
+            if (self.native(c.sqlite3_step(delete), .step, @src()) != c.SQLITE_DONE) return error.Step;
             if (c.sqlite3_changes(self.db) != 1) return error.DraftCascadeConflict;
         }
         try self.exec("COMMIT;");
@@ -759,17 +780,17 @@ pub const SqliteStore = struct {
             \\ WHERE workspace=? AND repository=? AND pr_id=? ORDER BY local_id;
         ;
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, key.workspace);
-        bindText(stmt, 2, key.repository);
-        bindInt(stmt, 3, @intCast(key.pull_request_id));
+        if (self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(stmt), .finalize, @src());
+        bindText(self, stmt, 1, key.workspace);
+        bindText(self, stmt, 2, key.repository);
+        bindInt(self, stmt, 3, @intCast(key.pull_request_id));
 
         var out: std.ArrayList(Draft) = .empty;
         errdefer out.deinit(allocator);
 
         while (true) {
-            switch (c.sqlite3_step(stmt)) {
+            switch (self.native(c.sqlite3_step(stmt), .step, @src())) {
                 c.SQLITE_ROW => try out.append(allocator, try rowToDraft(allocator, stmt)),
                 c.SQLITE_DONE => break,
                 else => return error.Step,
@@ -792,13 +813,13 @@ pub const SqliteStore = struct {
             \\SELECT retry_reason,retry_after_ms FROM submission_retry_carryovers
             \\ WHERE workspace=? AND repository=? AND pr_id=? AND temp_id=?;
         ;
-        if (c.sqlite3_prepare_v2(self.db, carry_sql, -1, &carry, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(carry);
-        bindText(carry, 1, key.workspace);
-        bindText(carry, 2, key.repository);
-        bindInt(carry, 3, @intCast(key.pull_request_id));
-        bindInt(carry, 4, @intCast(first_temp_id));
-        if (c.sqlite3_step(carry) == c.SQLITE_ROW) {
+        if (self.native(c.sqlite3_prepare_v2(self.db, carry_sql, -1, &carry, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(carry), .finalize, @src());
+        bindText(self, carry, 1, key.workspace);
+        bindText(self, carry, 2, key.repository);
+        bindInt(self, carry, 3, @intCast(key.pull_request_id));
+        bindInt(self, carry, 4, @intCast(first_temp_id));
+        if (self.native(c.sqlite3_step(carry), .step, @src()) == c.SQLITE_ROW) {
             const delay: u64 = @intCast(columnInt(carry, 1));
             carryover = .{
                 .phase = .post,
@@ -819,33 +840,33 @@ pub const SqliteStore = struct {
             \\  retry_effective_ms,retry_pending_wait)
             \\ VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?);
         ;
-        if (c.sqlite3_prepare_v2(self.db, insert_sql, -1, &insert, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(insert);
-        bindText(insert, 1, key.workspace);
-        bindText(insert, 2, key.repository);
-        bindInt(insert, 3, @intCast(key.pull_request_id));
-        bindText(insert, 4, source_commit);
-        bindInt(insert, 5, @intCast(first_temp_id));
+        if (self.native(c.sqlite3_prepare_v2(self.db, insert_sql, -1, &insert, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(insert), .finalize, @src());
+        bindText(self, insert, 1, key.workspace);
+        bindText(self, insert, 2, key.repository);
+        bindInt(self, insert, 3, @intCast(key.pull_request_id));
+        bindText(self, insert, 4, source_commit);
+        bindInt(self, insert, 5, @intCast(first_temp_id));
         if (carryover) |retry| {
-            bindInt(insert, 6, @intFromEnum(retry.phase));
-            bindInt(insert, 7, retry.attempt);
-            bindInt(insert, 8, @intFromEnum(retry.reason));
-            bindInt(insert, 9, @intCast(retry.local_delay_ms));
-            bindInt(insert, 10, @intCast(retry.server_delay_ms.?));
-            bindInt(insert, 11, @intCast(retry.effective_delay_ms));
-            bindInt(insert, 12, 1);
-        } else for (6..13) |index| bindNull(insert, @intCast(index));
-        if (c.sqlite3_step(insert) != c.SQLITE_DONE) return error.Step;
+            bindInt(self, insert, 6, @intFromEnum(retry.phase));
+            bindInt(self, insert, 7, retry.attempt);
+            bindInt(self, insert, 8, @intFromEnum(retry.reason));
+            bindInt(self, insert, 9, @intCast(retry.local_delay_ms));
+            bindInt(self, insert, 10, @intCast(retry.server_delay_ms.?));
+            bindInt(self, insert, 11, @intCast(retry.effective_delay_ms));
+            bindInt(self, insert, 12, 1);
+        } else for (6..13) |index| bindNull(self, insert, @intCast(index));
+        if (self.native(c.sqlite3_step(insert), .step, @src()) != c.SQLITE_DONE) return error.Step;
         const operation_id: OperationId = @intCast(c.sqlite3_last_insert_rowid(self.db));
         if (carryover != null) {
             var consume: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_retry_carryovers WHERE workspace=? AND repository=? AND pr_id=? AND temp_id=?;", -1, &consume, null) != c.SQLITE_OK) return error.Prepare;
-            defer _ = c.sqlite3_finalize(consume);
-            bindText(consume, 1, key.workspace);
-            bindText(consume, 2, key.repository);
-            bindInt(consume, 3, @intCast(key.pull_request_id));
-            bindInt(consume, 4, @intCast(first_temp_id));
-            if (c.sqlite3_step(consume) != c.SQLITE_DONE) return error.Step;
+            if (self.native(c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_retry_carryovers WHERE workspace=? AND repository=? AND pr_id=? AND temp_id=?;", -1, &consume, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+            defer _ = self.native(c.sqlite3_finalize(consume), .finalize, @src());
+            bindText(self, consume, 1, key.workspace);
+            bindText(self, consume, 2, key.repository);
+            bindInt(self, consume, 3, @intCast(key.pull_request_id));
+            bindInt(self, consume, 4, @intCast(first_temp_id));
+            if (self.native(c.sqlite3_step(consume), .step, @src()) != c.SQLITE_DONE) return error.Step;
         }
 
         for (items, 0..) |item, ordinal| {
@@ -856,31 +877,31 @@ pub const SqliteStore = struct {
                 \\ WHERE workspace=? AND repository=? AND pr_id=? AND local_id=? AND target=0
                 \\   AND parent_kind=? AND (parent_id IS ? OR parent_id=?);
             ;
-            if (c.sqlite3_prepare_v2(self.db, participant_sql, -1, &participant, null) != c.SQLITE_OK) return error.Prepare;
-            defer _ = c.sqlite3_finalize(participant);
-            bindInt(participant, 1, @intCast(operation_id));
-            bindInt(participant, 2, @intCast(ordinal));
-            bindText(participant, 3, key.workspace);
-            bindText(participant, 4, key.repository);
-            bindInt(participant, 5, @intCast(key.pull_request_id));
-            bindInt(participant, 6, @intCast(item.temp_id));
+            if (self.native(c.sqlite3_prepare_v2(self.db, participant_sql, -1, &participant, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+            defer _ = self.native(c.sqlite3_finalize(participant), .finalize, @src());
+            bindInt(self, participant, 1, @intCast(operation_id));
+            bindInt(self, participant, 2, @intCast(ordinal));
+            bindText(self, participant, 3, key.workspace);
+            bindText(self, participant, 4, key.repository);
+            bindInt(self, participant, 5, @intCast(key.pull_request_id));
+            bindInt(self, participant, 6, @intCast(item.temp_id));
             const parent_kind: i64 = if (item.parent) |parent| switch (parent) {
                 .draft => 1,
                 .comment => 2,
             } else 0;
-            bindInt(participant, 7, parent_kind);
+            bindInt(self, participant, 7, parent_kind);
             if (item.parent) |parent| {
                 const parent_id = switch (parent) {
                     .draft => |id| id,
                     .comment => |id| id,
                 };
-                bindInt(participant, 8, @intCast(parent_id));
-                bindInt(participant, 9, @intCast(parent_id));
+                bindInt(self, participant, 8, @intCast(parent_id));
+                bindInt(self, participant, 9, @intCast(parent_id));
             } else {
-                bindNull(participant, 8);
-                bindNull(participant, 9);
+                bindNull(self, participant, 8);
+                bindNull(self, participant, 9);
             }
-            if (c.sqlite3_step(participant) != c.SQLITE_DONE) return error.Step;
+            if (self.native(c.sqlite3_step(participant), .step, @src()) != c.SQLITE_DONE) return error.Step;
             if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionGraph;
         }
 
@@ -890,13 +911,13 @@ pub const SqliteStore = struct {
             \\ WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?
             \\   AND target=0 AND state_kind IN (0,3);
         ;
-        if (c.sqlite3_prepare_v2(self.db, update_sql, -1, &update, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(update);
-        bindText(update, 1, key.workspace);
-        bindText(update, 2, key.repository);
-        bindInt(update, 3, @intCast(key.pull_request_id));
-        bindInt(update, 4, @intCast(first_temp_id));
-        if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, update_sql, -1, &update, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(update), .finalize, @src());
+        bindText(self, update, 1, key.workspace);
+        bindText(self, update, 2, key.repository);
+        bindInt(self, update, 3, @intCast(key.pull_request_id));
+        bindInt(self, update, 4, @intCast(first_temp_id));
+        if (self.native(c.sqlite3_step(update), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.DraftNotSubmittable;
 
         try self.exec("COMMIT;");
@@ -905,10 +926,10 @@ pub const SqliteStore = struct {
 
     fn hasActiveSubmission(self: *SqliteStore) SqliteError!bool {
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "SELECT EXISTS(SELECT 1 FROM submission_runs WHERE state=0);", -1, &stmt, null) != c.SQLITE_OK)
+        if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT EXISTS(SELECT 1 FROM submission_runs WHERE state=0);", -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Step;
+        defer _ = self.native(c.sqlite3_finalize(stmt), .finalize, @src());
+        if (self.native(c.sqlite3_step(stmt), .step, @src()) != c.SQLITE_ROW) return error.Step;
         return columnInt(stmt, 0) != 0;
     }
 
@@ -922,19 +943,19 @@ pub const SqliteStore = struct {
             \\       retry_effective_ms, retry_pending_wait
             \\ FROM submission_runs WHERE state=0 LIMIT 1;
         ;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
-        return switch (c.sqlite3_step(stmt)) {
+        if (self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(stmt), .finalize, @src());
+        return switch (self.native(c.sqlite3_step(stmt), .step, @src())) {
             c.SQLITE_DONE => null,
             c.SQLITE_ROW => blk: {
                 const operation_id: OperationId = @intCast(columnInt(stmt, 0));
                 var items_stmt: ?*c.sqlite3_stmt = null;
-                if (c.sqlite3_prepare_v2(self.db, "SELECT temp_id,parent_kind,parent_id FROM submission_run_items WHERE operation_id=? ORDER BY ordinal;", -1, &items_stmt, null) != c.SQLITE_OK) return error.Prepare;
-                defer _ = c.sqlite3_finalize(items_stmt);
-                bindInt(items_stmt, 1, @intCast(operation_id));
+                if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT temp_id,parent_kind,parent_id FROM submission_run_items WHERE operation_id=? ORDER BY ordinal;", -1, &items_stmt, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+                defer _ = self.native(c.sqlite3_finalize(items_stmt), .finalize, @src());
+                bindInt(self, items_stmt, 1, @intCast(operation_id));
                 var items: std.ArrayList(SubmissionRunItem) = .empty;
                 errdefer items.deinit(allocator);
-                while (true) switch (c.sqlite3_step(items_stmt)) {
+                while (true) switch (self.native(c.sqlite3_step(items_stmt), .step, @src())) {
                     c.SQLITE_ROW => try items.append(allocator, .{
                         .temp_id = @intCast(columnInt(items_stmt, 0)),
                         .parent = switch (columnInt(items_stmt, 1)) {
@@ -982,21 +1003,21 @@ pub const SqliteStore = struct {
             \\ WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=?
             \\   AND current_temp_id=? AND state=0;
         ;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
-        bindInt(stmt, 1, @intFromEnum(checkpoint.phase));
-        bindInt(stmt, 2, checkpoint.attempt);
-        bindInt(stmt, 3, @intFromEnum(checkpoint.reason));
-        bindInt(stmt, 4, @intCast(checkpoint.local_delay_ms));
-        if (checkpoint.server_delay_ms) |delay| bindInt(stmt, 5, @intCast(delay)) else bindNull(stmt, 5);
-        bindInt(stmt, 6, @intCast(checkpoint.effective_delay_ms));
-        bindInt(stmt, 7, @intFromBool(checkpoint.pending_wait));
-        bindInt(stmt, 8, @intCast(operation_id));
-        bindText(stmt, 9, key.workspace);
-        bindText(stmt, 10, key.repository);
-        bindInt(stmt, 11, @intCast(key.pull_request_id));
-        bindInt(stmt, 12, @intCast(temp_id));
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(stmt), .finalize, @src());
+        bindInt(self, stmt, 1, @intFromEnum(checkpoint.phase));
+        bindInt(self, stmt, 2, checkpoint.attempt);
+        bindInt(self, stmt, 3, @intFromEnum(checkpoint.reason));
+        bindInt(self, stmt, 4, @intCast(checkpoint.local_delay_ms));
+        if (checkpoint.server_delay_ms) |delay| bindInt(self, stmt, 5, @intCast(delay)) else bindNull(self, stmt, 5);
+        bindInt(self, stmt, 6, @intCast(checkpoint.effective_delay_ms));
+        bindInt(self, stmt, 7, @intFromBool(checkpoint.pending_wait));
+        bindInt(self, stmt, 8, @intCast(operation_id));
+        bindText(self, stmt, 9, key.workspace);
+        bindText(self, stmt, 10, key.repository);
+        bindInt(self, stmt, 11, @intCast(key.pull_request_id));
+        bindInt(self, stmt, 12, @intCast(temp_id));
+        if (self.native(c.sqlite3_step(stmt), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCheckpoint;
     }
 
@@ -1013,27 +1034,27 @@ pub const SqliteStore = struct {
             \\     JOIN submission_run_items i ON i.operation_id=r.operation_id
             \\     WHERE r.workspace=? AND r.repository=? AND r.pr_id=? AND r.state=0 AND i.temp_id=?);
         ;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
+        if (self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(stmt), .finalize, @src());
         switch (resolution) {
             .posted => |id| {
-                bindInt(stmt, 1, 2);
-                bindInt(stmt, 2, @intCast(id));
+                bindInt(self, stmt, 1, 2);
+                bindInt(self, stmt, 2, @intCast(id));
             },
             .unpublished => {
-                bindInt(stmt, 1, 0);
-                if (c.sqlite3_bind_null(stmt, 2) != c.SQLITE_OK) return error.Bind;
+                bindInt(self, stmt, 1, 0);
+                if (self.native(c.sqlite3_bind_null(stmt, 2), .bind, @src()) != c.SQLITE_OK) return error.Bind;
             },
         }
-        bindText(stmt, 3, key.workspace);
-        bindText(stmt, 4, key.repository);
-        bindInt(stmt, 5, @intCast(key.pull_request_id));
-        bindInt(stmt, 6, @intCast(temp_id));
-        bindText(stmt, 7, key.workspace);
-        bindText(stmt, 8, key.repository);
-        bindInt(stmt, 9, @intCast(key.pull_request_id));
-        bindInt(stmt, 10, @intCast(temp_id));
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+        bindText(self, stmt, 3, key.workspace);
+        bindText(self, stmt, 4, key.repository);
+        bindInt(self, stmt, 5, @intCast(key.pull_request_id));
+        bindInt(self, stmt, 6, @intCast(temp_id));
+        bindText(self, stmt, 7, key.workspace);
+        bindText(self, stmt, 8, key.repository);
+        bindInt(self, stmt, 9, @intCast(key.pull_request_id));
+        bindInt(self, stmt, 10, @intCast(temp_id));
+        if (self.native(c.sqlite3_step(stmt), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidUnknownResolution;
         try self.exec("COMMIT;");
     }
@@ -1050,13 +1071,13 @@ pub const SqliteStore = struct {
                 \\SELECT (SELECT ordinal FROM submission_run_items WHERE operation_id=? AND temp_id=?),
                 \\       (SELECT ordinal FROM submission_run_items WHERE operation_id=? AND temp_id=?);
             ;
-            if (c.sqlite3_prepare_v2(self.db, order_sql, -1, &order, null) != c.SQLITE_OK) return error.Prepare;
-            defer _ = c.sqlite3_finalize(order);
-            bindInt(order, 1, @intCast(operation_id));
-            bindInt(order, 2, @intCast(completed_temp_id));
-            bindInt(order, 3, @intCast(operation_id));
-            bindInt(order, 4, @intCast(next_id));
-            if (c.sqlite3_step(order) != c.SQLITE_ROW or c.sqlite3_column_type(order, 0) == c.SQLITE_NULL or c.sqlite3_column_type(order, 1) == c.SQLITE_NULL or columnInt(order, 1) <= columnInt(order, 0))
+            if (self.native(c.sqlite3_prepare_v2(self.db, order_sql, -1, &order, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+            defer _ = self.native(c.sqlite3_finalize(order), .finalize, @src());
+            bindInt(self, order, 1, @intCast(operation_id));
+            bindInt(self, order, 2, @intCast(completed_temp_id));
+            bindInt(self, order, 3, @intCast(operation_id));
+            bindInt(self, order, 4, @intCast(next_id));
+            if (self.native(c.sqlite3_step(order), .step, @src()) != c.SQLITE_ROW or c.sqlite3_column_type(order, 0) == c.SQLITE_NULL or c.sqlite3_column_type(order, 1) == c.SQLITE_NULL or columnInt(order, 1) <= columnInt(order, 0))
                 return error.InvalidSubmissionCheckpoint;
         }
 
@@ -1066,14 +1087,14 @@ pub const SqliteStore = struct {
             \\ WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?
             \\   AND state_kind=1;
         ;
-        if (c.sqlite3_prepare_v2(self.db, completed_sql, -1, &completed, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(completed);
-        bindSubmissionOutcome(completed, outcome);
-        bindText(completed, 4, key.workspace);
-        bindText(completed, 5, key.repository);
-        bindInt(completed, 6, @intCast(key.pull_request_id));
-        bindInt(completed, 7, @intCast(completed_temp_id));
-        if (c.sqlite3_step(completed) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, completed_sql, -1, &completed, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(completed), .finalize, @src());
+        bindSubmissionOutcome(self, completed, outcome);
+        bindText(self, completed, 4, key.workspace);
+        bindText(self, completed, 5, key.repository);
+        bindInt(self, completed, 6, @intCast(key.pull_request_id));
+        bindInt(self, completed, 7, @intCast(completed_temp_id));
+        if (self.native(c.sqlite3_step(completed), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCheckpoint;
 
         if (next_temp_id) |next_id| {
@@ -1083,13 +1104,13 @@ pub const SqliteStore = struct {
                 \\ WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?
                 \\   AND target=0 AND state_kind IN (0,3);
             ;
-            if (c.sqlite3_prepare_v2(self.db, next_sql, -1, &next, null) != c.SQLITE_OK) return error.Prepare;
-            defer _ = c.sqlite3_finalize(next);
-            bindText(next, 1, key.workspace);
-            bindText(next, 2, key.repository);
-            bindInt(next, 3, @intCast(key.pull_request_id));
-            bindInt(next, 4, @intCast(next_id));
-            if (c.sqlite3_step(next) != c.SQLITE_DONE) return error.Step;
+            if (self.native(c.sqlite3_prepare_v2(self.db, next_sql, -1, &next, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+            defer _ = self.native(c.sqlite3_finalize(next), .finalize, @src());
+            bindText(self, next, 1, key.workspace);
+            bindText(self, next, 2, key.repository);
+            bindInt(self, next, 3, @intCast(key.pull_request_id));
+            bindInt(self, next, 4, @intCast(next_id));
+            if (self.native(c.sqlite3_step(next), .step, @src()) != c.SQLITE_DONE) return error.Step;
             if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCheckpoint;
         }
 
@@ -1099,15 +1120,15 @@ pub const SqliteStore = struct {
             \\ WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=?
             \\   AND current_temp_id=? AND state=0;
         ;
-        if (c.sqlite3_prepare_v2(self.db, run_sql, -1, &run, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(run);
-        if (next_temp_id) |next_id| bindInt(run, 1, @intCast(next_id)) else bindNull(run, 1);
-        bindInt(run, 2, @intCast(operation_id));
-        bindText(run, 3, key.workspace);
-        bindText(run, 4, key.repository);
-        bindInt(run, 5, @intCast(key.pull_request_id));
-        bindInt(run, 6, @intCast(completed_temp_id));
-        if (c.sqlite3_step(run) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, run_sql, -1, &run, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(run), .finalize, @src());
+        if (next_temp_id) |next_id| bindInt(self, run, 1, @intCast(next_id)) else bindNull(self, run, 1);
+        bindInt(self, run, 2, @intCast(operation_id));
+        bindText(self, run, 3, key.workspace);
+        bindText(self, run, 4, key.repository);
+        bindInt(self, run, 5, @intCast(key.pull_request_id));
+        bindInt(self, run, 6, @intCast(completed_temp_id));
+        if (self.native(c.sqlite3_step(run), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCheckpoint;
 
         if (outcome == .failed) {
@@ -1120,17 +1141,17 @@ pub const SqliteStore = struct {
                 \\ ON CONFLICT(workspace,repository,pr_id,temp_id) DO UPDATE SET
                 \\ retry_reason=excluded.retry_reason,retry_after_ms=excluded.retry_after_ms;
             ;
-            if (c.sqlite3_prepare_v2(self.db, retain_sql, -1, &retain, null) != c.SQLITE_OK) return error.Prepare;
-            defer _ = c.sqlite3_finalize(retain);
-            bindInt(retain, 1, @intCast(completed_temp_id));
-            bindInt(retain, 2, @intCast(operation_id));
-            if (c.sqlite3_step(retain) != c.SQLITE_DONE) return error.Step;
+            if (self.native(c.sqlite3_prepare_v2(self.db, retain_sql, -1, &retain, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+            defer _ = self.native(c.sqlite3_finalize(retain), .finalize, @src());
+            bindInt(self, retain, 1, @intCast(completed_temp_id));
+            bindInt(self, retain, 2, @intCast(operation_id));
+            if (self.native(c.sqlite3_step(retain), .step, @src()) != c.SQLITE_DONE) return error.Step;
         }
         var clear: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "UPDATE submission_runs SET retry_phase=NULL,retry_attempt=NULL,retry_reason=NULL,retry_local_ms=NULL,retry_server_ms=NULL,retry_effective_ms=NULL,retry_pending_wait=NULL WHERE operation_id=?;", -1, &clear, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(clear);
-        bindInt(clear, 1, @intCast(operation_id));
-        if (c.sqlite3_step(clear) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, "UPDATE submission_runs SET retry_phase=NULL,retry_attempt=NULL,retry_reason=NULL,retry_local_ms=NULL,retry_server_ms=NULL,retry_effective_ms=NULL,retry_pending_wait=NULL WHERE operation_id=?;", -1, &clear, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(clear), .finalize, @src());
+        bindInt(self, clear, 1, @intCast(operation_id));
+        if (self.native(c.sqlite3_step(clear), .step, @src()) != c.SQLITE_DONE) return error.Step;
 
         try self.exec("COMMIT;");
     }
@@ -1149,17 +1170,17 @@ pub const SqliteStore = struct {
                 \\     WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=?
                 \\       AND current_temp_id IS NOT NULL AND state=0);
             ;
-            if (c.sqlite3_prepare_v2(self.db, restore_sql, -1, &restore, null) != c.SQLITE_OK) return error.Prepare;
-            defer _ = c.sqlite3_finalize(restore);
-            bindSubmissionPendingState(restore, completion.aborted);
-            bindText(restore, 4, key.workspace);
-            bindText(restore, 5, key.repository);
-            bindInt(restore, 6, @intCast(key.pull_request_id));
-            bindInt(restore, 7, @intCast(operation_id));
-            bindText(restore, 8, key.workspace);
-            bindText(restore, 9, key.repository);
-            bindInt(restore, 10, @intCast(key.pull_request_id));
-            if (c.sqlite3_step(restore) != c.SQLITE_DONE) return error.Step;
+            if (self.native(c.sqlite3_prepare_v2(self.db, restore_sql, -1, &restore, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+            defer _ = self.native(c.sqlite3_finalize(restore), .finalize, @src());
+            bindSubmissionPendingState(self, restore, completion.aborted);
+            bindText(self, restore, 4, key.workspace);
+            bindText(self, restore, 5, key.repository);
+            bindInt(self, restore, 6, @intCast(key.pull_request_id));
+            bindInt(self, restore, 7, @intCast(operation_id));
+            bindText(self, restore, 8, key.workspace);
+            bindText(self, restore, 9, key.repository);
+            bindInt(self, restore, 10, @intCast(key.pull_request_id));
+            if (self.native(c.sqlite3_step(restore), .step, @src()) != c.SQLITE_DONE) return error.Step;
             if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCompletion;
         }
 
@@ -1173,17 +1194,17 @@ pub const SqliteStore = struct {
             \\ WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=?
             \\   AND current_temp_id IS NULL AND state=0;
         ;
-        if (c.sqlite3_prepare_v2(self.db, run_sql, -1, &run, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(run);
-        bindInt(run, 1, switch (completion) {
+        if (self.native(c.sqlite3_prepare_v2(self.db, run_sql, -1, &run, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(run), .finalize, @src());
+        bindInt(self, run, 1, switch (completion) {
             .clean => 1,
             .partial, .aborted => 2,
         });
-        bindInt(run, 2, @intCast(operation_id));
-        bindText(run, 3, key.workspace);
-        bindText(run, 4, key.repository);
-        bindInt(run, 5, @intCast(key.pull_request_id));
-        if (c.sqlite3_step(run) != c.SQLITE_DONE) return error.Step;
+        bindInt(self, run, 2, @intCast(operation_id));
+        bindText(self, run, 3, key.workspace);
+        bindText(self, run, 4, key.repository);
+        bindInt(self, run, 5, @intCast(key.pull_request_id));
+        if (self.native(c.sqlite3_step(run), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCompletion;
 
         if (completion == .clean) {
@@ -1196,13 +1217,13 @@ pub const SqliteStore = struct {
                 \\    AND state_kind!=2
                 \\);
             ;
-            if (c.sqlite3_prepare_v2(self.db, dirty_sql, -1, &dirty, null) != c.SQLITE_OK) return error.Prepare;
-            defer _ = c.sqlite3_finalize(dirty);
-            bindText(dirty, 1, key.workspace);
-            bindText(dirty, 2, key.repository);
-            bindInt(dirty, 3, @intCast(key.pull_request_id));
-            bindInt(dirty, 4, @intCast(operation_id));
-            if (c.sqlite3_step(dirty) != c.SQLITE_ROW) return error.Step;
+            if (self.native(c.sqlite3_prepare_v2(self.db, dirty_sql, -1, &dirty, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+            defer _ = self.native(c.sqlite3_finalize(dirty), .finalize, @src());
+            bindText(self, dirty, 1, key.workspace);
+            bindText(self, dirty, 2, key.repository);
+            bindInt(self, dirty, 3, @intCast(key.pull_request_id));
+            bindInt(self, dirty, 4, @intCast(operation_id));
+            if (self.native(c.sqlite3_step(dirty), .step, @src()) != c.SQLITE_ROW) return error.Step;
             if (columnInt(dirty, 0) != 0) return error.SubmissionNotClean;
 
             var remove: ?*c.sqlite3_stmt = null;
@@ -1212,26 +1233,26 @@ pub const SqliteStore = struct {
                 \\   AND local_id IN (SELECT temp_id FROM submission_run_items WHERE operation_id=?)
                 \\   AND state_kind=2;
             ;
-            if (c.sqlite3_prepare_v2(self.db, remove_sql, -1, &remove, null) != c.SQLITE_OK) return error.Prepare;
-            defer _ = c.sqlite3_finalize(remove);
-            bindText(remove, 1, key.workspace);
-            bindText(remove, 2, key.repository);
-            bindInt(remove, 3, @intCast(key.pull_request_id));
-            bindInt(remove, 4, @intCast(operation_id));
-            if (c.sqlite3_step(remove) != c.SQLITE_DONE) return error.Step;
+            if (self.native(c.sqlite3_prepare_v2(self.db, remove_sql, -1, &remove, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+            defer _ = self.native(c.sqlite3_finalize(remove), .finalize, @src());
+            bindText(self, remove, 1, key.workspace);
+            bindText(self, remove, 2, key.repository);
+            bindInt(self, remove, 3, @intCast(key.pull_request_id));
+            bindInt(self, remove, 4, @intCast(operation_id));
+            if (self.native(c.sqlite3_step(remove), .step, @src()) != c.SQLITE_DONE) return error.Step;
         }
 
         var cleanup_items: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_run_items WHERE operation_id=?;", -1, &cleanup_items, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(cleanup_items);
-        bindInt(cleanup_items, 1, @intCast(operation_id));
-        if (c.sqlite3_step(cleanup_items) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_run_items WHERE operation_id=?;", -1, &cleanup_items, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(cleanup_items), .finalize, @src());
+        bindInt(self, cleanup_items, 1, @intCast(operation_id));
+        if (self.native(c.sqlite3_step(cleanup_items), .step, @src()) != c.SQLITE_DONE) return error.Step;
 
         var cleanup_run: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_runs WHERE operation_id=? AND state!=0;", -1, &cleanup_run, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(cleanup_run);
-        bindInt(cleanup_run, 1, @intCast(operation_id));
-        if (c.sqlite3_step(cleanup_run) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_runs WHERE operation_id=? AND state!=0;", -1, &cleanup_run, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(cleanup_run), .finalize, @src());
+        bindInt(self, cleanup_run, 1, @intCast(operation_id));
+        if (self.native(c.sqlite3_step(cleanup_run), .step, @src()) != c.SQLITE_DONE) return error.Step;
 
         try self.exec("COMMIT;");
     }
@@ -1248,32 +1269,32 @@ pub const SqliteStore = struct {
             \\   AND local_id=(SELECT current_temp_id FROM submission_runs
             \\     WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=? AND state=0);
         ;
-        if (c.sqlite3_prepare_v2(self.db, draft_sql, -1, &draft, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(draft);
-        bindText(draft, 1, key.workspace);
-        bindText(draft, 2, key.repository);
-        bindInt(draft, 3, @intCast(key.pull_request_id));
-        bindInt(draft, 4, @intCast(operation_id));
-        bindText(draft, 5, key.workspace);
-        bindText(draft, 6, key.repository);
-        bindInt(draft, 7, @intCast(key.pull_request_id));
-        if (c.sqlite3_step(draft) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, draft_sql, -1, &draft, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(draft), .finalize, @src());
+        bindText(self, draft, 1, key.workspace);
+        bindText(self, draft, 2, key.repository);
+        bindInt(self, draft, 3, @intCast(key.pull_request_id));
+        bindInt(self, draft, 4, @intCast(operation_id));
+        bindText(self, draft, 5, key.workspace);
+        bindText(self, draft, 6, key.repository);
+        bindInt(self, draft, 7, @intCast(key.pull_request_id));
+        if (self.native(c.sqlite3_step(draft), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCompletion;
 
         var items: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_run_items WHERE operation_id=?;", -1, &items, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(items);
-        bindInt(items, 1, @intCast(operation_id));
-        if (c.sqlite3_step(items) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_run_items WHERE operation_id=?;", -1, &items, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(items), .finalize, @src());
+        bindInt(self, items, 1, @intCast(operation_id));
+        if (self.native(c.sqlite3_step(items), .step, @src()) != c.SQLITE_DONE) return error.Step;
 
         var run: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_runs WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=? AND state=0;", -1, &run, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(run);
-        bindInt(run, 1, @intCast(operation_id));
-        bindText(run, 2, key.workspace);
-        bindText(run, 3, key.repository);
-        bindInt(run, 4, @intCast(key.pull_request_id));
-        if (c.sqlite3_step(run) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_runs WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=? AND state=0;", -1, &run, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(run), .finalize, @src());
+        bindInt(self, run, 1, @intCast(operation_id));
+        bindText(self, run, 2, key.workspace);
+        bindText(self, run, 3, key.repository);
+        bindInt(self, run, 4, @intCast(key.pull_request_id));
+        if (self.native(c.sqlite3_step(run), .step, @src()) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCompletion;
         try self.exec("COMMIT;");
     }
@@ -1292,21 +1313,21 @@ pub const SqliteStore = struct {
             \\  COALESCE((SELECT state_kind FROM drafts
             \\    WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?), -1);
         ;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, key.workspace);
-        bindText(stmt, 2, key.repository);
-        bindInt(stmt, 3, @intCast(key.pull_request_id));
-        bindInt(stmt, 4, @intCast(local_id));
-        bindText(stmt, 5, key.workspace);
-        bindText(stmt, 6, key.repository);
-        bindInt(stmt, 7, @intCast(key.pull_request_id));
-        bindInt(stmt, 8, @intCast(local_id));
-        bindText(stmt, 9, key.workspace);
-        bindText(stmt, 10, key.repository);
-        bindInt(stmt, 11, @intCast(key.pull_request_id));
-        bindInt(stmt, 12, @intCast(local_id));
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(stmt), .finalize, @src());
+        bindText(self, stmt, 1, key.workspace);
+        bindText(self, stmt, 2, key.repository);
+        bindInt(self, stmt, 3, @intCast(key.pull_request_id));
+        bindInt(self, stmt, 4, @intCast(local_id));
+        bindText(self, stmt, 5, key.workspace);
+        bindText(self, stmt, 6, key.repository);
+        bindInt(self, stmt, 7, @intCast(key.pull_request_id));
+        bindInt(self, stmt, 8, @intCast(local_id));
+        bindText(self, stmt, 9, key.workspace);
+        bindText(self, stmt, 10, key.repository);
+        bindInt(self, stmt, 11, @intCast(key.pull_request_id));
+        bindInt(self, stmt, 12, @intCast(local_id));
+        if (self.native(c.sqlite3_step(stmt), .step, @src()) != c.SQLITE_ROW) return error.Step;
         if (columnInt(stmt, 2) == 4) return true;
         _ = incoming_target;
         return columnInt(stmt, 0) != 0;
@@ -1318,12 +1339,12 @@ pub const SqliteStore = struct {
             \\UPDATE drafts SET workspace=?, repository=?
             \\ WHERE workspace='' AND repository='' AND pr_id=?;
         ;
-        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, key.workspace);
-        bindText(stmt, 2, key.repository);
-        bindInt(stmt, 3, @intCast(key.pull_request_id));
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+        if (self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK) return error.Prepare;
+        defer _ = self.native(c.sqlite3_finalize(stmt), .finalize, @src());
+        bindText(self, stmt, 1, key.workspace);
+        bindText(self, stmt, 2, key.repository);
+        bindInt(self, stmt, 3, @intCast(key.pull_request_id));
+        if (self.native(c.sqlite3_step(stmt), .step, @src()) != c.SQLITE_DONE) return error.Step;
     }
 
     fn rowToDraft(allocator: std.mem.Allocator, stmt: ?*c.sqlite3_stmt) !Draft {
@@ -1387,58 +1408,58 @@ pub const SqliteStore = struct {
 
 // --- binding helpers --------------------------------------------------------
 
-fn bindInt(stmt: ?*c.sqlite3_stmt, idx: c_int, v: i64) void {
-    _ = c.sqlite3_bind_int64(stmt, idx, v);
+fn bindInt(self: *SqliteStore, stmt: ?*c.sqlite3_stmt, idx: c_int, v: i64) void {
+    _ = self.native(c.sqlite3_bind_int64(stmt, idx, v), .bind, @src());
 }
-fn bindNull(stmt: ?*c.sqlite3_stmt, idx: c_int) void {
-    _ = c.sqlite3_bind_null(stmt, idx);
+fn bindNull(self: *SqliteStore, stmt: ?*c.sqlite3_stmt, idx: c_int) void {
+    _ = self.native(c.sqlite3_bind_null(stmt, idx), .bind, @src());
 }
-fn bindText(stmt: ?*c.sqlite3_stmt, idx: c_int, s: []const u8) void {
+fn bindText(self: *SqliteStore, stmt: ?*c.sqlite3_stmt, idx: c_int, s: []const u8) void {
     // SQLITE_STATIC: don't copy. Safe here — `s` (a Draft's borrowed slice)
     // stays valid through the `step` that reads it, before we finalize/return.
-    _ = c.sqlite3_bind_text(stmt, idx, s.ptr, @intCast(s.len), null);
+    _ = self.native(c.sqlite3_bind_text(stmt, idx, s.ptr, @intCast(s.len), null), .bind, @src());
 }
-fn bindOptText(stmt: ?*c.sqlite3_stmt, idx: c_int, s: ?[]const u8) void {
-    if (s) |v| bindText(stmt, idx, v) else bindNull(stmt, idx);
+fn bindOptText(self: *SqliteStore, stmt: ?*c.sqlite3_stmt, idx: c_int, s: ?[]const u8) void {
+    if (s) |v| bindText(self, stmt, idx, v) else bindNull(self, stmt, idx);
 }
-fn bindOptU32(stmt: ?*c.sqlite3_stmt, idx: c_int, v: ?u32) void {
-    if (v) |x| bindInt(stmt, idx, @intCast(x)) else bindNull(stmt, idx);
+fn bindOptU32(self: *SqliteStore, stmt: ?*c.sqlite3_stmt, idx: c_int, v: ?u32) void {
+    if (v) |x| bindInt(self, stmt, idx, @intCast(x)) else bindNull(self, stmt, idx);
 }
-fn bindSubmissionOutcome(stmt: ?*c.sqlite3_stmt, outcome: SubmissionOutcome) void {
+fn bindSubmissionOutcome(self: *SqliteStore, stmt: ?*c.sqlite3_stmt, outcome: SubmissionOutcome) void {
     switch (outcome) {
         .posted => |id| {
-            bindInt(stmt, 1, 2);
-            bindInt(stmt, 2, @intCast(id));
-            bindNull(stmt, 3);
+            bindInt(self, stmt, 1, 2);
+            bindInt(self, stmt, 2, @intCast(id));
+            bindNull(self, stmt, 3);
         },
         .failed => |err| {
-            bindInt(stmt, 1, 3);
-            bindNull(stmt, 2);
-            bindText(stmt, 3, @errorName(err));
+            bindInt(self, stmt, 1, 3);
+            bindNull(self, stmt, 2);
+            bindText(self, stmt, 3, @errorName(err));
         },
         .outcome_unknown => {
-            bindInt(stmt, 1, 4);
-            bindNull(stmt, 2);
-            bindNull(stmt, 3);
+            bindInt(self, stmt, 1, 4);
+            bindNull(self, stmt, 2);
+            bindNull(self, stmt, 3);
         },
     }
 }
-fn bindSubmissionPendingState(stmt: ?*c.sqlite3_stmt, state: SubmissionPendingState) void {
+fn bindSubmissionPendingState(self: *SqliteStore, stmt: ?*c.sqlite3_stmt, state: SubmissionPendingState) void {
     switch (state) {
         .draft => {
-            bindInt(stmt, 1, 0);
-            bindNull(stmt, 2);
-            bindNull(stmt, 3);
+            bindInt(self, stmt, 1, 0);
+            bindNull(self, stmt, 2);
+            bindNull(self, stmt, 3);
         },
         .failed => |err| {
-            bindInt(stmt, 1, 3);
-            bindNull(stmt, 2);
-            bindText(stmt, 3, @errorName(err));
+            bindInt(self, stmt, 1, 3);
+            bindNull(self, stmt, 2);
+            bindText(self, stmt, 3, @errorName(err));
         },
         .outcome_unknown => {
-            bindInt(stmt, 1, 4);
-            bindNull(stmt, 2);
-            bindNull(stmt, 3);
+            bindInt(self, stmt, 1, 4);
+            bindNull(self, stmt, 2);
+            bindNull(self, stmt, 3);
         },
     }
 }
@@ -1488,6 +1509,53 @@ const testing = std.testing;
 
 fn testReviewKey(pull_request_id: u64) RemoteReviewIdentity {
     return .{ .workspace = "workspace", .repository = "repo", .pull_request_id = pull_request_id };
+}
+
+test "diagnostics SQLite records real open exec prepare bind and step codes without SQL" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const diagnostic = sink.handle(.persistence, .{ .command_id = 81, .draft_id = 82 });
+    try testing.expectError(error.Open, SqliteStore.openDiagnostic(home, diagnostic));
+    var db = try SqliteStore.openDiagnostic(":memory:", diagnostic);
+    defer db.deinit();
+    try testing.expectError(error.Exec, db.exec("SELECT private_missing_column;"));
+    try db.exec("DROP TABLE drafts;");
+    try testing.expectError(error.Prepare, db.store().load(testing.allocator, testReviewKey(7)));
+    try db.exec("CREATE TABLE private_table(value INTEGER PRIMARY KEY); INSERT INTO private_table VALUES(1);");
+    var stmt: ?*c.sqlite3_stmt = null;
+    try testing.expectEqual(c.SQLITE_OK, db.native(c.sqlite3_prepare_v2(db.db, "INSERT INTO private_table VALUES(?);", -1, &stmt, null), .prepare, @src()));
+    bindInt(&db, stmt, 999, 1);
+    bindInt(&db, stmt, 1, 1);
+    try testing.expectEqual(c.SQLITE_CONSTRAINT, db.native(c.sqlite3_step(stmt), .step, @src()));
+    _ = db.native(c.sqlite3_finalize(stmt), .finalize, @src());
+    const locked_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/locked.db", .{home}, 0);
+    defer testing.allocator.free(locked_path);
+    var owner = try SqliteStore.openDiagnostic(locked_path, diagnostic);
+    defer owner.deinit();
+    var contender = try SqliteStore.openDiagnostic(locked_path, diagnostic);
+    defer contender.deinit();
+    try owner.exec("BEGIN EXCLUSIVE;");
+    try testing.expectError(error.Exec, contender.exec("CREATE TABLE private_blocked(value INTEGER);"));
+    try owner.exec("ROLLBACK;");
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    for ([_][]const u8{ "phase=open", "result=14 extended=14", "phase=exec", "phase=prepare", "result=1 extended=1", "phase=bind", "result=25 extended=25", "phase=step", "result=19 extended=1555", "result=5 extended=5", "phase=finalize", "command_id=81", "draft_id=82", "source=persist/sqlite_store.zig:" }) |needle|
+        try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
+    for ([_][]const u8{ "private_", "SELECT", "INSERT", "workspace", home }) |secret|
+        try testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
 }
 
 test "in-memory round-trip preserves fields, anchor, parent, and state" {

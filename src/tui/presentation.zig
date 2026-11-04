@@ -226,7 +226,7 @@ fn visitCodeCard(state: *Presentation, id: u64) !void {
 fn highlightLaunchFailed(job: *code_highlighting.Analyze) !OwnedInput {
     var command: OwnedCommand = .{ .highlight_code = job };
     errdefer command.deinit();
-    return command.launchFailed();
+    return command.launchFailed(error.TestLaunchFailure);
 }
 
 fn codeCapacityCompletion(job: *code_highlighting.Analyze, span_capacity: usize) !code_highlighting.Completed {
@@ -950,10 +950,57 @@ pub const InitialReview = struct {
 };
 
 pub const Boot = struct {
+    diagnostic_state: bbr.diagnostic.State = .off,
     initial: ?InitialReview = null,
     viewport_rows: usize = 1,
     geometry: ?frame_mod.Geometry = null,
 };
+
+test "diagnostics pure help allocation failure survives UI changes without an allocation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var state = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{ .diagnostic_state = .on });
+    defer state.deinit();
+    failing.fail_index = failing.alloc_index;
+    try state.dispatch(.{ .action = .help });
+    try testing.expectEqual(ActionError.out_of_memory, state.projection().action_error.?);
+    try state.dispatch(.request_shutdown);
+    const failure = state.takeCommand().?.report_diagnostic;
+    try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+    try testing.expectEqual(bbr.diagnostic.Operation.help, failure.operation);
+}
+
+test "diagnostics palette sends an idempotent target and waits for its actual correlated acknowledgement" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{});
+    defer state.deinit();
+    try state.dispatch(.{ .action = .open_command_palette });
+    try testType(&state, "diagnostic logging");
+    try state.dispatch(.{ .key = test_enter });
+    try testing.expect(state.projection().list_overlay == null);
+    const command = state.takeCommand().?.set_diagnostics;
+    try testing.expect(command.enabled);
+    try testing.expect(state.projection().diagnostic_state == .off);
+    try state.dispatch(.{ .action = .toggle_diagnostic_logging });
+    try testing.expect(state.takeCommand() == null);
+    try state.dispatch(.{ .diagnostics_changed = .{ .command_id = command.command_id + 1, .state = .on } });
+    try testing.expect(state.projection().diagnostic_state == .off);
+    const failure = bbr.diagnostic.Failure.capture(.diagnostics, .open, .{}, .{ .zig = error.AccessDenied }, @src());
+    try state.dispatch(.{ .diagnostics_changed = .{ .command_id = command.command_id, .state = .{ .unavailable = failure } } });
+    try testing.expect(state.projection().diagnostic_state == .unavailable);
+    try state.dispatch(.{ .action = .toggle_diagnostic_logging });
+    const retry = state.takeCommand().?.set_diagnostics;
+    try testing.expect(retry.enabled);
+    try state.dispatch(.{ .diagnostics_changed = .{ .command_id = retry.command_id, .state = .on } });
+    try state.dispatch(.{ .action = .toggle_diagnostic_logging });
+    const disable = state.takeCommand().?.set_diagnostics;
+    try testing.expect(!disable.enabled);
+    try testing.expect(state.projection().diagnostic_state == .on);
+    try state.dispatch(.{ .diagnostics_changed = .{ .command_id = disable.command_id, .state = .off } });
+    try testing.expect(state.projection().diagnostic_state == .off);
+}
 
 pub const SessionLoadOutcome = union(enum) {
     loaded: *Session,
@@ -961,12 +1008,14 @@ pub const SessionLoadOutcome = union(enum) {
 };
 
 pub const SessionLoaded = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId = 0,
     intent: LoadIntent,
     outcome: SessionLoadOutcome,
 };
 
 pub const OwnedInput = union(enum) {
+    diagnostics_changed: struct { command_id: ?CommandId = null, state: bbr.diagnostic.State },
     choose_pull_request: OwnedReviewIdentity,
     key: keymap_mod.KeyStroke,
     mouse: MouseInput,
@@ -1050,6 +1099,7 @@ pub const MouseInput = struct {
 };
 
 pub const PostDraftCompleted = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
     identity: ?OwnedRemoteReviewIdentity = null,
@@ -1059,6 +1109,7 @@ pub const PostDraftCompleted = struct {
 };
 
 pub const PostDraftLaunchFailed = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
     identity: ?OwnedRemoteReviewIdentity = null,
@@ -1066,6 +1117,7 @@ pub const PostDraftLaunchFailed = struct {
 };
 
 pub const WaitSubmission = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
     identity: ?OwnedRemoteReviewIdentity = null,
@@ -1097,7 +1149,7 @@ pub const CheckRecovery = struct {
 
 pub const RecoveryCheckOutcome = union(enum) {
     current_source: BoundedText(64),
-    failed,
+    failed: bbr.diagnostic.Failure,
 };
 
 pub const RecoveryChecked = struct {
@@ -1115,6 +1167,7 @@ pub const DuplicateCheckOutcome = union(enum) {
 };
 
 pub const DuplicateChecked = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
     identity: ?OwnedRemoteReviewIdentity = null,
@@ -1125,7 +1178,7 @@ pub const DuplicateChecked = struct {
 
 pub const PullRequestSummaries = list_overlay_mod.PullRequestSummaries;
 
-pub const PullRequestsLoadOutcome = union(enum) { loaded: *PullRequestSummaries, failed };
+pub const PullRequestsLoadOutcome = union(enum) { loaded: *PullRequestSummaries, failed: bbr.diagnostic.Failure };
 pub const PullRequestsLoaded = struct { command_id: CommandId = 0, work_id: WorkId, outcome: PullRequestsLoadOutcome };
 pub const ListPullRequests = struct {
     command_id: CommandId = 0,
@@ -1138,11 +1191,11 @@ pub const ListPullRequests = struct {
 };
 
 pub fn recoveryCheckSucceeded(command_id: CommandId, operation_id: bbr.review.OperationId, identity: ?OwnedRemoteReviewIdentity, source_commit: []const u8) OwnedInput {
-    const source = BoundedText(64).init(source_commit) catch return .{ .recovery_checked = .{
+    const source = BoundedText(64).init(source_commit) catch |err| return .{ .recovery_checked = .{
         .command_id = command_id,
         .operation_id = operation_id,
         .identity = identity,
-        .outcome = .failed,
+        .outcome = .{ .failed = bbr.diagnostic.Failure.capture(.recovery_check, .decode, .{ .command_id = command_id, .operation_id = operation_id }, .{ .zig = err }, @src()) },
     } };
     return .{ .recovery_checked = .{
         .command_id = command_id,
@@ -1168,6 +1221,7 @@ pub const FileEnrichmentFailure = enum {
 };
 
 pub const FileEnrichmentCompleted = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId = 0,
     work_id: WorkId,
     session_epoch: SessionEpoch,
@@ -1254,6 +1308,7 @@ pub const SessionLoadCause = enum { picker, refresh, reconciliation };
 /// Owns a private Candidate Session until its complete initial Frame can publish.
 /// Store reads and ScopeProjection resolution finish before worker handoff.
 pub const PrepareSession = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     allocator: Allocator,
     command_id: CommandId = 0,
     intent: LoadIntent,
@@ -1265,6 +1320,7 @@ pub const PrepareSession = struct {
 
     pub fn build(self: *PrepareSession) void {
         self.candidate.?.finishCreate(self.preferences) catch |err| {
+            self.evidence = bbr.diagnostic.Failure.capture(.buffer_build, .prepare, .{ .command_id = self.command_id }, .{ .zig = err }, @src());
             self.failure = if (err == error.OutOfMemory) .out_of_memory else .buffer_build_failed;
             return;
         };
@@ -1286,6 +1342,7 @@ pub const CommentEditOutcome = union(enum) {
 };
 
 pub const CommentEditCompleted = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId,
     identity: OwnedRemoteReviewIdentity,
     comment_id: bbr.review.CommentId,
@@ -1293,6 +1350,7 @@ pub const CommentEditCompleted = struct {
 };
 
 pub const CommentEditLaunchFailed = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId,
     identity: OwnedRemoteReviewIdentity,
     comment_id: bbr.review.CommentId,
@@ -1306,6 +1364,7 @@ pub const CommentDeleteOutcome = union(enum) {
 };
 
 pub const CommentDeleteCompleted = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId,
     identity: OwnedRemoteReviewIdentity,
     comment_id: bbr.review.CommentId,
@@ -1313,12 +1372,14 @@ pub const CommentDeleteCompleted = struct {
 };
 
 pub const CommentDeleteLaunchFailed = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId,
     identity: OwnedRemoteReviewIdentity,
     comment_id: bbr.review.CommentId,
 };
 
 pub const ReviewerVerdictChanged = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId,
     identity: OwnedRemoteReviewIdentity,
     target: bbr.bitbucket.ReviewerVerdict,
@@ -1492,6 +1553,8 @@ pub const ChangeReviewerVerdict = struct {
 };
 
 pub const OwnedCommand = union(enum) {
+    set_diagnostics: struct { command_id: CommandId = 0, enabled: bool },
+    report_diagnostic: bbr.diagnostic.Failure,
     load_session: LoadSession,
     prepare_session: *PrepareSession,
     enrich_file: EnrichFile,
@@ -1523,7 +1586,7 @@ pub const OwnedCommand = union(enum) {
             .scan_buffer_search => |*command| command.deinit(),
             .build_buffer_disclosure => |command| command.destroy(),
             .scan_review_source => |*command| command.deinit(),
-            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .persist_theme => {},
+            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .persist_theme, .set_diagnostics, .report_diagnostic => {},
         }
         self.* = undefined;
     }
@@ -1534,29 +1597,79 @@ pub const OwnedCommand = union(enum) {
     /// No arm frees its payload. An arm whose payload moves into the input
     /// returns at once. Every other arm only reads, and `deinit` frees the
     /// payload after the input exists.
-    pub fn launchFailed(self: *OwnedCommand) error{OutOfMemory}!OwnedInput {
+    pub fn diagnosticContext(self: OwnedCommand, work_id: ?u64) struct { operation: bbr.diagnostic.Operation, context: bbr.diagnostic.Context } {
+        const operation: bbr.diagnostic.Operation = switch (self) {
+            .load_session, .prepare_session => .session_load,
+            .enrich_file => .file_enrichment,
+            .highlight_code => .highlighting,
+            .post_draft, .wait_submission => .submission,
+            .update_comment, .delete_comment => .mutation,
+            .change_reviewer_verdict => .verdict,
+            .check_recovery => .recovery_check,
+            .find_duplicate => .duplicate_check,
+            .list_pull_requests => .picker_list,
+            .copy_clipboard => .clipboard,
+            .persist_theme => .configuration,
+            .external_edit => .external_edit,
+            .scan_buffer_search => .buffer_search,
+            .build_buffer_disclosure => .buffer_build,
+            .scan_review_source => .review_search,
+            .set_diagnostics, .report_diagnostic => .diagnostics,
+        };
+        var context: bbr.diagnostic.Context = .{ .work_id = work_id };
+        switch (self) {
+            .report_diagnostic => |failure| return .{ .operation = operation, .context = failure.context },
+            inline else => |command| {
+                context.command_id = command.command_id;
+                const T = switch (@typeInfo(@TypeOf(command))) {
+                    .pointer => |pointer| pointer.child,
+                    else => @TypeOf(command),
+                };
+                if (@hasField(T, "work_id")) context.work_id = command.work_id;
+                if (@hasField(T, "session_epoch")) context.session_epoch = command.session_epoch;
+                if (@hasField(T, "epoch")) context.session_epoch = command.epoch;
+                if (@hasField(T, "operation_id")) context.operation_id = command.operation_id;
+                if (@hasField(T, "file_index")) context.file_index = command.file_index;
+                if (@hasField(T, "temp_id")) context.draft_id = command.temp_id;
+                if (@hasField(T, "draft")) context.draft_id = command.draft.local_id;
+                if (@hasField(T, "identity") and T == code_highlighting.Analyze) context.session_epoch = command.identity.session_epoch;
+            },
+        }
+        return .{ .operation = operation, .context = context };
+    }
+
+    pub fn launchFailed(self: *OwnedCommand, cause: anyerror) error{OutOfMemory}!OwnedInput {
+        const diagnostic = self.diagnosticContext(null);
+        const failure = bbr.diagnostic.Failure.capture(diagnostic.operation, .launch, diagnostic.context, .{ .zig = cause }, @src());
         const input: OwnedInput = switch (self.*) {
+            .set_diagnostics => |command| .{ .diagnostics_changed = .{ .command_id = command.command_id, .state = .{ .unavailable = failure } } },
+            .report_diagnostic => unreachable,
             .prepare_session => |job| {
+                job.evidence = failure;
                 job.failure = .buffer_build_failed;
                 self.* = undefined;
                 return .{ .session_prepared = job };
             },
             .build_buffer_disclosure => |job| {
+                job.evidence = failure;
                 job.failed = true;
                 self.* = undefined;
                 return .{ .buffer_disclosure_built = job };
             },
             .highlight_code => |job| .{ .code_highlight_completed = .{
+                .evidence = failure,
                 .command_id = job.command_id,
                 .identity = job.identity,
-                .failure = error.WorkerLaunchFailed,
+                .failure = cause,
             } },
             .load_session => |load| .{ .session_loaded = .{
+                .evidence = failure,
                 .command_id = load.command_id,
                 .intent = load.intent,
-                .outcome = .{ .failed = error.WorkerLaunchFailed },
+                .outcome = .{ .failed = cause },
             } },
             .enrich_file => |enrich| .{ .file_enrichment_completed = .{
+                .evidence = failure,
                 .command_id = enrich.command_id,
                 .work_id = enrich.work_id,
                 .session_epoch = enrich.session_epoch,
@@ -1564,35 +1677,44 @@ pub const OwnedCommand = union(enum) {
                 .outcome = .{ .failed = .launch_failed },
             } },
             .post_draft => |post| .{ .post_draft_launch_failed = .{
+                .evidence = failure,
                 .command_id = post.command_id,
                 .operation_id = post.operation_id,
                 .identity = post.identity,
                 .temp_id = post.draft.local_id,
             } },
             .update_comment => |update| .{ .comment_edit_launch_failed = .{
+                .evidence = failure,
                 .command_id = update.command_id,
                 .identity = update.identity,
                 .comment_id = update.comment_id,
             } },
             .delete_comment => |delete| .{ .comment_delete_launch_failed = .{
+                .evidence = failure,
                 .command_id = delete.command_id,
                 .identity = delete.identity,
                 .comment_id = delete.comment_id,
             } },
             .change_reviewer_verdict => |verdict| .{ .reviewer_verdict_changed = .{
+                .evidence = failure,
                 .command_id = verdict.command_id,
                 .identity = verdict.identity,
                 .target = verdict.target,
                 .outcome = .launch_failed,
             } },
-            .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
+            .wait_submission => |wait| blk: {
+                var completed = wait;
+                completed.evidence = failure;
+                break :blk .{ .submission_wait_launch_failed = completed };
+            },
             .check_recovery => |check| .{ .recovery_checked = .{
                 .command_id = check.command_id,
                 .operation_id = check.operation_id,
                 .identity = check.identity,
-                .outcome = .failed,
+                .outcome = .{ .failed = failure },
             } },
             .find_duplicate => |check| .{ .duplicate_checked = .{
+                .evidence = failure,
                 .command_id = check.command_id,
                 .operation_id = check.operation_id,
                 .identity = check.identity,
@@ -1602,16 +1724,18 @@ pub const OwnedCommand = union(enum) {
             .list_pull_requests => |list| .{ .pull_requests_loaded = .{
                 .command_id = list.command_id,
                 .work_id = list.work_id,
-                .outcome = .failed,
+                .outcome = .{ .failed = failure },
             } },
-            .copy_clipboard => |copy| .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } },
-            .persist_theme => |persist| .{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = .write_failed } },
+            .copy_clipboard => |copy| .{ .clipboard_completed = .{ .evidence = failure, .command_id = copy.command_id, .success = false } },
+            .persist_theme => |persist| .{ .theme_persisted = .{ .evidence = failure, .command_id = persist.command_id, .outcome = .write_failed } },
             .external_edit => |edit| blk: {
                 const completed = try ExternalEditCompleted.create(edit.allocator, edit.command_id, edit.session_epoch);
+                completed.evidence = failure;
                 completed.outcome = .failed;
                 break :blk .{ .external_edit_completed = completed };
             },
             .scan_buffer_search => |scan| .{ .buffer_search_scanned = .{
+                .evidence = failure,
                 .allocator = std.heap.page_allocator,
                 .command_id = scan.command_id,
                 .request_id = scan.request_id,
@@ -1620,6 +1744,7 @@ pub const OwnedCommand = union(enum) {
                 .outcome = .failed,
             } },
             .scan_review_source => |scan| .{ .review_source_scanned = .{
+                .evidence = failure,
                 .allocator = std.heap.page_allocator,
                 .command_id = scan.command_id,
                 .session_epoch = scan.session_epoch,
@@ -1646,6 +1771,8 @@ fn commandTarget(command: OwnedCommand) CommandTarget {
 
 fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
     switch (command.*) {
+        .set_diagnostics => |*value| value.command_id = command_id,
+        .report_diagnostic => unreachable,
         .highlight_code => |value| value.command_id = command_id,
         .load_session => |*value| value.command_id = command_id,
         .prepare_session => |value| value.command_id = command_id,
@@ -1683,6 +1810,8 @@ const LaunchFailureFixture = struct {
     fn command(comptime target: CommandTarget, disclosure: *Presentation) !OwnedCommand {
         const a = testing.allocator;
         return switch (target) {
+            .set_diagnostics => .{ .set_diagnostics = .{ .enabled = true } },
+            .report_diagnostic => .{ .report_diagnostic = bbr.diagnostic.Failure.capture(.diagnostics, .execute, .{}, .{ .zig = error.TestFailure }, @src()) },
             .load_session => .{ .load_session = .{ .intent = intent, .key = (try remote()).value } },
             .prepare_session => blk: {
                 const job = try a.create(PrepareSession);
@@ -1870,6 +1999,11 @@ const LaunchFailureFixture = struct {
                 try testing.expectEqual(file_index, scanned.file_index);
                 try testing.expect(scanned.outcome == .failed);
             },
+            .diagnostics_changed => |changed| {
+                try testing.expectEqual(@as(?CommandId, command_id), changed.command_id);
+                try testing.expectEqual(error.TestLaunchFailure, changed.state.unavailable.cause.zig);
+                try testing.expectEqual(@as(?u64, command_id), changed.state.unavailable.context.command_id);
+            },
             else => return error.UnexpectedLaunchFailureInput,
         }
     }
@@ -1883,10 +2017,11 @@ test "every OwnedCommand launch failure keeps its correlation and frees the comm
     });
     defer disclosure.deinit();
     inline for (comptime std.meta.tags(CommandTarget), 0..) |target, index| {
+        if (target == .report_diagnostic) continue;
         var command = try LaunchFailureFixture.command(target, &disclosure);
         const command_id: CommandId = 100 + index;
         setCommandId(&command, command_id);
-        var input = try command.launchFailed();
+        var input = try command.launchFailed(error.TestLaunchFailure);
         defer input.deinit();
         LaunchFailureFixture.expectInput(input, command_id) catch |err| {
             std.debug.print("launch failure for {s} lost its correlation\n", .{@tagName(target)});
@@ -2570,7 +2705,9 @@ const DraftMutationError = error{ OutOfMemory, DraftLocked, DraftEditConflict, D
 
 pub const DisclosureBuild = struct {
     const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, cache_update, draft_save, draft_mutation, review_destination, draft_destination };
+
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
+    evidence: ?bbr.diagnostic.Failure = null,
     arena: std.heap.ArenaAllocator,
     session: *Session,
     inputs: *DisclosureInputs,
@@ -2718,7 +2855,8 @@ pub const DisclosureBuild = struct {
     }
 
     pub fn build(self: *DisclosureBuild) void {
-        self.buildFallible() catch {
+        self.buildFallible() catch |err| {
+            self.evidence = bbr.diagnostic.Failure.capture(.buffer_build, .execute, .{ .command_id = self.command_id, .session_epoch = self.epoch }, .{ .zig = err }, @src());
             self.failed = true;
         };
     }
@@ -3038,6 +3176,7 @@ pub const ScanBufferSearch = struct {
 pub const BufferSearchScanOutcome = union(enum) { scanned: search.Batch, failed };
 
 pub const BufferSearchScanned = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     allocator: Allocator,
     command_id: CommandId,
     request_id: u64,
@@ -3057,14 +3196,20 @@ pub const BufferSearchScanned = struct {
 };
 
 pub fn executeBufferSearchScan(allocator: Allocator, command: *const ScanBufferSearch) BufferSearchScanned {
-    const arena = if (command.mode == .literal) allocator.create(std.heap.ArenaAllocator) catch null else null;
+    var evidence: ?bbr.diagnostic.Failure = null;
+    const context: bbr.diagnostic.Context = .{ .command_id = command.command_id, .session_epoch = command.session_epoch };
+    const arena = if (command.mode == .literal) allocator.create(std.heap.ArenaAllocator) catch |err| blk: {
+        evidence = bbr.diagnostic.Failure.capture(.buffer_search, .prepare, context, .{ .zig = err }, @src());
+        break :blk null;
+    } else null;
     if (arena) |owned| owned.* = std.heap.ArenaAllocator.init(allocator);
     const scan_allocator = if (arena) |owned| owned.allocator() else allocator;
     const result: BufferSearchScanOutcome = if (arena == null and command.mode == .literal) .failed else if (search.scan(scan_allocator, command.query, command.corpus.candidates, command.mode)) |value| blk: {
         var batch = value;
         if (arena) |owned| batch.owner_arena = owned;
         break :blk .{ .scanned = batch };
-    } else |_| blk: {
+    } else |err| blk: {
+        evidence = bbr.diagnostic.Failure.capture(.buffer_search, .execute, context, .{ .zig = err }, @src());
         if (arena) |owned| {
             owned.deinit();
             allocator.destroy(owned);
@@ -3072,6 +3217,7 @@ pub fn executeBufferSearchScan(allocator: Allocator, command: *const ScanBufferS
         break :blk .failed;
     };
     var completed: BufferSearchScanned = .{
+        .evidence = evidence,
         .allocator = allocator,
         .command_id = command.command_id,
         .request_id = command.request_id,
@@ -3080,7 +3226,8 @@ pub fn executeBufferSearchScan(allocator: Allocator, command: *const ScanBufferS
         .outcome = result,
     };
     if (command.mode == .literal and command.projection != null and completed.outcome == .scanned) {
-        const projected = command.projection.?.project(std.heap.page_allocator, completed.outcome.scanned) catch {
+        const projected = command.projection.?.project(std.heap.page_allocator, completed.outcome.scanned) catch |err| {
+            completed.evidence = bbr.diagnostic.Failure.capture(.buffer_search, .prepare, context, .{ .zig = err }, @src());
             completed.outcome.scanned.deinit(allocator);
             completed.outcome = .failed;
             return completed;
@@ -3138,6 +3285,7 @@ pub const ScanReviewSource = struct {
 };
 
 pub const ReviewSourceScanned = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     allocator: Allocator,
     command_id: CommandId,
     session_epoch: SessionEpoch,
@@ -3153,13 +3301,19 @@ pub const ReviewSourceScanned = struct {
 
 pub fn executeReviewSourceScan(allocator: Allocator, command: *const ScanReviewSource) ReviewSourceScanned {
     const view = command.lease.view;
+    var evidence: ?bbr.diagnostic.Failure = null;
+    const outcome: BufferSearchScanOutcome = if (search.scanFile(allocator, command.query, command.file, command.file_index, command.session_epoch, if (view.old == .content) view.old.content.blob else null, if (view.new == .content) view.new.content.blob else null)) |batch| .{ .scanned = batch } else |err| blk: {
+        evidence = bbr.diagnostic.Failure.capture(.review_search, .execute, .{ .command_id = command.command_id, .session_epoch = command.session_epoch, .file_index = command.file_index }, .{ .zig = err }, @src());
+        break :blk .failed;
+    };
     return .{
+        .evidence = evidence,
         .allocator = allocator,
         .command_id = command.command_id,
         .session_epoch = command.session_epoch,
         .request_id = command.request_id,
         .file_index = command.file_index,
-        .outcome = if (search.scanFile(allocator, command.query, command.file, command.file_index, command.session_epoch, if (view.old == .content) view.old.content.blob else null, if (view.new == .content) view.new.content.blob else null)) |batch| .{ .scanned = batch } else |_| .failed,
+        .outcome = outcome,
     };
 }
 
@@ -3177,6 +3331,7 @@ pub const ClipboardCopy = struct {
 };
 
 pub const ClipboardCompleted = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId,
     success: bool,
 };
@@ -3188,6 +3343,7 @@ pub const PersistTheme = struct {
 };
 
 pub const ThemePersisted = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: CommandId,
     outcome: Outcome,
 
@@ -3244,6 +3400,8 @@ pub const ExternalEditOutcome = union(enum) {
 };
 
 pub const ExternalEditCompleted = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
+    secondary_evidence: ?bbr.diagnostic.Failure = null,
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     command_id: CommandId,
@@ -3294,6 +3452,8 @@ pub const PaintRevision = struct {
 };
 
 pub const Projection = struct {
+    diagnostic_state: bbr.diagnostic.State = .off,
+    diagnostic_pending: bool = false,
     revision: PaintRevision,
     review: ?ReviewProjection,
     submission: ?SubmissionProjection,
@@ -3474,7 +3634,7 @@ pub const ActionAvailability = struct {
     pub fn available(self: ActionAvailability, action: Action) bool {
         if (!self.has_review) return switch (action) {
             .quit, .help, .open_pull_request_picker => self.remote,
-            .open_command_palette, .open_theme_overlay => true,
+            .open_command_palette, .open_theme_overlay, .toggle_diagnostic_logging => true,
             else => false,
         };
         if (!self.remote) switch (action) {
@@ -4016,6 +4176,7 @@ const Published = struct {
     epoch: SessionEpoch,
     session: *Session,
     backing_allocator: Allocator,
+    diagnostic_failure: ?bbr.diagnostic.Failure,
     review_arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
     scope_projection: std.ArrayList(bbr.review.ScopeProjectionEntry),
@@ -4100,6 +4261,7 @@ const Published = struct {
         errdefer allocator.destroy(published);
 
         published.allocator = allocator;
+        published.diagnostic_failure = null;
         published.backing_allocator = allocator;
         published.key = key;
         published.epoch = epoch;
@@ -4372,7 +4534,10 @@ const Published = struct {
         new_draft: bbr.review.NewDraft,
     ) SaveDraftError!bbr.review.Draft {
         new_draft.validate() catch |err| return err;
-        const reserved_id = store.reserveTempId(self.key.storeKey()) catch return error.PersistenceFailed;
+        const reserved_id = store.reserveTempId(self.key.storeKey()) catch |err| {
+            self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch }, .{ .zig = err }, @src());
+            return error.PersistenceFailed;
+        };
 
         var draft: bbr.review.Draft = .{
             .local_id = reserved_id,
@@ -4416,7 +4581,10 @@ const Published = struct {
         const draft = try cloneDisclosureDraft(a, candidate);
         try self.review.drafts.ensureUnusedCapacity(a, 1);
         if (draft.parent == null) try self.scope_projection.ensureUnusedCapacity(a, 1);
-        store.put(self.key.storeKey(), draft) catch return error.PersistenceFailed;
+        store.put(self.key.storeKey(), draft) catch |err| {
+            self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = draft.local_id }, .{ .zig = err }, @src());
+            return error.PersistenceFailed;
+        };
         self.review.drafts.appendAssumeCapacity(draft);
         self.review.next_id = @max(self.review.next_id, draft.local_id + 1);
         if (draft.parent == null) self.scope_projection.appendAssumeCapacity(.{
@@ -4438,7 +4606,10 @@ const Published = struct {
                     .expected_kind = draft.kind,
                     .expected_parent = draft.parent,
                     .body = body,
-                }) catch |err| return draftMutationStoreError(err);
+                }) catch |err| {
+                    self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = mutation.temp_id }, .{ .zig = err }, @src());
+                    return draftMutationStoreError(err);
+                };
                 draft.body = body;
                 draft.state = job.mutation_state.?;
             },
@@ -4448,7 +4619,10 @@ const Published = struct {
                     .expected_kind = draft.kind,
                     .anchor = replacement.anchor,
                     .snapshot = replacement.snapshot,
-                }) catch |err| return draftMutationStoreError(err);
+                }) catch |err| {
+                    self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = mutation.temp_id }, .{ .zig = err }, @src());
+                    return draftMutationStoreError(err);
+                };
                 draft.scope = .{ .@"inline" = replacement.anchor };
                 draft.anchor = replacement.anchor;
                 draft.snapshot = replacement.snapshot;
@@ -4462,7 +4636,10 @@ const Published = struct {
                     .root_temp_id = mutation.temp_id,
                     .expected_parent = draft.parent,
                     .cascade = job.deleted_ids,
-                }) catch |err| return draftMutationStoreError(err);
+                }) catch |err| {
+                    self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = mutation.temp_id }, .{ .zig = err }, @src());
+                    return draftMutationStoreError(err);
+                };
                 var kept: usize = 0;
                 for (self.review.drafts.items) |candidate| {
                     if (bbr.review.containsTempId(job.deleted_ids, candidate.local_id)) continue;
@@ -4479,7 +4656,10 @@ const Published = struct {
                 self.scope_projection.shrinkRetainingCapacity(kept);
             },
             .unpublished => {
-                store.resolveUnknown(self.key.storeKey(), mutation.temp_id, .unpublished) catch |err| return draftMutationStoreError(err);
+                store.resolveUnknown(self.key.storeKey(), mutation.temp_id, .unpublished) catch |err| {
+                    self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = mutation.temp_id }, .{ .zig = err }, @src());
+                    return draftMutationStoreError(err);
+                };
                 draft.state = .draft;
             },
         }
@@ -5998,7 +6178,10 @@ pub const Presentation = struct {
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
     action_error: ?ActionError = null,
+    diagnostic_state: bbr.diagnostic.State = .off,
+    diagnostic_pending: bool = false,
     fatal_error: ?FatalError = null,
+    emergency_diagnostic: ?bbr.diagnostic.Failure = null,
     clipboard_status: ?ClipboardStatus = null,
     external_edit_pending: ?SessionEpoch = null,
     composer_footer: std.ArrayList(u8) = .empty,
@@ -6022,6 +6205,7 @@ pub const Presentation = struct {
             .dependencies = dependencies,
             .geometry = geometry,
             .configured_theme = dependencies.configured_theme,
+            .diagnostic_state = boot.diagnostic_state,
         };
         errdefer self.deinit();
         if (boot.initial) |initial| {
@@ -6072,6 +6256,10 @@ pub const Presentation = struct {
     /// The sole mutation entry point. Candidate construction consumes a loaded
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
+        defer if (self.published) |published| {
+            if (published.diagnostic_failure) |failure| self.reportEvidence(failure);
+            published.diagnostic_failure = null;
+        };
         // Durable effects can change persisted Drafts while a private initial
         // Frame is building. Retry that snapshot before it becomes current.
         switch (input) {
@@ -6102,6 +6290,13 @@ pub const Presentation = struct {
         }
         switch (input) {
             .choose_pull_request => |key| if (!self.shutdown_requested) try self.choosePullRequest(key),
+            .diagnostics_changed => |changed| {
+                if (changed.command_id) |id| {
+                    if (!self.consumeCommand(id, .set_diagnostics)) return;
+                    self.diagnostic_pending = false;
+                }
+                self.diagnostic_state = changed.state;
+            },
             .key => |key| try self.applyKey(key),
             .mouse => |mouse| self.applyMouse(mouse),
             .session_loaded => |completed| self.acceptLoadedSession(completed),
@@ -6148,7 +6343,13 @@ pub const Presentation = struct {
     }
 
     pub fn takeCommand(self: *Presentation) ?OwnedCommand {
+        if (self.emergency_diagnostic) |failure| {
+            self.emergency_diagnostic = null;
+            return .{ .report_diagnostic = failure };
+        }
+        if (self.commands.items.len > 0 and self.commands.items[0] == .report_diagnostic) return self.commands.orderedRemove(0);
         if (self.commands.items.len == 0 and self.code_work == null and !self.shutdown_requested) self.scheduleCodeHighlight();
+        if (self.commands.items.len > 0 and self.commands.items[0] == .report_diagnostic) return self.commands.orderedRemove(0);
         if (self.commands.items.len == 0) return null;
         const next = self.commands.items[0];
         if (next == .scan_buffer_search or next == .scan_review_source or next == .build_buffer_disclosure) {
@@ -6163,7 +6364,8 @@ pub const Presentation = struct {
                 (published.review_search.authored_scan_active or published.review_search.source_scan_active)) return null;
             if (self.commands.items[0] == .scan_review_source and published.review_search.authored_scan_active) return null;
         }
-        self.issued_commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.issued_commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.fatal_error = .out_of_memory;
             self.requestShutdown();
             return null;
@@ -6175,6 +6377,8 @@ pub const Presentation = struct {
         setCommandId(&command, command_id);
         self.issued_commands.appendAssumeCapacity(.{ .id = command_id, .target = commandTarget(command) });
         switch (command) {
+            .set_diagnostics => {},
+            .report_diagnostic => unreachable,
             .highlight_code => {},
             .load_session => self.outstanding_loads += 1,
             .prepare_session => {},
@@ -6214,6 +6418,18 @@ pub const Presentation = struct {
         }
         if (self.durable_submission) |durable| self.syncSubmissionTree(durable);
         return command;
+    }
+
+    fn reportFailure(self: *Presentation, operation: bbr.diagnostic.Operation, phase: bbr.diagnostic.Phase, err: anyerror, comptime source: std.builtin.SourceLocation) void {
+        const failure = bbr.diagnostic.Failure.capture(operation, phase, .{ .session_epoch = if (self.published) |published| published.epoch else null }, .{ .zig = err }, source);
+        self.reportEvidence(failure);
+    }
+
+    fn reportEvidence(self: *Presentation, failure: bbr.diagnostic.Failure) void {
+        if (self.diagnostic_state != .on) return;
+        self.commands.append(self.allocator, .{ .report_diagnostic = failure }) catch {
+            self.emergency_diagnostic = failure;
+        };
     }
 
     fn consumeCommand(self: *Presentation, command_id: CommandId, target: CommandTarget) bool {
@@ -6271,6 +6487,8 @@ pub const Presentation = struct {
             .picker_tick_scope = if (self.shutdown_requested) null else if (self.list_overlay) |*overlay| overlay.tickScope() else null,
             .theme = self.activeTheme(),
             .configured_theme = self.configured_theme,
+            .diagnostic_state = self.diagnostic_state,
+            .diagnostic_pending = self.diagnostic_pending,
             .help = if (self.help) |*help| help.view() else null,
             .action_availability = self.actionAvailability(),
             .loading_pull_request_id = if (self.replacement) |replacement|
@@ -6548,7 +6766,8 @@ pub const Presentation = struct {
         const locks = self.dependencies.submission_locks orelse return;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const run = self.dependencies.reviews.activeSubmission(arena.allocator()) catch {
+        const run = self.dependencies.reviews.activeSubmission(arena.allocator()) catch |err| {
+            self.reportFailure(.recovery_check, .read, err, @src());
             self.action_error = .recovery_claim_failed;
             return;
         } orelse return;
@@ -6566,7 +6785,8 @@ pub const Presentation = struct {
         };
         self.recovery_participants.clearRetainingCapacity();
         for (run.items) |item| self.recovery_participants.appendAssumeCapacity(item.temp_id);
-        var probe = locks.tryAcquire(run.key) catch {
+        var probe = locks.tryAcquire(run.key) catch |err| {
+            self.reportFailure(.submission_lock, .open, err, @src());
             self.action_error = .recovery_claim_failed;
             return;
         };
@@ -6602,7 +6822,8 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
-        var lock = (locks.tryAcquire(notice.key.storeKey()) catch {
+        var lock = (locks.tryAcquire(notice.key.storeKey()) catch |err| {
+            self.reportFailure(.submission_lock, .open, err, @src());
             self.action_error = .recovery_claim_failed;
             return;
         }) orelse {
@@ -6612,7 +6833,8 @@ pub const Presentation = struct {
         };
         var validation_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer validation_arena.deinit();
-        const active = self.dependencies.reviews.activeSubmission(validation_arena.allocator()) catch {
+        const active = self.dependencies.reviews.activeSubmission(validation_arena.allocator()) catch |err| {
+            self.reportFailure(.recovery_check, .read, err, @src());
             lock.release();
             self.action_error = .recovery_claim_failed;
             return;
@@ -6632,7 +6854,8 @@ pub const Presentation = struct {
             self.completeRecoveredTerminal(notice, active, &lock);
             return;
         }
-        const recovered = DurableSubmission.recover(self.allocator, self.dependencies.reviews, active, notice.key, lock) catch {
+        const recovered = DurableSubmission.recover(self.allocator, self.dependencies.reviews, active, notice.key, lock) catch |err| {
+            self.reportFailure(.recovery_check, .prepare, err, @src());
             lock.ptr = null;
             self.action_error = .recovery_claim_failed;
             return;
@@ -6655,7 +6878,8 @@ pub const Presentation = struct {
         defer lock.release();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const review = self.dependencies.reviews.loadReview(arena.allocator(), notice.key.storeKey()) catch {
+        const review = self.dependencies.reviews.loadReview(arena.allocator(), notice.key.storeKey()) catch |err| {
+            self.reportFailure(.recovery_check, .read, err, @src());
             self.action_error = .recovery_claim_failed;
             return;
         };
@@ -6691,7 +6915,8 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
-        self.dependencies.reviews.completeSubmission(notice.operation_id, notice.key.storeKey(), result.completion) catch {
+        self.dependencies.reviews.completeSubmission(notice.operation_id, notice.key.storeKey(), result.completion) catch |err| {
+            self.reportFailure(.submission, .write, err, @src());
             tree.destroy();
             self.action_error = .recovery_claim_failed;
             return;
@@ -6705,7 +6930,8 @@ pub const Presentation = struct {
 
     fn queueRecoveryCheck(self: *Presentation, durable: *DurableSubmission) void {
         const source_commit = durable.recovery_source_commit orelse return;
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -6720,12 +6946,14 @@ pub const Presentation = struct {
 
     fn queueDuplicateCheck(self: *Presentation, durable: *DurableSubmission) void {
         const source_changed = durable.source_changed;
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             durable.phase = .duplicate_check_paused;
             self.action_error = .out_of_memory;
             return;
         };
-        const command = durable.materializeDuplicateCheck(self.allocator) catch {
+        const command = durable.materializeDuplicateCheck(self.allocator) catch |err| {
+            self.reportFailure(.duplicate_check, .prepare, err, @src());
             durable.phase = .duplicate_check_paused;
             self.action_error = .out_of_memory;
             return;
@@ -7019,7 +7247,8 @@ pub const Presentation = struct {
         }
 
         if (published.pending_draft_mutation != null) return;
-        self.queueDraftMutation(published, .{ .temp_id = temp_id, .change = .delete }, null) catch {
+        self.queueDraftMutation(published, .{ .temp_id = temp_id, .change = .delete }, null) catch |err| {
+            self.reportFailure(.mutation, .prepare, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -7032,7 +7261,8 @@ pub const Presentation = struct {
             self.action_error = mutationRefusalError(refusal);
             return;
         }
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -7148,7 +7378,8 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
-        self.queueDraftMutation(published, .{ .temp_id = capture.temp_id, .change = .{ .reanchor = .{ .anchor = candidate.anchor, .snapshot = snapshot } } }, null) catch {
+        self.queueDraftMutation(published, .{ .temp_id = capture.temp_id, .change = .{ .reanchor = .{ .anchor = candidate.anchor, .snapshot = snapshot } } }, null) catch |err| {
+            self.reportFailure(.mutation, .prepare, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -7337,6 +7568,7 @@ pub const Presentation = struct {
         const state = if (self.help) |*state| state else return;
         const page = frame_mod.helpBodyRows(self.geometry, state.view().layout());
         const result = state.applyKey(self.dependencies.keymap, key, page) catch |err| {
+            self.reportFailure(.help, .execute, err, @src());
             self.action_error = switch (err) {
                 error.OutOfMemory => .out_of_memory,
                 error.TooLong => .buffer_search_query_too_long,
@@ -7442,7 +7674,8 @@ pub const Presentation = struct {
         const durable = self.durable_submission orelse return;
         if (!durable.recovered) return;
         const temp_id = durable.current_temp_id orelse return;
-        self.dependencies.reviews.abandonSubmission(durable.operation_id, durable.key.storeKey()) catch {
+        self.dependencies.reviews.abandonSubmission(durable.operation_id, durable.key.storeKey()) catch |err| {
+            self.reportFailure(.submission, .write, err, @src());
             self.action_error = .persistence_failed;
             return;
         };
@@ -7577,12 +7810,22 @@ pub const Presentation = struct {
             if (action == .submit) self.resumeDurableSubmission();
             return;
         }
+        if (action == .toggle_diagnostic_logging) {
+            if (self.diagnostic_pending) return;
+            self.commands.append(self.allocator, .{ .set_diagnostics = .{ .enabled = self.diagnostic_state != .on } }) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            self.diagnostic_pending = true;
+            return;
+        }
         if (action == .recover_submission) {
             self.recoverSubmission();
             return;
         }
         if (action == .help) {
-            const next = help_mod.State.init(self.allocator, self.dependencies.keymap) catch {
+            const next = help_mod.State.init(self.allocator, self.dependencies.keymap) catch |err| {
+                self.reportFailure(.help, .prepare, err, @src());
                 self.action_error = .out_of_memory;
                 return;
             };
@@ -7599,7 +7842,8 @@ pub const Presentation = struct {
             return;
         }
         if (action == .open_command_palette) {
-            const overlay = ListOverlay.openCommandPalette(self.allocator, self.paneContext()) catch {
+            const overlay = ListOverlay.openCommandPalette(self.allocator, self.paneContext()) catch |err| {
+                self.reportFailure(.completion, .prepare, err, @src());
                 self.action_error = .out_of_memory;
                 return;
             };
@@ -7607,7 +7851,8 @@ pub const Presentation = struct {
             return;
         }
         if (action == .open_theme_overlay) {
-            const overlay = ListOverlay.openTheme(self.allocator, self.configured_theme) catch {
+            const overlay = ListOverlay.openTheme(self.allocator, self.configured_theme) catch |err| {
+                self.reportFailure(.configuration, .prepare, err, @src());
                 self.action_error = .out_of_memory;
                 return;
             };
@@ -7712,12 +7957,13 @@ pub const Presentation = struct {
             .resolve_unpublished => self.resolveSelectedUnknownAsUnpublished(published),
             .link_existing_comment => self.openUnknownResolutionEditor(published),
             .yank => self.yank(published, yank_count),
-            .open_file_finder, .open_pull_request_picker, .open_command_palette, .open_theme_overlay, .confirm_picker, .help => unreachable,
+            .open_file_finder, .open_pull_request_picker, .open_command_palette, .open_theme_overlay, .toggle_diagnostic_logging, .confirm_picker, .help => unreachable,
             .quit => unreachable,
         }
         clampSelectionAtUnavailableRow(published, selection_cursor_before, self.preferences.scope);
         if (published.focus == .diff and keymap_mod.isMotion(action) and published.navigation.cursor != navigation_before.cursor and published.buffer_search.active != null) {
             self.clearBufferSearchActive(published) catch |err| {
+                self.reportFailure(.buffer_search, .execute, err, @src());
                 published.navigation = navigation_before;
                 self.action_error = normalizeActionError(err);
                 return;
@@ -7734,6 +7980,7 @@ pub const Presentation = struct {
         self.cancelQueuedViewBuild(published);
         if (state.corpus == null) {
             const corpus = published.reviewSearchCorpus() catch |err| {
+                self.reportFailure(.review_search, .prepare, err, @src());
                 self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_scan_failed;
                 return;
             };
@@ -7863,6 +8110,7 @@ pub const Presentation = struct {
         state.opening_source = false;
         state.opening_identity = null;
         var query = search.Query.init(self.allocator, text) catch |err| {
+            if (err == error.OutOfMemory) self.reportFailure(.review_search, .prepare, err, @src());
             self.action_error = switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
                 error.OutOfMemory => .out_of_memory,
@@ -7896,6 +8144,7 @@ pub const Presentation = struct {
             return;
         }
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
+            if (err == error.OutOfMemory) self.reportFailure(.review_search, .prepare, err, @src());
             query.deinit(self.allocator);
             self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_invalid_query;
             return;
@@ -7913,7 +8162,8 @@ pub const Presentation = struct {
             .query = worker_query,
             .mode = .fuzzy,
         } };
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             command.deinit();
             query.deinit(self.allocator);
             self.action_error = .out_of_memory;
@@ -8034,7 +8284,8 @@ pub const Presentation = struct {
                 self.action_error = .out_of_memory;
                 return;
             } };
-            self.commands.append(self.allocator, command) catch {
+            self.commands.append(self.allocator, command) catch |err| {
+                self.reportFailure(.review_search, .admission, err, @src());
                 self.finishSearchLease(published, index);
                 command.deinit();
                 self.action_error = .out_of_memory;
@@ -8064,7 +8315,8 @@ pub const Presentation = struct {
         if (self.shutdown_requested) return;
         const focused = if (published.pending_cache_update != null) published.pending_cache_focus else published.session.enrichment.focused;
         if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
-        self.queueCacheBuild(published, focused) catch {
+        self.queueCacheBuild(published, focused) catch |err| {
+            self.reportFailure(.buffer_build, .prepare, err, @src());
             self.action_error = .out_of_memory;
         };
     }
@@ -8119,7 +8371,8 @@ pub const Presentation = struct {
                 before < old.occurrences.len and searchOccurrenceEql(old.occurrences[before], combined.occurrences[after])
             else
                 false else false;
-            const ranges = published.projectReviewRanges(combined, selected) catch {
+            const ranges = published.projectReviewRanges(combined, selected) catch |err| {
+                self.reportFailure(.review_search, .prepare, err, @src());
                 std.heap.page_allocator.free(occurrences);
                 self.reviewSourcePublicationFailed(published, completed.file_index);
                 return;
@@ -8225,7 +8478,8 @@ pub const Presentation = struct {
         if (state.pending) return;
         const batch = state.batch orelse return;
         if (index >= batch.occurrences.len) return;
-        const ranges = published.projectReviewRanges(batch, index) catch {
+        const ranges = published.projectReviewRanges(batch, index) catch |err| {
+            self.reportFailure(.review_search, .prepare, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -8285,7 +8539,8 @@ pub const Presentation = struct {
             old_index < old.occurrences.len and searchOccurrenceEql(old.occurrences[old_index], batch.occurrences[new_index])
         else
             false else false else false;
-        const ranges = published.projectReviewRanges(batch, selected) catch {
+        const ranges = published.projectReviewRanges(batch, selected) catch |err| {
+            self.reportFailure(.review_search, .prepare, err, @src());
             batch.deinit(self.allocator);
             self.rollbackReviewSearchQuery(state);
             self.action_error = .out_of_memory;
@@ -8692,6 +8947,7 @@ pub const Presentation = struct {
             return;
         }
         var query = search.Query.init(self.allocator, text) catch |err| {
+            if (err == error.OutOfMemory) self.reportFailure(.buffer_search, .prepare, err, @src());
             self.action_error = switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
                 error.OutOfMemory => .out_of_memory,
@@ -8700,6 +8956,7 @@ pub const Presentation = struct {
             return;
         };
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
+            if (err == error.OutOfMemory) self.reportFailure(.buffer_search, .prepare, err, @src());
             query.deinit(self.allocator);
             self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_invalid_query;
             return;
@@ -8715,7 +8972,8 @@ pub const Presentation = struct {
             .visual_rows_revision = published.visual_rows_revision,
             .query = worker_query,
         } };
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             command.deinit();
             query.deinit(self.allocator);
             self.action_error = .out_of_memory;
@@ -9113,6 +9371,7 @@ pub const Presentation = struct {
                 return self.failDraftDestination(published, .out_of_memory);
         }
         if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
+            self.reportFailure(.composer, .write, err, @src());
             published.pending_draft_save = null;
             self.action_error = if (err == error.PersistenceFailed) .persistence_failed else .out_of_memory;
             return;
@@ -9130,6 +9389,7 @@ pub const Presentation = struct {
                 return;
             }
             published.persistDraftMutation(self.dependencies.reviews, job) catch |err| {
+                self.reportFailure(.mutation, .write, err, @src());
                 published.pending_draft_mutation = null;
                 self.action_error = draftMutationActionError(err);
                 return;
@@ -9436,7 +9696,8 @@ pub const Presentation = struct {
             published.session.enrichment.resetLoading(job.enrichment_file.?);
             return;
         };
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             next.destroy();
             if (!job.enrichment_speculative) self.action_error = .out_of_memory;
             published.session.enrichment.resetLoading(job.enrichment_file.?);
@@ -10036,11 +10297,13 @@ pub const Presentation = struct {
                     self.action_error = .comment_owned_by_other;
                     return;
                 }
-                self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+                self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+                    self.reportFailure(.completion, .admission, err, @src());
                     self.action_error = .out_of_memory;
                     return;
                 };
-                self.dependencies.reviews.resolveUnknown(editor.key.storeKey(), editor.temp_id, .{ .posted = comment_id }) catch {
+                self.dependencies.reviews.resolveUnknown(editor.key.storeKey(), editor.temp_id, .{ .posted = comment_id }) catch |err| {
+                    self.reportFailure(.submission, .write, err, @src());
                     self.action_error = .persistence_failed;
                     return;
                 };
@@ -10110,11 +10373,13 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         };
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .submission_start_failed;
             return;
         };
-        const lock = locks.tryAcquire(published.key.remote()) catch {
+        const lock = locks.tryAcquire(published.key.remote()) catch |err| {
+            self.reportFailure(.submission_lock, .open, err, @src());
             self.action_error = .submission_start_failed;
             return;
         } orelse {
@@ -10191,7 +10456,8 @@ pub const Presentation = struct {
         if (!self.consumeCommand(completed.command_id, .post_draft)) return;
         const durable = self.durable_submission orelse return;
         if (durable.operation_id != completed.operation_id or !durableIdentityMatches(durable.key, completed.identity) or durable.current_temp_id != completed.temp_id or durable.phase != .awaiting_post) return;
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             durable.pending_admission = .{ .post = completed };
             durable.phase = .admission_paused;
             self.syncSubmissionTree(durable);
@@ -10300,7 +10566,8 @@ pub const Presentation = struct {
             self.action_error = .reviewer_verdict_failed;
             return;
         };
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -10349,7 +10616,8 @@ pub const Presentation = struct {
                     self.action_error = null;
                     return;
                 }
-                self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+                self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+                    self.reportFailure(.completion, .admission, err, @src());
                     self.durable_reviewer_verdict = null;
                     self.action_error = .out_of_memory;
                     return;
@@ -10405,7 +10673,8 @@ pub const Presentation = struct {
     }
 
     fn resumePostDraftLaunch(self: *Presentation, durable: *DurableSubmission) void {
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -10418,7 +10687,8 @@ pub const Presentation = struct {
     }
 
     fn processPostDraft(self: *Presentation, durable: *DurableSubmission, completed: PostDraftCompleted) void {
-        const progress = durable.acceptPost(self.allocator, self.dependencies.reviews, completed) catch {
+        const progress = durable.acceptPost(self.allocator, self.dependencies.reviews, completed) catch |err| {
+            self.reportFailure(.mutation, .write, err, @src());
             self.publishDurableCheckpoint(durable);
             self.syncSubmissionTree(durable);
             self.action_error = .persistence_failed;
@@ -10430,7 +10700,8 @@ pub const Presentation = struct {
 
     fn resumeSubmissionAdmission(self: *Presentation, durable: *DurableSubmission) void {
         const pending = durable.pending_admission orelse return;
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -10449,11 +10720,13 @@ pub const Presentation = struct {
     }
 
     fn resumeSubmissionPersistence(self: *Presentation, durable: *DurableSubmission) void {
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
-        const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch {
+        const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch |err| {
+            self.reportFailure(.mutation, .write, err, @src());
             self.publishDurableCheckpoint(durable);
             self.syncSubmissionTree(durable);
             self.action_error = .persistence_failed;
@@ -10523,7 +10796,8 @@ pub const Presentation = struct {
                 if (OwnedReviewIdentity.eql(gate.key, durable.key)) self.stale_repair = null;
             }
         }
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             durable.phase = .recovery_check_paused;
             self.action_error = .out_of_memory;
             return;
@@ -10575,7 +10849,8 @@ pub const Presentation = struct {
             return;
         };
         const completion: bbr.review.SubmissionCompletion = .{ .aborted = .draft };
-        self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch {
+        self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch |err| {
+            self.reportFailure(.submission, .write, err, @src());
             durable.phase = .recovery_check_paused;
             self.action_error = .persistence_failed;
             return;
@@ -10627,7 +10902,8 @@ pub const Presentation = struct {
     }
 
     fn advanceAfterPolicyCheck(self: *Presentation, durable: *DurableSubmission, temp_id: bbr.review.TempId) void {
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             durable.phase = .duplicate_check_paused;
             durable.policy_check = true;
             self.action_error = .out_of_memory;
@@ -10658,7 +10934,8 @@ pub const Presentation = struct {
                 };
                 durable.pending_wait_retry = command;
                 durable.phase = .wait_retry_paused;
-                self.dependencies.reviews.checkpointSubmissionRetry(durable.operation_id, durable.key.storeKey(), wait.temp_id, wait.checkpoint) catch {
+                self.dependencies.reviews.checkpointSubmissionRetry(durable.operation_id, durable.key.storeKey(), wait.temp_id, wait.checkpoint) catch |err| {
+                    self.reportFailure(.submission, .write, err, @src());
                     self.action_error = .persistence_failed;
                     return;
                 };
@@ -10681,7 +10958,8 @@ pub const Presentation = struct {
                     .completion = if (durable.machine.isClean()) .clean else .partial,
                 };
                 durable.phase = .persistence_paused;
-                const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch {
+                const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch |err| {
+                    self.reportFailure(.submission, .write, err, @src());
                     self.action_error = .persistence_failed;
                     return;
                 };
@@ -10701,7 +10979,8 @@ pub const Presentation = struct {
             .failed => unreachable,
         };
         if (!pending.checkpoint_done) {
-            self.dependencies.reviews.checkpointSubmission(durable.operation_id, durable.key.storeKey(), temp_id, outcome, null) catch {
+            self.dependencies.reviews.checkpointSubmission(durable.operation_id, durable.key.storeKey(), temp_id, outcome, null) catch |err| {
+                self.reportFailure(.submission, .write, err, @src());
                 durable.phase = .duplicate_persistence_paused;
                 self.action_error = .persistence_failed;
                 return;
@@ -10715,7 +10994,8 @@ pub const Presentation = struct {
             break;
         };
         const completion: bbr.review.SubmissionCompletion = if (clean) .clean else .partial;
-        self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch {
+        self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch |err| {
+            self.reportFailure(.submission, .write, err, @src());
             durable.phase = .duplicate_persistence_paused;
             self.action_error = .persistence_failed;
             return;
@@ -10742,7 +11022,8 @@ pub const Presentation = struct {
         if (!self.consumeCommand(completed.command_id, .wait_submission)) return;
         const durable = self.durable_submission orelse return;
         if (durable.operation_id != completed.operation_id or !durableIdentityMatches(durable.key, completed.identity) or durable.current_temp_id != completed.temp_id or durable.phase != .awaiting_wait) return;
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
             self.syncSubmissionTree(durable);
@@ -10764,7 +11045,8 @@ pub const Presentation = struct {
 
     fn resumeSubmissionWaitLaunch(self: *Presentation, durable: *DurableSubmission) void {
         const wait = durable.pending_wait_retry orelse return;
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -10786,6 +11068,7 @@ pub const Presentation = struct {
 
     fn processSubmissionWait(self: *Presentation, durable: *DurableSubmission, completed: WaitSubmission) void {
         const command = durable.completeWait(self.allocator, self.dependencies.reviews, completed) catch |err| {
+            self.reportFailure(.submission, .execute, err, @src());
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
             self.action_error = if (err == error.OutOfMemory) .out_of_memory else .persistence_failed;
@@ -11034,14 +11317,16 @@ pub const Presentation = struct {
         if (composer_input != .save) self.cancelDraftSave(published);
         switch (composer_input) {
             .insert => |chunk| {
-                composer.insert(chunk.slice()) catch {
+                composer.insert(chunk.slice()) catch |err| {
+                    self.reportFailure(.composer, .execute, err, @src());
                     self.action_error = .out_of_memory;
                     return;
                 };
                 self.action_error = null;
             },
             .newline => {
-                composer.newline() catch {
+                composer.newline() catch |err| {
+                    self.reportFailure(.composer, .execute, err, @src());
                     self.action_error = .out_of_memory;
                     return;
                 };
@@ -11075,7 +11360,8 @@ pub const Presentation = struct {
                     self.setComposerFooter("External Edit could not allocate the body snapshot");
                     return;
                 };
-                self.commands.append(self.allocator, .{ .external_edit = command }) catch {
+                self.commands.append(self.allocator, .{ .external_edit = command }) catch |err| {
+                    self.reportFailure(.external_edit, .admission, err, @src());
                     command.destroy();
                     self.setComposerFooter("External Edit could not be started");
                     return;
@@ -11096,12 +11382,14 @@ pub const Presentation = struct {
         const composer = if (published.composer) |*value| value else return;
         if (expected_epoch != completed.session_epoch or published.epoch != completed.session_epoch) return;
         switch (completed.outcome) {
-            .changed => |body| composer.seed(body) catch {
+            .changed => |body| composer.seed(body) catch |err| {
+                self.reportFailure(.external_edit, .admission, err, @src());
                 self.setComposerFooter("External Edit returned content, but reseeding ran out of memory");
                 return;
             },
             .cleanup_failed => |retained| {
-                composer.seed(retained.body) catch {
+                composer.seed(retained.body) catch |err| {
+                    self.reportFailure(.external_edit, .admission, err, @src());
                     self.setComposerFooter("External Edit returned content, but reseeding ran out of memory");
                     return;
                 };
@@ -11248,8 +11536,8 @@ pub const Presentation = struct {
     }
 
     fn scheduleCodeBody(self: *Presentation, published: *Published, body: *code_highlighting.Body, preview_only: bool) bool {
-        while (body.nextEligible(self.allocator, self.dependencies.highlight_max_file_bytes, preview_only) catch {
-            std.log.warn("code Highlighting Grammar selection allocation failed", .{});
+        while (body.nextEligible(self.allocator, self.dependencies.highlight_max_file_bytes, preview_only) catch |err| {
+            self.reportFailure(.highlighting, .prepare, err, @src());
             return false;
         }) |eligible| {
             defer self.allocator.free(eligible.path);
@@ -11261,15 +11549,15 @@ pub const Presentation = struct {
                 .body_hash = std.hash.Wyhash.hash(0, body.parsed.source),
                 .context_hash = std.hash.Wyhash.hash(0, eligible.path),
             };
-            const command = code_highlighting.Analyze.create(std.heap.page_allocator, identity, eligible.block, eligible.path) catch {
+            const command = code_highlighting.Analyze.create(std.heap.page_allocator, identity, eligible.block, eligible.path) catch |err| {
                 state.state = .failed;
-                std.log.warn("code Highlighting command allocation failed", .{});
+                self.reportFailure(.highlighting, .prepare, err, @src());
                 continue;
             };
-            self.commands.append(self.allocator, .{ .highlight_code = command }) catch {
+            self.commands.append(self.allocator, .{ .highlight_code = command }) catch |err| {
                 command.destroy();
                 state.state = .failed;
-                std.log.warn("code Highlighting command admission failed", .{});
+                self.reportFailure(.highlighting, .admission, err, @src());
                 continue;
             };
             state.state = .running;
@@ -11298,13 +11586,10 @@ pub const Presentation = struct {
             const state = &body.blocks[completed.identity.block];
             if (state.state != .running or state.context_hash != completed.identity.context_hash) return;
             state.state = .failed;
-            if (completed.failure) |err| {
-                std.log.warn("code Highlighting failed: {s}", .{@errorName(err)});
-                return;
-            }
+            if (completed.failure != null) return;
             const result = completed.result orelse return;
-            if (published.code_highlighting.admit(self.allocator, body, completed.identity.block, result) catch {
-                std.log.warn("code Highlighting admission failed", .{});
+            if (published.code_highlighting.admit(self.allocator, body, completed.identity.block, result) catch |err| {
+                self.reportFailure(.highlighting, .admission, err, @src());
                 return;
             }) {
                 completed.result = null;
@@ -11543,7 +11828,8 @@ pub const Presentation = struct {
                 defer result.deinit();
                 if (!applies) return;
                 const current = published.?;
-                self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+                self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+                    self.reportFailure(.completion, .admission, err, @src());
                     current.session.enrichment.resetLoading(completed.file_index);
                     if (!issued.speculative) self.action_error = .out_of_memory;
                     return;
@@ -11576,7 +11862,8 @@ pub const Presentation = struct {
         if (composer.isBlank()) return;
         if (composer.request.mutation) |target| return self.saveComposerEdit(published, target);
         if (published.pending_draft_save != null or published.pending_draft_mutation != null) return;
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -11586,6 +11873,7 @@ pub const Presentation = struct {
         };
         job.kind = .draft_save;
         job.new_draft = published.prepareDraft(self.dependencies.reviews, job.arena.allocator(), composer.toNewDraft()) catch |err| {
+            if (err == error.OutOfMemory or err == error.PersistenceFailed) self.reportFailure(.composer, .prepare, err, @src());
             job.destroy();
             self.action_error = switch (err) {
                 error.AnchorRangeTooLong => .anchor_range_too_long,
@@ -11640,7 +11928,8 @@ pub const Presentation = struct {
             self.action_error = null;
             return;
         }
-        self.queueDraftMutation(published, .{ .temp_id = temp_id, .change = .{ .body = body } }, null) catch {
+        self.queueDraftMutation(published, .{ .temp_id = temp_id, .change = .{ .body = body } }, null) catch |err| {
+            self.reportFailure(.mutation, .prepare, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -11662,7 +11951,8 @@ pub const Presentation = struct {
             self.action_error = mutationRefusalError(refusal);
             return;
         }
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -11825,7 +12115,8 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         }
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -11851,7 +12142,8 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         };
-        const overlay = ListOverlay.openFileFinder(self.allocator, published.session.diff.files) catch {
+        const overlay = ListOverlay.openFileFinder(self.allocator, published.session.diff.files) catch |err| {
+            self.reportFailure(.completion, .prepare, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -11972,7 +12264,8 @@ pub const Presentation = struct {
             return;
         };
         command.* = .{ .allocator = self.allocator, .text = owned };
-        self.commands.append(self.allocator, .{ .copy_clipboard = command }) catch {
+        self.commands.append(self.allocator, .{ .copy_clipboard = command }) catch |err| {
+            self.reportFailure(.clipboard, .admission, err, @src());
             command.destroy();
             self.action_error = .out_of_memory;
             return;
@@ -12031,7 +12324,8 @@ pub const Presentation = struct {
         self.action_error = null;
         self.configured_theme = id;
         if (!self.dependencies.persist_theme) return;
-        self.commands.append(self.allocator, .{ .persist_theme = .{ .theme = id } }) catch {
+        self.commands.append(self.allocator, .{ .persist_theme = .{ .theme = id } }) catch |err| {
+            self.reportFailure(.configuration, .admission, err, @src());
             self.action_error = .out_of_memory;
         };
     }
@@ -12066,6 +12360,7 @@ pub const Presentation = struct {
             },
             .loaded => |summaries| {
                 (overlay orelse return summaries.destroy()).populatePullRequests(loaded.work_id, summaries) catch |err| {
+                    self.reportFailure(.picker_list, .admission, err, @src());
                     summaries.destroy();
                     if (err == error.OutOfMemory) {
                         self.closeListOverlay();
@@ -12202,6 +12497,7 @@ pub const Presentation = struct {
             },
             .loaded => |session| {
                 self.queueCandidateSession(session, replacement.intent, replacement.key) catch |err| {
+                    self.reportFailure(.session_load, .prepare, err, @src());
                     self.replacement = null;
                     self.replacement_error = switch (err) {
                         error.OutOfMemory => .out_of_memory,
@@ -28674,7 +28970,7 @@ test "a failed Draft jump shows the Submission Overlay again and reports the fai
         other.deinit();
     }
     var command = presentation.takeCommand().?;
-    try presentation.dispatch(try command.launchFailed());
+    try presentation.dispatch(try command.launchFailed(error.TestLaunchFailure));
     try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?);
     try testing.expect(presentation.projection().submission_tree != null);
     try testing.expect(presentation.published.?.pending_draft_destination == null);

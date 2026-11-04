@@ -1,5 +1,6 @@
 const std = @import("std");
 const regex_mod = @import("query_regex.zig");
+const diagnostics = @import("bbr").diagnostics;
 const Allocator = std.mem.Allocator;
 
 pub const c = @cImport({
@@ -13,6 +14,7 @@ pub const Diagnostic = struct {
     column: u32,
     regex_failure: ?regex_mod.CompileFailure = null,
     query_kind: QueryKind = .highlight,
+    query_error: ?c.TSQueryError = null,
 
     pub const QueryKind = enum { highlight, locals };
 
@@ -28,12 +30,20 @@ pub const Diagnostic = struct {
     pub fn report(self: Diagnostic) void {
         const query_kind = @tagName(self.query_kind);
         if (self.regex_failure) |failure| {
-            std.log.err("{s}-query:{d}:{d}: invalid #match? expression for {s}: {s}", .{ query_kind, self.line, self.column, regex_mod.engine, @tagName(failure.reason) });
-            std.log.err("engine-code: {d}; engine-fragment: {s}; dialect: {s}", .{ failure.engine_code, failure.fragment(), regex_mod.dialect });
+            std.debug.print("error: {s}-query:{d}:{d}: invalid #match? expression for {s}: {s}\n", .{ query_kind, self.line, self.column, regex_mod.engine, @tagName(failure.reason) });
+            std.debug.print("error: engine-code: {d}; engine-fragment: {s}; dialect: {s}\n", .{ failure.engine_code, failure.fragment(), regex_mod.dialect });
         } else if (self.kind == .invalid_query) {
-            std.log.err("{s}-query:{d}:{d}: invalid query", .{ query_kind, self.line, self.column });
+            std.debug.print("error: {s}-query:{d}:{d}: invalid query\n", .{ query_kind, self.line, self.column });
         } else {
-            std.log.err("{s}-query:{d}:{d}: invalid predicate: {s}", .{ query_kind, self.line, self.column, @tagName(self.kind) });
+            std.debug.print("error: {s}-query:{d}:{d}: invalid predicate: {s}\n", .{ query_kind, self.line, self.column, @tagName(self.kind) });
+        }
+    }
+
+    pub fn record(self: Diagnostic, handle: diagnostics.Handle, comptime source: std.builtin.SourceLocation) void {
+        if (self.query_error) |code| {
+            _ = handle.failure(.query, .{ .grammar = .{ .code = code, .offset = self.source_offset } }, source);
+        } else if (self.regex_failure) |failure| {
+            _ = handle.failure(.query, .{ .grammar = .{ .code = @bitCast(failure.engine_code), .offset = self.source_offset } }, source);
         }
     }
 };
@@ -57,6 +67,7 @@ pub const Locals = struct {
         const query = c.ts_query_new(grammar_language, query_source.ptr, @intCast(query_source.len), &query_error_offset, &query_error_type) orelse {
             setDiagnostic(query_source, diagnostic, .invalid_query, null, query_error_offset);
             diagnostic.query_kind = .locals;
+            diagnostic.query_error = query_error_type;
             return error.InvalidLocalsQuery;
         };
         defer c.ts_query_delete(query);

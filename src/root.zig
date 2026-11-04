@@ -185,9 +185,15 @@ pub const bitbucket = struct {
 };
 
 pub const startup = @import("startup.zig");
+pub const diagnostic = @import("diagnostic.zig");
+pub const diagnostics = @import("diagnostics.zig");
+pub const config_source = @import("config_source.zig");
+pub const logging_config = @import("logging_config.zig");
 pub const xdg = @import("xdg.zig");
 
 test {
+    _ = @import("diagnostics.zig");
+    _ = @import("logging_config.zig");
     _ = @import("http/client.zig");
     _ = @import("http/fake_client.zig");
     _ = @import("http/std_client.zig");

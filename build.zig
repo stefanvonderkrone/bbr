@@ -211,6 +211,16 @@ pub fn build(b: *std.Build) void {
     stdio_writers.addFileArg(b.path("tools/check_stdio_writers.py"));
     stdio_writers.addDirectoryArg(b.path("."));
     const test_step = b.step("test", "Run tests");
+    const diagnostic_check = b.addSystemCommand(&.{"python3"});
+    diagnostic_check.addFileArg(b.path("tools/check_diagnostics.py"));
+    diagnostic_check.addDirectoryArg(b.path("."));
+    test_step.dependOn(&diagnostic_check.step);
+    const diagnostic_tests = b.addTest(.{ .root_module = exe.root_module, .filters = &.{"diagnostics"} });
+    const diagnostic_core_tests = b.addTest(.{ .root_module = mod, .filters = &.{"diagnostics"} });
+    const diagnostic_step = b.step("test-diagnostics", "Run diagnostic logging checks");
+    diagnostic_step.dependOn(&diagnostic_check.step);
+    diagnostic_step.dependOn(&b.addRunArtifact(diagnostic_tests).step);
+    diagnostic_step.dependOn(&b.addRunArtifact(diagnostic_core_tests).step);
     const cli_test_step = b.step("test-cli", "Run hermetic Python CLI checks (requires python3)");
     addTestScripts(b, exe, test_step, cli_test_step);
 

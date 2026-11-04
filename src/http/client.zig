@@ -14,6 +14,7 @@ pub const Header = struct {
 };
 
 pub const Request = struct {
+    diagnostic: @import("../diagnostics.zig").Handle = .{},
     method: Method,
     /// Absolute URL.
     url: []const u8,

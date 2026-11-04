@@ -32,6 +32,7 @@ const frame_arena_retained_limit = 4 * 1024 * 1024;
 /// offline `demo`, which disables the network-backed Picker. `store` persists
 /// the reviewer's pending Drafts (SQLite in production, `:memory:` for demo).
 pub const RunCtx = struct {
+    diagnostic: bbr.diagnostics.Handle = .{},
     io: std.Io,
     gpa: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
@@ -119,6 +120,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         .configured_theme = ctx.theme,
         .persist_theme = ctx.persist_theme,
     }, .{
+        .diagnostic_state = if (ctx.diagnostic.sink) |sink| sink.state() else .off,
         .initial = if (initial) |loaded| .{
             .key = initial_key,
             .session = loaded,
@@ -186,6 +188,11 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
         }
         try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
+        if (ctx.diagnostic.sink) |sink| {
+            const actual = sink.state();
+            if (!std.meta.eql(actual, state.projection().diagnostic_state))
+                try state.dispatch(.{ .diagnostics_changed = .{ .state = actual } });
+        }
         if (try syncContentGeometry(&state, &frame_arena, vx.window(), &sent_geometry)) {
             // A taller DiffPane can expose Files outside the old Enrichment Range.
             if (state.projection().review != null) try state.dispatch(.ensure_focused_enrichment);
@@ -339,6 +346,12 @@ fn presentationStatus(
     };
     if (projection.buffer_search) |search_projection| return bufferSearchStatus(frame, projection, search_projection);
     if (projection.action_error) |err| return actionErrorText(err);
+    if (projection.diagnostic_pending) return "changing diagnostic logging";
+    switch (projection.diagnostic_state) {
+        .on => return "diagnostic logging enabled",
+        .unavailable => return "diagnostic logging unavailable",
+        .off => {},
+    }
     if (projection.clipboard_status) |status| return switch (status) {
         .copied => "copied text",
         .failed => "could not copy text",
@@ -718,10 +731,11 @@ fn createSmokeExternalEdit(allocator: std.mem.Allocator) !*presentation.External
 const PresentationSinkContext = struct {
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle = .{},
 };
 
 fn presentationSink(context: *PresentationSinkContext) presentation_runtime.CompletionSink {
-    return .{ .ptr = context, .post_fn = postPresentationInput };
+    return .{ .ptr = context, .post_fn = postPresentationInput, .diagnostic = context.diagnostic };
 }
 
 fn postPresentationInput(ptr: *anyopaque, input: presentation.OwnedInput) anyerror!void {
@@ -735,10 +749,11 @@ fn postPresentationInput(ptr: *anyopaque, input: presentation.OwnedInput) anyerr
 fn presentationPostWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: *presentation.PostDraft,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     var poster = bbr.bitbucket.Poster{
@@ -753,10 +768,11 @@ fn presentationPostWorker(
 fn presentationCommentEditWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: *presentation.UpdateComment,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, client);
@@ -765,10 +781,11 @@ fn presentationCommentEditWorker(
 fn presentationCommentDeleteWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: *presentation.DeleteComment,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, client);
@@ -777,10 +794,11 @@ fn presentationCommentDeleteWorker(
 fn presentationReviewerVerdictWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: presentation.ChangeReviewerVerdict,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.executeReviewerVerdict(scratch.allocator(), command, client));
@@ -789,11 +807,12 @@ fn presentationReviewerVerdictWorker(
 fn presentationLoadWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     io: std.Io,
     client: ?bbr.bitbucket.Client,
     command: presentation.LoadSession,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     const outcome: presentation.SessionLoadOutcome = switch (command.key.kind) {
         .remote => if (session.loadWith(
             io,
@@ -804,6 +823,7 @@ fn presentationLoadWorker(
         )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err },
         .local => blk: {
             var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
+            git.diagnostic = diagnostic;
             break :blk if (session.loadLocalWith(
                 std.heap.page_allocator,
                 git.gitClient(),
@@ -813,6 +833,7 @@ fn presentationLoadWorker(
         },
     };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_loaded = .{
+        .evidence = if (outcome == .failed) bbr.diagnostic.Failure.capture(.session_load, .execute, diagnostic.context, .{ .zig = outcome.failed }, @src()) else null,
         .command_id = command.command_id,
         .intent = command.intent,
         .outcome = outcome,
@@ -822,14 +843,17 @@ fn presentationLoadWorker(
 fn presentationEnrichmentWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     io: std.Io,
     client: ?bbr.bitbucket.Client,
     highlighter: bbr.highlight.Highlighter,
     command: presentation.EnrichFile,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
+    var request = command.request();
+    request.diagnostic = diagnostic;
     const outcome: presentation.FileEnrichmentOutcome = switch (command.source) {
         .remote => blk: {
             break :blk if (file_enrichment.enrichConcurrent(
@@ -837,17 +861,18 @@ fn presentationEnrichmentWorker(
                 std.heap.page_allocator,
                 client.?,
                 highlighter,
-                command.request(),
+                request,
             )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
         },
         .local => blk: {
             var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
+            git.diagnostic = diagnostic;
             var source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
             break :blk if (file_enrichment.enrichFrom(
                 std.heap.page_allocator,
                 source.source(),
                 highlighter,
-                command.request(),
+                request,
             )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
         },
     };
@@ -863,40 +888,43 @@ fn presentationEnrichmentWorker(
 fn presentationBufferSearchWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     command_value: presentation.ScanBufferSearch,
 ) void {
     var command = command_value;
     defer command.deinit();
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     presentation_runtime.deliver(
         presentationSink(&sink_context),
         .{ .buffer_search_scanned = presentation.executeBufferSearchScan(std.heap.page_allocator, &command) },
     );
 }
 
-fn presentationDisclosureWorker(loop: *Loop, work_id: u64, job: *presentation.DisclosureBuild) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+fn presentationDisclosureWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, job: *presentation.DisclosureBuild) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     job.build();
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .buffer_disclosure_built = job });
 }
 
-fn presentationPrepareSessionWorker(loop: *Loop, work_id: u64, job: *presentation.PrepareSession) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+fn presentationPrepareSessionWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, job: *presentation.PrepareSession) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     job.build();
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_prepared = job });
 }
 
-fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, command_value: presentation.ScanReviewSource) void {
+fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, command_value: presentation.ScanReviewSource) void {
     var command = command_value;
     defer command.deinit();
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .review_source_scanned = presentation.executeReviewSourceScan(std.heap.page_allocator, &command) });
 }
 
-fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentation.WaitSubmission) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
-    io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_launch_failed = wait });
+fn presentationWaitWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, io: std.Io, wait: presentation.WaitSubmission) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
+    io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch |err| {
+        var completed = wait;
+        completed.evidence = bbr.diagnostic.Failure.capture(.submission, .execute, diagnostic.context, .{ .zig = err }, @src());
+        presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_launch_failed = completed });
         return;
     };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_completed = wait });
@@ -905,31 +933,31 @@ fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentat
 fn presentationRecoveryCheckWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     check: presentation.CheckRecovery,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    const input = if (client.getPullRequest(scratch.allocator(), check.identity.repository(), check.identity.pullRequestId())) |pr|
-        presentation.recoveryCheckSucceeded(check.command_id, check.operation_id, check.identity, pr.source_commit)
-    else |_|
-        presentation.OwnedInput{ .recovery_checked = .{ .command_id = check.command_id, .operation_id = check.operation_id, .identity = check.identity, .outcome = .failed } };
+    const input = presentation_adapter.checkRecovery(scratch.allocator(), client, check);
     presentation_runtime.deliver(presentationSink(&sink_context), input);
 }
 
 fn presentationDuplicateCheckWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: *presentation.PostDraft,
 ) void {
     defer command.destroy();
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch {
+    const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch |err| {
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
+            .evidence = bbr.diagnostic.Failure.capture(.duplicate_check, .execute, diagnostic.context, .{ .zig = err }, @src()),
             .command_id = command.command_id,
             .operation_id = command.operation_id,
             .identity = command.identity,
@@ -946,11 +974,17 @@ fn presentationDuplicateCheckWorker(
         .author_uuid = author_uuid,
         .require_author_match = true,
     };
-    const checked = poster.poster().findExisting(command.draft, command.parent) catch bbr.review.CheckResult{ .outcome = .ambiguous };
+    const checked = poster.poster().findExisting(command.draft, command.parent) catch |err| blk: {
+        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
+        break :blk bbr.review.CheckResult{ .outcome = .ambiguous };
+    };
     const outcome: presentation.DuplicateCheckOutcome = switch (checked.outcome) {
         .found => |id| .{ .found = id },
         .missing => .missing,
-        .rejected => |err| .{ .rejected = err },
+        .rejected => |err| rejected: {
+            _ = diagnostic.failure(.rejection, .{ .zig = err }, @src());
+            break :rejected .{ .rejected = err };
+        },
         .ambiguous => .failed,
     };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
@@ -966,44 +1000,16 @@ fn presentationDuplicateCheckWorker(
 fn presentationListPullRequestsWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: presentation.ListPullRequests,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
-    const summaries = presentation.PullRequestSummaries.create(std.heap.page_allocator) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
-            .command_id = command.command_id,
-            .work_id = command.work_id,
-            .outcome = .failed,
-        } });
-        return;
-    };
-    loadPullRequestSummaries(client, command.repositoryName(), summaries) catch {
-        summaries.destroy();
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
-            .command_id = command.command_id,
-            .work_id = command.work_id,
-            .outcome = .failed,
-        } });
-        return;
-    };
-    presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
-        .command_id = command.command_id,
-        .work_id = command.work_id,
-        .outcome = .{ .loaded = summaries },
-    } });
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.listPullRequests(std.heap.page_allocator, client, command));
 }
 
-fn loadPullRequestSummaries(
-    client: bbr.bitbucket.Client,
-    repository: []const u8,
-    summaries: *presentation.PullRequestSummaries,
-) !void {
-    summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
-}
-
-fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .code_highlight_completed = command.execute(highlighter) });
 }
 
@@ -1020,25 +1026,41 @@ fn drainPresentationCommands(
 ) !void {
     while (state.takeCommand()) |command_value| {
         var command = command_value;
+        if (command == .report_diagnostic) {
+            ctx.diagnostic.record(command.report_diagnostic);
+            continue;
+        }
+        if (command == .set_diagnostics) {
+            const actual = if (ctx.diagnostic.sink) |sink| sink.setEnabled(command.set_diagnostics.enabled) else .off;
+            try state.dispatch(.{ .diagnostics_changed = .{ .command_id = command.set_diagnostics.command_id, .state = actual } });
+            continue;
+        }
         if (command == .copy_clipboard) {
+            const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, null);
             const input = presentation_adapter.copyToClipboard(vx.*, tty.writer(), command.copy_clipboard);
             command = undefined;
+            presentation_runtime.recordFailures(diagnostic, input);
             try state.dispatch(input);
             continue;
         }
         // config.toml is at most 64 KiB, so the write runs on the terminal
         // thread and completes before the next event.
         if (command == .persist_theme) {
+            const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, null);
             const persist = command.persist_theme;
-            const outcome: presentation.ThemePersisted.Outcome = if (config.persistTheme(ctx.gpa, ctx.io, ctx.env_map, persist.theme)) |_| .saved else |err| switch (err) {
-                error.NoConfigLocation => .no_config_location,
-                error.ConfigInvalid => .config_invalid,
-                error.WriteFailed, error.OutOfMemory => .write_failed,
+            const outcome: presentation.ThemePersisted.Outcome = if (config.persistTheme(ctx.gpa, ctx.io, ctx.env_map, persist.theme)) |_| .saved else |err| blk: {
+                _ = diagnostic.failure(.write, .{ .zig = err }, @src());
+                break :blk switch (err) {
+                    error.NoConfigLocation => .no_config_location,
+                    error.ConfigInvalid => .config_invalid,
+                    error.WriteFailed, error.OutOfMemory => .write_failed,
+                };
             };
             try state.dispatch(.{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = outcome } });
             continue;
         }
         if (command == .external_edit) {
+            const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, null);
             var handoff_context: TerminalHandoffContext = .{
                 .ctx = ctx,
                 .loop = loop,
@@ -1047,11 +1069,13 @@ fn drainPresentationCommands(
                 .vx = vx,
                 .write_buf = write_buf,
             };
-            const completed = presentation_adapter.externalEdit(ctx.io, ctx.env_map, handoff_context.handoff(), command.external_edit) catch {
+            const completed = presentation_adapter.externalEdit(ctx.io, ctx.env_map, handoff_context.handoff(), command.external_edit) catch |err| {
+                _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
                 command = undefined;
                 return error.OutOfMemory;
             };
             command = undefined;
+            presentation_runtime.recordFailures(diagnostic, .{ .external_edit_completed = completed });
             const restoration_failed = completed.outcome == .restoration_failed;
             const retained_path = if (restoration_failed) completed.outcome.restoration_failed else null;
             if (retained_path) |path| {
@@ -1061,32 +1085,39 @@ fn drainPresentationCommands(
             try state.dispatch(.{ .external_edit_completed = completed });
             continue;
         }
-        futures.ensureUnusedCapacity(ctx.gpa, 1) catch {
-            try state.dispatch(try command.launchFailed());
+        futures.ensureUnusedCapacity(ctx.gpa, 1) catch |err| {
+            const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, null);
+            const input = try command.launchFailed(err);
+            presentation_runtime.recordFailures(diagnostic, input);
+            try state.dispatch(input);
             continue;
         };
         const work_id = next_work_id.*;
         next_work_id.* +%= 1;
+        const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, work_id);
+        const client = if (ctx.bitbucket) |value| value.withDiagnostics(diagnostic) else null;
         const future = switch (command) {
-            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, workerBitbucketForReviewKind(ctx.bitbucket, load.key.kind), load }),
-            .prepare_session => |job| ctx.io.concurrent(presentationPrepareSessionWorker, .{ loop, work_id, job }),
-            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, workerBitbucketForEnrichment(ctx.bitbucket, enrich.source), ctx.highlighter, enrich }),
-            .highlight_code => |job| ctx.io.concurrent(presentationCodeHighlightWorker, .{ loop, work_id, ctx.highlighter, job }),
-            .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.bitbucket.?, post }),
-            .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.bitbucket.?, update }),
-            .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.bitbucket.?, delete }),
-            .change_reviewer_verdict => |verdict| ctx.io.concurrent(presentationReviewerVerdictWorker, .{ loop, work_id, ctx.bitbucket.?, verdict }),
-            .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, ctx.io, wait }),
-            .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
-            .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
-            .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
-            .copy_clipboard, .persist_theme => unreachable,
+            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, diagnostic, ctx.io, workerBitbucketForReviewKind(client, load.key.kind), load }),
+            .prepare_session => |job| ctx.io.concurrent(presentationPrepareSessionWorker, .{ loop, work_id, diagnostic, job }),
+            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, diagnostic, ctx.io, workerBitbucketForEnrichment(client, enrich.source), ctx.highlighter, enrich }),
+            .highlight_code => |job| ctx.io.concurrent(presentationCodeHighlightWorker, .{ loop, work_id, diagnostic, ctx.highlighter, job }),
+            .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, diagnostic, client.?, post }),
+            .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, diagnostic, client.?, update }),
+            .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, diagnostic, client.?, delete }),
+            .change_reviewer_verdict => |verdict| ctx.io.concurrent(presentationReviewerVerdictWorker, .{ loop, work_id, diagnostic, client.?, verdict }),
+            .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, diagnostic, ctx.io, wait }),
+            .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, diagnostic, client.?, check }),
+            .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, diagnostic, client.?, check }),
+            .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, diagnostic, client.?, list }),
+            .copy_clipboard, .persist_theme, .set_diagnostics, .report_diagnostic => unreachable,
             .external_edit => unreachable,
-            .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),
-            .build_buffer_disclosure => |job| ctx.io.concurrent(presentationDisclosureWorker, .{ loop, work_id, job }),
-            .scan_review_source => |scan| ctx.io.concurrent(presentationReviewSourceWorker, .{ loop, work_id, scan }),
-        } catch {
-            try state.dispatch(try command.launchFailed());
+            .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, diagnostic, scan }),
+            .build_buffer_disclosure => |job| ctx.io.concurrent(presentationDisclosureWorker, .{ loop, work_id, diagnostic, job }),
+            .scan_review_source => |scan| ctx.io.concurrent(presentationReviewSourceWorker, .{ loop, work_id, diagnostic, scan }),
+        } catch |err| {
+            const input = try command.launchFailed(err);
+            presentation_runtime.recordFailures(diagnostic, input);
+            try state.dispatch(input);
             continue;
         };
         futures.appendAssumeCapacity(.{ .id = work_id, .future = future });

@@ -10,8 +10,10 @@ const client = @import("client.zig");
 const HttpClient = client.HttpClient;
 const Request = client.Request;
 const Response = client.Response;
+const diagnostics = @import("../diagnostics.zig");
 
 pub const StdHttpClient = struct {
+    diagnostic: diagnostics.Handle = .{},
     inner: http.Client,
     max_connection_count: std.atomic.Value(usize) = .init(0),
     track_connection_count: bool = false,
@@ -33,6 +35,7 @@ pub const StdHttpClient = struct {
         arena: Allocator,
         environ_map: *const std.process.Environ.Map,
     ) !void {
+        errdefer |err| _ = self.diagnostic.failure(.proxy, .{ .zig = err }, @src());
         try validateProxyEnvironment(environ_map);
         try self.inner.initDefaultProxies(arena, environ_map);
     }
@@ -50,27 +53,22 @@ pub const StdHttpClient = struct {
         self.track_connection_count = true;
     }
 
-    const vtable: HttpClient.VTable = .{ .send = sendLogged };
-
-    fn sendLogged(ptr: *anyopaque, allocator: Allocator, req: Request) anyerror!Response {
-        return send(ptr, allocator, req) catch |err| {
-            if (isSubmissionRequest(req)) {
-                const self: *StdHttpClient = @ptrCast(@alignCast(ptr));
-                writeSubmitError(self.inner.io, .cwd(), req.method, req.url, err) catch {};
-            }
-            return err;
-        };
-    }
+    const vtable: HttpClient.VTable = .{ .send = send };
 
     fn send(ptr: *anyopaque, allocator: Allocator, req: Request) anyerror!Response {
         const self: *StdHttpClient = @ptrCast(@alignCast(ptr));
+        const diagnostic = if (req.diagnostic.sink != null) req.diagnostic else self.diagnostic;
+        var phase: diagnostics.Phase = .prepare;
+        errdefer |err| _ = diagnostic.failure(phase, .{ .zig = err }, @src());
 
         // Translate our headers into std's borrowed-header slice.
         const extra = try allocator.alloc(http.Header, req.headers.len);
         defer allocator.free(extra);
         for (req.headers, extra) |h, *out| out.* = .{ .name = h.name, .value = h.value };
 
+        phase = .uri;
         const uri = try std.Uri.parse(req.url);
+        phase = .connect;
         var request = try self.inner.request(toStdMethod(req.method), uri, .{
             .extra_headers = extra,
             .headers = .{ .accept_encoding = .omit },
@@ -80,6 +78,7 @@ pub const StdHttpClient = struct {
         defer request.deinit();
         request.accept_encoding = @splat(false);
         request.accept_encoding[@intFromEnum(http.ContentEncoding.identity)] = true;
+        phase = .send_body;
         if (req.body) |payload| {
             request.transfer_encoding = .{ .content_length = payload.len };
             var request_body = try request.sendBodyUnflushed(&.{});
@@ -99,6 +98,7 @@ pub const StdHttpClient = struct {
         }
 
         var redirect_buffer: [8 * 1024]u8 = undefined;
+        phase = .receive_head;
         var response = try request.receiveHead(&redirect_buffer);
         const status: u16 = @intFromEnum(response.head.status);
         const retry_after_ms = if (status == 429 or status >= 500 and status <= 599)
@@ -116,17 +116,16 @@ pub const StdHttpClient = struct {
         const has_body = !(status == 204 or status == 304 or (status >= 100 and status < 200));
         if (!has_body) request.connection.?.closing = true;
         if (has_body) {
+            phase = .receive_body;
             var transfer_buffer: [64]u8 = undefined;
             const reader = response.reader(&transfer_buffer);
             _ = reader.streamRemaining(&body.writer) catch |err| switch (err) {
-                error.ReadFailed => return response.bodyErr().?,
-                else => |e| return e,
+                error.ReadFailed => return @as(anyerror!Response, response.bodyErr().?),
+                else => |e| return @as(anyerror!Response, e),
             };
         }
 
         const response_body = try body.toOwnedSlice();
-        if (isSubmissionRequest(req))
-            writeSubmitResponse(self.inner.io, .cwd(), req.method, req.url, status) catch {};
 
         return .{
             .status = status,
@@ -182,68 +181,6 @@ fn validateProxyEnvironment(environ_map: *const std.process.Environ.Map) !void {
             if (proxy_configured and value.len != 0) return error.InvalidProxyConfiguration;
         }
     }
-}
-
-fn isSubmissionRequest(req: Request) bool {
-    return std.mem.indexOf(u8, req.url, "/comments") != null and (req.method == .POST or req.method == .GET);
-}
-
-fn methodName(method: client.Method) []const u8 {
-    return switch (method) {
-        .GET => "GET",
-        .POST => "POST",
-        .PUT => "PUT",
-        .DELETE => "DELETE",
-    };
-}
-
-fn writeSubmitResponse(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, status: u16) !void {
-    var file = try dir.createFile(io, "bbr-submit-response.log", .{ .truncate = false, .lock = .exclusive, .permissions = @enumFromInt(0o600) });
-    defer file.close(io);
-    var offset = try file.length(io);
-    try appendLog(file, io, &offset, methodName(method));
-    try appendLog(file, io, &offset, " ");
-    try appendRequestLocation(file, io, &offset, url);
-    var status_buffer: [32]u8 = undefined;
-    const status_line = try std.fmt.bufPrint(&status_buffer, "\nstatus: {d}\n", .{status});
-    try appendLog(file, io, &offset, status_line);
-}
-
-fn writeSubmitError(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, err: anyerror) !void {
-    var file = try dir.createFile(io, "bbr-submit-response.log", .{ .truncate = false, .lock = .exclusive, .permissions = @enumFromInt(0o600) });
-    defer file.close(io);
-    var offset = try file.length(io);
-    try appendLog(file, io, &offset, methodName(method));
-    try appendLog(file, io, &offset, " ");
-    try appendRequestLocation(file, io, &offset, url);
-    try appendLog(file, io, &offset, "\ntransport error: ");
-    try appendLog(file, io, &offset, @errorName(err));
-    try appendLog(file, io, &offset, "\n");
-}
-
-fn appendRequestLocation(file: Io.File, io: Io, offset: *u64, url: []const u8) !void {
-    const uri = std.Uri.parse(url) catch {
-        return appendLog(file, io, offset, "<invalid request location>");
-    };
-    try appendLog(file, io, offset, uri.scheme);
-    try appendLog(file, io, offset, "://");
-    try appendLog(file, io, offset, componentText(uri.host orelse return error.InvalidRequestLocation));
-    if (uri.port) |port| {
-        var port_buffer: [8]u8 = undefined;
-        try appendLog(file, io, offset, try std.fmt.bufPrint(&port_buffer, ":{d}", .{port}));
-    }
-    try appendLog(file, io, offset, componentText(uri.path));
-}
-
-fn componentText(component: std.Uri.Component) []const u8 {
-    return switch (component) {
-        .raw, .percent_encoded => |text| text,
-    };
-}
-
-fn appendLog(file: Io.File, io: Io, offset: *u64, bytes: []const u8) !void {
-    try file.writePositionalAll(io, bytes, offset.*);
-    offset.* += bytes.len;
 }
 
 fn retryAfterFromHead(head: http.Client.Response.Head, now_seconds: i64) ?u64 {
@@ -434,21 +371,6 @@ test "proxy with unsupported bypass list stops without a direct fallback" {
     );
     try testing.expect(transport.inner.http_proxy == null);
     try testing.expect(transport.inner.https_proxy == null);
-}
-
-test "submission diagnostics omit credentials query values and response bodies" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeSubmitResponse(std.testing.io, tmp.dir, .POST, "https://account:credential@api.bitbucket.org/2.0/comments?token=credential", 201);
-    try writeSubmitError(std.testing.io, tmp.dir, .GET, "https://api.bitbucket.org/2.0/comments?access_token=credential", error.ConnectionResetByPeer);
-    const logged = try tmp.dir.readFileAlloc(std.testing.io, "bbr-submit-response.log", std.testing.allocator, .limited(4096));
-    defer std.testing.allocator.free(logged);
-    try std.testing.expectEqualStrings(
-        "POST https://api.bitbucket.org/2.0/comments\nstatus: 201\nGET https://api.bitbucket.org/2.0/comments\ntransport error: ConnectionResetByPeer\n",
-        logged,
-    );
-    try std.testing.expect(std.mem.indexOf(u8, logged, "credential") == null);
 }
 
 test "one StdHttpClient overlaps two local requests and cleans up" {

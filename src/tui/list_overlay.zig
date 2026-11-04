@@ -368,6 +368,7 @@ pub const CommandPalette = struct {
         .{ .action = .link_existing_comment, .title = "Link Existing Comment", .description = "Link an unknown-outcome Draft to a posted Comment" },
         .{ .action = .focus_next_pane, .title = "Switch Pane", .description = "Move focus between the Sidebar and the DiffPane" },
         .{ .action = .open_theme_overlay, .title = "Theme", .description = "Preview and choose the color Theme" },
+        .{ .action = .toggle_diagnostic_logging, .title = "Toggle diagnostic logging", .description = "Enable or disable private error records for this process" },
         .{ .action = .help, .title = "Keybindings", .description = "Show the keybinding help" },
         .{ .action = .quit, .title = "Quit", .description = "Quit bbr" },
     };
