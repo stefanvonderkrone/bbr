@@ -282,6 +282,7 @@ for persisted local Drafts. Cancel M18 if that ADR removes LocalReview.
 ## M25 - Browser navigation, finding, recents, and settings  ·  M/L  ·  needs M24
 Make the Browser and review Session feel like levels of one application, not separate launch modes.
 
+- [ ] Rework the Browser into a Repository view and a PullRequest view, with `/` filters and a PullRequest filter Overlay. See `.scratch/m25-browser-navigation-finding-recents-settings/issues/01-rework-the-browser-into-repository-and-pullrequest-views.md`.
 - [ ] Define hierarchical back and quit Actions. From a review Session, back returns to its Repository's PullRequest list. From that list, back returns to the Repository list. A separate global quit Action exits bbr from any Interaction Context.
 - [ ] Add direct Actions for the Repository list, the current Repository's PullRequest list, and the current review Session. Preserve each level's selection and scroll state when switching levels.
 - [ ] Replace the current PullRequest Picker with a Browser-aware Picker available from the Repository list, a PullRequest list, and a review Session. Repository-scoped finding remains the required baseline.
