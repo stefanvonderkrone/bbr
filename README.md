@@ -178,6 +178,13 @@ PullRequest creation requires a title and a source branch. It defaults to ready 
 
 Create and update support descriptions, reviewers, draft state, and source-branch closure. `--description-file PATH` reads up to 1 MiB. Repeated `--reviewer UUID` options replace the reviewer list. `--clear-reviewers` sends an empty list. Omitted fields stay unchanged on update, including reviewers. An empty description clears the description.
 
+The Bitbucket web UI adds the Default Reviewers of the Repository to a new PullRequest, but the API adds none. `--default-reviewers` on create or update sends the Default Reviewers and the `--reviewer` values, without the PullRequest Author. `--effective` uses the Effective Default Reviewers, which also include the Default Reviewers of the Project. On update, `--default-reviewers` replaces the reviewer list. `list-default-reviewers` shows the Default Reviewers:
+
+```sh
+bbr api list-default-reviewers --repository sample --effective
+bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --default-reviewers --effective
+```
+
 Approve or decline a PullRequest, or find PullRequests for a commit:
 
 ```sh
