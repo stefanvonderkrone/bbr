@@ -93,6 +93,7 @@ The agreed outcomes are:
 - If candidate PendingReview loading, Anchor Resolution infrastructure, or Buffer construction fails, destroy the candidate and preserve the exact old aggregate, including its cursor, Selection, folds, isolation, input grammar, and Session Epoch. A per-Anchor `unavailable` result is not infrastructure failure.
 - If initial load fails and there is no old aggregate, publish no Session. Quit, help, and Picker Actions remain available.
 - While replacement loads, retain the old aggregate as rollback state but suspend Session-specific Actions. Session-independent Actions remain available, and Durable Operations continue.
+- A Session load that does not finish within 60 seconds is canceled and fails with a timeout, so a stalled connection cannot suspend Session-specific Actions forever. The failure keeps the old aggregate, as every other load failure does. Enter in the Submission Overlay reports the pending replacement instead of doing nothing.
 - Latest replacement intent wins. If A is current and B then C are requested, discard B even if it completes first. If C fails, restore interaction with A rather than falling back to B.
 - Selecting A again through the Picker cancels replacement intent and reuses A. Explicit refresh and post-Submission Reconciliation may still replace a Session with another Session for the same PullRequest.
 - A File Enrichment result for A may be accepted while C is loading because A remains published until C commits.

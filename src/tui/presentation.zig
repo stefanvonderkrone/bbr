@@ -3698,6 +3698,7 @@ pub const ActionError = enum {
     anchor_candidate_ambiguous,
     anchor_range_too_long,
     suggestion_anchor_not_new_side,
+    replacement_pending,
 };
 
 const BufferSearchInput = struct {
@@ -3904,6 +3905,7 @@ const SaveDraftError = BufferTransactionError || error{ PersistenceFailed, Ancho
 
 pub const ReplacementError = enum {
     session_load_failed,
+    session_load_timed_out,
     pending_review_load_failed,
     buffer_build_failed,
     out_of_memory,
@@ -7373,7 +7375,10 @@ pub const Presentation = struct {
         }
         if (key.matches(keymap_mod.special.enter, .{})) {
             const item = tree.selectedItem() orelse return;
-            if (self.replacement != null) return;
+            if (self.replacement != null) {
+                self.action_error = .replacement_pending;
+                return;
+            }
             const published = self.published orelse return;
             if (!OwnedReviewIdentity.eql(published.key, tree.key)) return;
             self.jumpToSubmissionCard(published, tree, item.*);
@@ -12341,7 +12346,11 @@ pub const Presentation = struct {
                 };
                 if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
                 self.replacement = null;
-                self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .session_load_failed;
+                self.replacement_error = switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    error.Timeout => .session_load_timed_out,
+                    else => .session_load_failed,
+                };
             },
             .loaded => |session| {
                 self.queueCandidateSession(session, replacement.intent, replacement.key) catch |err| {
@@ -30774,6 +30783,49 @@ test "clean completion moves visible Replies to the posted CommentId like the st
     try testing.expectEqualDeep(expected, stored.getConst(2).?.parent.?);
     try testing.expectEqualDeep(expected, published.review.getConst(2).?.parent.?);
     try testing.expectEqualDeep(expected, published.disclosure_inputs.drafts[1].parent.?);
+}
+
+test "Submission Overlay Enter reports a pending Reconciliation and a load timeout ends it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+    const reconciliation = presentation.takeCommand().?.load_session;
+    try testing.expect(presentation.projection().submission_tree != null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expectEqual(ActionError.replacement_pending, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().replacing);
+
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = reconciliation.command_id,
+        .intent = reconciliation.intent,
+        .outcome = .{ .failed = error.Timeout },
+    } });
+    try testing.expect(!presentation.projection().replacing);
+    try testing.expectEqual(ReplacementError.session_load_timed_out, presentation.projection().replacement_error.?);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    try testing.expect(presentation.projection().action_error == null);
 }
 
 test "retryable POST rejection waits and reissues without checkpointing an outcome" {
