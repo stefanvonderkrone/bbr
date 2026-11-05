@@ -900,6 +900,7 @@ pub const InMemoryStore = struct {
                     for (self.entries.items) |entry| if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == item.temp_id and entry.draft.state != .posted)
                         return error.SubmissionNotClean;
                 }
+                try self.retainTempIdFloor(key);
                 var i: usize = 0;
                 while (i < self.entries.items.len) {
                     const entry = self.entries.items[i];
@@ -1614,6 +1615,20 @@ test "clean Submission completion removes posted Drafts and closes the run" {
     const drafts = try store.load(arena.allocator(), key);
     try testing.expectEqual(@as(usize, 1), drafts.len);
     try testing.expectEqual(@as(TempId, 2), drafts[0].local_id);
+}
+
+test "clean Submission completion never hands a posted Draft's TempId to the next Draft" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+
+    try store.completeSubmission(operation_id, key, .clean);
+
+    try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
 }
 
 test "clean Submission completion remaps surviving Replies before removing their posted parents" {

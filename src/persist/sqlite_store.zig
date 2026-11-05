@@ -706,25 +706,7 @@ pub const SqliteStore = struct {
             if (columnInt(member, 0) == 0) return error.DraftCascadeConflict;
         }
 
-        // A TempId is never reused. `reserveTempId` falls back to MAX(local_id)+1
-        // whenever no counter row exists — which is every resumed review — so
-        // deleting the highest Draft would hand its id straight back. Pin the
-        // counter at or above every id in use before any row disappears.
-        var floor: ?*c.sqlite3_stmt = null;
-        const floor_sql =
-            \\INSERT INTO draft_temp_ids(workspace,repository,pr_id,next_id)
-            \\ VALUES (?1,?2,?3,
-            \\   (SELECT COALESCE(MAX(local_id),0)+1 FROM drafts
-            \\     WHERE workspace=?1 AND repository=?2 AND pr_id=?3))
-            \\ ON CONFLICT(workspace,repository,pr_id)
-            \\ DO UPDATE SET next_id=MAX(next_id, excluded.next_id);
-        ;
-        if (c.sqlite3_prepare_v2(self.db, floor_sql, -1, &floor, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(floor);
-        bindText(floor, 1, key.workspace);
-        bindText(floor, 2, key.repository);
-        bindInt(floor, 3, @intCast(key.pull_request_id));
-        if (c.sqlite3_step(floor) != c.SQLITE_DONE) return error.Step;
+        try self.retainTempIdFloor(key);
 
         var delete: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, "DELETE FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &delete, null) != c.SQLITE_OK)
@@ -740,6 +722,29 @@ pub const SqliteStore = struct {
             if (c.sqlite3_changes(self.db) != 1) return error.DraftCascadeConflict;
         }
         try self.exec("COMMIT;");
+    }
+
+    /// A TempId is never reused. `reserveTempId` falls back to MAX(local_id)+1
+    /// whenever no counter row exists — which is every resumed review — so
+    /// removing the highest Draft would hand its id straight back. Pin the
+    /// counter at or above every id in use before any row disappears, inside
+    /// the caller's transaction.
+    fn retainTempIdFloor(self: *SqliteStore, key: RemoteReviewIdentity) !void {
+        var floor: ?*c.sqlite3_stmt = null;
+        const floor_sql =
+            \\INSERT INTO draft_temp_ids(workspace,repository,pr_id,next_id)
+            \\ VALUES (?1,?2,?3,
+            \\   (SELECT COALESCE(MAX(local_id),0)+1 FROM drafts
+            \\     WHERE workspace=?1 AND repository=?2 AND pr_id=?3))
+            \\ ON CONFLICT(workspace,repository,pr_id)
+            \\ DO UPDATE SET next_id=MAX(next_id, excluded.next_id);
+        ;
+        if (c.sqlite3_prepare_v2(self.db, floor_sql, -1, &floor, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(floor);
+        bindText(floor, 1, key.workspace);
+        bindText(floor, 2, key.repository);
+        bindInt(floor, 3, @intCast(key.pull_request_id));
+        if (c.sqlite3_step(floor) != c.SQLITE_DONE) return error.Step;
     }
 
     fn loadImpl(ptr: *anyopaque, allocator: std.mem.Allocator, key: RemoteReviewIdentity) anyerror![]Draft {
@@ -1204,6 +1209,8 @@ pub const SqliteStore = struct {
             bindInt(dirty, 4, @intCast(operation_id));
             if (c.sqlite3_step(dirty) != c.SQLITE_ROW) return error.Step;
             if (columnInt(dirty, 0) != 0) return error.SubmissionNotClean;
+
+            try self.retainTempIdFloor(key);
 
             var remap: ?*c.sqlite3_stmt = null;
             const remap_sql =
@@ -2061,6 +2068,20 @@ test "SQLite clean completion durably remaps surviving Replies and rolls back a 
         try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, unrelated_review.getConst(2).?.parent.?);
     }
     try testing.expect((try store.activeSubmission(arena.allocator())) == null);
+}
+
+test "SQLite clean completion never hands a posted Draft's TempId to the next Draft" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+
+    try store.completeSubmission(operation_id, key, .clean);
+
+    try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
 }
 
 test "a rejected SQLite Submission checkpoint rolls back its completed outcome" {

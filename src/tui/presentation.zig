@@ -3297,6 +3297,9 @@ pub const ReviewProjection = struct {
 pub const PaintRevision = struct {
     interaction: frame_mod.Revision,
     frame: frame_mod.Revision,
+    /// Changes the painted status without the interaction revision, which
+    /// also invalidates a pending mouse press.
+    status: frame_mod.Revision,
 };
 
 pub const Projection = struct {
@@ -4465,7 +4468,12 @@ const Published = struct {
     // Frame and closes the Composer through an infallible final step.
     fn persistPreparedDraft(self: *Published, store: bbr.review.PendingReviewStore, candidate: bbr.review.Draft) SaveDraftError!void {
         const a = self.review_arena.allocator();
-        const draft = try cloneDisclosureDraft(a, candidate);
+        var draft = try cloneDisclosureDraft(a, candidate);
+        // A completion can post the parent Draft after the Composer opens. The
+        // store then holds the Reply's parent only as the posted CommentId.
+        if (draft.parent) |parent| if (parent == .draft) if (self.review.getConst(parent.draft)) |target| if (target.state == .posted) {
+            draft.parent = .{ .comment = target.state.posted };
+        };
         try self.review.drafts.ensureUnusedCapacity(a, 1);
         if (draft.parent == null) try self.scope_projection.ensureUnusedCapacity(a, 1);
         store.put(self.key.storeKey(), draft) catch return error.PersistenceFailed;
@@ -6104,6 +6112,7 @@ pub const Presentation = struct {
     external_edit_pending: ?SessionEpoch = null,
     composer_footer: std.ArrayList(u8) = .empty,
     interaction_revision: frame_mod.Revision = 1,
+    status_revision: frame_mod.Revision = 0,
     mouse_press: ?MousePress = null,
     last_review_click: ?struct { index: usize, time_ns: ?i96 } = null,
     version_restoration: ?VersionRestoration = null,
@@ -6335,6 +6344,7 @@ pub const Presentation = struct {
             .revision = .{
                 .interaction = self.interaction_revision,
                 .frame = if (self.published) |published| published.frame_revision else 0,
+                .status = self.status_revision,
             },
             .review = if (self.published) |published| self.reviewProjection(published) else null,
             .submission = if (self.durable_submission) |durable| blk: {
@@ -12344,25 +12354,32 @@ pub const Presentation = struct {
                         durable.destroy();
                     }
                 };
-                if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
-                self.replacement = null;
-                self.replacement_error = switch (err) {
+                self.failReplacement(replacement, switch (err) {
                     error.OutOfMemory => .out_of_memory,
                     error.Timeout => .session_load_timed_out,
                     else => .session_load_failed,
-                };
+                });
             },
             .loaded => |session| {
                 self.queueCandidateSession(session, replacement.intent, replacement.key) catch |err| {
-                    self.replacement = null;
-                    self.replacement_error = switch (err) {
+                    self.failReplacement(replacement, switch (err) {
                         error.OutOfMemory => .out_of_memory,
                         else => .pending_review_load_failed,
-                    };
-                    if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
+                    });
                 };
             },
         }
+    }
+
+    /// Ends a replacement with an error. A completion input bumps no
+    /// revision in `dispatch`, so this bump repaints the failure, and a
+    /// pending-replacement notice must not outlive its replacement.
+    fn failReplacement(self: *Presentation, replacement: Replacement, err: ReplacementError) void {
+        if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
+        self.replacement = null;
+        self.replacement_error = err;
+        if (self.action_error == .replacement_pending) self.action_error = null;
+        self.status_revision +%= 1;
     }
 
     fn queueCandidateSession(self: *Presentation, session: *Session, intent: LoadIntent, key: OwnedReviewIdentity) !void {
@@ -12417,12 +12434,7 @@ pub const Presentation = struct {
         if (!self.consumeCommand(job.command_id, .prepare_session)) return;
         const replacement = self.replacement orelse return;
         if (self.shutdown_requested or replacement.intent != job.intent) return;
-        if (job.failure) |failure| {
-            self.replacement = null;
-            self.replacement_error = failure;
-            if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
-            return;
-        }
+        if (job.failure) |failure| return self.failReplacement(replacement, failure);
         const candidate = job.candidate.?;
         if (!job.ready) return;
         const previous = self.published;
@@ -12434,39 +12446,25 @@ pub const Presentation = struct {
             job.review_revision != self.candidate_review_revision)
         {
             candidate.session.retain();
-            self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
-                self.replacement = null;
-                self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .pending_review_load_failed;
-                if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
-            };
+            self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err|
+                self.failReplacement(replacement, if (err == error.OutOfMemory) .out_of_memory else .pending_review_load_failed);
             return;
         }
         if (location) |target| {
             const required = reviewLocationDisclosures(candidate, target);
             for (required.items[0..required.len]) |key| if (!candidate.disclosure_keys.contains(key)) {
                 candidate.session.retain();
-                self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
-                    self.replacement = null;
-                    self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_build_failed;
-                    if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
-                };
+                self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err|
+                    self.failReplacement(replacement, if (err == error.OutOfMemory) .out_of_memory else .buffer_build_failed);
                 return;
             };
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
-        disclosures.appendSlice(self.allocator, candidate.disclosure_keys.items()) catch {
-            self.replacement = null;
-            self.replacement_error = .out_of_memory;
-            if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
-            return;
-        };
+        disclosures.appendSlice(self.allocator, candidate.disclosure_keys.items()) catch
+            return self.failReplacement(replacement, .out_of_memory);
         defer disclosures.deinit(self.allocator);
-        const owned_location = if (location) |target| target.clone(candidate.review_arena.allocator()) catch {
-            self.replacement = null;
-            self.replacement_error = .out_of_memory;
-            if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
-            return;
-        } else null;
+        const owned_location = if (location) |target| target.clone(candidate.review_arena.allocator()) catch
+            return self.failReplacement(replacement, .out_of_memory) else null;
         candidate.expanded_disclosures = disclosures;
         disclosures = .empty;
         if (owned_location) |target| {
@@ -30785,6 +30783,63 @@ test "clean completion moves visible Replies to the posted CommentId like the st
     try testing.expectEqualDeep(expected, published.disclosure_inputs.drafts[1].parent.?);
 }
 
+test "a Reply saved on a posted Draft card stores the posted CommentId as its parent" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    // A Composer save reserves the parent's TempId, so the Reply cannot reuse it.
+    try testing.expectEqual(@as(bbr.review.TempId, 1), try store.store().reserveTempId(key.storeKey()));
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().submission_tree == null);
+
+    // The Composer opens before the completion and saves after it.
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reply });
+    try testing.expectEqualStrings("Reply", presentation.projection().composer.?.label);
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("late Reply") } });
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+    // The Composer refuses a save during Reconciliation, so the Reconciliation
+    // load fails and leaves the posted Draft card in the open Review.
+    const reconciliation = presentation.takeCommand().?.load_session;
+    try testing.expect(reconciliation.cause == .reconciliation);
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = reconciliation.command_id,
+        .intent = reconciliation.intent,
+        .outcome = .{ .failed = error.Timeout },
+    } });
+    try testing.expect(!presentation.projection().replacing);
+    try testing.expect(presentation.published.?.review.getConst(1).?.state == .posted);
+    try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.projection().composer == null);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const stored = try store.store().loadReview(arena.allocator(), key.storeKey());
+    try testing.expectEqual(@as(usize, 1), stored.drafts.items.len);
+    const expected: bbr.review.draft.Parent = .{ .comment = 900 };
+    try testing.expectEqualDeep(expected, stored.drafts.items[0].parent.?);
+}
+
 test "Submission Overlay Enter reports a pending Reconciliation and a load timeout ends it" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -30816,6 +30871,7 @@ test "Submission Overlay Enter reports a pending Reconciliation and a load timeo
     try testing.expectEqual(ActionError.replacement_pending, presentation.projection().action_error.?);
     try testing.expect(presentation.projection().replacing);
 
+    const pending_revision = presentation.projection().revision;
     try presentation.dispatch(.{ .session_loaded = .{
         .command_id = reconciliation.command_id,
         .intent = reconciliation.intent,
@@ -30823,9 +30879,57 @@ test "Submission Overlay Enter reports a pending Reconciliation and a load timeo
     } });
     try testing.expect(!presentation.projection().replacing);
     try testing.expectEqual(ReplacementError.session_load_timed_out, presentation.projection().replacement_error.?);
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(!std.meta.eql(pending_revision, presentation.projection().revision));
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     try testing.expect(presentation.projection().submission_tree == null);
     try testing.expect(presentation.projection().action_error == null);
+}
+
+test "Submission Overlay Enter ends its pending Reconciliation notice when the candidate preparation fails" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+    const reconciliation = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expectEqual(ActionError.replacement_pending, presentation.projection().action_error.?);
+
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = reconciliation.command_id,
+        .intent = reconciliation.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'a') },
+    } });
+    while (presentation.commands.items.len > 0 and presentation.commands.items[0] != .prepare_session) {
+        var other = presentation.takeCommand().?;
+        other.deinit();
+    }
+    var prepare = presentation.takeCommand().?;
+    const pending_revision = presentation.projection().revision;
+    try presentation.dispatch(try prepare.launchFailed());
+    try testing.expect(!presentation.projection().replacing);
+    try testing.expectEqual(ReplacementError.buffer_build_failed, presentation.projection().replacement_error.?);
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(!std.meta.eql(pending_revision, presentation.projection().revision));
 }
 
 test "retryable POST rejection waits and reissues without checkpointing an outcome" {
