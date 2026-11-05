@@ -52,6 +52,18 @@ pub const Reviewer = struct {
     display_name: []const u8 = "",
 };
 
+/// The list that names a Default Reviewer: the Repository's own list or its Project's list.
+pub const DefaultReviewerType = enum { repository, project };
+
+/// An account that Bitbucket pre-fills as a reviewer of a new PullRequest in the web UI.
+/// The producing allocator owns the strings.
+pub const DefaultReviewer = struct {
+    uuid: []const u8,
+    display_name: []const u8,
+    /// The plain Default Reviewer list holds only the Repository's own entries, so its rows are `.repository`.
+    reviewer_type: DefaultReviewerType,
+};
+
 /// Optional values distinguish unchanged fields from explicit false or empty values.
 pub const PullRequestOptions = struct {
     title: ?[]const u8 = null,
