@@ -2331,6 +2331,11 @@ test "submitting Draft parents retain separate readable card trees and Active Pa
     };
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(usize, 2), root_bodies);
+    var reply_headers: usize = 0;
+    for (buf.rows) |row| if (row == .draft and row.draft.part == .header and row.draft.card.?.parent != null) {
+        reply_headers += 1;
+    };
+    try testing.expectEqual(@as(usize, 3), reply_headers);
     const path = try buf.activePath(a, roots[1].rows.start);
     try testing.expect(!path.holds(roots[0]));
 }

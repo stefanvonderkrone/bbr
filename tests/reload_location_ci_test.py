@@ -19,56 +19,56 @@ def main():
     def control(*args):
         return subprocess.check_output([str(CONTROL), *args], cwd=ROOT, env=env, text=True)
 
-    state = json.loads((evidence / "instance.json").read_text())
-    repo = Path(state["scratch"]) / "repo"
-    git_env = {
-        "PATH": os.environ["PATH"],
-        "HOME": str(Path(state["scratch"]) / "home"),
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_COUNT": "3",
-        "GIT_CONFIG_KEY_0": "user.useConfigOnly",
-        "GIT_CONFIG_VALUE_0": "true",
-        "GIT_CONFIG_KEY_1": "commit.gpgsign",
-        "GIT_CONFIG_VALUE_1": "true",
-        "GIT_CONFIG_KEY_2": "gpg.program",
-        "GIT_CONFIG_VALUE_2": "false",
-    }
-
-    def git(*args):
-        return subprocess.check_output(
-            [
-                "git", "-c", "user.name=Verification", "-c", "user.email=verify@example.invalid",
-                "-c", "commit.gpgsign=false", *args,
-            ],
-            cwd=repo,
-            env=git_env,
-            text=True,
-        )
-
-    def commit():
-        git("add", "notes.txt", "sample.txt")
-        git("commit", "-qm", "Change reload fixture")
-
-    def position(screen):
-        return tuple(map(int, re.search(r"Local review.*?([0-9]+)/([0-9]+)", screen).groups()))
-
-    def cursor(screen):
-        match = re.search(r"Local review.*?([0-9]+)/[0-9]+", screen)
-        return int(match.group(1)) if match else None
-
-    # tmux accepts keys before bbr paints them, so poll for the moved cursor.
-    def capture_when(label, ready):
-        deadline = time.monotonic() + 15
-        while True:
-            screen = control("capture", label)
-            if ready(cursor(screen)):
-                return screen
-            if time.monotonic() > deadline:
-                raise AssertionError(screen)
-            time.sleep(0.1)
-
     try:
+        state = json.loads((evidence / "instance.json").read_text())
+        repo = Path(state["scratch"]) / "repo"
+        git_env = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(Path(state["scratch"]) / "home"),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "user.useConfigOnly",
+            "GIT_CONFIG_VALUE_0": "true",
+            "GIT_CONFIG_KEY_1": "commit.gpgsign",
+            "GIT_CONFIG_VALUE_1": "true",
+            "GIT_CONFIG_KEY_2": "gpg.program",
+            "GIT_CONFIG_VALUE_2": "false",
+        }
+
+        def git(*args):
+            return subprocess.check_output(
+                [
+                    "git", "-c", "user.name=Verification", "-c", "user.email=verify@example.invalid",
+                    "-c", "commit.gpgsign=false", *args,
+                ],
+                cwd=repo,
+                env=git_env,
+                text=True,
+            )
+
+        def commit():
+            git("add", "notes.txt", "sample.txt")
+            git("commit", "-qm", "Change reload fixture")
+
+        def position(screen):
+            return tuple(map(int, re.search(r"Local review.*?([0-9]+)/([0-9]+)", screen).groups()))
+
+        def cursor(screen):
+            match = re.search(r"Local review.*?([0-9]+)/[0-9]+", screen)
+            return int(match.group(1)) if match else None
+
+        # tmux accepts keys before bbr paints them, so poll for the moved cursor.
+        def capture_when(label, ready):
+            deadline = time.monotonic() + 15
+            while True:
+                screen = control("capture", label)
+                if ready(cursor(screen)):
+                    return screen
+                if time.monotonic() > deadline:
+                    raise AssertionError(screen)
+                time.sleep(0.1)
+
         control("doctor")
         start = cursor(capture_when("reload-source-start", lambda line: line is not None))
         control("keys", "]")

@@ -2012,10 +2012,16 @@ test "SQLite clean completion durably remaps surviving Replies and rolls back a 
     const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/reply-parent.db", .{&tmp.sub_path}, 0);
     const key = testReviewKey(7);
     const other = testReviewKey(8);
+    const other_repository: RemoteReviewIdentity = .{ .workspace = "workspace", .repository = "other", .pull_request_id = 7 };
+    const other_workspace: RemoteReviewIdentity = .{ .workspace = "other", .repository = "repo", .pull_request_id = 7 };
     {
         var sqlite = try SqliteStore.open(path);
         defer sqlite.deinit();
         const store = sqlite.store();
+        try store.put(other_repository, .{ .local_id = 1, .kind = .comment, .body = "other repository parent", .state = .{ .posted = 910 } });
+        try store.put(other_repository, .{ .local_id = 2, .kind = .comment, .body = "other repository Reply", .parent = .{ .draft = 1 } });
+        try store.put(other_workspace, .{ .local_id = 1, .kind = .comment, .body = "other Workspace parent", .state = .{ .posted = 920 } });
+        try store.put(other_workspace, .{ .local_id = 2, .kind = .comment, .body = "other Workspace Reply", .parent = .{ .draft = 1 } });
         try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "parent" });
         try store.put(key, .{ .local_id = 4, .kind = .comment, .body = "omitted posted parent", .state = .{ .posted = 904 } });
         try store.put(key, .{ .local_id = 6, .kind = .comment, .body = "second parent" });
@@ -2049,6 +2055,11 @@ test "SQLite clean completion durably remaps surviving Replies and rolls back a 
     try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 4 }, review.getConst(5).?.parent.?);
     const other_drafts = try store.load(arena.allocator(), other);
     try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, other_drafts[0].parent.?);
+    for ([_]RemoteReviewIdentity{ other_repository, other_workspace }) |unrelated| {
+        const unrelated_review = try store.loadReview(arena.allocator(), unrelated);
+        try testing.expect(unrelated_review.getConst(1) != null);
+        try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, unrelated_review.getConst(2).?.parent.?);
+    }
     try testing.expect((try store.activeSubmission(arena.allocator())) == null);
 }
 
