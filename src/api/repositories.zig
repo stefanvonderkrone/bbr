@@ -22,6 +22,21 @@ pub const get_help =
     \\
 ;
 
+/// The `--concurrency` default of `list-default-reviewers`.
+pub const default_reviewers_concurrency: usize = 2;
+
+pub const default_reviewers_help =
+    \\usage: bbr api list-default-reviewers --repository SLUG [--effective] [--pagelen N] [--page N]
+    \\      [--no-follow] [--concurrency N] [--limit N] [--json]
+    \\
+    \\List the Default Reviewers of a Repository (GET .../default-reviewers).
+    \\The Bitbucket web UI pre-fills them on a new PullRequest. The API does not add them.
+    \\--effective lists the Effective Default Reviewers (GET .../effective-default-reviewers).
+    \\They add the Default Reviewers of the Repository's Project.
+    \\Each row names its reviewer type, repository or project.
+    \\
+++ ws.pagingHelp(bbr.bitbucket.max_pagelen.default_reviewers, default_reviewers_concurrency);
+
 const ListArgs = struct {
     workspace: ?[]const u8,
     page: bbr.bitbucket.PageOptions,
@@ -77,6 +92,54 @@ test "repository list flags can interleave workspace and page controls" {
 test "list-repositories help states the concurrency default of its parser" {
     try std.testing.expectEqual(ws.default_concurrency, (try parseList(&.{})).concurrency);
     try std.testing.expect(std.mem.indexOf(u8, list_help, ws.concurrencyHelp(ws.default_concurrency)) != null);
+}
+
+const DefaultReviewerArgs = struct {
+    repository: []const u8,
+    effective: bool,
+    page: bbr.bitbucket.PageOptions,
+    concurrency: usize,
+};
+
+fn parseDefaultReviewers(args: []const []const u8) !DefaultReviewerArgs {
+    var cur: arg.Cursor = .{ .args = args };
+    var repository: ?[]const u8 = null;
+    var effective = false;
+    var page: bbr.bitbucket.PageOptions = .{};
+    var concurrency: ?usize = null;
+    while (cur.peek()) |text| {
+        const f = arg.splitFlag(text) orelse return error.UnknownFlag;
+        if (std.mem.eql(u8, f.name, "query") or std.mem.eql(u8, f.name, "sort")) return error.UnknownFlag;
+        if (try ws.takePageFlag(&cur, f, &page, bbr.bitbucket.max_pagelen.default_reviewers)) continue;
+        _ = cur.next();
+        if (std.mem.eql(u8, f.name, "repository")) {
+            try arg.setOption([]const u8, &repository, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "effective")) {
+            if (f.value != null) return error.UnknownFlag;
+            effective = true;
+        } else if (std.mem.eql(u8, f.name, "concurrency")) {
+            try ws.takeConcurrency(&cur, f, &concurrency);
+        } else return error.UnknownFlag;
+    }
+    const repo = repository orelse return error.MissingRequired;
+    if (repo.len == 0) return error.BadRequest;
+    return .{ .repository = repo, .effective = effective, .page = page, .concurrency = concurrency orelse default_reviewers_concurrency };
+}
+
+pub fn runListDefaultReviewers(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    const parsed = try parseDefaultReviewers(args);
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const concurrency = ws.effectiveConcurrency(parsed.concurrency, std.Thread.getCpuCount());
+    const reviewers = try bb.listDefaultReviewers(init.io, arena.allocator(), parsed.repository, parsed.effective, parsed.page, concurrency);
+    if (json) return out.printJson(init, reviewers);
+    for (reviewers) |reviewer| try out.printLine(init, "{s} {s} ({s})", .{ reviewer.uuid, reviewer.display_name, @tagName(reviewer.reviewer_type) });
+    try out.printLine(init, "ok: {d} Default Reviewer(s)", .{reviewers.len});
+}
+
+test "list-default-reviewers help states the concurrency default of its parser" {
+    try std.testing.expectEqual(@as(usize, 2), (try parseDefaultReviewers(&.{"--repository=sample"})).concurrency);
+    try std.testing.expect(std.mem.indexOf(u8, default_reviewers_help, ws.concurrencyHelp(2)) != null);
 }
 
 pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
