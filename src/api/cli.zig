@@ -469,6 +469,16 @@ test "every verb with --pagelen names its maximum in the help" {
     try std.testing.expect(std.mem.indexOf(u8, findVerb("list-pull-requests").?.help, "--pagelen accepts 1 to 50 ") != null);
 }
 
+test "every verb with --concurrency names its default in the help" {
+    var failed = false;
+    for (verbs) |verb| {
+        if (!contains(verb.value_flags, "concurrency") or std.mem.indexOf(u8, verb.help, "--concurrency bounds the parallel page requests of the whole command.\nIt defaults to ") != null) continue;
+        std.debug.print("bbr api {s}: its help does not include `workspaces.concurrencyHelp`\n", .{verb.name});
+        failed = true;
+    }
+    try std.testing.expect(!failed);
+}
+
 test "skills/bbr/VERBS.md lists every bbr api verb once" {
     const doc = @embedFile("bbr_verbs_md");
     var failed = false;

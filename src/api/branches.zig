@@ -20,7 +20,7 @@ pub const list_help =
     \\
     \\List branches. --query filters branches. --sort name uses Bitbucket's natural name order.
     \\
-++ pages.pagingHelp(bbr.bitbucket.max_pagelen.branches);
+++ pages.pagingHelp(bbr.bitbucket.max_pagelen.branches, pages.default_concurrency);
 
 pub const get_help =
     \\usage: bbr api get-branch --repository SLUG --name NAME [--json]
@@ -58,6 +58,7 @@ fn parse(args: []const []const u8, kind: Kind) !Parsed {
     }
     const repository = p.repository orelse return error.MissingRequired;
     if (repository.len == 0) return error.BadRequest;
+    if (kind == .list) p.concurrency = p.concurrency orelse pages.default_concurrency;
     if (kind != .list) {
         const name = p.name orelse return error.MissingRequired;
         if (name.len == 0 or std.mem.startsWith(u8, name, "refs/heads/")) return error.BadRequest;
@@ -104,7 +105,7 @@ pub fn runList(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const [
     const p = try parse(args, .list);
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
-    const concurrency = pages.effectiveConcurrency(p.concurrency orelse pages.default_concurrency, std.Thread.getCpuCount());
+    const concurrency = pages.effectiveConcurrency(p.concurrency.?, std.Thread.getCpuCount());
     const branches = try bb.listBranches(init.io, arena.allocator(), p.repository.?, p.page, concurrency);
     if (json) return out.printJson(init, branches);
     for (branches) |branch| try out.printLine(init, "{s} {s}", .{ branch.name, branch.target.hash });
@@ -129,4 +130,9 @@ test "API lifecycle branch flags support interleaved values and reject invalid w
     try std.testing.expectError(error.MissingRequired, branchRequest(a, bb, &.{"--repository=sample"}, true));
     try std.testing.expectError(error.UnknownFlag, parse(&.{ "--repository=sample", "--name=main", "--target=other" }, .get));
     try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+}
+
+test "list-branches help states the concurrency default of its parser" {
+    try std.testing.expectEqual(pages.default_concurrency, (try parse(&.{"--repository=sample"}, .list)).concurrency.?);
+    try std.testing.expect(std.mem.indexOf(u8, list_help, pages.concurrencyHelp(pages.default_concurrency)) != null);
 }

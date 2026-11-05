@@ -13,7 +13,7 @@ pub const list_help =
     \\List pull requests (GET .../pullrequests).
     \\--state ignores letter case. The default is OPEN.
     \\
-++ ws.pagingHelp(bbr.bitbucket.max_pagelen.pull_requests);
+++ ws.pagingHelp(bbr.bitbucket.max_pagelen.pull_requests, ws.default_concurrency);
 
 pub const workspace_list_help =
     \\usage: bbr api list-workspace-pull-requests --author UUID [--reviewer UUID]
@@ -32,7 +32,7 @@ pub const workspace_list_help =
     \\A repeated Repository is scanned once.
     \\Repeat --state to select several states. --state ignores letter case. The default is OPEN.
     \\--query is a Bitbucket q expression. The command joins it to its own filter with AND.
-++ ws.concurrency_help ++
+++ ws.concurrencyHelp(ws.default_concurrency) ++
     \\--limit caps the total. A failed request fails the complete list, unless all its rows
     \\come after the first --limit rows. HTTP 429 is not retried.
     \\
@@ -739,6 +739,14 @@ test "list-workspace-pull-requests accepts --concurrency with or without --repos
     var fake: bbr.http.FakeHttpClient = .{};
     try std.testing.expectError(error.InvalidNumber, listWorkspacePullRequests(std.testing.allocator, std.Io.failing, testClient(&fake), &.{ "--author={a}", "--concurrency=0" }));
     try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+}
+
+test "PullRequest list helps state the concurrency default of their parsers" {
+    try std.testing.expectEqual(ws.default_concurrency, (try parseList(&.{"--repository=sample"})).concurrency);
+    const workspace = try parseWorkspaceList(std.testing.allocator, &.{"--author={a}"});
+    try std.testing.expectEqual(ws.default_concurrency, workspace.options.concurrency);
+    for ([_][]const u8{ list_help, workspace_list_help }) |help|
+        try std.testing.expect(std.mem.indexOf(u8, help, ws.concurrencyHelp(ws.default_concurrency)) != null);
 }
 
 test "set-verdict rejects a spoofed uuid before HTTP" {

@@ -13,7 +13,7 @@ pub const list_help =
     \\List repositories in a workspace (GET /repositories/{workspace}).
     \\Workspace defaults to BITBUCKET_WORKSPACE.
     \\
-++ ws.pagingHelp(bbr.bitbucket.max_pagelen.repositories);
+++ ws.pagingHelp(bbr.bitbucket.max_pagelen.repositories, ws.default_concurrency);
 
 pub const get_help =
     \\usage: bbr api get-repository --repository SLUG [--workspace SLUG] [--json]
@@ -72,6 +72,11 @@ test "repository list flags can interleave workspace and page controls" {
     try std.testing.expect(!parsed.page.follow);
     try std.testing.expectError(error.UnknownFlag, parseList(&.{ "--workspace=demo", "--no-follow=false" }));
     try std.testing.expectError(error.InvalidNumber, parseList(&.{ "--page=0", "--workspace=demo" }));
+}
+
+test "list-repositories help states the concurrency default of its parser" {
+    try std.testing.expectEqual(ws.default_concurrency, (try parseList(&.{})).concurrency);
+    try std.testing.expect(std.mem.indexOf(u8, list_help, ws.concurrencyHelp(ws.default_concurrency)) != null);
 }
 
 pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
