@@ -31,6 +31,7 @@ pub const default_reviewers_help =
     \\
     \\List the Default Reviewers of a Repository (GET .../default-reviewers).
     \\The Bitbucket web UI pre-fills them on a new PullRequest. The API does not add them.
+    \\create-pull-request and update-pull-request send them with --default-reviewers.
     \\--effective lists the Effective Default Reviewers (GET .../effective-default-reviewers).
     \\They add the Default Reviewers of the Repository's Project.
     \\Each row names its reviewer type, repository or project.

@@ -44,6 +44,15 @@ pub fn printLine(init: std.process.Init, comptime fmt: []const u8, args: anytype
     try stdout.interface.flush();
 }
 
+/// Print one `bbr api VERB: warning:` line to stderr. A warning does not stop the command.
+pub fn printWarning(io: std.Io, verb: []const u8, comptime fmt: []const u8, args: anytype) !void {
+    var buf: [1024]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &buf);
+    try stderr.interface.print("bbr api {s}: warning: ", .{verb});
+    try stderr.interface.print(fmt ++ "\n", args);
+    try stderr.interface.flush();
+}
+
 /// Print raw bytes (diff/blob/patch) to stdout, optionally tee-ing to a file.
 pub fn printRaw(
     init: std.process.Init,
