@@ -4476,7 +4476,13 @@ const Published = struct {
         };
         try self.review.drafts.ensureUnusedCapacity(a, 1);
         if (draft.parent == null) try self.scope_projection.ensureUnusedCapacity(a, 1);
-        store.put(self.key.storeKey(), draft) catch return error.PersistenceFailed;
+        const requested = draft.parent;
+        draft.parent = store.putResolvingParent(self.key.storeKey(), draft) catch return error.PersistenceFailed;
+        // Another process posted the parent and removed it from the store. The
+        // parent card then shows as posted, so the Reply stays under it.
+        if (requested) |parent| if (parent == .draft and draft.parent.? == .comment) if (self.review.get(parent.draft)) |target| {
+            target.state = .{ .posted = draft.parent.?.comment };
+        };
         self.review.drafts.appendAssumeCapacity(draft);
         self.review.next_id = @max(self.review.next_id, draft.local_id + 1);
         if (draft.parent == null) self.scope_projection.appendAssumeCapacity(.{
@@ -30840,7 +30846,42 @@ test "a Reply saved on a posted Draft card stores the posted CommentId as its pa
     try testing.expectEqualDeep(expected, stored.drafts.items[0].parent.?);
 }
 
-test "a Reply to a Draft that another process removed fails and keeps the Composer" {
+test "a Reply to a Draft that another process posted saves under the posted Comment" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), try store.store().reserveTempId(key.storeKey()));
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reply });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("stale Reply") } });
+    // Another bbr instance posts the parent and completes cleanly.
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }});
+    try store.store().checkpointSubmission(operation_id, key.storeKey(), 1, .{ .posted = 900 }, null);
+    try store.store().completeSubmission(operation_id, key.storeKey(), .clean);
+
+    try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
+
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expect(presentation.projection().action_error == null);
+    const expected: bbr.review.draft.Parent = .{ .comment = 900 };
+    const published = presentation.published.?;
+    try testing.expectEqual(@as(bbr.review.CommentId, 900), published.review.getConst(1).?.state.posted);
+    try testing.expectEqualDeep(expected, published.review.getConst(2).?.parent.?);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const stored = try store.store().loadReview(arena.allocator(), key.storeKey());
+    try testing.expectEqual(@as(usize, 1), stored.drafts.items.len);
+    try testing.expectEqualDeep(expected, stored.drafts.items[0].parent.?);
+}
+
+test "a Reply to a Draft that another process deleted fails and keeps the Composer" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);

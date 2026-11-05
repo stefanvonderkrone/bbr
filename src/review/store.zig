@@ -214,7 +214,8 @@ pub const PendingReviewStore = struct {
 
     pub const VTable = struct {
         /// Insert or replace a Draft under `pr_id` (keyed by `draft.local_id`).
-        put: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, draft: Draft) anyerror!void,
+        /// Returns the parent that the store wrote.
+        put: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, draft: Draft) anyerror!?draft_mod.Parent,
         /// Atomically replace one existing Draft's body after rechecking its
         /// identity, expected shape, editable state, and run participation.
         edit_draft_body: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, edit: DraftBodyEdit) anyerror!void,
@@ -239,10 +240,17 @@ pub const PendingReviewStore = struct {
         reserve_temp_id: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity) anyerror!TempId,
     };
 
-    /// Insert or replace `draft`. A Draft parent must exist in the same
-    /// transaction, because another process can complete a Submission and
-    /// delete it. A missing parent returns `error.DraftParentMissing`.
+    /// Insert or replace `draft`. See `putResolvingParent`.
     pub fn put(self: PendingReviewStore, key: RemoteReviewIdentity, draft: Draft) !void {
+        _ = try self.vtable.put(self.ptr, key, draft);
+    }
+
+    /// Insert or replace `draft`, and return the parent that the store wrote.
+    /// Another process can complete a Submission and delete a Draft parent
+    /// before this write. The store then writes the CommentId that the clean
+    /// completion recorded for the parent. A parent with no row and no
+    /// recorded CommentId returns `error.DraftParentMissing`.
+    pub fn putResolvingParent(self: PendingReviewStore, key: RemoteReviewIdentity, draft: Draft) !?draft_mod.Parent {
         return self.vtable.put(self.ptr, key, draft);
     }
 
@@ -425,6 +433,7 @@ pub const InMemoryStore = struct {
     next_repository_id: ReviewRepositoryId = 1,
     repository_aliases: std.ArrayList(RepositoryAlias) = .empty,
     temp_counters: std.ArrayList(TempCounter) = .empty,
+    posted_drafts: std.ArrayList(PostedDraft) = .empty,
     /// Deterministic adapter fault injection for Presentation edit tests.
     fail_next_edit: bool = false,
     /// Deterministic adapter fault injection for Presentation re-anchor tests.
@@ -439,6 +448,7 @@ pub const InMemoryStore = struct {
     const Entry = struct { key: RemoteReviewIdentity, draft: Draft };
     const RepositoryAlias = struct { alias: []const u8, repository_id: ReviewRepositoryId };
     const TempCounter = struct { key: RemoteReviewIdentity, next_id: TempId };
+    const PostedDraft = struct { key: RemoteReviewIdentity, temp_id: TempId, comment_id: CommentId };
     const RetryCarryover = struct { key: RemoteReviewIdentity, temp_id: TempId, checkpoint: SubmissionRetryCheckpoint };
 
     pub fn init(gpa: Allocator) InMemoryStore {
@@ -450,6 +460,7 @@ pub const InMemoryStore = struct {
         self.entries.deinit(gpa);
         self.repository_aliases.deinit(gpa);
         self.temp_counters.deinit(gpa);
+        self.posted_drafts.deinit(gpa);
         self.retry_carryovers.deinit(gpa);
         self.arena.deinit();
         self.* = undefined;
@@ -524,26 +535,29 @@ pub const InMemoryStore = struct {
         return next_id;
     }
 
-    fn putImpl(ptr: *anyopaque, key: RemoteReviewIdentity, d: Draft) anyerror!void {
+    fn putImpl(ptr: *anyopaque, key: RemoteReviewIdentity, incoming: Draft) anyerror!?draft_mod.Parent {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
         for (self.entries.items) |entry| {
-            if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == d.local_id and entry.draft.state == .outcome_unknown)
+            if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == incoming.local_id and entry.draft.state == .outcome_unknown)
                 return error.DraftLocked;
         }
         if (self.active_submission) |run| {
             if (RemoteReviewIdentity.eql(run.key, key)) {
-                if (submissionItemIndex(run.items, d.local_id) != null) return error.DraftLocked;
+                if (submissionItemIndex(run.items, incoming.local_id) != null) return error.DraftLocked;
             }
         }
+        var d = incoming;
         if (d.parent) |parent| if (parent == .draft) for (self.entries.items) |entry| {
             if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == parent.draft) break;
-        } else return error.DraftParentMissing;
+        } else {
+            d.parent = .{ .comment = self.postedComment(key, parent.draft) orelse return error.DraftParentMissing };
+        };
         const owned = try dupeDraft(self.arena.allocator(), d);
         // Replace an existing row with the same key; else append.
         for (self.entries.items) |*e| {
             if (RemoteReviewIdentity.eql(e.key, key) and e.draft.local_id == d.local_id) {
                 e.draft = owned;
-                return;
+                return d.parent;
             }
         }
         const owned_key: RemoteReviewIdentity = .{
@@ -552,6 +566,14 @@ pub const InMemoryStore = struct {
             .pull_request_id = key.pull_request_id,
         };
         try self.entries.append(self.arena.child_allocator, .{ .key = owned_key, .draft = owned });
+        return d.parent;
+    }
+
+    fn postedComment(self: *const InMemoryStore, key: RemoteReviewIdentity, temp_id: TempId) ?CommentId {
+        for (self.posted_drafts.items) |posted| {
+            if (RemoteReviewIdentity.eql(posted.key, key) and posted.temp_id == temp_id) return posted.comment_id;
+        }
+        return null;
     }
 
     fn editDraftBodyImpl(ptr: *anyopaque, key: RemoteReviewIdentity, edit: DraftBodyEdit) anyerror!void {
@@ -907,6 +929,12 @@ pub const InMemoryStore = struct {
                         return error.SubmissionNotClean;
                 }
                 try self.retainTempIdFloor(key);
+                // A stale Session in another process can still save a Reply
+                // to a removed Draft, so the store keeps its CommentId.
+                for (self.entries.items) |entry| {
+                    if (!RemoteReviewIdentity.eql(entry.key, key) or entry.draft.state != .posted or submissionItemIndex(run.items, entry.draft.local_id) == null) continue;
+                    try self.posted_drafts.append(self.arena.child_allocator, .{ .key = entry.key, .temp_id = entry.draft.local_id, .comment_id = entry.draft.state.posted });
+                }
                 var i: usize = 0;
                 while (i < self.entries.items.len) {
                     const entry = self.entries.items[i];
@@ -1637,7 +1665,7 @@ test "clean Submission completion never hands a posted Draft's TempId to the nex
     try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
 }
 
-test "a Reply to a Draft that another process removed is refused" {
+test "a Reply to a Draft that another process posted gets the posted CommentId" {
     var mem = InMemoryStore.init(testing.allocator);
     defer mem.deinit();
     const store = mem.store();
@@ -1647,8 +1675,24 @@ test "a Reply to a Draft that another process removed is refused" {
     try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
     try store.completeSubmission(operation_id, key, .clean);
 
+    const stored = try store.putResolvingParent(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    try testing.expectEqualDeep(draft_mod.Parent{ .comment = 900 }, stored.?);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expectEqualDeep(draft_mod.Parent{ .comment = 900 }, drafts[0].parent.?);
+    try testing.expectError(error.DraftParentMissing, store.put(testReviewKey(8), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "other Review" }));
+}
+
+test "a Reply to a Draft that another process deleted is refused" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "deleted" });
+    try store.deleteDraftSubtree(key, .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{1} });
+
     try testing.expectError(error.DraftParentMissing, store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" }));
-    try store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 900 }, .body = "reply" });
 }
 
 test "clean Submission completion remaps surviving Replies before removing their posted parents" {

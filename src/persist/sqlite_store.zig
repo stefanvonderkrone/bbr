@@ -268,6 +268,20 @@ pub const SqliteStore = struct {
                 \\COMMIT;
             );
         }
+        // v10: the CommentId of each Draft that a clean completion removed. A
+        // stale Session in another process can still save a Reply to it.
+        if (try self.userVersion() < 10) {
+            try self.exec(
+                \\BEGIN;
+                \\CREATE TABLE posted_drafts (
+                \\  workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
+                \\  temp_id INTEGER NOT NULL, comment_id INTEGER NOT NULL,
+                \\  PRIMARY KEY (workspace, repository, pr_id, temp_id)
+                \\) WITHOUT ROWID;
+                \\PRAGMA user_version = 10;
+                \\COMMIT;
+            );
+        }
     }
 
     fn userVersion(self: *SqliteStore) SqliteError!i64 {
@@ -390,12 +404,15 @@ pub const SqliteStore = struct {
         return reserved;
     }
 
-    fn putImpl(ptr: *anyopaque, key: RemoteReviewIdentity, d: Draft) anyerror!void {
+    fn putImpl(ptr: *anyopaque, key: RemoteReviewIdentity, incoming: Draft) anyerror!?Parent {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
-        if (try self.draftMutationLocked(key, d.local_id, d.target)) return error.DraftLocked;
-        if (d.parent) |parent| if (parent == .draft and !try self.draftExists(key, parent.draft)) return error.DraftParentMissing;
+        if (try self.draftMutationLocked(key, incoming.local_id, incoming.target)) return error.DraftLocked;
+        var d = incoming;
+        if (d.parent) |parent| if (parent == .draft and !try self.draftExists(key, parent.draft)) {
+            d.parent = .{ .comment = try self.postedComment(key, parent.draft) orelse return error.DraftParentMissing };
+        };
         const sql =
             \\INSERT OR REPLACE INTO drafts
             \\ (pr_id, local_id, kind, target, parent_kind, parent_id,
@@ -514,6 +531,7 @@ pub const SqliteStore = struct {
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
         try self.exec("COMMIT;");
+        return d.parent;
     }
 
     /// One transaction: recheck identity, expected shape, editable state, and
@@ -1213,6 +1231,22 @@ pub const SqliteStore = struct {
 
             try self.retainTempIdFloor(key);
 
+            var record: ?*c.sqlite3_stmt = null;
+            const record_sql =
+                \\INSERT OR REPLACE INTO posted_drafts(workspace,repository,pr_id,temp_id,comment_id)
+                \\ SELECT workspace, repository, pr_id, local_id, state_id FROM drafts
+                \\ WHERE workspace=? AND repository=? AND pr_id=?
+                \\   AND local_id IN (SELECT temp_id FROM submission_run_items WHERE operation_id=?)
+                \\   AND state_kind=2;
+            ;
+            if (c.sqlite3_prepare_v2(self.db, record_sql, -1, &record, null) != c.SQLITE_OK) return error.Prepare;
+            defer _ = c.sqlite3_finalize(record);
+            bindText(record, 1, key.workspace);
+            bindText(record, 2, key.repository);
+            bindInt(record, 3, @intCast(key.pull_request_id));
+            bindInt(record, 4, @intCast(operation_id));
+            if (c.sqlite3_step(record) != c.SQLITE_DONE) return error.Step;
+
             var remap: ?*c.sqlite3_stmt = null;
             const remap_sql =
                 \\UPDATE drafts AS reply SET parent_kind=2, parent_id=parent.state_id
@@ -1307,6 +1341,22 @@ pub const SqliteStore = struct {
 
     /// Must be called inside a write transaction so an active SubmissionRun
     /// cannot appear between this check and the mutation.
+    fn postedComment(self: *SqliteStore, key: RemoteReviewIdentity, temp_id: TempId) SqliteError!?CommentId {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT comment_id FROM posted_drafts WHERE workspace=? AND repository=? AND pr_id=? AND temp_id=?;";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key.workspace);
+        bindText(stmt, 2, key.repository);
+        bindInt(stmt, 3, @intCast(key.pull_request_id));
+        bindInt(stmt, 4, @intCast(temp_id));
+        return switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => @intCast(c.sqlite3_column_int64(stmt, 0)),
+            c.SQLITE_DONE => null,
+            else => error.Step,
+        };
+    }
+
     fn draftExists(self: *SqliteStore, key: RemoteReviewIdentity, local_id: TempId) SqliteError!bool {
         var stmt: ?*c.sqlite3_stmt = null;
         const sql = "SELECT EXISTS(SELECT 1 FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?);";
@@ -2099,21 +2149,46 @@ test "SQLite clean completion never hands a posted Draft's TempId to the next Dr
     try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
 }
 
-test "SQLite refuses a Reply to a Draft that another process removed" {
+test "SQLite gives a Reply to a Draft that another process posted the posted CommentId" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/posted-parent.db", .{&tmp.sub_path}, 0);
+    const key = testReviewKey(7);
+    {
+        var completing = try SqliteStore.open(path);
+        defer completing.deinit();
+        const store = completing.store();
+        try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
+        const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+        try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+        try store.completeSubmission(operation_id, key, .clean);
+    }
+    var stale = try SqliteStore.open(path);
+    defer stale.deinit();
+    const store = stale.store();
+
+    const stored = try store.putResolvingParent(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    try testing.expectEqualDeep(Parent{ .comment = 900 }, stored.?);
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqualDeep(Parent{ .comment = 900 }, drafts[0].parent.?);
+    try testing.expectError(error.DraftParentMissing, store.put(testReviewKey(8), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "other Review" }));
+}
+
+test "SQLite refuses a Reply to a Draft that another process deleted" {
     var s = try SqliteStore.open(":memory:");
     defer s.deinit();
     const store = s.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
-    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
-    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
-    try store.completeSubmission(operation_id, key, .clean);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "deleted" });
+    try store.deleteDraftSubtree(key, .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{1} });
 
     try testing.expectError(error.DraftParentMissing, store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" }));
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectEqual(@as(usize, 0), (try store.load(arena.allocator(), key)).len);
-    try store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 900 }, .body = "reply" });
 }
 
 test "a rejected SQLite Submission checkpoint rolls back its completed outcome" {
@@ -2368,6 +2443,7 @@ test "v8 migration preserves every authored Draft field and lifecycle state" {
             .state = .outcome_unknown,
         });
         try sqlite.exec(
+            \\DROP TABLE posted_drafts;
             \\DROP TABLE submission_run_items;
             \\DROP TABLE submission_retry_carryovers;
             \\ALTER TABLE submission_runs DROP COLUMN retry_phase;
