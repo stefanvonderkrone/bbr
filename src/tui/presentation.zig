@@ -30840,6 +30840,33 @@ test "a Reply saved on a posted Draft card stores the posted CommentId as its pa
     try testing.expectEqualDeep(expected, stored.drafts.items[0].parent.?);
 }
 
+test "a Reply to a Draft that another process removed fails and keeps the Composer" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), try store.store().reserveTempId(key.storeKey()));
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reply });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("stale Reply") } });
+    // Another bbr instance completes a Submission and removes the parent.
+    try store.store().deleteDraftSubtree(key.storeKey(), .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{1} });
+
+    try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
+
+    try testing.expectEqual(ActionError.persistence_failed, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().composer != null);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 0), (try store.store().loadReview(arena.allocator(), key.storeKey())).drafts.items.len);
+}
+
 test "Submission Overlay Enter reports a pending Reconciliation and a load timeout ends it" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();

@@ -239,6 +239,9 @@ pub const PendingReviewStore = struct {
         reserve_temp_id: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity) anyerror!TempId,
     };
 
+    /// Insert or replace `draft`. A Draft parent must exist in the same
+    /// transaction, because another process can complete a Submission and
+    /// delete it. A missing parent returns `error.DraftParentMissing`.
     pub fn put(self: PendingReviewStore, key: RemoteReviewIdentity, draft: Draft) !void {
         return self.vtable.put(self.ptr, key, draft);
     }
@@ -532,6 +535,9 @@ pub const InMemoryStore = struct {
                 if (submissionItemIndex(run.items, d.local_id) != null) return error.DraftLocked;
             }
         }
+        if (d.parent) |parent| if (parent == .draft) for (self.entries.items) |entry| {
+            if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == parent.draft) break;
+        } else return error.DraftParentMissing;
         const owned = try dupeDraft(self.arena.allocator(), d);
         // Replace an existing row with the same key; else append.
         for (self.entries.items) |*e| {
@@ -1631,6 +1637,20 @@ test "clean Submission completion never hands a posted Draft's TempId to the nex
     try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
 }
 
+test "a Reply to a Draft that another process removed is refused" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+    try store.completeSubmission(operation_id, key, .clean);
+
+    try testing.expectError(error.DraftParentMissing, store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" }));
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 900 }, .body = "reply" });
+}
+
 test "clean Submission completion remaps surviving Replies before removing their posted parents" {
     var mem = InMemoryStore.init(testing.allocator);
     defer mem.deinit();
@@ -1645,6 +1665,7 @@ test "clean Submission completion remaps surviving Replies before removing their
     try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "nested Reply", .parent = .{ .draft = 2 } });
     try store.put(key, .{ .local_id = 5, .kind = .comment, .body = "omitted Reply", .parent = .{ .draft = 4 } });
     try store.put(key, .{ .local_id = 7, .kind = .comment, .body = "second Reply", .parent = .{ .draft = 6 } });
+    try store.put(other, .{ .local_id = 1, .kind = .comment, .body = "other Review parent", .state = .{ .posted = 930 } });
     try store.put(other, .{ .local_id = 2, .kind = .comment, .body = "other Review", .parent = .{ .draft = 1 } });
     try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 6);
     try store.checkpointSubmission(operation_id, key, 6, .{ .posted = 906 }, null);
@@ -1661,7 +1682,7 @@ test "clean Submission completion remaps surviving Replies before removing their
     try testing.expectEqualDeep(draft_mod.Parent{ .draft = 2 }, review.getConst(3).?.parent.?);
     try testing.expectEqualDeep(draft_mod.Parent{ .draft = 4 }, review.getConst(5).?.parent.?);
     const other_drafts = try store.load(arena.allocator(), other);
-    try testing.expectEqualDeep(draft_mod.Parent{ .draft = 1 }, other_drafts[0].parent.?);
+    try testing.expectEqualDeep(draft_mod.Parent{ .draft = 1 }, other_drafts[1].parent.?);
     try testing.expect((try store.activeSubmission(arena.allocator())) == null);
 }
 
@@ -1794,7 +1815,6 @@ test "abandoning recovery preserves ambiguity and releases participant ownership
 test "the fake's subtree membership matches the shared rule exactly" {
     var mem = InMemoryStore.init(testing.allocator);
     defer mem.deinit();
-    const s = mem.store();
     const key = testReviewKey(4);
     var review = PendingReview.init(4);
     defer review.deinit(testing.allocator);
@@ -1808,8 +1828,10 @@ test "the fake's subtree membership matches the shared rule exactly" {
         .{ .local_id = 6, .kind = .comment, .parent = .{ .draft = 7 }, .body = "cycle a" },
         .{ .local_id = 7, .kind = .comment, .parent = .{ .draft = 6 }, .body = "cycle b" },
     };
+    // The rows include an orphan and a cycle, which `put` refuses, so they
+    // enter the fake directly.
     for (rows) |row| {
-        try s.put(key, row);
+        try mem.entries.append(testing.allocator, .{ .key = key, .draft = row });
         try review.addExisting(testing.allocator, row);
     }
 

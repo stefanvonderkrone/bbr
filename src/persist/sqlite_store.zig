@@ -395,6 +395,7 @@ pub const SqliteStore = struct {
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
         if (try self.draftMutationLocked(key, d.local_id, d.target)) return error.DraftLocked;
+        if (d.parent) |parent| if (parent == .draft and !try self.draftExists(key, parent.draft)) return error.DraftParentMissing;
         const sql =
             \\INSERT OR REPLACE INTO drafts
             \\ (pr_id, local_id, kind, target, parent_kind, parent_id,
@@ -1306,6 +1307,19 @@ pub const SqliteStore = struct {
 
     /// Must be called inside a write transaction so an active SubmissionRun
     /// cannot appear between this check and the mutation.
+    fn draftExists(self: *SqliteStore, key: RemoteReviewIdentity, local_id: TempId) SqliteError!bool {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT EXISTS(SELECT 1 FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?);";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key.workspace);
+        bindText(stmt, 2, key.repository);
+        bindInt(stmt, 3, @intCast(key.pull_request_id));
+        bindInt(stmt, 4, @intCast(local_id));
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Step;
+        return columnInt(stmt, 0) != 0;
+    }
+
     fn draftMutationLocked(self: *SqliteStore, key: RemoteReviewIdentity, local_id: TempId, incoming_target: ?CommentTarget) SqliteError!bool {
         var stmt: ?*c.sqlite3_stmt = null;
         const sql =
@@ -2037,6 +2051,7 @@ test "SQLite clean completion durably remaps surviving Replies and rolls back a 
         try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "nested Reply", .parent = .{ .draft = 2 } });
         try store.put(key, .{ .local_id = 5, .kind = .comment, .body = "omitted Reply", .parent = .{ .draft = 4 } });
         try store.put(key, .{ .local_id = 7, .kind = .comment, .body = "second Reply", .parent = .{ .draft = 6 } });
+        try store.put(other, .{ .local_id = 1, .kind = .comment, .body = "other Review parent", .state = .{ .posted = 930 } });
         try store.put(other, .{ .local_id = 2, .kind = .comment, .body = "other Review", .parent = .{ .draft = 1 } });
         try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 6);
         try store.checkpointSubmission(operation_id, key, 6, .{ .posted = 906 }, null);
@@ -2061,7 +2076,7 @@ test "SQLite clean completion durably remaps surviving Replies and rolls back a 
     try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 2 }, review.getConst(3).?.parent.?);
     try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 4 }, review.getConst(5).?.parent.?);
     const other_drafts = try store.load(arena.allocator(), other);
-    try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, other_drafts[0].parent.?);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, other_drafts[1].parent.?);
     for ([_]RemoteReviewIdentity{ other_repository, other_workspace }) |unrelated| {
         const unrelated_review = try store.loadReview(arena.allocator(), unrelated);
         try testing.expect(unrelated_review.getConst(1) != null);
@@ -2082,6 +2097,23 @@ test "SQLite clean completion never hands a posted Draft's TempId to the next Dr
     try store.completeSubmission(operation_id, key, .clean);
 
     try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
+}
+
+test "SQLite refuses a Reply to a Draft that another process removed" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+    try store.completeSubmission(operation_id, key, .clean);
+
+    try testing.expectError(error.DraftParentMissing, store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" }));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 0), (try store.load(arena.allocator(), key)).len);
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 900 }, .body = "reply" });
 }
 
 test "a rejected SQLite Submission checkpoint rolls back its completed outcome" {
