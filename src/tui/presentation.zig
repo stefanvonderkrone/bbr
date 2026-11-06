@@ -9435,7 +9435,6 @@ pub const Presentation = struct {
             published.composer = null;
             published.review_search.invalidate(self.allocator);
             if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
-            if (parent_reposted) self.republishPostedParent(published);
         }
         if (job.mutation) |mutation| {
             published.pending_draft_mutation = null;
@@ -9468,6 +9467,8 @@ pub const Presentation = struct {
             self.refreshStaleRepairTree();
         }
         if (job.kind != .enrichment or !job.enrichment_speculative) self.action_error = null;
+        // After the success reset, so a failure stays visible.
+        if (parent_reposted) self.republishPostedParent(published);
         if (job.enrichment_file) |index| {
             published.session.enrichment.commitCacheUpdate();
             countFileCandidates(&published.review_search, index, published.session.enrichment.file(index));
@@ -9621,7 +9622,12 @@ pub const Presentation = struct {
         published.disclosure_inputs.release();
         published.disclosure_inputs = inputs;
         published.disclosure_inputs_current = true;
-        self.queueViewBuild(published, self.preferences, published.isolated_file, self.geometry, .restore) catch {
+        // A pending view, such as a resize, describes the newer request.
+        const result = if (published.pending_view) |pending|
+            self.queueViewBuild(published, pending.preferences, pending.isolated_file, pending.geometry, pending.navigation_policy)
+        else
+            self.queueViewBuild(published, self.preferences, published.isolated_file, self.geometry, .restore);
+        result catch {
             self.action_error = .out_of_memory;
         };
     }
@@ -30869,51 +30875,58 @@ test "a Reply saved on a posted Draft card stores the posted CommentId as its pa
 }
 
 test "a Reply to a Draft that another process posted saves under the posted Comment" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
-    try testing.expectEqual(@as(bbr.review.TempId, 1), try store.store().reserveTempId(key.storeKey()));
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
-        .viewport_rows = 8,
-    });
-    defer presentation.deinit();
-    try cursorToDraftCard(&presentation, 1);
-    try presentation.dispatch(.{ .action = .reply });
-    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("stale Reply") } });
-    // Another bbr instance posts the parent and completes cleanly.
-    const operation_id = try store.store().beginSubmission(key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }});
-    try store.store().checkpointSubmission(operation_id, key.storeKey(), 1, .{ .posted = 900 }, null);
-    try store.store().completeSubmission(operation_id, key.storeKey(), .clean);
+    // The second pass resizes while the save worker runs. The parent
+    // rebuild must keep the newer geometry.
+    for ([_]bool{ false, true }) |resize| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try testing.expectEqual(@as(bbr.review.TempId, 1), try store.store().reserveTempId(key.storeKey()));
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+            .viewport_rows = 8,
+        });
+        defer presentation.deinit();
+        try cursorToDraftCard(&presentation, 1);
+        try presentation.dispatch(.{ .action = .reply });
+        try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("stale Reply") } });
+        // Another bbr instance posts the parent and completes cleanly.
+        const operation_id = try store.store().beginSubmission(key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }});
+        try store.store().checkpointSubmission(operation_id, key.storeKey(), 1, .{ .posted = 900 }, null);
+        try store.store().completeSubmission(operation_id, key.storeKey(), .clean);
 
-    try presentation.dispatch(.{ .composer = .save });
-    try completeDisclosureBuild(&presentation);
+        try presentation.dispatch(.{ .composer = .save });
+        const resized: frame_mod.Geometry = .{ .cols = 90, .rows = 21 };
+        if (resize) try presentation.dispatch(.{ .resize = resized });
+        try completeDisclosureBuild(&presentation);
 
-    try testing.expect(presentation.projection().composer == null);
-    try testing.expect(presentation.projection().action_error == null);
-    // The worker Frame predates the resolution, so a view build follows.
-    try completeDisclosureBuild(&presentation);
-    try testing.expect(presentation.takeCommand() == null);
-    var parent_headers: usize = 0;
-    for (presentation.projection().review.?.buffer.rows) |row| switch (row) {
-        .draft => |card| if (card.draftItem().local_id == 1 and card.part == .header) {
-            try testing.expectEqual(@as(u64, 900), card.draftItem().state.posted);
-            parent_headers += 1;
-        },
-        else => {},
-    };
-    try testing.expectEqual(@as(usize, 1), parent_headers);
-    const expected: bbr.review.draft.Parent = .{ .comment = 900 };
-    const published = presentation.published.?;
-    for (published.disclosure_inputs.drafts) |draft| if (draft.local_id == 1) try testing.expectEqual(@as(u64, 900), draft.state.posted);
-    try testing.expectEqual(@as(bbr.review.CommentId, 900), published.review.getConst(1).?.state.posted);
-    try testing.expectEqualDeep(expected, published.review.getConst(2).?.parent.?);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const stored = try store.store().loadReview(arena.allocator(), key.storeKey());
-    try testing.expectEqual(@as(usize, 1), stored.drafts.items.len);
-    try testing.expectEqualDeep(expected, stored.drafts.items[0].parent.?);
+        try testing.expect(presentation.projection().composer == null);
+        try testing.expect(presentation.projection().action_error == null);
+        // The worker Frame predates the resolution, so a view build follows.
+        try completeDisclosureBuild(&presentation);
+        try testing.expect(presentation.takeCommand() == null);
+        if (resize) try testing.expectEqualDeep(resized, presentation.published.?.geometry);
+        var parent_headers: usize = 0;
+        for (presentation.projection().review.?.buffer.rows) |row| switch (row) {
+            .draft => |card| if (card.draftItem().local_id == 1 and card.part == .header) {
+                try testing.expectEqual(@as(u64, 900), card.draftItem().state.posted);
+                parent_headers += 1;
+            },
+            else => {},
+        };
+        try testing.expectEqual(@as(usize, 1), parent_headers);
+        const expected: bbr.review.draft.Parent = .{ .comment = 900 };
+        const published = presentation.published.?;
+        for (published.disclosure_inputs.drafts) |draft| if (draft.local_id == 1) try testing.expectEqual(@as(u64, 900), draft.state.posted);
+        try testing.expectEqual(@as(bbr.review.CommentId, 900), published.review.getConst(1).?.state.posted);
+        try testing.expectEqualDeep(expected, published.review.getConst(2).?.parent.?);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const stored = try store.store().loadReview(arena.allocator(), key.storeKey());
+        try testing.expectEqual(@as(usize, 1), stored.drafts.items.len);
+        try testing.expectEqualDeep(expected, stored.drafts.items[0].parent.?);
+    }
 }
 
 test "a Reply to a Draft that another process deleted fails and keeps the Composer" {
