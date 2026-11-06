@@ -217,7 +217,7 @@ pub const fixed_sections = [_]FixedSection{
     // `applySubmissionTreeKey`
     .{ .title = "Submission Overlay", .entries = &.{
         .{ .keys = "j k ↑ ↓", .description = "select Draft" },
-        .{ .keys = "⏎", .description = "jump to Draft (X shows the Overlay again)" },
+        .{ .keys = "⏎", .description = "jump to Draft or posted Comment (X shows the Overlay again)" },
         .{ .keys = "e", .description = "edit Draft" },
         .{ .keys = "a", .description = "re-anchor Draft" },
         .{ .keys = "D", .description = "delete Draft and its Replies" },
@@ -227,7 +227,7 @@ pub const fixed_sections = [_]FixedSection{
         .{ .keys = "L", .description = "outcome unknown: link existing Comment" },
         .{ .keys = "A", .description = "abandon recovery, or decide later" },
         .{ .keys = "p", .description = "open PullRequest Picker" },
-        .{ .keys = "q esc", .description = "close Submission" },
+        .{ .keys = "q esc ctrl-c", .description = "close Overlay without stopping Submission" },
     } },
     // `applyDeleteConfirmationInput` callers in `applyKey`
     .{ .title = "Delete Confirmation", .entries = &.{
