@@ -37,6 +37,7 @@ pub const Phase = enum {
     execute,
     launch,
     decode,
+    validate,
     read,
     write,
     prepare,
@@ -79,8 +80,12 @@ pub const Cause = union(enum) {
     http: struct { status: u16, classification: HttpClass },
     git: struct { kind: enum { exited, signal, stopped, unknown }, code: u32 },
     sqlite: struct { result: i32, extended: i32 },
-    grammar: struct { code: u32, offset: u32 },
+    grammar: struct { rule: GrammarRule, code: u32 = 0, offset: u32 },
 };
+
+/// `query` carries a Tree-sitter query error code and `regex` a regex engine code.
+/// The other rules have no code.
+pub const GrammarRule = enum { query, regex, unknown_operator, unsupported_directive, malformed_arguments, unsupported_property };
 
 pub const Failure = struct {
     operation: Operation,

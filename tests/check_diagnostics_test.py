@@ -38,6 +38,22 @@ class DiagnosticsCheckTest(unittest.TestCase):
                 self.assertEqual(len(found), 1)
                 self.assertIn("SqliteStore.native", found[0])
 
+    def test_an_unrelated_native_call_on_the_line_does_not_hide_an_unwrapped_result(self):
+        found = self.check("src/persist/sqlite_store.zig", "_ = self.native(rc, .step, @src()); _ = c.sqlite3_finalize(stmt);")
+        self.assertEqual(len(found), 1)
+        self.assertIn("sqlite_store.zig:1:", found[0])
+
+    def test_a_multiline_wrapper_and_another_receiver_are_accepted(self):
+        text = "\n".join((
+            "if (self.native(",
+            "    c.sqlite3_step(stmt),",
+            "    .step,",
+            "    @src(),",
+            ") != c.SQLITE_DONE) return error.Step;",
+            "defer _ = store.native(c.sqlite3_finalize(stmt), .finalize, @src());",
+        ))
+        self.assertEqual(self.check("src/persist/sqlite_store.zig", text), [])
+
     def test_old_auth_error_exit_must_record_its_cause(self):
         found = self.check("src/main.zig", 'fn statusRun() void {\n std.debug.print("bbr: stored credential is unusable", .{});\n std.process.exit(1);\n}')
         self.assertEqual(len(found), 1)

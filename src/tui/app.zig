@@ -99,6 +99,7 @@ const picker_tick_interval_ms = 250;
 
 fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
     var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
+    anchor_git.diagnostic = ctx.diagnostic.forContext(.git, .{});
     var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient());
     defer git_anchor_resolver.deinit();
     var state = try presentation.Presentation.init(ctx.gpa, .{
@@ -347,11 +348,6 @@ fn presentationStatus(
     if (projection.buffer_search) |search_projection| return bufferSearchStatus(frame, projection, search_projection);
     if (projection.action_error) |err| return actionErrorText(err);
     if (projection.diagnostic_pending) return "changing diagnostic logging";
-    switch (projection.diagnostic_state) {
-        .on => return "diagnostic logging enabled",
-        .unavailable => return "diagnostic logging unavailable",
-        .off => {},
-    }
     if (projection.clipboard_status) |status| return switch (status) {
         .copied => "copied text",
         .failed => "could not copy text",
@@ -1049,7 +1045,7 @@ fn presentationListPullRequestsWorker(
 
 fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    presentation_runtime.deliver(presentationSink(&sink_context), .{ .code_highlight_completed = command.execute(highlighter) });
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .code_highlight_completed = command.execute(highlighter.withDiagnostics(diagnostic)) });
 }
 
 fn drainPresentationCommands(
@@ -1275,13 +1271,24 @@ const StatusFacts = struct {
     submitting: bool = false,
     draft_count: usize = 0,
     status_msg: ?[]const u8 = null,
+    diagnostic_state: bbr.diagnostic.State = .off,
     searching: bool = false,
     search_has_no_matches: bool = false,
 };
 
+/// Diagnostic logging state is its own meta item, so it never hides an
+/// operation status or the key hints.
+fn diagnosticStatus(state: bbr.diagnostic.State) ?[]const u8 {
+    return switch (state) {
+        .on => "diagnostic logging enabled",
+        .unavailable => "diagnostic logging unavailable",
+        .off => null,
+    };
+}
+
 fn projectionStatusItems(frame: std.mem.Allocator, projection: presentation.Projection) StatusItems {
     const active_theme = theme.value(projection.theme);
-    const review = projection.review orelse return loadingStatusItems(active_theme, presentationStatus(frame, projection, null));
+    const review = projection.review orelse return loadingStatusItems(active_theme, presentationStatus(frame, projection, null), projection.diagnostic_state);
     const visual_cursor = review.navigation.cursor;
     return statusItems(frame, active_theme, .{
         .header = review.header,
@@ -1299,6 +1306,7 @@ fn projectionStatusItems(frame: std.mem.Allocator, projection: presentation.Proj
         .submitting = projection.submission != null,
         .draft_count = review.drafts.len,
         .status_msg = presentationStatus(frame, projection, review.key),
+        .diagnostic_state = projection.diagnostic_state,
         .searching = projection.buffer_search != null,
         .search_has_no_matches = if (projection.buffer_search) |search| search.query.len > 0 and search.total == 0 else false,
     });
@@ -1326,6 +1334,7 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
         items.add(.refs, facts.header.base_ref, .ref);
         items.add(.position, std.fmt.allocPrint(frame, "{d}/{d}", .{ facts.position, facts.total }) catch "", .position);
         items.position_width = @intCast(std.fmt.count("{d}/{d}", .{ facts.total, facts.total }));
+        if (diagnosticStatus(facts.diagnostic_state)) |text| items.add(.diagnostics, text, .message);
     }
     items.hint(.layout, "s", if (facts.layout == .unified) " split" else " unified");
     // Names the *current* scope; `f` cycles Changes → fetched → whole.
@@ -1359,8 +1368,9 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
 }
 
 /// Before a review exists, the hint part holds the loading message alone.
-fn loadingStatusItems(active_theme: theme.Theme, status_msg: ?[]const u8) StatusItems {
+fn loadingStatusItems(active_theme: theme.Theme, status_msg: ?[]const u8, diagnostic_state: bbr.diagnostic.State) StatusItems {
     var items: StatusItems = .init(active_theme);
+    if (diagnosticStatus(diagnostic_state)) |text| items.add(.diagnostics, text, .message);
     if (status_msg) |message| items.add(.message, message, .message) else items.add(.message, "loading…", .busy);
     return items;
 }
@@ -1527,6 +1537,7 @@ const TestStatus = struct {
     total: usize = 1,
     loading: bool = false,
     status_msg: ?[]const u8 = null,
+    diagnostic_state: bbr.diagnostic.State = .off,
     searching: bool = false,
     search_has_no_matches: bool = false,
 };
@@ -1543,6 +1554,7 @@ fn testStatusItems(arena: std.mem.Allocator, active_theme: theme.Theme, case: Te
         .loading = case.loading,
         .draft_count = 2,
         .status_msg = case.status_msg,
+        .diagnostic_state = case.diagnostic_state,
         .searching = case.searching,
         .search_has_no_matches = case.search_has_no_matches,
     });
@@ -1602,6 +1614,18 @@ test "the status puts the meta items above the hint items and separates items on
         for (narrow) |row| rows_with_item += @intFromBool(std.mem.indexOf(u8, row, item) != null);
         try std.testing.expectEqual(@as(usize, 1), rows_with_item);
     }
+}
+
+test "diagnostic logging state is a meta item that hides no status message or key hint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const enabled = try testStatusRows(a, try testDrawStatus(a, theme.dark, .{ .diagnostic_state = .on }));
+    try std.testing.expectEqualStrings("#7 Fix parser  ·  Approved  ·  review → main  ·  1/1  ·  diagnostic logging enabled", enabled[0]);
+    try std.testing.expect(std.mem.indexOf(u8, enabled[1], "? help") != null);
+    const copied = try testStatusRows(a, try testDrawStatus(a, theme.dark, .{ .diagnostic_state = .on, .status_msg = "copied text" }));
+    try std.testing.expect(std.mem.indexOf(u8, copied[0], "diagnostic logging enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copied[1], "copied text") != null);
 }
 
 test "the status height does not change when only the cursor moves" {

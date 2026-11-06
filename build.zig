@@ -229,6 +229,13 @@ pub fn build(b: *std.Build) void {
     diagnostic_step.dependOn(&diagnostic_check.step);
     diagnostic_step.dependOn(&b.addRunArtifact(diagnostic_tests).step);
     diagnostic_step.dependOn(&b.addRunArtifact(diagnostic_core_tests).step);
+    for ([_][]const u8{ "tests/check_diagnostics_test.py", "tests/diagnostic_types_test.py" }) |path| {
+        const run = b.addSystemCommand(&.{"python3"});
+        run.addFileArg(b.path(path));
+        run.setCwd(b.path("."));
+        run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+        diagnostic_step.dependOn(&run.step);
+    }
     const cli_test_step = b.step("test-cli", "Run hermetic Python CLI checks (requires python3)");
     addTestScripts(b, exe, test_step, cli_test_step);
 
@@ -454,6 +461,8 @@ fn addTestScripts(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.B
         run.addFileArg(b.path(path));
         run.setCwd(b.path("."));
         if (script != .cli) {
+            // A test that compiles Zig uses the compiler of this build, also when PATH has none.
+            run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
             test_step.dependOn(&run.step);
             continue;
         }

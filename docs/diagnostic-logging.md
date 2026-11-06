@@ -11,6 +11,8 @@ enabled = true
 
 The startup reader checks this setting before command dispatch, including `api`, `auth`, `grammar`, and `completion`.
 A missing setting, an invalid logging setting, or an unreadable configuration leaves startup logging off.
+The reader accepts only a regular file. It does not open a FIFO or another special file, so a FIFO cannot block startup.
+When the setting enables logging but the sink cannot open its file, bbr prints `bbr: diagnostic logging unavailable` and the cause to stderr. The command continues with the same exit status.
 Commands that do not need TUI configuration still ignore unrelated TUI values.
 The TUI retains its full configuration validation.
 
@@ -18,6 +20,8 @@ The `Toggle diagnostic logging` Action in the `ctrl-p` Command Palette changes o
 The terminal adapter opens the file before Presentation reports that logging is enabled.
 A failed enable leaves logging unavailable. A file write failure closes the file and makes logging unavailable.
 Disabling waits for a current write to finish. Later writes do nothing.
+A write blocks cancellation of its worker, so a cancelled worker cannot make logging unavailable.
+The TUI status shows the logging state as its own meta item. The item does not hide an operation status or a key hint.
 The Action never writes `config.toml`.
 
 Files live in `<state home>/bbr/diagnostics`.
@@ -54,6 +58,7 @@ Available numeric context follows the source field.
 It can include the command ID, work ID, Session Epoch, OperationId, Draft ID, File index, File side, attempt, or page.
 Absent context fields do not appear.
 Native cause fields retain HTTP classification and status, Git termination and code, or SQLite primary and extended codes.
+A Grammar cause names its `rule`: `query` with the Tree-sitter query error code, `regex` with the regex engine code, or a predicate rule such as `unknown_operator` with code 0. Each Grammar cause has the byte offset in the query, but never the query text.
 Zig causes use the original error name where capture precedes domain conversion.
 
 The sink accepts no arbitrary message or field map.

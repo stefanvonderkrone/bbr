@@ -194,7 +194,7 @@ pub const Registry = struct {
         for (entries) |entry| {
             const name = try allocator.dupe(u8, entry.name);
             errdefer allocator.free(name);
-            var inspection = inspectWithDiagnostics(allocator, io, entry.path, if (entry.enabled) diagnostic_handle else .{}) catch |err| {
+            var inspection = inspectWithDiagnostics(allocator, io, entry.path, diagnostic_handle) catch |err| {
                 if (entry.enabled) return err;
                 try installations.append(allocator, .{ .name = name, .enabled = false });
                 continue;

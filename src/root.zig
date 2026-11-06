@@ -195,6 +195,7 @@ pub const stdout = @import("stdout.zig");
 test {
     _ = @import("diagnostics.zig");
     _ = @import("logging_config.zig");
+    _ = @import("config_source.zig");
     _ = @import("http/client.zig");
     _ = @import("http/fake_client.zig");
     _ = @import("http/std_client.zig");

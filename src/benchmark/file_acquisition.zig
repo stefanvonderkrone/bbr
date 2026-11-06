@@ -41,7 +41,7 @@ const CountingSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(ptr: *anyopaque, allocator: std.mem.Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+    fn read(ptr: *anyopaque, allocator: std.mem.Allocator, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *CountingSource = @ptrCast(@alignCast(ptr));
         const active = self.active.fetchAdd(1, .acq_rel) + 1;
         defer _ = self.active.fetchSub(1, .acq_rel);
@@ -49,7 +49,7 @@ const CountingSource = struct {
         while (active > previous) {
             previous = self.max_active.cmpxchgWeak(previous, active, .release, .monotonic) orelse break;
         }
-        return self.inner.read(allocator, commit, path);
+        return self.inner.readWithDiagnostics(allocator, commit, path, diagnostic);
     }
 };
 

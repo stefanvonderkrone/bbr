@@ -391,17 +391,23 @@ pub const Client = struct {
         };
         const parsed = parseJson(self.diagnostic, @src(), Wire, allocator, metadata_body, .{ .ignore_unknown_fields = true }) catch return error.MalformedResponse;
         defer parsed.deinit();
-        errdefer |err| _ = self.diagnostic.failure(.decode, .{ .zig = err }, @src());
         const metadata = parsed.value;
-        if (!std.mem.eql(u8, metadata.type, "commit_file")) return error.BlobTypeMismatch;
-        if (!std.mem.eql(u8, metadata.path, path)) return error.BlobPathMismatch;
-        if (!hashMatches(metadata.commit.hash, commit)) return error.BlobCommitMismatch;
-        if (!stringSlicesEqual(metadata.attributes, expected_attributes)) return error.BlobAttributesMismatch;
+        if (!std.mem.eql(u8, metadata.type, "commit_file")) return self.invalidBlob(error.BlobTypeMismatch, @src());
+        if (!std.mem.eql(u8, metadata.path, path)) return self.invalidBlob(error.BlobPathMismatch, @src());
+        if (!hashMatches(metadata.commit.hash, commit)) return self.invalidBlob(error.BlobCommitMismatch, @src());
+        if (!stringSlicesEqual(metadata.attributes, expected_attributes)) return self.invalidBlob(error.BlobAttributesMismatch, @src());
 
         const raw = try self.getFileBlob(allocator, repo_slug, commit, path);
         defer allocator.free(raw);
-        if (metadata.size != raw.len) return error.BlobSizeMismatch;
+        if (metadata.size != raw.len) return self.invalidBlob(error.BlobSizeMismatch, @src());
         return raw.len;
+    }
+
+    const BlobShapeError = error{ BlobTypeMismatch, BlobPathMismatch, BlobCommitMismatch, BlobAttributesMismatch, BlobSizeMismatch };
+
+    fn invalidBlob(self: Client, err: BlobShapeError, comptime source: std.builtin.SourceLocation) BlobShapeError {
+        _ = self.diagnostic.failure(.validate, .{ .zig = err }, source);
+        return err;
     }
 
     fn getSource(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, path: []const u8, metadata: bool) ![]u8 {

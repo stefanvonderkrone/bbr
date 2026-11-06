@@ -5,6 +5,7 @@ pub const Failure = value.Failure;
 pub const State = value.State;
 pub const Context = value.Context;
 pub const Cause = value.Cause;
+pub const GrammarRule = value.GrammarRule;
 pub const Operation = value.Operation;
 pub const Phase = value.Phase;
 
@@ -119,6 +120,8 @@ pub const Sink = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.actual != .on) return;
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
         self.write(failure_value) catch |err| self.fail(err, .write);
     }
 
@@ -143,7 +146,7 @@ pub const Sink = struct {
             .http => |http| try writer.print(" cause=http status={d} classification={s}", .{ http.status, @tagName(http.classification) }),
             .git => |git| try writer.print(" cause=git termination={s} code={d}", .{ @tagName(git.kind), git.code }),
             .sqlite => |sqlite| try writer.print(" cause=sqlite result={d} extended={d}", .{ sqlite.result, sqlite.extended }),
-            .grammar => |grammar| try writer.print(" cause=grammar code={d} offset={d}", .{ grammar.code, grammar.offset }),
+            .grammar => |grammar| try writer.print(" cause=grammar rule={s} code={d} offset={d}", .{ @tagName(grammar.rule), grammar.code, grammar.offset }),
         }
         try writer.writeByte('\n');
         try self.file.?.writeStreamingAll(self.io, writer.buffered());
@@ -233,6 +236,7 @@ test "diagnostics concurrent records stay complete and separate sinks own separa
     defer dir.close(testing.io);
     var iterator = dir.iterate();
     var files: usize = 0;
+    var total_records: usize = 0;
     while (try iterator.next(testing.io)) |entry| {
         files += 1;
         const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(128 * 1024));
@@ -248,8 +252,10 @@ test "diagnostics concurrent records stay complete and separate sinks own separa
             try testing.expect((std.mem.indexOf(u8, line, "work_id=1") != null) != (std.mem.indexOf(u8, line, "work_id=2") != null));
         }
         try testing.expect(records == 0 or records == 200);
+        total_records += records;
     }
     try testing.expectEqual(@as(usize, 2), files);
+    try testing.expectEqual(@as(usize, 200), total_records);
 }
 
 test "diagnostics write failure closes the sink and keeps the original sink error" {

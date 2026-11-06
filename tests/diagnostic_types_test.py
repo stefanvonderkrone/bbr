@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ class DiagnosticTypesTest(unittest.TestCase):
                 self.assertNotEqual(source, broken)
                 file = Path(temporary) / "diagnostic.zig"
                 file.write_text(broken)
-                result = subprocess.run(["zig", "test", str(file)], capture_output=True, text=True, timeout=60)
+                result = subprocess.run([os.environ.get("ZIG", "zig"), "test", str(file)], capture_output=True, text=True, timeout=60)
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 self.assertIn("diagnostic evidence must contain only closed causes and numeric identities", result.stderr)
 

@@ -10,6 +10,11 @@ pub const Snapshot = struct {
     pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) Snapshot {
         const path = xdg.configFile(allocator, env) catch |err| return .{ .read_error = err };
         const resolved = path orelse return .{};
+        // Opening a FIFO blocks until a writer appears, so check the kind first.
+        const stat = std.Io.Dir.cwd().statFile(io, resolved, .{}) catch |err| {
+            return .{ .path = resolved, .read_error = if (err == error.FileNotFound) null else err };
+        };
+        if (stat.kind != .file) return .{ .path = resolved, .read_error = error.ConfigNotRegularFile };
         const source = std.Io.Dir.cwd().readFileAlloc(io, resolved, allocator, .limited(max_bytes + 1)) catch |err| {
             return .{ .path = resolved, .read_error = if (err == error.FileNotFound) null else err };
         };
@@ -115,3 +120,24 @@ pub const LineParser = struct {
         return error.ExpectedBoolean;
     }
 };
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "a FIFO config file is refused without a blocking open" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "bbr");
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    const fifo = try std.fs.path.joinZ(testing.allocator, &.{ home, "bbr", "config.toml" });
+    defer testing.allocator.free(fifo);
+    try testing.expectEqual(@as(c_int, 0), mkfifo(fifo, 0o600));
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", home);
+    var snapshot = Snapshot.load(testing.allocator, testing.io, &env);
+    defer snapshot.deinit(testing.allocator);
+    try testing.expectEqual(@as(?anyerror, error.ConfigNotRegularFile), snapshot.read_error);
+    try testing.expect(snapshot.source == null);
+}

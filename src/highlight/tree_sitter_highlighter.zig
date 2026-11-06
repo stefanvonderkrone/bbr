@@ -79,37 +79,38 @@ pub const TreeSitterHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlightImpl };
 
-    fn highlightImpl(ptr: *anyopaque, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlightImpl(ptr: *anyopaque, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8, request: diagnostics.Handle) anyerror!bbr.highlight.HighlightResult {
         const self: *TreeSitterHighlighter = @ptrCast(@alignCast(ptr));
+        const diagnostic = if (request.sink != null) request else self.diagnostic_handle;
         if (self.registry) |registry| {
             if (registry.matchName(path, content) != null) {
                 const grammar = registry.grammar(path, content) catch |err| {
-                    _ = self.diagnostic_handle.failure(.prepare, .{ .zig = err }, @src());
-                    return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch .{ .spans = &.{} };
+                    _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
+                    return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content, diagnostic) catch .{ .spans = &.{} };
                 };
                 if (grammar) |selected| {
                     return highlightWithPackage(result_allocator, scratch_allocator, selected.package, content, null) catch |err| {
-                        self.recordHighlightFailure(err);
-                        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch .{ .spans = &.{} };
+                        recordHighlightFailure(diagnostic, err);
+                        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content, diagnostic) catch .{ .spans = &.{} };
                     };
                 }
             }
         }
-        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content);
+        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content, diagnostic);
     }
 
-    fn highlightBuiltIn(self: *TreeSitterHighlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
+    fn highlightBuiltIn(self: *TreeSitterHighlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8, diagnostic: diagnostics.Handle) !bbr.highlight.HighlightResult {
         const selected = grammar_match.selectBuiltIn(path, content) orelse return .{ .spans = &.{} };
         return highlightWithPackage(result_allocator, scratch_allocator, &self.packages[@intFromEnum(selected)], content, null) catch |err| {
-            self.recordHighlightFailure(err);
+            recordHighlightFailure(diagnostic, err);
             return err;
         };
     }
 
-    fn recordHighlightFailure(self: *const TreeSitterHighlighter, err: anyerror) void {
+    fn recordHighlightFailure(diagnostic: diagnostics.Handle, err: anyerror) void {
         switch (err) {
             error.FileTooLarge, error.InvalidUtf8 => {},
-            else => _ = self.diagnostic_handle.failure(.execute, .{ .zig = err }, @src()),
+            else => _ = diagnostic.failure(.execute, .{ .zig = err }, @src()),
         }
     }
 };
@@ -413,7 +414,7 @@ test "diagnostics retain native query and regex codes without source or engine f
     try testing.expect(diagnostic.query_error.? != c.TSQueryErrorNone);
     diagnostic.record(handle, @src());
     var expected_buffer: [80]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buffer, "code={d} offset={d}", .{ diagnostic.query_error.?, diagnostic.source_offset });
+    const expected = try std.fmt.bufPrint(&expected_buffer, "rule=query code={d} offset={d}", .{ diagnostic.query_error.?, diagnostic.source_offset });
     const query_bytes = try diagnosticBytes(tmp);
     defer testing.allocator.free(query_bytes);
     try testing.expect(std.mem.indexOf(u8, query_bytes, expected) != null);
@@ -429,10 +430,25 @@ test "diagnostics retain native query and regex codes without source or engine f
     diagnostic.record(handle, @src());
     const bytes = try diagnosticBytes(tmp);
     defer testing.allocator.free(bytes);
-    const expected_regex = try std.fmt.bufPrint(&expected_buffer, "code={d} offset={d}", .{ @as(u32, @bitCast(diagnostic.regex_failure.?.engine_code)), diagnostic.source_offset });
+    const expected_regex = try std.fmt.bufPrint(&expected_buffer, "rule=regex code={d} offset={d}", .{ @as(u32, @bitCast(diagnostic.regex_failure.?.engine_code)), diagnostic.source_offset });
     try testing.expect(std.mem.indexOf(u8, bytes, expected_regex) != null);
     for ([_][]const u8{ "private_query_node_8f2b", "private_capture_9e", "private_regex_fragment_7c", diagnostic.regex_failure.?.fragment() }) |secret|
         try testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
+
+    try testing.expectError(error.InvalidPredicate, RuntimePackage.init(
+        testing.allocator,
+        tree_sitter_javascript().?,
+        "((identifier) @private_capture_9e (#private-operator-4d? @private_capture_9e))",
+        "",
+        &diagnostic,
+    ));
+    try testing.expectEqual(predicate_mod.Diagnostic.Kind.unknown_operator, diagnostic.kind);
+    diagnostic.record(handle, @src());
+    const predicate_bytes = try diagnosticBytes(tmp);
+    defer testing.allocator.free(predicate_bytes);
+    const expected_predicate = try std.fmt.bufPrint(&expected_buffer, "rule=unknown_operator code=0 offset={d}", .{diagnostic.source_offset});
+    try testing.expect(std.mem.indexOf(u8, predicate_bytes, expected_predicate) != null);
+    try testing.expect(std.mem.indexOf(u8, predicate_bytes, "private-operator-4d") == null);
 }
 
 fn privateSink(tmp: testing.TmpDir, env: *std.process.Environ.Map) !diagnostics.Sink {

@@ -40,7 +40,13 @@ pub fn main(init: std.process.Init) !void {
     defer snapshot.deinit(init.gpa);
     var sink = bbr.diagnostics.Sink.init(init.gpa, init.io, init.environ_map);
     defer sink.deinit();
-    _ = sink.setEnabled(bbr.logging_config.enabled(snapshot));
+    switch (sink.setEnabled(bbr.logging_config.enabled(snapshot))) {
+        .unavailable => |failure| std.debug.print("bbr: diagnostic logging unavailable: {s}\n", .{switch (failure.cause) {
+            .zig => |err| @errorName(err),
+            else => @tagName(failure.cause),
+        }}),
+        .off, .on => {},
+    }
     const diagnostic = sink.handle(.startup, .{});
     runMain(init, snapshot, diagnostic) catch |err| switch (err) {
         error.StdoutClosed => {},
@@ -212,7 +218,7 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagn
         const path_index: usize = if (std.mem.eql(u8, args.items[0], "update")) 2 else 1;
         if (args.items.len <= path_index) return invalidUsage(diagnostic, error.MissingRequired, @src());
         var previewed_digest: [32]u8 = undefined;
-        try bbr.stdout.write(init.io, writeTrustQuestion, .{ gpa, init.io, args.items[path_index], &previewed_digest });
+        try bbr.stdout.write(init.io, writeTrustQuestion, .{ gpa, init.io, args.items[path_index], &previewed_digest, diagnostic });
         var buffer: [16]u8 = undefined;
         var stdin = std.Io.File.stdin().reader(init.io, &buffer);
         const answer = (try stdin.interface.takeDelimiter('\n')) orelse "";
@@ -226,8 +232,8 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagn
     };
 }
 
-fn writeTrustQuestion(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, path: []const u8, digest: *[32]u8) !void {
-    digest.* = try grammar_cli.writeCandidateReport(gpa, io, path, writer);
+fn writeTrustQuestion(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, path: []const u8, digest: *[32]u8, diagnostic: bbr.diagnostics.Handle) !void {
+    digest.* = try grammar_cli.writeCandidateReportWithDiagnostics(gpa, io, path, writer, diagnostic);
     try writer.writeAll("Trust this exact bundle? [y/N] ");
 }
 

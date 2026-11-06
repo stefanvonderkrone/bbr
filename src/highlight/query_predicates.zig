@@ -40,11 +40,15 @@ pub const Diagnostic = struct {
     }
 
     pub fn record(self: Diagnostic, handle: diagnostics.Handle, comptime source: std.builtin.SourceLocation) void {
-        if (self.query_error) |code| {
-            _ = handle.failure(.query, .{ .grammar = .{ .code = code, .offset = self.source_offset } }, source);
-        } else if (self.regex_failure) |failure| {
-            _ = handle.failure(.query, .{ .grammar = .{ .code = @bitCast(failure.engine_code), .offset = self.source_offset } }, source);
-        }
+        const cause: diagnostics.Cause = if (self.query_error) |code|
+            .{ .grammar = .{ .rule = .query, .code = code, .offset = self.source_offset } }
+        else if (self.regex_failure) |failure|
+            .{ .grammar = .{ .rule = .regex, .code = @bitCast(failure.engine_code), .offset = self.source_offset } }
+        else switch (self.kind) {
+            .invalid_query, .invalid_regex => return,
+            inline .unknown_operator, .unsupported_directive, .malformed_arguments, .unsupported_property => |kind| .{ .grammar = .{ .rule = @field(diagnostics.GrammarRule, @tagName(kind)), .offset = self.source_offset } },
+        };
+        _ = handle.failure(.query, cause, source);
     }
 };
 

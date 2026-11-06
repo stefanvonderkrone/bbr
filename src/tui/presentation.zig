@@ -6300,7 +6300,10 @@ pub const Presentation = struct {
     diagnostic_state: bbr.diagnostic.State = .off,
     diagnostic_pending: bool = false,
     fatal_error: ?FatalError = null,
-    emergency_diagnostic: ?bbr.diagnostic.Failure = null,
+    /// Reports that the command queue could not take. They need no allocation, so an
+    /// allocation failure loses none of the first `emergency_diagnostics.len` reports.
+    emergency_diagnostics: [4]bbr.diagnostic.Failure = undefined,
+    emergency_diagnostic_count: usize = 0,
     clipboard_status: ?ClipboardStatus = null,
     external_edit_pending: ?SessionEpoch = null,
     composer_footer: std.ArrayList(u8) = .empty,
@@ -6463,8 +6466,10 @@ pub const Presentation = struct {
     }
 
     pub fn takeCommand(self: *Presentation) ?OwnedCommand {
-        if (self.emergency_diagnostic) |failure| {
-            self.emergency_diagnostic = null;
+        if (self.emergency_diagnostic_count > 0) {
+            const failure = self.emergency_diagnostics[0];
+            self.emergency_diagnostic_count -= 1;
+            std.mem.copyForwards(bbr.diagnostic.Failure, self.emergency_diagnostics[0..self.emergency_diagnostic_count], self.emergency_diagnostics[1 .. self.emergency_diagnostic_count + 1]);
             return .{ .report_diagnostic = failure };
         }
         if (self.commands.items.len > 0 and self.commands.items[0] == .report_diagnostic) return self.commands.orderedRemove(0);
@@ -6548,7 +6553,9 @@ pub const Presentation = struct {
     fn reportEvidence(self: *Presentation, failure: bbr.diagnostic.Failure) void {
         if (self.diagnostic_state != .on) return;
         self.commands.append(self.allocator, .{ .report_diagnostic = failure }) catch {
-            self.emergency_diagnostic = failure;
+            if (self.emergency_diagnostic_count == self.emergency_diagnostics.len) return;
+            self.emergency_diagnostics[self.emergency_diagnostic_count] = failure;
+            self.emergency_diagnostic_count += 1;
         };
     }
 
@@ -7102,7 +7109,7 @@ pub const Presentation = struct {
         var write: usize = 0;
         for (self.commands.items) |command_value| {
             var command = command_value;
-            if (command == .post_draft or command == .update_comment or command == .delete_comment or command == .change_reviewer_verdict or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
+            if (command == .report_diagnostic or command == .post_draft or command == .update_comment or command == .delete_comment or command == .change_reviewer_verdict or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
                 self.commands.items[write] = command;
                 write += 1;
             } else {
@@ -10572,7 +10579,8 @@ pub const Presentation = struct {
             return;
         };
         const source_check = if (self.dependencies.require_source_check)
-            BoundedText(64).init(published.session.header.source_commit) catch {
+            BoundedText(64).init(published.session.header.source_commit) catch |err| {
+                self.reportFailure(.submission, .prepare, err, @src());
                 self.action_error = .submission_start_failed;
                 return;
             }
@@ -10586,6 +10594,7 @@ pub const Presentation = struct {
             lock,
             selected_root,
         ) catch |err| {
+            if (err != error.SubmissionAlreadyActive) self.reportFailure(.submission, .prepare, err, @src());
             self.action_error = if (err == error.SubmissionAlreadyActive) .submission_already_active else .submission_start_failed;
             return;
         } orelse {
@@ -11232,7 +11241,9 @@ pub const Presentation = struct {
     }
 
     fn resumeSubmissionWaitLaunch(self: *Presentation, durable: *DurableSubmission) void {
-        const wait = durable.pending_wait_retry orelse return;
+        var wait = durable.pending_wait_retry orelse return;
+        // The retry is a new launch. The failed launch already reported its evidence.
+        wait.evidence = null;
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
             self.action_error = .out_of_memory;
@@ -11243,7 +11254,8 @@ pub const Presentation = struct {
             durable.key.storeKey(),
             wait.temp_id,
             checkpoint,
-        ) catch {
+        ) catch |err| {
+            self.reportFailure(.persistence, .write, err, @src());
             self.action_error = .persistence_failed;
             return;
         };
@@ -19720,7 +19732,7 @@ const PersistenceTestHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(_: *anyopaque, allocator: Allocator, _: Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(_: *anyopaque, allocator: Allocator, _: Allocator, _: []const u8, _: []const u8, _: bbr.diagnostics.Handle) anyerror!bbr.highlight.HighlightResult {
         const spans = try allocator.alloc(bbr.highlight.Span, 1);
         spans[0] = .{
             .line = 1,
@@ -28841,7 +28853,7 @@ const TestNoopHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(_: *anyopaque, _: Allocator, _: Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(_: *anyopaque, _: Allocator, _: Allocator, _: []const u8, _: []const u8, _: bbr.diagnostics.Handle) anyerror!bbr.highlight.HighlightResult {
         return .{ .spans = &.{} };
     }
 };
