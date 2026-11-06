@@ -2430,7 +2430,6 @@ pub const max_pagelen = struct {
     pub const commits: u32 = 100;
     pub const workspaces: u32 = 100;
     pub const members: u32 = 100;
-    /// Provisional for both Default Reviewer endpoints. No live check confirms it yet.
     pub const default_reviewers: u32 = 100;
 };
 
