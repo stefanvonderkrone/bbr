@@ -190,6 +190,7 @@ pub const diagnostics = @import("diagnostics.zig");
 pub const config_source = @import("config_source.zig");
 pub const logging_config = @import("logging_config.zig");
 pub const xdg = @import("xdg.zig");
+pub const stdout = @import("stdout.zig");
 
 test {
     _ = @import("diagnostics.zig");
@@ -221,4 +222,5 @@ test {
     _ = @import("bitbucket/url.zig");
     _ = @import("startup.zig");
     _ = @import("xdg.zig");
+    _ = @import("stdout.zig");
 }

@@ -42,9 +42,12 @@ pub fn main(init: std.process.Init) !void {
     defer sink.deinit();
     _ = sink.setEnabled(bbr.logging_config.enabled(snapshot));
     const diagnostic = sink.handle(.startup, .{});
-    runMain(init, snapshot, diagnostic) catch |err| {
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
-        return err;
+    runMain(init, snapshot, diagnostic) catch |err| switch (err) {
+        error.StdoutClosed => {},
+        else => {
+            _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
+            return err;
+        },
     };
 }
 
@@ -97,12 +100,7 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
     var rest = ArgSlice{ .args = rest_args };
 
     if (first) |argument| {
-        if (std.mem.eql(u8, argument, "--version")) {
-            var output_buffer: [128]u8 = undefined;
-            var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-            try stdout.interface.print("bbr {s}\n", .{build_options.version});
-            return stdout.interface.flush();
-        }
+        if (std.mem.eql(u8, argument, "--version")) return bbr.stdout.print(init.io, "bbr {s}\n", .{build_options.version});
     }
 
     // `demo` needs no credentials: it feeds synthetic data through the real
@@ -213,11 +211,8 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagn
     if (needs_confirmation) {
         const path_index: usize = if (std.mem.eql(u8, args.items[0], "update")) 2 else 1;
         if (args.items.len <= path_index) return invalidUsage(diagnostic, error.MissingRequired, @src());
-        var output_buffer: [4096]u8 = undefined;
-        var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-        const previewed_digest = try grammar_cli.writeCandidateReport(gpa, init.io, args.items[path_index], &stdout.interface);
-        try stdout.interface.writeAll("Trust this exact bundle? [y/N] ");
-        try stdout.interface.flush();
+        var previewed_digest: [32]u8 = undefined;
+        try bbr.stdout.write(init.io, writeTrustQuestion, .{ gpa, init.io, args.items[path_index], &previewed_digest });
         var buffer: [16]u8 = undefined;
         var stdin = std.Io.File.stdin().reader(init.io, &buffer);
         const answer = (try stdin.interface.takeDelimiter('\n')) orelse "";
@@ -225,13 +220,19 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagn
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer, " \t\r"), "yes");
         if (approved) interactive_digest = previewed_digest;
     }
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    grammar_cli.runWithDiagnostics(gpa, init.io, init.environ_map, args.items, interactive_digest, &stdout.interface, diagnostic) catch |err| {
-        std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
+    bbr.stdout.write(init.io, runGrammar, .{ gpa, init.io, init.environ_map, args.items, interactive_digest, diagnostic }) catch |err| {
+        if (err != error.StdoutClosed) std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
         return @as(anyerror!void, err);
     };
-    try stdout.interface.flush();
+}
+
+fn writeTrustQuestion(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, path: []const u8, digest: *[32]u8) !void {
+    digest.* = try grammar_cli.writeCandidateReport(gpa, io, path, writer);
+    try writer.writeAll("Trust this exact bundle? [y/N] ");
+}
+
+fn runGrammar(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, args: []const []const u8, interactive_digest: ?[32]u8, diagnostic: bbr.diagnostics.Handle) !void {
+    return grammar_cli.runWithDiagnostics(gpa, io, env, args, interactive_digest, writer, diagnostic);
 }
 
 fn containsTrustArgument(args: []const []const u8) bool {
@@ -894,17 +895,9 @@ fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt
         _ = diagnostic.failure(.cleanup, .{ .zig = err }, @src());
     };
 
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(io, &output_buffer);
-    try stdout.interface.writeAll(prompt);
-    try stdout.interface.flush();
-    defer if (original != null) {
-        stdout.interface.writeAll("\n") catch |err| {
-            _ = diagnostic.failure(.write, .{ .zig = err }, @src());
-        };
-        stdout.interface.flush() catch |err| {
-            _ = diagnostic.failure(.write, .{ .zig = err }, @src());
-        };
+    try bbr.stdout.writeAll(io, prompt);
+    defer if (original != null) bbr.stdout.writeAll(io, "\n") catch |err| {
+        _ = diagnostic.failure(.write, .{ .zig = err }, @src());
     };
     const line = (try stdin.takeDelimiter('\n')) orelse return error.LoginAborted;
     const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -1271,17 +1264,12 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     const email_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_USERNAME") != null) "env" else "file";
     const token_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_TOKEN") != null) "env" else "file";
     const workspace_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_WORKSPACE") != null) "env" else "file";
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    stdout.interface.print("profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
+    bbr.stdout.print(init.io, "profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
         owned.profile, owned.username, email_src, token_src, owned.workspace, workspace_src, uuid,
     }) catch |err| {
+        if (err == error.StdoutClosed) return err;
         std.debug.print("bbr: status failed: output error\n", .{});
-        exitFailure(diagnostic, stdout.err orelse err, @src());
-    };
-    stdout.interface.flush() catch |err| {
-        std.debug.print("bbr: status failed: output error\n", .{});
-        exitFailure(diagnostic, stdout.err orelse err, @src());
+        exitFailure(diagnostic, err, @src());
     };
 }
 

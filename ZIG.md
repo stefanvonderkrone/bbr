@@ -53,8 +53,11 @@ Implications for us:
 - Formatting goes through `writer.print(...)`; there is no more `anytype`-generic stream.
 - `File.writer(io, buf)` starts in `.positional` mode at offset 0 (`std/Io/File/Writer.zig`
   `init`). On stdout or stderr redirected to a file, it overwrites earlier text, and later
-  writers overwrite its text. Use `File.writerStreaming` for stdout and stderr.
-  `tools/check_stdio_writers.py` enforces it.
+  writers overwrite its text. Use `File.writerStreaming` for stderr. Write stdout through
+  `bbr.stdout` in `src/stdout.zig`, the only file that makes a stdout writer.
+  `tools/check_stdio_writers.py` enforces both.
+- A `File.Writer` returns the generic `error.WriteFailed` and keeps the cause in its `err`
+  field. `bbr.stdout` returns that cause, and a closed pipe becomes `error.StdoutClosed`.
 - Anything wrapping I/O (our diff parser reading a `RawDiff`, JSON decoding) targets these
   interfaces. Prefer taking a `*std.Io.Reader` over a concrete stream.
 

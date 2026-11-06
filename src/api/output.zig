@@ -1,9 +1,9 @@
 //! Output helpers for `bbr api`: human lines by default, JSON with `--json`.
 //! Human output goes to stdout (scriptable); errors go to stderr via
-//! `std.debug.print` at call sites. stdout writes use the
-//! `stdout.writerStreaming(io, &buf).interface` pattern from `main.zig --version`.
+//! `std.debug.print` at call sites. stdout writes go through `bbr.stdout`.
 
 const std = @import("std");
+const bbr = @import("bbr");
 
 /// Return the text before the first CR or LF.
 pub fn firstLine(text: []const u8) []const u8 {
@@ -20,12 +20,10 @@ pub fn printJson(init: std.process.Init, value: anytype) !void {
 
 /// Write optional raw file output before printing the JSON result to stdout.
 pub fn printJsonFile(init: std.process.Init, value: anytype, raw: []const u8, out_path: ?[]const u8) !void {
-    var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
-    try writeJsonFile(init.io, init.gpa, &stdout.interface, value, raw, out_path);
+    try bbr.stdout.write(init.io, writeJsonFile, .{ init.io, init.gpa, value, raw, out_path });
 }
 
-fn writeJsonFile(io: std.Io, gpa: std.mem.Allocator, writer: *std.Io.Writer, value: anytype, raw: []const u8, out_path: ?[]const u8) !void {
+fn writeJsonFile(writer: *std.Io.Writer, io: std.Io, gpa: std.mem.Allocator, value: anytype, raw: []const u8, out_path: ?[]const u8) !void {
     const body = try std.json.Stringify.valueAlloc(gpa, value, .{
         .emit_null_optional_fields = false,
     });
@@ -33,28 +31,22 @@ fn writeJsonFile(io: std.Io, gpa: std.mem.Allocator, writer: *std.Io.Writer, val
     if (out_path) |path| try writeFile(io, raw, path);
     try writer.writeAll(body);
     try writer.writeAll("\n");
-    try writer.flush();
 }
 
 /// Print one line of text to stdout.
 pub fn printLine(init: std.process.Init, comptime fmt: []const u8, args: anytype) !void {
-    var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
-    try stdout.interface.print(fmt ++ "\n", args);
-    try stdout.interface.flush();
+    try bbr.stdout.print(init.io, fmt ++ "\n", args);
 }
 
-/// Print raw bytes (diff/blob/patch) to stdout, optionally tee-ing to a file.
+/// Write raw bytes (diff/blob/patch) to the optional file, then print them to stdout.
+/// The file comes first, so a reader that closes stdout early cannot stop the file.
 pub fn printRaw(
     init: std.process.Init,
     raw: []const u8,
     out_path: ?[]const u8,
 ) !void {
-    var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
-    try stdout.interface.writeAll(raw);
-    try stdout.interface.flush();
     if (out_path) |path| try writeFile(init.io, raw, path);
+    try bbr.stdout.writeAll(init.io, raw);
 }
 
 /// Write raw bytes to a file without writing to stdout.
@@ -84,7 +76,7 @@ test "JSON file output keeps binary bytes out of stdout and truncates empty file
     for ([_][]const u8{ "\x00\xff\nraw", "" }) |raw| {
         var buf: [128]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buf);
-        try writeJsonFile(io, a, &writer, .{ .size = raw.len }, raw, path);
+        try writeJsonFile(&writer, io, a, .{ .size = raw.len }, raw, path);
         const expected = try std.fmt.allocPrint(a, "{{\"size\":{d}}}\n", .{raw.len});
         defer a.free(expected);
         try std.testing.expectEqualStrings(expected, writer.buffered());
@@ -102,7 +94,7 @@ test "JSON file creation failure emits no success result" {
     defer a.free(path);
     var buf: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
-    try std.testing.expectError(error.FileNotFound, writeJsonFile(std.testing.io, a, &writer, .{ .size = @as(usize, 3) }, "raw", path));
+    try std.testing.expectError(error.FileNotFound, writeJsonFile(&writer, std.testing.io, a, .{ .size = @as(usize, 3) }, "raw", path));
     try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
 }
 
