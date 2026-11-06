@@ -546,6 +546,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .anchor_candidate_ambiguous => "that source range is ambiguous; select one side of one File",
         .anchor_range_too_long => "an Anchor covers at most 30 lines",
         .suggestion_anchor_not_new_side => "a Suggestion cannot anchor to removed lines",
+        .replacement_pending => "the Review is reloading; try again when it finishes",
         .buffer_search_selection_active => "Clear Selection before Buffer Search",
         .buffer_search_query_too_long => "Buffer Search Query limit is 256 characters",
         .buffer_search_invalid_query => "Buffer Search Query is invalid",
@@ -813,31 +814,69 @@ fn presentationLoadWorker(
     command: presentation.LoadSession,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    const outcome: presentation.SessionLoadOutcome = switch (command.key.kind) {
-        .remote => if (session.loadWith(
-            io,
-            std.heap.page_allocator,
-            client.?,
-            command.key.repository(),
-            command.key.pull_request_id,
-        )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err },
-        .local => blk: {
-            var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
-            git.diagnostic = diagnostic;
-            break :blk if (session.loadLocalWith(
-                std.heap.page_allocator,
-                git.gitClient(),
-                command.key.baseRef(),
-                command.key.sourceRef(),
-            )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err };
-        },
-    };
+    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, diagnostic, client, command })) |loaded|
+        .{ .loaded = loaded }
+    else |err|
+        .{ .failed = err };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_loaded = .{
         .evidence = if (outcome == .failed) bbr.diagnostic.Failure.capture(.session_load, .execute, diagnostic.context, .{ .zig = outcome.failed }, @src()) else null,
         .command_id = command.command_id,
         .intent = command.intent,
         .outcome = outcome,
     } });
+}
+
+/// A stalled connection must not hold a Session replacement forever, because
+/// replacement suspends Session-specific Actions until it completes.
+const session_load_timeout = std.Io.Duration.fromSeconds(60);
+
+fn loadSession(io: std.Io, diagnostic: bbr.diagnostics.Handle, client: ?bbr.bitbucket.Client, command: presentation.LoadSession) anyerror!*Session {
+    return switch (command.key.kind) {
+        .remote => session.loadWith(
+            io,
+            std.heap.page_allocator,
+            client.?,
+            command.key.repository(),
+            command.key.pull_request_id,
+        ),
+        .local => blk: {
+            var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
+            git.diagnostic = diagnostic;
+            break :blk session.loadLocalWith(
+                std.heap.page_allocator,
+                git.gitClient(),
+                command.key.baseRef(),
+                command.key.sourceRef(),
+            );
+        },
+    };
+}
+
+const LoadRace = union(enum) {
+    loaded: anyerror!*Session,
+    expired: std.Io.Cancelable!void,
+};
+
+/// Run `load` until it finishes or `timeout` passes. On timeout, cancel the
+/// load, destroy a Session that finishes during cancelation, and return
+/// `error.Timeout`.
+fn loadSessionWithin(io: std.Io, timeout: std.Io.Duration, load: anytype, args: std.meta.ArgsTuple(@TypeOf(load))) anyerror!*Session {
+    var buffer: [2]LoadRace = undefined;
+    var race = std.Io.Select(LoadRace).init(io, &buffer);
+    defer discardLoadRace(&race);
+    try race.concurrent(.loaded, load, args);
+    try race.concurrent(.expired, std.Io.sleep, .{ io, timeout, .awake });
+    return switch (try race.await()) {
+        .loaded => |result| result,
+        .expired => error.Timeout,
+    };
+}
+
+fn discardLoadRace(race: *std.Io.Select(LoadRace)) void {
+    while (race.cancel()) |late| switch (late) {
+        .loaded => |result| if (result) |loaded| loaded.destroy() else |_| {},
+        .expired => {},
+    };
 }
 
 fn presentationEnrichmentWorker(
@@ -1733,4 +1772,26 @@ test "stopping a Picker tick cancels and reaps its sleeping future" {
     cancelPresentationWork(&work, io, 19);
 
     try std.testing.expectEqual(@as(usize, 0), work.items.len);
+}
+
+fn testStalledLoad(io: std.Io) anyerror!*Session {
+    try io.sleep(std.Io.Duration.fromSeconds(60), .awake);
+    return error.TestUnexpectedResult;
+}
+
+fn testQuickLoad() anyerror!*Session {
+    return session.create(std.heap.page_allocator);
+}
+
+test "a stalled Session load times out and its load is canceled" {
+    const io = std.testing.io;
+    const started = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Timeout, loadSessionWithin(io, std.Io.Duration.fromMilliseconds(20), testStalledLoad, .{io}));
+    // The stalled load sleeps for 60 seconds, so a quick return proves its cancelation.
+    try std.testing.expect(started.untilNow(io, .awake).toSeconds() < 10);
+}
+
+test "a Session load that finishes before its timeout returns the Session" {
+    const loaded = try loadSessionWithin(std.testing.io, std.Io.Duration.fromSeconds(60), testQuickLoad, .{});
+    loaded.destroy();
 }

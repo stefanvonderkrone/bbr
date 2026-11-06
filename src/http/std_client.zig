@@ -406,6 +406,22 @@ test "one StdHttpClient overlaps two local requests and cleans up" {
     try std.testing.expectEqual(@as(usize, 2), transport.maxConnectionCount());
 }
 
+test "cancelation ends a request to a server that never answers" {
+    const io = std.testing.io;
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    var transport = StdHttpClient.init(std.testing.allocator, io);
+    defer transport.deinit();
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/stalled", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    var request = try io.concurrent(localGet, .{ transport.httpClient(), url });
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    // A Session load timeout depends on this: only cancelation ends the request.
+    if (request.cancel(io)) |_| return error.TestUnexpectedResult else |_| {}
+}
+
 fn localGet(http_client: HttpClient, url: []const u8) !void {
     const response = try http_client.send(std.heap.page_allocator, .{ .method = .GET, .url = url });
     defer std.heap.page_allocator.free(response.body);
