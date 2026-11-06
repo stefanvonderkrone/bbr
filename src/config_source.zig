@@ -10,15 +10,26 @@ pub const Snapshot = struct {
     pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) Snapshot {
         const path = xdg.configFile(allocator, env) catch |err| return .{ .read_error = err };
         const resolved = path orelse return .{};
-        // Opening a FIFO blocks until a writer appears, so check the kind first.
-        const stat = std.Io.Dir.cwd().statFile(io, resolved, .{}) catch |err| {
-            return .{ .path = resolved, .read_error = if (err == error.FileNotFound) null else err };
-        };
-        if (stat.kind != .file) return .{ .path = resolved, .read_error = error.ConfigNotRegularFile };
-        const source = std.Io.Dir.cwd().readFileAlloc(io, resolved, allocator, .limited(max_bytes + 1)) catch |err| {
+        const source = readRegular(allocator, io, resolved) catch |err| {
             return .{ .path = resolved, .read_error = if (err == error.FileNotFound) null else err };
         };
         return .{ .path = resolved, .source = source };
+    }
+
+    /// A blocking open of a FIFO waits until a writer appears. The open is
+    /// nonblocking, and the type check uses the opened descriptor, so a file
+    /// that becomes a FIFO after a path check cannot block startup either.
+    fn readRegular(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        // O_NONBLOCK has no effect on reads of a regular file.
+        const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+        defer file.close(io);
+        if ((try file.stat(io)).kind != .file) return error.ConfigNotRegularFile;
+        var reader = file.reader(io, &.{});
+        return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1)) catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+            error.OutOfMemory, error.StreamTooLong => |e| return e,
+        };
     }
 
     pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {

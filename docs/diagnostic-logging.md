@@ -11,7 +11,7 @@ enabled = true
 
 The startup reader checks this setting before command dispatch, including `api`, `auth`, `grammar`, and `completion`.
 A missing setting, an invalid logging setting, or an unreadable configuration leaves startup logging off.
-The reader accepts only a regular file. It does not open a FIFO or another special file, so a FIFO cannot block startup.
+The reader accepts only a regular file. It opens the path without blocking and checks the type of the opened file, so a FIFO cannot block startup.
 When the setting enables logging but the sink cannot open its file, bbr prints `bbr: diagnostic logging unavailable` and the cause to stderr. The command continues with the same exit status.
 Commands that do not need TUI configuration still ignore unrelated TUI values.
 The TUI retains its full configuration validation.
