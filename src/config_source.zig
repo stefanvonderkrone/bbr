@@ -121,7 +121,16 @@ pub const LineParser = struct {
     }
 };
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+/// Linux tests build without libc, so they create the FIFO with a raw system call.
+fn makeFifo(path: [*:0]const u8) !void {
+    const ok = switch (@import("builtin").os.tag) {
+        .linux => std.os.linux.errno(std.os.linux.mknodat(std.os.linux.AT.FDCWD, path, std.os.linux.S.IFIFO | 0o600, 0)) == .SUCCESS,
+        else => struct {
+            extern "c" fn mkfifo(fifo_path: [*:0]const u8, mode: std.c.mode_t) c_int;
+        }.mkfifo(path, 0o600) == 0,
+    };
+    if (!ok) return error.MakeFifoFailed;
+}
 
 test "a FIFO config file is refused without a blocking open" {
     const testing = std.testing;
@@ -132,7 +141,7 @@ test "a FIFO config file is refused without a blocking open" {
     defer testing.allocator.free(home);
     const fifo = try std.fs.path.joinZ(testing.allocator, &.{ home, "bbr", "config.toml" });
     defer testing.allocator.free(fifo);
-    try testing.expectEqual(@as(c_int, 0), mkfifo(fifo, 0o600));
+    try makeFifo(fifo);
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
     try env.put("XDG_CONFIG_HOME", home);
