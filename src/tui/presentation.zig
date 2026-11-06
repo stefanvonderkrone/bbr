@@ -4465,8 +4465,10 @@ const Published = struct {
     }
 
     // All allocations precede persistence. The caller then publishes the worker
-    // Frame and closes the Composer through an infallible final step.
-    fn persistPreparedDraft(self: *Published, store: bbr.review.PendingReviewStore, candidate: bbr.review.Draft) SaveDraftError!void {
+    // Frame and closes the Composer through an infallible final step. Returns
+    // true when the store resolved the parent to a Comment that another
+    // process posted, so the worker Frame shows a stale parent.
+    fn persistPreparedDraft(self: *Published, store: bbr.review.PendingReviewStore, candidate: bbr.review.Draft) SaveDraftError!bool {
         const a = self.review_arena.allocator();
         var draft = try cloneDisclosureDraft(a, candidate);
         // A completion can post the parent Draft after the Composer opens. The
@@ -4480,8 +4482,10 @@ const Published = struct {
         draft.parent = store.putResolvingParent(self.key.storeKey(), draft) catch return error.PersistenceFailed;
         // Another process posted the parent and removed it from the store. The
         // parent card then shows as posted, so the Reply stays under it.
+        var reposted = false;
         if (requested) |parent| if (parent == .draft and draft.parent.? == .comment) if (self.review.get(parent.draft)) |target| {
             target.state = .{ .posted = draft.parent.?.comment };
+            reposted = true;
         };
         self.review.drafts.appendAssumeCapacity(draft);
         self.review.next_id = @max(self.review.next_id, draft.local_id + 1);
@@ -4489,6 +4493,7 @@ const Published = struct {
             .temp_id = draft.local_id,
             .resolution = .{ .resolved = .{ .state = .current, .scope = draft.effectiveScope() } },
         });
+        return reposted;
     }
 
     // Copy only changed authored data before the store write. The worker owns
@@ -9257,11 +9262,11 @@ pub const Presentation = struct {
             disclosures.appendSlice(self.allocator, job.disclosures) catch
                 return self.failCardDestination(published, .out_of_memory);
         }
-        if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
+        const parent_reposted = if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
             published.pending_draft_save = null;
             self.action_error = if (err == error.PersistenceFailed) .persistence_failed else .out_of_memory;
             return;
-        };
+        } else false;
         if (job.mutation) |mutation| {
             const refusal = switch (mutation.change) {
                 .body => self.draftEditRefusal(published, mutation.temp_id),
@@ -9430,6 +9435,7 @@ pub const Presentation = struct {
             published.composer = null;
             published.review_search.invalidate(self.allocator);
             if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
+            if (parent_reposted) self.republishPostedParent(published);
         }
         if (job.mutation) |mutation| {
             published.pending_draft_mutation = null;
@@ -9602,6 +9608,22 @@ pub const Presentation = struct {
             !published.review_search.held.?[next.enrichment_file.?]) next.hold_enrichment = true;
         job.enrichment_result = null;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = next });
+    }
+
+    /// The worker built the saved Reply's Frame and disclosure inputs before
+    /// the store resolved its parent as posted. Rebuild both from the Review.
+    fn republishPostedParent(self: *Presentation, published: *Published) void {
+        const inputs = DisclosureInputs.create(published) catch {
+            published.disclosure_inputs_current = false;
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.disclosure_inputs.release();
+        published.disclosure_inputs = inputs;
+        published.disclosure_inputs_current = true;
+        self.queueViewBuild(published, self.preferences, published.isolated_file, self.geometry, .restore) catch {
+            self.action_error = .out_of_memory;
+        };
     }
 
     fn queueViewBuild(self: *Presentation, published: *Published, preferences: Preferences, isolated_file: ?usize, geometry: frame_mod.Geometry, policy: DisclosureBuild.NavigationPolicy) !void {
@@ -14977,7 +14999,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             .scope = .{ .@"inline" = .{ .path = session.diff.files[0].new_path, .to = 1, .commit = "source" } },
             .body = &body,
         });
-        try published.persistPreparedDraft(store.store(), root);
+        _ = try published.persistPreparedDraft(store.store(), root);
         var parent = root.local_id;
         for (0..2) |_| {
             const reply = try published.prepareDraft(store.store(), published.review_arena.allocator(), .{
@@ -14986,7 +15008,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
                 .parent = .{ .draft = parent },
                 .body = &body,
             });
-            try published.persistPreparedDraft(store.store(), reply);
+            _ = try published.persistPreparedDraft(store.store(), reply);
             parent = reply.local_id;
         }
         try published.rebuildBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
@@ -30870,8 +30892,21 @@ test "a Reply to a Draft that another process posted saves under the posted Comm
 
     try testing.expect(presentation.projection().composer == null);
     try testing.expect(presentation.projection().action_error == null);
+    // The worker Frame predates the resolution, so a view build follows.
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.takeCommand() == null);
+    var parent_headers: usize = 0;
+    for (presentation.projection().review.?.buffer.rows) |row| switch (row) {
+        .draft => |card| if (card.draftItem().local_id == 1 and card.part == .header) {
+            try testing.expectEqual(@as(u64, 900), card.draftItem().state.posted);
+            parent_headers += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), parent_headers);
     const expected: bbr.review.draft.Parent = .{ .comment = 900 };
     const published = presentation.published.?;
+    for (published.disclosure_inputs.drafts) |draft| if (draft.local_id == 1) try testing.expectEqual(@as(u64, 900), draft.state.posted);
     try testing.expectEqual(@as(bbr.review.CommentId, 900), published.review.getConst(1).?.state.posted);
     try testing.expectEqualDeep(expected, published.review.getConst(2).?.parent.?);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

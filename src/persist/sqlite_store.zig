@@ -1339,8 +1339,8 @@ pub const SqliteStore = struct {
         try self.exec("COMMIT;");
     }
 
-    /// Must be called inside a write transaction so an active SubmissionRun
-    /// cannot appear between this check and the mutation.
+    /// Must be called inside a write transaction so a clean completion
+    /// cannot record or remove the Draft between this read and the write.
     fn postedComment(self: *SqliteStore, key: RemoteReviewIdentity, temp_id: TempId) SqliteError!?CommentId {
         var stmt: ?*c.sqlite3_stmt = null;
         const sql = "SELECT comment_id FROM posted_drafts WHERE workspace=? AND repository=? AND pr_id=? AND temp_id=?;";
@@ -1357,6 +1357,8 @@ pub const SqliteStore = struct {
         };
     }
 
+    /// Must be called inside a write transaction so a clean completion
+    /// cannot remove the Draft between this check and the write.
     fn draftExists(self: *SqliteStore, key: RemoteReviewIdentity, local_id: TempId) SqliteError!bool {
         var stmt: ?*c.sqlite3_stmt = null;
         const sql = "SELECT EXISTS(SELECT 1 FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?);";
@@ -1370,6 +1372,8 @@ pub const SqliteStore = struct {
         return columnInt(stmt, 0) != 0;
     }
 
+    /// Must be called inside a write transaction so an active SubmissionRun
+    /// cannot appear between this check and the mutation.
     fn draftMutationLocked(self: *SqliteStore, key: RemoteReviewIdentity, local_id: TempId, incoming_target: ?CommentTarget) SqliteError!bool {
         var stmt: ?*c.sqlite3_stmt = null;
         const sql =
