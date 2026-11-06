@@ -47,6 +47,22 @@ with tempfile.NamedTemporaryFile() as read_only:
 
         refused = run_with_stdout(args, read_only_file)
         assert refused.returncode != 0, (args, refused.returncode)
-        assert refused.stderr, args
+        assert b"NotOpenForWriting" in refused.stderr, (args, refused.stderr)
 
-print("bbr ends quietly with exit 0 when the reader of stdout is gone, and still fails on other write errors.")
+# Login prompts on stdout. With the reader gone, nobody sees the prompt and no Credential is saved, so login must fail.
+with tempfile.TemporaryDirectory(prefix="bbr-broken-pipe-") as data_home:
+    terminal, terminal_peer = os.openpty()
+    stdout = closed_pipe()
+    try:
+        login = subprocess.run(
+            [binary, "auth", "login"], stdin=terminal_peer, stdout=stdout, stderr=subprocess.PIPE,
+            env=cli_env(XDG_DATA_HOME=data_home), timeout=5,
+        )
+    finally:
+        for descriptor in (terminal, terminal_peer, stdout):
+            os.close(descriptor)
+    assert login.returncode == 1, (login.returncode, login.stderr)
+    assert login.stderr == b"bbr: login aborted (StdoutClosed)\n", login.stderr
+    assert not os.listdir(data_home), os.listdir(data_home)
+
+print("bbr ends quietly with exit 0 when the reader of stdout is gone, fails login without a prompt, and still fails on other write errors.")
