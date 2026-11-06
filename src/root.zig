@@ -186,6 +186,7 @@ pub const bitbucket = struct {
 
 pub const startup = @import("startup.zig");
 pub const xdg = @import("xdg.zig");
+pub const stdout = @import("stdout.zig");
 
 test {
     _ = @import("http/client.zig");
@@ -215,4 +216,5 @@ test {
     _ = @import("bitbucket/url.zig");
     _ = @import("startup.zig");
     _ = @import("xdg.zig");
+    _ = @import("stdout.zig");
 }

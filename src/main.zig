@@ -36,6 +36,13 @@ const ArgSlice = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    run(init) catch |err| switch (err) {
+        error.StdoutClosed => {},
+        else => return err,
+    };
+}
+
+fn run(init: std.process.Init) !void {
     const gpa = init.gpa;
     const auth = bbr.bitbucket.auth;
 
@@ -84,12 +91,7 @@ pub fn main(init: std.process.Init) !void {
     var rest = ArgSlice{ .args = rest_args };
 
     if (first) |argument| {
-        if (std.mem.eql(u8, argument, "--version")) {
-            var output_buffer: [128]u8 = undefined;
-            var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-            try stdout.interface.print("bbr {s}\n", .{build_options.version});
-            return stdout.interface.flush();
-        }
+        if (std.mem.eql(u8, argument, "--version")) return bbr.stdout.print(init.io, "bbr {s}\n", .{build_options.version});
     }
 
     // `demo` needs no credentials: it feeds synthetic data through the real
@@ -191,11 +193,8 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void
     if (needs_confirmation) {
         const path_index: usize = if (std.mem.eql(u8, args.items[0], "update")) 2 else 1;
         if (args.items.len <= path_index) return usage();
-        var output_buffer: [4096]u8 = undefined;
-        var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-        const previewed_digest = try grammar_cli.writeCandidateReport(gpa, init.io, args.items[path_index], &stdout.interface);
-        try stdout.interface.writeAll("Trust this exact bundle? [y/N] ");
-        try stdout.interface.flush();
+        var previewed_digest: [32]u8 = undefined;
+        try bbr.stdout.write(init.io, writeTrustQuestion, .{ gpa, init.io, args.items[path_index], &previewed_digest });
         var buffer: [16]u8 = undefined;
         var stdin = std.Io.File.stdin().reader(init.io, &buffer);
         const answer = (try stdin.interface.takeDelimiter('\n')) orelse "";
@@ -203,13 +202,19 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer, " \t\r"), "yes");
         if (approved) interactive_digest = previewed_digest;
     }
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    grammar_cli.run(gpa, init.io, init.environ_map, args.items, interactive_digest, &stdout.interface) catch |err| {
-        std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
+    bbr.stdout.write(init.io, runGrammar, .{ gpa, init.io, init.environ_map, args.items, interactive_digest }) catch |err| {
+        if (err != error.StdoutClosed) std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
         return err;
     };
-    try stdout.interface.flush();
+}
+
+fn writeTrustQuestion(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, path: []const u8, digest: *[32]u8) !void {
+    digest.* = try grammar_cli.writeCandidateReport(gpa, io, path, writer);
+    try writer.writeAll("Trust this exact bundle? [y/N] ");
+}
+
+fn runGrammar(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, args: []const []const u8, interactive_digest: ?[32]u8) !void {
+    return grammar_cli.run(gpa, io, env, args, interactive_digest, writer);
 }
 
 fn containsTrustArgument(args: []const []const u8) bool {
@@ -834,14 +839,8 @@ fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt
     }
     defer if (original) |term| std.posix.tcsetattr(fd, .NOW, term) catch {};
 
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(io, &output_buffer);
-    try stdout.interface.writeAll(prompt);
-    try stdout.interface.flush();
-    defer if (original != null) {
-        stdout.interface.writeAll("\n") catch {};
-        stdout.interface.flush() catch {};
-    };
+    try bbr.stdout.writeAll(io, prompt);
+    defer if (original != null) bbr.stdout.writeAll(io, "\n") catch {};
     const line = (try stdin.takeDelimiter('\n')) orelse return error.LoginAborted;
     const trimmed = std.mem.trim(u8, line, " \t\r");
     if (trimmed.len == 0) return error.EmptyInput;
@@ -1202,15 +1201,10 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     const email_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_USERNAME") != null) "env" else "file";
     const token_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_TOKEN") != null) "env" else "file";
     const workspace_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_WORKSPACE") != null) "env" else "file";
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    stdout.interface.print("profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
+    bbr.stdout.print(init.io, "profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
         owned.profile, owned.username, email_src, token_src, owned.workspace, workspace_src, uuid,
-    }) catch {
-        std.debug.print("bbr: status failed: output error\n", .{});
-        std.process.exit(1);
-    };
-    stdout.interface.flush() catch {
+    }) catch |err| {
+        if (err == error.StdoutClosed) return err;
         std.debug.print("bbr: status failed: output error\n", .{});
         std.process.exit(1);
     };

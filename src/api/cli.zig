@@ -205,13 +205,6 @@ fn parseGlobal(
     };
 }
 
-fn printHelp(init: std.process.Init, verb: ?[]const u8) !void {
-    var buf: [8192]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
-    try writeHelp(&stdout.interface, verb);
-    try stdout.interface.flush();
-}
-
 fn writeHelp(writer: *std.Io.Writer, name: ?[]const u8) !void {
     if (name) |n| {
         if (findVerb(n)) |verb| {
@@ -325,7 +318,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, profile:
     var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = gpa, .io = init.io };
     defer detail.deinit();
     runArgs(init, gpa, argv.items, profile, &detail) catch |err| {
-        try printError(init, diagnosticVerb(argv.items), err, &detail);
+        if (err != error.StdoutClosed) try printError(init, diagnosticVerb(argv.items), err, &detail);
         return err;
     };
 }
@@ -335,10 +328,7 @@ fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const
     defer gpa.free(parsed.rest);
 
     if (parsed.verb == null and !parsed.help_only and parsed.rest.len != 0) return error.UnknownFlag;
-    if (parsed.verb == null or parsed.help_only) {
-        try printHelp(init, parsed.verb);
-        return;
-    }
+    if (parsed.verb == null or parsed.help_only) return bbr.stdout.write(init.io, writeHelp, .{parsed.verb});
     const verb = parsed.verb.?;
 
     const entry = findVerb(verb) orelse return error.UnknownFlag;
