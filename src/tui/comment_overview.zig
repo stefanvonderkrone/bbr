@@ -667,7 +667,7 @@ test "M29 overview the index lists resolved Threads, Deleted Comments, and outda
     try testing.expectEqual(review_card.CardRole.outcome_unknown, outcome.role);
 }
 
-test "M29 overview the index hides a submitting Draft and lists a posted Draft until its Comment is fetched" {
+test "M29 overview the index lists a submitting Draft and a posted Draft until its Comment is fetched" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -676,11 +676,14 @@ test "M29 overview the index hides a submitting Draft and lists a posted Draft u
         .{ .local_id = 2, .kind = .comment, .body = "posted", .state = .{ .posted = 50 } },
     };
     const pending = try (Fixture{ .drafts = &drafts }).index(a);
-    try expectOwners(&.{.{ .draft = 2 }}, pending);
-    try testing.expectEqualStrings("✎ draft (posted)", pending.records[0].author);
+    try testing.expectEqual(@as(usize, 2), pending.records.len);
+    try testing.expectEqualStrings("✎ draft (submitting)", (try recordOf(pending, .{ .draft = 1 })).author);
+    try testing.expectEqualStrings("✎ draft (posted)", (try recordOf(pending, .{ .draft = 2 })).author);
     const comments = [_]Comment{.{ .id = 50, .author = "Ada", .body = "posted" }};
     const fetched = try (Fixture{ .comments = &comments, .drafts = &drafts }).index(a);
-    try expectOwners(&.{.{ .comment = 50 }}, fetched);
+    try testing.expectEqual(@as(usize, 2), fetched.records.len);
+    _ = try recordOf(fetched, .{ .draft = 1 });
+    _ = try recordOf(fetched, .{ .comment = 50 });
 }
 
 const OwnerPair = struct { owner: Owner, parent: ?Owner };
@@ -758,7 +761,7 @@ test "M29 overview the index lists the DiffPane ReviewCards with every disclosur
     try testing.expect(expected.items.len >= 14);
     try testing.expect(!std.meta.eql((try recordOf(index, .{ .comment = 100 })).owner, Owner{ .draft = 1 }));
     try testing.expectError(error.TestExpectedRecord, recordOf(index, .{ .draft = 1 }));
-    try testing.expectError(error.TestExpectedRecord, recordOf(index, .{ .draft = 7 }));
+    try testing.expectEqualStrings("✎ draft (submitting)", (try recordOf(index, .{ .draft = 7 })).author);
 }
 
 test "M29 overview Review order puts Review-level Threads first, then Files in File Tree order, then Lines" {

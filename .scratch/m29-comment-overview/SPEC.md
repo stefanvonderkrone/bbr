@@ -280,7 +280,7 @@ It does not read `Published.expanded_disclosures`, and it never changes it.
 
 - A Comment of every Thread is listed, also when the Thread is resolved and collapsed.
 - A Deleted Comment is listed with its author.
-- A Draft in the `submitting` state is not listed, because the DiffPane hides it.
+- A Draft in the `submitting` state is listed with the `submitting` state in its Title, because the DiffPane shows it.
 - A Draft in the `posted` state is listed until the fetched Comment with its CommentId exists.
   Then only the Comment is listed.
 - An outdated, moved, or unavailable item is listed with its ScopeState.
@@ -817,7 +817,7 @@ Index and listing:
 - The index lists a Reply at depth 1 and a Reply to a Reply at depth 2.
 - The index lists a Draft root, a Draft Reply to a Comment, and a Draft Reply to a Draft.
 - The index lists a resolved Thread, a Deleted Comment, and outdated, moved, and unavailable items.
-- The index hides a `submitting` Draft and lists a `posted` Draft until its Comment is fetched.
+- The index lists a `submitting` Draft and a `posted` Draft until its Comment is fetched.
 - "M29 overview the index lists the DiffPane ReviewCards with every disclosure open" compares the Owners and parents with `buffer.buildWithComments`.
 - Review order puts Review-level Threads first, then Files in File Tree order, then Lines.
 - Newest first puts a Draft Thread before Comment Threads and keeps Replies under their parents.

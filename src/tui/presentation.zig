@@ -32718,7 +32718,7 @@ test "M29 overview a Draft deleted in the DiffPane leaves the listing" {
     try testOverviewOwners(&presentation, &.{.{ .draft = 4 }});
 }
 
-test "M29 overview a submitting Draft leaves the listing" {
+test "M29 overview a submitting Draft stays listed with its state" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
@@ -32737,7 +32737,9 @@ test "M29 overview a submitting Draft leaves the listing" {
     var post = presentation.takeCommand().?;
     defer post.deinit();
     try testing.expectEqual(@as(bbr.review.TempId, 1), post.post_draft.draft.local_id);
-    try testOverviewOwners(&presentation, &.{.{ .draft = 2 }});
+    try testOverviewOwners(&presentation, &.{ .{ .draft = 1 }, .{ .draft = 2 } });
+    const overview = presentation.projection().review.?.frame.overview;
+    try testing.expectEqualStrings("✎ draft (submitting)", overview.records[overview.listing.entries[0].record].author);
 }
 
 test "M29 overview a Draft linked to its fetched Comment leaves the listing" {
