@@ -214,6 +214,14 @@ pub fn build(b: *std.Build) void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    const review_recovery_tests = b.addTest(.{
+        .name = "review-recovery-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"Review recovery"},
+    });
+    const run_review_recovery_tests = b.addRunArtifact(review_recovery_tests);
+    const review_recovery_step = b.step("test-review-recovery", "Run Review recovery regression tests");
+    review_recovery_step.dependOn(&run_review_recovery_tests.step);
     const version_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("build/version.zig"),
