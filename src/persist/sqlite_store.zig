@@ -234,7 +234,15 @@ pub const SqliteStore = struct {
         \\ PRIMARY KEY (workspace, repository, pr_id, temp_id)
         \\) WITHOUT ROWID;
         ,
-        // v10 (M22): File Read Receipts, one per ReviewIdentity and canonical
+        // v10: the CommentId of each Draft that a clean completion removed. A
+        // stale Session in another process can still save a Reply to it.
+        \\CREATE TABLE posted_drafts (
+        \\  workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
+        \\  temp_id INTEGER NOT NULL, comment_id INTEGER NOT NULL,
+        \\  PRIMARY KEY (workspace, repository, pr_id, temp_id)
+        \\) WITHOUT ROWID;
+        ,
+        // v11 (M22): File Read Receipts, one per ReviewIdentity and canonical
         // path. The table is independent of every PendingReview table.
         \\CREATE TABLE file_read_receipts (
         \\  review_kind   INTEGER NOT NULL,
@@ -463,11 +471,15 @@ pub const SqliteStore = struct {
         return reserved;
     }
 
-    fn putImpl(ptr: *anyopaque, key: RemoteReviewIdentity, d: Draft) anyerror!void {
+    fn putImpl(ptr: *anyopaque, key: RemoteReviewIdentity, incoming: Draft) anyerror!?Parent {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
-        if (try self.draftMutationLocked(key, d.local_id, d.target)) return error.DraftLocked;
+        if (try self.draftMutationLocked(key, incoming.local_id, incoming.target)) return error.DraftLocked;
+        var d = incoming;
+        if (d.parent) |parent| if (parent == .draft and !try self.draftExists(key, parent.draft)) {
+            d.parent = .{ .comment = try self.postedComment(key, parent.draft) orelse return error.DraftParentMissing };
+        };
         const sql =
             \\INSERT OR REPLACE INTO drafts
             \\ (pr_id, local_id, kind, target, parent_kind, parent_id,
@@ -586,6 +598,7 @@ pub const SqliteStore = struct {
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
         try self.exec("COMMIT;");
+        return d.parent;
     }
 
     /// One transaction: recheck identity, expected shape, editable state, and
@@ -779,25 +792,7 @@ pub const SqliteStore = struct {
             if (columnInt(member, 0) == 0) return error.DraftCascadeConflict;
         }
 
-        // A TempId is never reused. `reserveTempId` falls back to MAX(local_id)+1
-        // whenever no counter row exists — which is every resumed review — so
-        // deleting the highest Draft would hand its id straight back. Pin the
-        // counter at or above every id in use before any row disappears.
-        var floor: ?*c.sqlite3_stmt = null;
-        const floor_sql =
-            \\INSERT INTO draft_temp_ids(workspace,repository,pr_id,next_id)
-            \\ VALUES (?1,?2,?3,
-            \\   (SELECT COALESCE(MAX(local_id),0)+1 FROM drafts
-            \\     WHERE workspace=?1 AND repository=?2 AND pr_id=?3))
-            \\ ON CONFLICT(workspace,repository,pr_id)
-            \\ DO UPDATE SET next_id=MAX(next_id, excluded.next_id);
-        ;
-        if (c.sqlite3_prepare_v2(self.db, floor_sql, -1, &floor, null) != c.SQLITE_OK) return error.Prepare;
-        defer _ = c.sqlite3_finalize(floor);
-        bindText(floor, 1, key.workspace);
-        bindText(floor, 2, key.repository);
-        bindInt(floor, 3, @intCast(key.pull_request_id));
-        if (c.sqlite3_step(floor) != c.SQLITE_DONE) return error.Step;
+        try self.retainTempIdFloor(key);
 
         var delete: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, "DELETE FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &delete, null) != c.SQLITE_OK)
@@ -813,6 +808,29 @@ pub const SqliteStore = struct {
             if (c.sqlite3_changes(self.db) != 1) return error.DraftCascadeConflict;
         }
         try self.exec("COMMIT;");
+    }
+
+    /// A TempId is never reused. `reserveTempId` falls back to MAX(local_id)+1
+    /// whenever no counter row exists — which is every resumed review — so
+    /// removing the highest Draft would hand its id straight back. Pin the
+    /// counter at or above every id in use before any row disappears, inside
+    /// the caller's transaction.
+    fn retainTempIdFloor(self: *SqliteStore, key: RemoteReviewIdentity) !void {
+        var floor: ?*c.sqlite3_stmt = null;
+        const floor_sql =
+            \\INSERT INTO draft_temp_ids(workspace,repository,pr_id,next_id)
+            \\ VALUES (?1,?2,?3,
+            \\   (SELECT COALESCE(MAX(local_id),0)+1 FROM drafts
+            \\     WHERE workspace=?1 AND repository=?2 AND pr_id=?3))
+            \\ ON CONFLICT(workspace,repository,pr_id)
+            \\ DO UPDATE SET next_id=MAX(next_id, excluded.next_id);
+        ;
+        if (c.sqlite3_prepare_v2(self.db, floor_sql, -1, &floor, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(floor);
+        bindText(floor, 1, key.workspace);
+        bindText(floor, 2, key.repository);
+        bindInt(floor, 3, @intCast(key.pull_request_id));
+        if (c.sqlite3_step(floor) != c.SQLITE_DONE) return error.Step;
     }
 
     fn loadImpl(ptr: *anyopaque, allocator: std.mem.Allocator, key: RemoteReviewIdentity) anyerror![]Draft {
@@ -1278,6 +1296,43 @@ pub const SqliteStore = struct {
             if (c.sqlite3_step(dirty) != c.SQLITE_ROW) return error.Step;
             if (columnInt(dirty, 0) != 0) return error.SubmissionNotClean;
 
+            try self.retainTempIdFloor(key);
+
+            var record: ?*c.sqlite3_stmt = null;
+            const record_sql =
+                \\INSERT OR REPLACE INTO posted_drafts(workspace,repository,pr_id,temp_id,comment_id)
+                \\ SELECT workspace, repository, pr_id, local_id, state_id FROM drafts
+                \\ WHERE workspace=? AND repository=? AND pr_id=?
+                \\   AND local_id IN (SELECT temp_id FROM submission_run_items WHERE operation_id=?)
+                \\   AND state_kind=2;
+            ;
+            if (c.sqlite3_prepare_v2(self.db, record_sql, -1, &record, null) != c.SQLITE_OK) return error.Prepare;
+            defer _ = c.sqlite3_finalize(record);
+            bindText(record, 1, key.workspace);
+            bindText(record, 2, key.repository);
+            bindInt(record, 3, @intCast(key.pull_request_id));
+            bindInt(record, 4, @intCast(operation_id));
+            if (c.sqlite3_step(record) != c.SQLITE_DONE) return error.Step;
+
+            var remap: ?*c.sqlite3_stmt = null;
+            const remap_sql =
+                \\UPDATE drafts AS reply SET parent_kind=2, parent_id=parent.state_id
+                \\ FROM drafts AS parent JOIN submission_run_items AS item
+                \\   ON item.operation_id=?1 AND item.temp_id=parent.local_id
+                \\ WHERE parent.workspace=?2 AND parent.repository=?3 AND parent.pr_id=?4
+                \\   AND parent.state_kind=2
+                \\   AND reply.workspace=parent.workspace AND reply.repository=parent.repository
+                \\   AND reply.pr_id=parent.pr_id AND reply.parent_kind=1
+                \\   AND reply.parent_id=parent.local_id;
+            ;
+            if (c.sqlite3_prepare_v2(self.db, remap_sql, -1, &remap, null) != c.SQLITE_OK) return error.Prepare;
+            defer _ = c.sqlite3_finalize(remap);
+            bindInt(remap, 1, @intCast(operation_id));
+            bindText(remap, 2, key.workspace);
+            bindText(remap, 3, key.repository);
+            bindInt(remap, 4, @intCast(key.pull_request_id));
+            if (c.sqlite3_step(remap) != c.SQLITE_DONE) return error.Step;
+
             var remove: ?*c.sqlite3_stmt = null;
             const remove_sql =
                 \\DELETE FROM drafts
@@ -1349,6 +1404,39 @@ pub const SqliteStore = struct {
         if (c.sqlite3_step(run) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCompletion;
         try self.exec("COMMIT;");
+    }
+
+    /// Must be called inside a write transaction so a clean completion
+    /// cannot record or remove the Draft between this read and the write.
+    fn postedComment(self: *SqliteStore, key: RemoteReviewIdentity, temp_id: TempId) SqliteError!?CommentId {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT comment_id FROM posted_drafts WHERE workspace=? AND repository=? AND pr_id=? AND temp_id=?;";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key.workspace);
+        bindText(stmt, 2, key.repository);
+        bindInt(stmt, 3, @intCast(key.pull_request_id));
+        bindInt(stmt, 4, @intCast(temp_id));
+        return switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => @intCast(c.sqlite3_column_int64(stmt, 0)),
+            c.SQLITE_DONE => null,
+            else => error.Step,
+        };
+    }
+
+    /// Must be called inside a write transaction so a clean completion
+    /// cannot remove the Draft between this check and the write.
+    fn draftExists(self: *SqliteStore, key: RemoteReviewIdentity, local_id: TempId) SqliteError!bool {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql = "SELECT EXISTS(SELECT 1 FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?);";
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, key.workspace);
+        bindText(stmt, 2, key.repository);
+        bindInt(stmt, 3, @intCast(key.pull_request_id));
+        bindInt(stmt, 4, @intCast(local_id));
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Step;
+        return columnInt(stmt, 0) != 0;
     }
 
     /// Must be called inside a write transaction so an active SubmissionRun
@@ -2082,6 +2170,122 @@ test "Submission checkpoint survives closing and reopening the database" {
     try testing.expectEqual(@as(usize, 0), after_completion.len);
 }
 
+test "SQLite clean completion durably remaps surviving Replies and rolls back a failed removal" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/reply-parent.db", .{&tmp.sub_path}, 0);
+    const key = testReviewKey(7);
+    const other = testReviewKey(8);
+    const other_repository: RemoteReviewIdentity = .{ .workspace = "workspace", .repository = "other", .pull_request_id = 7 };
+    const other_workspace: RemoteReviewIdentity = .{ .workspace = "other", .repository = "repo", .pull_request_id = 7 };
+    {
+        var sqlite = try SqliteStore.open(path);
+        defer sqlite.deinit();
+        const store = sqlite.store();
+        try store.put(other_repository, .{ .local_id = 1, .kind = .comment, .body = "other repository parent", .state = .{ .posted = 910 } });
+        try store.put(other_repository, .{ .local_id = 2, .kind = .comment, .body = "other repository Reply", .parent = .{ .draft = 1 } });
+        try store.put(other_workspace, .{ .local_id = 1, .kind = .comment, .body = "other Workspace parent", .state = .{ .posted = 920 } });
+        try store.put(other_workspace, .{ .local_id = 2, .kind = .comment, .body = "other Workspace Reply", .parent = .{ .draft = 1 } });
+        try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "parent" });
+        try store.put(key, .{ .local_id = 4, .kind = .comment, .body = "omitted posted parent", .state = .{ .posted = 904 } });
+        try store.put(key, .{ .local_id = 6, .kind = .comment, .body = "second parent" });
+        const operation_id = try store.beginSubmission(key, "source", &.{ .{ .temp_id = 1, .parent = null }, .{ .temp_id = 6, .parent = null } });
+        try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "later Reply", .parent = .{ .draft = 1 } });
+        try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "nested Reply", .parent = .{ .draft = 2 } });
+        try store.put(key, .{ .local_id = 5, .kind = .comment, .body = "omitted Reply", .parent = .{ .draft = 4 } });
+        try store.put(key, .{ .local_id = 7, .kind = .comment, .body = "second Reply", .parent = .{ .draft = 6 } });
+        try store.put(other, .{ .local_id = 1, .kind = .comment, .body = "other Review parent", .state = .{ .posted = 930 } });
+        try store.put(other, .{ .local_id = 2, .kind = .comment, .body = "other Review", .parent = .{ .draft = 1 } });
+        try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 6);
+        try store.checkpointSubmission(operation_id, key, 6, .{ .posted = 906 }, null);
+        try sqlite.exec("CREATE TRIGGER fail_removal BEFORE DELETE ON drafts BEGIN SELECT RAISE(ABORT, 'test failure'); END;");
+        try testing.expectError(error.Step, store.completeSubmission(operation_id, key, .clean));
+        const unchanged = try store.loadReview(arena.allocator(), key);
+        try testing.expectEqual(@as(CommentId, 900), unchanged.getConst(1).?.state.posted);
+        try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, unchanged.getConst(2).?.parent.?);
+        try testing.expect((try store.activeSubmission(arena.allocator())) != null);
+        try sqlite.exec("DROP TRIGGER fail_removal;");
+        try store.completeSubmission(operation_id, key, .clean);
+    }
+    var reopened = try SqliteStore.open(path);
+    defer reopened.deinit();
+    const store = reopened.store();
+    const review = try store.loadReview(arena.allocator(), key);
+    try testing.expect(review.getConst(1) == null);
+    try testing.expect(review.getConst(6) == null);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .comment = 906 }, review.getConst(7).?.parent.?);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .comment = 900 }, review.getConst(2).?.parent.?);
+    try testing.expect(review.getConst(2).?.state == .draft);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 2 }, review.getConst(3).?.parent.?);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 4 }, review.getConst(5).?.parent.?);
+    const other_drafts = try store.load(arena.allocator(), other);
+    try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, other_drafts[1].parent.?);
+    for ([_]RemoteReviewIdentity{ other_repository, other_workspace }) |unrelated| {
+        const unrelated_review = try store.loadReview(arena.allocator(), unrelated);
+        try testing.expect(unrelated_review.getConst(1) != null);
+        try testing.expectEqualDeep(bbr.review.draft.Parent{ .draft = 1 }, unrelated_review.getConst(2).?.parent.?);
+    }
+    try testing.expect((try store.activeSubmission(arena.allocator())) == null);
+}
+
+test "SQLite clean completion never hands a posted Draft's TempId to the next Draft" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+
+    try store.completeSubmission(operation_id, key, .clean);
+
+    try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
+}
+
+test "SQLite gives a Reply to a Draft that another process posted the posted CommentId" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/posted-parent.db", .{&tmp.sub_path}, 0);
+    const key = testReviewKey(7);
+    {
+        var completing = try SqliteStore.open(path);
+        defer completing.deinit();
+        const store = completing.store();
+        try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
+        const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+        try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+        try store.completeSubmission(operation_id, key, .clean);
+    }
+    var stale = try SqliteStore.open(path);
+    defer stale.deinit();
+    const store = stale.store();
+
+    const stored = try store.putResolvingParent(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    try testing.expectEqualDeep(Parent{ .comment = 900 }, stored.?);
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqualDeep(Parent{ .comment = 900 }, drafts[0].parent.?);
+    try testing.expectError(error.DraftParentMissing, store.put(testReviewKey(8), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "other Review" }));
+}
+
+test "SQLite refuses a Reply to a Draft that another process deleted" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "deleted" });
+    try store.deleteDraftSubtree(key, .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{1} });
+
+    try testing.expectError(error.DraftParentMissing, store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" }));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 0), (try store.load(arena.allocator(), key)).len);
+}
+
 test "a rejected SQLite Submission checkpoint rolls back its completed outcome" {
     var s = try SqliteStore.open(":memory:");
     defer s.deinit();
@@ -2323,7 +2527,8 @@ const downgrades = [_]struct { from: i64, sql: [*:0]const u8 }{
     \\ALTER TABLE submission_runs DROP COLUMN retry_effective_ms;
     \\ALTER TABLE submission_runs DROP COLUMN retry_pending_wait;
     },
-    .{ .from = 10, .sql = "DROP TABLE file_read_receipts;" },
+    .{ .from = 10, .sql = "DROP TABLE posted_drafts;" },
+    .{ .from = 11, .sql = "DROP TABLE file_read_receipts;" },
 };
 
 comptime {
@@ -2430,28 +2635,28 @@ test "M22 read SqliteStore drops a receipt whose fingerprint is not 32 bytes" {
     try testing.expectEqualStrings("src/a.zig", loaded[0].path);
 }
 
-test "M22 read a version 9 database migrates to version 10, keeps its Drafts, and reopens once" {
+test "M22 read a version 10 database migrates to version 11, keeps its Drafts, and reopens once" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/v9.db", .{&tmp.sub_path}, 0);
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/v10.db", .{&tmp.sub_path}, 0);
     const key = testReviewKey(61);
     const review: ReviewIdentity = .{ .remote = key };
 
     {
         var sqlite = try SqliteStore.open(path);
         defer sqlite.deinit();
-        try sqlite.store().put(key, .{ .local_id = 1, .kind = .comment, .body = "kept across v10" });
-        try downgradeTo(&sqlite, 9);
+        try sqlite.store().put(key, .{ .local_id = 1, .kind = .comment, .body = "kept across v11" });
+        try downgradeTo(&sqlite, 10);
     }
     {
         var upgraded = try SqliteStore.open(path);
         defer upgraded.deinit();
-        try testing.expectEqual(@as(i64, 10), try upgraded.userVersion());
+        try testing.expectEqual(@as(i64, 11), try upgraded.userVersion());
         const drafts = try upgraded.store().load(arena.allocator(), key);
         try testing.expectEqual(@as(usize, 1), drafts.len);
-        try testing.expectEqualStrings("kept across v10", drafts[0].body);
+        try testing.expectEqualStrings("kept across v11", drafts[0].body);
         try upgraded.fileReadStore().put(review, "src/a.zig", .{ .bytes = @splat(9) });
 
         var stmt: ?*c.sqlite3_stmt = null;
@@ -2462,7 +2667,7 @@ test "M22 read a version 9 database migrates to version 10, keeps its Drafts, an
     // A second migration would fail on the existing table.
     var reopened = try SqliteStore.open(path);
     defer reopened.deinit();
-    try testing.expectEqual(@as(i64, 10), try reopened.userVersion());
+    try testing.expectEqual(@as(i64, 11), try reopened.userVersion());
     const receipts = try reopened.fileReadStore().load(arena.allocator(), review);
     try testing.expectEqual(@as(usize, 1), receipts.len);
     try testing.expectEqual(@as(usize, 1), (try reopened.store().load(arena.allocator(), key)).len);
@@ -2501,17 +2706,17 @@ test "M22 read a migration step that another process already applied is skipped"
     {
         var sqlite = try SqliteStore.open(path);
         defer sqlite.deinit();
-        try downgradeTo(&sqlite, 9);
+        try downgradeTo(&sqlite, 10);
     }
     var stale = try openUnmigrated(path);
     defer stale.deinit();
     var rival = try openUnmigrated(path);
     defer rival.deinit();
 
-    try rival.migrateStep(10, SqliteStore.migrations[9]);
-    try stale.migrateStep(10, SqliteStore.migrations[9]);
+    try rival.migrateStep(11, SqliteStore.migrations[10]);
+    try stale.migrateStep(11, SqliteStore.migrations[10]);
 
-    try testing.expectEqual(@as(i64, 10), try stale.userVersion());
+    try testing.expectEqual(@as(i64, 11), try stale.userVersion());
     const review: ReviewIdentity = .{ .remote = testReviewKey(81) };
     try stale.fileReadStore().put(review, "src/a.zig", .{ .bytes = @splat(8) });
     try testing.expectEqual(@as(usize, 1), (try stale.fileReadStore().load(arena.allocator(), review)).len);
