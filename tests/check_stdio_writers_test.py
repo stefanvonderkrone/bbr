@@ -21,6 +21,28 @@ class StdioWritersTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root / "src").mkdir()
         self.source = self.root / "src/main.zig"
+        self.owner = self.root / "src/stdout.zig"
+
+    def test_a_stdout_writer_outside_its_owner_names_the_owner(self):
+        for text, line in (
+            ("var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);\n", 1),
+            ("const a = 1;\nvar w = std.Io.File.stdout()\n    .writerStreaming(io, &buf);\n", 2),
+        ):
+            with self.subTest(text=text):
+                self.source.write_text(text, encoding="utf-8")
+                found = list(checker.violations(self.root))
+                self.assertEqual(len(found), 1)
+                self.assertIn(f"src/main.zig:{line}:", found[0])
+                self.assertIn("bbr.stdout.write", found[0])
+                self.assertIn("src/stdout.zig", found[0])
+
+    def test_only_the_owner_makes_the_stdout_writer(self):
+        self.owner.write_text("var w = std.Io.File.stdout().writerStreaming(io, &buffer);\n", encoding="utf-8")
+        self.assertEqual(list(checker.violations(self.root)), [])
+        self.owner.write_text("var w = std.Io.File.stdout().writer(io, &buffer);\n", encoding="utf-8")
+        found = list(checker.violations(self.root))
+        self.assertEqual(len(found), 1)
+        self.assertIn("src/stdout.zig:1: use stdout() only as stdout().writerStreaming(", found[0])
 
     def test_positional_stdout_and_stderr_writers(self):
         for stream in ("stdout", "stderr"):
@@ -47,7 +69,7 @@ class StdioWritersTest(unittest.TestCase):
         self.assertEqual(list(checker.violations(self.root)), [])
 
     def test_zig_fmt_line_breaks_keep_a_valid_use_valid(self):
-        self.source.write_text(
+        self.owner.write_text(
             "const same = file.handle ==\n"
             "    std.Io.File.stdout().handle;\n"
             "var w = std.Io.File.stdout()\n"
@@ -80,7 +102,7 @@ class StdioWritersTest(unittest.TestCase):
                 self.assertEqual(len(list(checker.violations(self.root))), 1)
 
     def test_streaming_writers_and_comments_are_allowed(self):
-        self.source.write_text(
+        self.owner.write_text(
             "var w = std.Io.File.stdout().writerStreaming(io, &buf);\n"
             "// stdout().writer( writes at offset 0.\n"
             "    /// stderr().writer( is positional.\n"
