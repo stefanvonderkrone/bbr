@@ -63,28 +63,20 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         }
     }
 
-    if (help_only and shell == null and !list_profiles) {
-        var buf: [2048]u8 = undefined;
-        var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
-        try stdout.interface.writeAll(completion_help);
-        return stdout.interface.flush();
-    }
+    if (help_only and shell == null and !list_profiles) return bbr.stdout.writeAll(init.io, completion_help);
     if (list_profiles and shell == null) return listProfiles(init, gpa);
     if (list_profiles) return fail(init, "bbr completion: bad options (UnknownFlag)\n");
 
     const name = shell orelse return fail(init, "bbr completion: a shell name is required (bash|zsh|fish)\n");
-    var buf: [131072]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
-    if (std.mem.eql(u8, name, "bash")) {
-        try stdout.interface.writeAll(bash_script);
-    } else if (std.mem.eql(u8, name, "zsh")) {
-        try stdout.interface.writeAll(zsh_script);
-    } else if (std.mem.eql(u8, name, "fish")) {
-        try stdout.interface.writeAll(fish_script);
-    } else {
+    const script = if (std.mem.eql(u8, name, "bash"))
+        bash_script
+    else if (std.mem.eql(u8, name, "zsh"))
+        zsh_script
+    else if (std.mem.eql(u8, name, "fish"))
+        fish_script
+    else
         return fail(init, "bbr completion: unknown shell (bash|zsh|fish)\n");
-    }
-    return stdout.interface.flush();
+    return bbr.stdout.writeAll(init.io, script);
 }
 
 fn fail(init: std.process.Init, comptime message: []const u8) error{UnknownFlag} {
@@ -98,15 +90,13 @@ fn fail(init: std.process.Init, comptime message: []const u8) error{UnknownFlag}
 /// Print one saved Profile name per line. Missing file prints nothing;
 /// a corrupt file keeps `auth.load`'s stderr diagnostic and fails.
 fn listProfiles(init: std.process.Init, gpa: std.mem.Allocator) !void {
-    const loaded = try bbr.bitbucket.auth.load(gpa, init.io, init.environ_map);
-    var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
-    if (loaded) |l| {
-        var owned = l;
-        defer owned.deinit(gpa);
-        for (owned.file.profiles) |p| try stdout.interface.print("{s}\n", .{p.name});
-    }
-    try stdout.interface.flush();
+    var loaded = (try bbr.bitbucket.auth.load(gpa, init.io, init.environ_map)) orelse return;
+    defer loaded.deinit(gpa);
+    try bbr.stdout.write(init.io, writeProfileNames, .{loaded.file.profiles});
+}
+
+fn writeProfileNames(writer: *std.Io.Writer, profiles: []const bbr.bitbucket.auth.NamedProfile) !void {
+    for (profiles) |profile| try writer.print("{s}\n", .{profile.name});
 }
 
 const verbs_space = blk: {

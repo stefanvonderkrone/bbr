@@ -18,9 +18,13 @@ const tui = @import("benchmark_tui");
 const TreeSitterHighlighter = @import("benchmark_highlight").TreeSitterHighlighter;
 
 pub fn main(init: std.process.Init) !void {
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    const writer = &stdout.interface;
+    bbr.stdout.write(init.io, run, .{init}) catch |err| switch (err) {
+        error.StdoutClosed => {},
+        else => return err,
+    };
+}
+
+fn run(writer: *std.Io.Writer, init: std.process.Init) !void {
     errdefer writer.flush() catch {};
 
     var arguments = init.minimal.args.iterate();
@@ -434,7 +438,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (!matched) return error.UnknownBenchmark;
-    try writer.flush();
 }
 
 fn sourceFixture(allocator: std.mem.Allocator, minimum_bytes: usize, line: []const u8) ![]u8 {
