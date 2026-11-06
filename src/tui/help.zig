@@ -221,7 +221,7 @@ pub const FixedKeyInput = enum {
 pub const fixed_sections = std.EnumArray(FixedKeyInput, FixedSection).init(.{
     .submission_overlay = .{ .title = "Submission Overlay", .entries = &.{
         .{ .keys = "j k ↑ ↓", .description = "select Draft" },
-        .{ .keys = "⏎", .description = "jump to Draft (X shows the Overlay again)" },
+        .{ .keys = "⏎", .description = "jump to Draft or posted Comment (X shows the Overlay again)" },
         .{ .keys = "e", .description = "edit Draft" },
         .{ .keys = "a", .description = "re-anchor Draft" },
         .{ .keys = "D", .description = "delete Draft and its Replies" },
@@ -231,7 +231,7 @@ pub const fixed_sections = std.EnumArray(FixedKeyInput, FixedSection).init(.{
         .{ .keys = "L", .description = "outcome unknown: link existing Comment" },
         .{ .keys = "A", .description = "abandon recovery, or decide later" },
         .{ .keys = "p", .description = "open PullRequest Picker" },
-        .{ .keys = "q esc", .description = "close Submission" },
+        .{ .keys = "q esc ctrl-c", .description = "close Overlay without stopping Submission" },
     } },
     .delete_confirmation = .{ .title = "Delete Confirmation", .entries = &.{
         .{ .keys = "y ⏎", .description = "delete" },

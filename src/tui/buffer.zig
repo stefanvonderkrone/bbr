@@ -1351,33 +1351,31 @@ const Weave = struct {
         const d = &w.drafts[i];
         // Fetched Comments replace posted Drafts through the ParentIndex alias.
         // Until then, the posted Draft retains its place and known ancestry.
-        if (d.state != .submitting) {
-            const is_reply = d.parent != null;
-            const owner: review_card.Owner = .{ .draft = d.local_id };
-            const ancestry = try indentation.state(w.a, depth);
-            const states = draftStates(d);
-            const parsed = try review_card.ReviewBody.parseWithMentions(w.a, d.body, w.opts.mention_names);
-            const role: review_card.CardRole = if (d.state == .outcome_unknown)
-                (if (is_reply) .outcome_unknown_reply else .outcome_unknown)
-            else if (is_reply)
-                .draft_reply
-            else
-                .draft;
-            try w.projectCard(parsed, .{
-                .owner = owner,
-                .source = .{ .draft = d },
-                .scope = w.card_scope,
-                .role = role,
-                .header = try cardTitle(w.a, ancestry, "✎ draft", &states),
-                .plain_header = try cardTitle(w.a, ancestry, "draft", &states),
-                .content_width = cardContentWidth(w.opts.card_width, indentation.offset(depth)),
-                .depth = depth,
-                .indent = indentation.offset(depth),
-                .metrics = w.opts.cell_metrics,
-                .collapsed_rows = w.opts.collapsed_rows,
-                .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
-            });
-        }
+        const is_reply = d.parent != null;
+        const owner: review_card.Owner = .{ .draft = d.local_id };
+        const ancestry = try indentation.state(w.a, depth);
+        const states = draftStates(d);
+        const parsed = try review_card.ReviewBody.parseWithMentions(w.a, d.body, w.opts.mention_names);
+        const role: review_card.CardRole = if (d.state == .outcome_unknown)
+            (if (is_reply) .outcome_unknown_reply else .outcome_unknown)
+        else if (is_reply)
+            .draft_reply
+        else
+            .draft;
+        try w.projectCard(parsed, .{
+            .owner = owner,
+            .source = .{ .draft = d },
+            .scope = w.card_scope,
+            .role = role,
+            .header = try cardTitle(w.a, ancestry, "✎ draft", &states),
+            .plain_header = try cardTitle(w.a, ancestry, "draft", &states),
+            .content_width = cardContentWidth(w.opts.card_width, indentation.offset(depth)),
+            .depth = depth,
+            .indent = indentation.offset(depth),
+            .metrics = w.opts.cell_metrics,
+            .collapsed_rows = w.opts.collapsed_rows,
+            .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
+        });
         try w.emitRepliesTo(.{ .draft = d.local_id }, depth + 1, indentation);
     }
 
@@ -1865,7 +1863,13 @@ fn commentStates(c: *const Comment) [2]?[]const u8 {
 
 fn draftStates(d: *const Draft) [2]?[]const u8 {
     return .{
-        if (d.state == .outcome_unknown) "outcome unknown" else if (d.state == .posted) "posted" else null,
+        switch (d.state) {
+            .draft => null,
+            .submitting => "submitting",
+            .posted => "posted",
+            .failed => "failed",
+            .outcome_unknown => "outcome unknown",
+        },
         if (d.kind == .suggestion) "suggestion" else null,
     };
 }
@@ -2358,34 +2362,48 @@ test "ReviewCard metadata construction releases every failed arena" {
     }.run, .{});
 }
 
-test "hidden Draft parents keep separate card trees and sparse Active Path depths" {
+test "submitting Draft parents retain separate readable card trees and Active Path ancestry" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const drafts = [_]Draft{
-        .{ .local_id = 1, .kind = .comment, .body = "hidden", .state = .submitting },
+        .{ .local_id = 1, .kind = .comment, .body = "submitting first", .state = .submitting },
         .{ .local_id = 2, .kind = .comment, .body = "first", .parent = .{ .draft = 1 } },
-        .{ .local_id = 3, .kind = .comment, .body = "hidden", .state = .submitting },
+        .{ .local_id = 3, .kind = .comment, .body = "submitting second", .state = .submitting },
         .{ .local_id = 4, .kind = .comment, .body = "second", .parent = .{ .draft = 3 } },
         .{ .local_id = 5, .kind = .comment, .body = "nested", .parent = .{ .draft = 2 } },
     };
     const buf = try buildWithComments(a, .{ .files = &.{} }, .unified, &.{}, .{ .drafts = &drafts });
     var roots: [2]*const review_card.Card = undefined;
     var count: usize = 0;
+    var root_bodies: usize = 0;
     for (buf.rows) |row| if (row == .draft) {
         const card = row.draft.card.?;
         try testing.expect(!row.draft.sibling_below);
         try testing.expect(row.draft.rails == null);
+        if (card.parent == null and row.draft.part == .body) root_bodies += 1;
+        if (row.draft.part == .header) {
+            var top = card;
+            while (top.parent) |parent| top = parent;
+            try testing.expectEqual(top, card.root);
+        }
         if (row.draft.part == .header and card.parent == null) {
             roots[count] = card;
             count += 1;
-            try testing.expectEqual(@as(usize, 1), card.depth);
+            try testing.expectEqualStrings("draft (submitting)", row.draft.plain_label.?);
+            try testing.expectEqual(@as(usize, 0), card.depth);
             const path = try buf.activePath(a, card.rows.start);
-            try testing.expect(path.by_depth[0] == null);
+            try testing.expectEqual(card, path.by_depth[0].?);
             try testing.expectEqual(card, path.root().?);
         }
     };
     try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(usize, 2), root_bodies);
+    var reply_headers: usize = 0;
+    for (buf.rows) |row| if (row == .draft and row.draft.part == .header and row.draft.card.?.parent != null) {
+        reply_headers += 1;
+    };
+    try testing.expectEqual(@as(usize, 3), reply_headers);
     const path = try buf.activePath(a, roots[1].rows.start);
     try testing.expect(!path.holds(roots[0]));
 }
