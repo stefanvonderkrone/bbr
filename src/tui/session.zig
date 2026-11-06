@@ -166,7 +166,9 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     const Completion = union(enum) { pull_request: void, account: void, raw_diff: void, comments: void };
     var completion_buffer: [4]Completion = undefined;
     var select = Io.Select(Completion).init(io, &completion_buffer);
-    defer select.group.await(io) catch {};
+    // Every branch has finished on success. After an error, such as a load
+    // timeout, cancel the branches that still wait on Bitbucket.
+    defer select.group.cancel(io);
     var active: usize = 0;
     var comments_ready = false;
     var raw_diff_started = false;

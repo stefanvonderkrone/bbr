@@ -78,7 +78,9 @@ Published review
 └── Session-specific status
 ```
 
-Reviewer preferences cross Session replacement: layout, scope, and `show_resolved`. Session-relative state does not: navigation, Selection, expanded Folds, isolated File, Composer, Leader, Count, and Session-specific status reset when replacement commits.
+Reviewer preferences cross Session replacement: layout, scope, and `show_resolved`. Switching Reviews resets navigation. Refresh and Reconciliation of the same Review retain the reading location where the new Session can represent it. Presentation matches source by File path, version, and Line number. It matches a ReviewCard by Draft or Comment identity and authored offset. It retains the cursor's viewport offset where geometry permits. If the exact location is absent, navigation falls back to the matching File header. If the File is absent, navigation keeps the initial reset.
+
+Selection, search, unrelated expanded Folds, isolated File, Composer, Leader, Count, and Session-specific status reset when replacement commits. Restoration uses candidate-owned identities rather than pointers or File indexes from the previous Session. A location that needs lazy File Enrichment can wait at its File header until the normal acquisition completes. Explicit navigation cancels that pending restoration. A terminal acquisition failure leaves the File-header fallback. Restoration adds no retry policy or second acquisition path.
 
 Rendering receives only a borrowed immutable Projection. It cannot retain pointers across `dispatch`, and it cannot access mutable Session, PendingReview, navigation, ArenaRing, worker, or Durable Operation state.
 
@@ -91,6 +93,7 @@ The agreed outcomes are:
 - If candidate PendingReview loading, Anchor Resolution infrastructure, or Buffer construction fails, destroy the candidate and preserve the exact old aggregate, including its cursor, Selection, folds, isolation, input grammar, and Session Epoch. A per-Anchor `unavailable` result is not infrastructure failure.
 - If initial load fails and there is no old aggregate, publish no Session. Quit, help, and Picker Actions remain available.
 - While replacement loads, retain the old aggregate as rollback state but suspend Session-specific Actions. Session-independent Actions remain available, and Durable Operations continue.
+- A Session load that does not finish within 60 seconds is canceled and fails with a timeout, so a stalled connection cannot suspend Session-specific Actions forever. The failure keeps the old aggregate, as every other load failure does. Enter in the Submission Overlay reports the pending replacement instead of doing nothing.
 - Latest replacement intent wins. If A is current and B then C are requested, discard B even if it completes first. If C fails, restore interaction with A rather than falling back to B.
 - Selecting A again through the Picker cancels replacement intent and reuses A. Explicit refresh and post-Submission Reconciliation may still replace a Session with another Session for the same PullRequest.
 - A File Enrichment result for A may be accepted while C is loading because A remains published until C commits.
@@ -113,6 +116,8 @@ Session replacement invalidates only Session-bound projection work. It does not 
 
 - File Enrichment carries Session Epoch and is rejected after its Session is replaced.
 - Submission carries an OperationId and Repository-qualified PullRequest identity. It continues posting and persisting after its originating Session is replaced.
+- Escape and ctrl-c close the Submission Overlay without cancelling Submission, releasing its lock, or changing its durable checkpoints. Active and failed results retain their inspection state. An explicit close retires a clean result when it cannot authorize an unrelated retry. Enter hides the result for inspection and navigates to the selected Draft or posted Comment. The Submission Action reopens a hidden result. Submitting Drafts remain readable after Frame rebuilds. These reading Actions do not grant mutation rights.
+- If a retained result omits the Draft under the DiffPane cursor, the Submission Action targets only that Draft subtree. Existing retry, recovery, and source checks still apply. Reading or closing a result never authorizes retrying all unrelated failures.
 - Submission progress always persists against its original PullRequest. Visible modal/projection changes additionally depend on which Session is current.
 - When another PullRequest becomes current, remove the old PullRequest's blocking submission modal and show a non-blocking global status identifying the PullRequest being submitted. Completion likewise produces a PullRequest-qualified global result.
 - Only one Submission is active globally for now. Another PullRequest may be reviewed, but attempting another Submission reports which PullRequest is already submitting.

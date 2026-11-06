@@ -7,6 +7,7 @@ Presentation projects the Diff and Review models.
 
 **Session**:
 The currently loaded review: private source context plus the common Diff, Threads, and per-File data materialized by either remote or local acquisition. Switching or explicitly refreshing a review replaces the Session; Buffer rebuilds and screen redraws do not.
+A replacement for the same Review can retain the reading location without retaining the previous Session's identity.
 _Avoid_: workspace, document, review state.
 
 **ReviewHeader**:
@@ -194,6 +195,7 @@ _Avoid_: Session work, background job, task.
 
 **Submission Overlay**:
 The PullRequest-qualified dependency-tree Overlay that follows one authorized SubmissionRun from queued work through terminal inspection. Its frozen forest shows typed Draft identities, scope or Reply context, explicit item states, retry evidence, and blocking ancestry; terminal repair and retry operate only on the selected eligible failed Draft subtree. Switching Reviews hides the Overlay without cancelling its Durable Operation.
+The Overlay can hide independently of the SubmissionRun. A posted entry identifies its published Comment after its transient Draft disappears.
 _Avoid_: submission result dialog, progress popup, retry-all.
 
 **Keymap**:
