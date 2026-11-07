@@ -9,12 +9,15 @@ import check_diagnostics as checker
 
 
 class DiagnosticsCheckTest(unittest.TestCase):
-    def check(self, path, text):
+    def check(self, path, text, baseline=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / path
             source.parent.mkdir(parents=True)
             source.write_text(text)
+            if baseline is not None:
+                (root / "tools").mkdir()
+                (root / checker.CATCH_BASELINE).write_text(baseline)
             return list(checker.violations(root))
 
     def test_a_with_diagnostics_wrapper_is_rejected(self):
@@ -27,10 +30,30 @@ class DiagnosticsCheckTest(unittest.TestCase):
             "    return report(a, w, diagnostic);",
             "}",
         ))
-        found = self.check("src/highlight/grammar_cli.zig", text)
+        found = self.check("src/highlight/grammar_cli.zig", text, "")
         self.assertEqual(len(found), 1)
         self.assertIn("required diagnostics.Handle", found[0])
-        self.assertEqual(self.check("src/highlight/highlighter.zig", "pub fn withDiagnostics(self: H, d: Handle) H {}"), [])
+        self.assertEqual(self.check("src/highlight/highlighter.zig", "pub fn withDiagnostics(self: H, d: Handle) H {}", ""), [])
+
+    def test_a_new_catch_that_drops_its_cause_is_rejected(self):
+        # The DurableSubmission.begin catch that e32ce2f had to fix.
+        text = "const started = DurableSubmission.begin(a) catch {\n    self.action_error = .submission_start_failed;\n    return;\n};"
+        found = self.check("src/tui/presentation.zig", text)
+        self.assertEqual(len(found), 1)
+        self.assertIn("reportFailure", found[0])
+        self.assertEqual(self.check("src/tui/presentation.zig", text, "1 src/tui/presentation.zig\n"), [])
+
+    def test_a_captured_cause_and_test_blocks_are_allowed_and_a_removed_drop_lowers_the_baseline(self):
+        text = "\n".join((
+            "x() catch |err| self.reportFailure(.submission, .prepare, err, @src());",
+            'test "ignored" {',
+            "    x() catch {};",
+            "}",
+        ))
+        self.assertEqual(self.check("src/tui/presentation.zig", text), [])
+        found = self.check("src/tui/presentation.zig", text, "2 src/tui/presentation.zig\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn("Lower the count", found[0])
 
     def test_old_highlighting_warning_bypasses_the_sink(self):
         found = self.check("src/tui/presentation.zig", 'std.log.warn("code Highlighting failed: {s}", .{@errorName(err)});')
