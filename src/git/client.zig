@@ -98,12 +98,19 @@ pub const GitClient = struct {
 
 /// Real implementation: runs `git` in `cwd` (default: the process CWD).
 pub const ShellGitClient = struct {
+    diagnostic: @import("../diagnostics.zig").Handle = .{},
     gpa: Allocator,
     io: Io,
     cwd: std.process.Child.Cwd = .inherit,
 
     pub fn init(gpa: Allocator, io: Io) ShellGitClient {
         return .{ .gpa = gpa, .io = io };
+    }
+
+    pub fn withDiagnostics(self: ShellGitClient, diagnostic: @import("../diagnostics.zig").Handle) ShellGitClient {
+        var bound = self;
+        bound.diagnostic = diagnostic;
+        return bound;
     }
 
     pub fn gitClient(self: *ShellGitClient) GitClient {
@@ -125,8 +132,13 @@ pub const ShellGitClient = struct {
     /// Run `git <args>` and return trimmed stdout owned by `allocator`. A
     /// non-zero exit maps to `on_fail` (so the caller distinguishes "not a repo"
     /// from "no remote"). Stderr is discarded.
-    fn run(self: *ShellGitClient, allocator: Allocator, args: []const []const u8, on_fail: anyerror) ![]u8 {
-        const stdout = try self.runRaw(allocator, args, on_fail);
+    const Evidence = struct {
+        source: std.builtin.SourceLocation,
+        optional_config: bool = false,
+    };
+
+    fn run(self: *ShellGitClient, allocator: Allocator, args: []const []const u8, on_fail: anyerror, comptime evidence: Evidence) ![]u8 {
+        const stdout = try self.runRaw(allocator, args, on_fail, evidence);
         errdefer allocator.free(stdout);
         const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
         // Shrink to the trimmed extent so the caller owns exactly what it sees.
@@ -140,21 +152,33 @@ pub const ShellGitClient = struct {
 
     /// Run Git while preserving stdout byte-for-byte. Diff and blob content use
     /// this path; metadata commands use `run`, which trims line endings.
-    fn runRaw(self: *ShellGitClient, allocator: Allocator, args: []const []const u8, on_fail: anyerror) ![]u8 {
+    fn runRaw(self: *ShellGitClient, allocator: Allocator, args: []const []const u8, on_fail: anyerror, comptime evidence: Evidence) ![]u8 {
         const res = std.process.run(allocator, self.io, .{
             .argv = args,
             .cwd = self.cwd,
-        }) catch return on_fail;
+        }) catch |err| {
+            _ = self.diagnostic.failure(.launch, .{ .zig = err }, evidence.source);
+            return on_fail;
+        };
         defer allocator.free(res.stderr);
         errdefer allocator.free(res.stdout);
 
         switch (res.term) {
             .exited => |code| if (code != 0) {
-                allocator.free(res.stdout);
+                if (!(evidence.optional_config and code == 1))
+                    _ = self.diagnostic.failure(.execute, .{ .git = .{ .kind = .exited, .code = code } }, evidence.source);
                 return on_fail;
             },
-            else => {
-                allocator.free(res.stdout);
+            .signal => |signal| {
+                _ = self.diagnostic.failure(.execute, .{ .git = .{ .kind = .signal, .code = @intFromEnum(signal) } }, evidence.source);
+                return on_fail;
+            },
+            .stopped => |signal| {
+                _ = self.diagnostic.failure(.execute, .{ .git = .{ .kind = .stopped, .code = @intFromEnum(signal) } }, evidence.source);
+                return on_fail;
+            },
+            .unknown => |code| {
+                _ = self.diagnostic.failure(.execute, .{ .git = .{ .kind = .unknown, .code = code } }, evidence.source);
                 return on_fail;
             },
         }
@@ -168,6 +192,7 @@ pub const ShellGitClient = struct {
             allocator,
             &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
             error.NotAGitRepo,
+            .{ .source = @src() },
         );
         errdefer allocator.free(branch);
         // `rev-parse --abbrev-ref HEAD` prints "HEAD" verbatim when detached.
@@ -187,7 +212,7 @@ pub const ShellGitClient = struct {
         defer scratch.deinit();
         const sa = scratch.allocator();
 
-        const url = try self.run(sa, &.{ "git", "remote", "get-url", "origin" }, error.NoRemote);
+        const url = try self.run(sa, &.{ "git", "remote", "get-url", "origin" }, error.NoRemote, .{ .source = @src() });
         const rewrites = try self.readInsteadOf(sa);
 
         const r = try remote_mod.parse(url, rewrites);
@@ -203,8 +228,8 @@ pub const ShellGitClient = struct {
         defer scratch.deinit();
         const sa = scratch.allocator();
         const commit_expr = try std.fmt.allocPrint(sa, "{s}^{{commit}}", .{ref});
-        const commit = try self.run(sa, &.{ "git", "rev-parse", "--verify", "--end-of-options", commit_expr }, error.UnknownRef);
-        const symbolic = try self.run(sa, &.{ "git", "rev-parse", "--symbolic-full-name", "--verify", "--end-of-options", ref }, error.UnknownRef);
+        const commit = try self.run(sa, &.{ "git", "rev-parse", "--verify", "--end-of-options", commit_expr }, error.UnknownRef, .{ .source = @src() });
+        const symbolic = try self.run(sa, &.{ "git", "rev-parse", "--symbolic-full-name", "--verify", "--end-of-options", ref }, error.UnknownRef, .{ .source = @src() });
         return .{
             .canonical = try allocator.dupe(u8, if (symbolic.len > 0) symbolic else commit),
             .commit = try allocator.dupe(u8, commit),
@@ -222,24 +247,24 @@ pub const ShellGitClient = struct {
         if (std.mem.startsWith(u8, source_ref, heads)) {
             const branch = source_ref[heads.len..];
             const key = try std.fmt.allocPrint(sa, "branch.{s}.remote", .{branch});
-            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch "origin";
+            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote, .{ .source = @src(), .optional_config = true }) catch "origin";
             if (std.mem.eql(u8, remote_name, ".")) return error.NoDefaultBaseRef;
         }
         const remote_head = try std.fmt.allocPrint(sa, "refs/remotes/{s}/HEAD", .{remote_name});
-        const base = try self.run(sa, &.{ "git", "symbolic-ref", remote_head }, error.NoDefaultBaseRef);
+        const base = try self.run(sa, &.{ "git", "symbolic-ref", remote_head }, error.NoDefaultBaseRef, .{ .source = @src() });
         return allocator.dupe(u8, base);
     }
 
     fn commonDir(ptr: *anyopaque, allocator: Allocator) anyerror![]u8 {
         const self: *ShellGitClient = @ptrCast(@alignCast(ptr));
-        return self.run(allocator, &.{ "git", "rev-parse", "--path-format=absolute", "--git-common-dir" }, error.NotAGitRepo);
+        return self.run(allocator, &.{ "git", "rev-parse", "--path-format=absolute", "--git-common-dir" }, error.NotAGitRepo, .{ .source = @src() });
     }
 
     fn worktrees(ptr: *anyopaque, allocator: Allocator) anyerror![]Worktree {
         const self: *ShellGitClient = @ptrCast(@alignCast(ptr));
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
-        const raw = try self.run(scratch.allocator(), &.{ "git", "worktree", "list", "--porcelain" }, error.NotAGitRepo);
+        const raw = try self.run(scratch.allocator(), &.{ "git", "worktree", "list", "--porcelain" }, error.NotAGitRepo, .{ .source = @src() });
 
         var result: std.ArrayList(Worktree) = .empty;
         errdefer {
@@ -286,7 +311,7 @@ pub const ShellGitClient = struct {
 
     fn diff(ptr: *anyopaque, allocator: Allocator, base_commit: []const u8, source_commit: []const u8) anyerror![]u8 {
         const self: *ShellGitClient = @ptrCast(@alignCast(ptr));
-        return self.runRaw(allocator, &.{ "git", "diff", "--find-renames", "--no-ext-diff", "--no-color", base_commit, source_commit }, error.UnknownRef);
+        return self.runRaw(allocator, &.{ "git", "diff", "--find-renames", "--no-ext-diff", "--no-color", base_commit, source_commit }, error.UnknownRef, .{ .source = @src() });
     }
 
     fn blob(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
@@ -294,7 +319,7 @@ pub const ShellGitClient = struct {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const spec = try std.fmt.allocPrint(scratch.allocator(), "{s}:{s}", .{ commit, path });
-        const contents = try self.runRaw(scratch.allocator(), &.{ "git", "show", spec }, error.BlobNotFound);
+        const contents = try self.runRaw(scratch.allocator(), &.{ "git", "show", spec }, error.BlobNotFound, .{ .source = @src() });
         return allocator.dupe(u8, contents);
     }
 
@@ -308,10 +333,10 @@ pub const ShellGitClient = struct {
         if (std.mem.startsWith(u8, source_ref, heads)) {
             const branch = source_ref[heads.len..];
             const key = try std.fmt.allocPrint(sa, "branch.{s}.remote", .{branch});
-            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch "origin";
+            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote, .{ .source = @src(), .optional_config = true }) catch "origin";
             if (std.mem.eql(u8, remote_name, ".")) return error.NoRemote;
         }
-        const url = try self.run(sa, &.{ "git", "remote", "get-url", remote_name }, error.NoRemote);
+        const url = try self.run(sa, &.{ "git", "remote", "get-url", remote_name }, error.NoRemote, .{ .source = @src() });
         return remote_mod.normalize(allocator, url, try self.readInsteadOf(sa));
     }
 
@@ -320,7 +345,7 @@ pub const ShellGitClient = struct {
     /// Returns an empty slice when none are configured. All memory is `sa`-owned.
     fn readInsteadOf(self: *ShellGitClient, sa: Allocator) ![]Rewrite {
         // A missing key makes git exit 1; treat that as "no rewrites".
-        const out = self.run(sa, &.{ "git", "config", "--get-regexp", "url\\..*\\.insteadof" }, error.NoRemote) catch
+        const out = self.run(sa, &.{ "git", "config", "--get-regexp", "url\\..*\\.insteadof" }, error.NoRemote, .{ .source = @src(), .optional_config = true }) catch
             return &.{};
 
         var list: std.ArrayList(Rewrite) = .empty;
@@ -455,6 +480,48 @@ pub const FakeGitClient = struct {
 };
 
 const testing = std.testing;
+
+test "diagnostics Git records actual termination and launch causes without command data" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = @import("../diagnostics.zig").Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+
+    try runTestProcess(home, &.{ "git", "init", "-b", "main" });
+    var shell = ShellGitClient.init(testing.allocator, testing.io).withDiagnostics(sink.handle(.git, .{ .work_id = 42, .session_epoch = 9 }));
+    shell.cwd = .{ .path = home };
+    try testing.expectError(error.UnknownRef, shell.gitClient().resolveRef(testing.allocator, "private-ref-never-log"));
+    try testing.expectError(error.UnknownRef, shell.gitClient().diff(testing.allocator, "private-base-never-log", "private-source-never-log"));
+    try testing.expectError(error.NoRemote, shell.run(testing.allocator, &.{ "git", "config", "--file", "/dev/null", "--get", "bbr.missing" }, error.NoRemote, .{ .source = @src(), .optional_config = true }));
+    try testing.expectEqual(@as(u64, 2), sink.sequence);
+    try testing.expectError(error.NotAGitRepo, shell.runRaw(testing.allocator, &.{"/bbr-diagnostics-no-such-executable"}, error.NotAGitRepo, .{ .source = @src() }));
+    try testing.expectEqual(@as(u64, 3), sink.sequence);
+
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    for ([_][]const u8{ "operation=git", "work_id=42", "session_epoch=9", "termination=exited code=128", "phase=launch", "error=FileNotFound", "source=git/client.zig:" }) |needle|
+        try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
+    for ([_][]const u8{ "private-ref", "private-base", "private-source", "no-such-executable", home }) |secret|
+        try testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    _ = lines.next();
+    const first = lines.next().?;
+    const second = lines.next().?;
+    const first_source = first[std.mem.indexOf(u8, first, "source=").?..];
+    const second_source = second[std.mem.indexOf(u8, second, "source=").?..];
+    try testing.expect(!std.mem.eql(u8, first_source, second_source));
+}
 
 test "fake reports the current branch" {
     var fake: FakeGitClient = .{ .branch = "feature/timeout" };

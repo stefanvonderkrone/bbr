@@ -247,7 +247,21 @@ vertical_scroll_rows = 3
 
 [external_edit]
 max_bytes = 1048576
+
+[logging]
+enabled = false
 ```
+
+Diagnostic logging is off by default. Set `[logging] enabled = true` to enable it at startup.
+Open the Command Palette with `ctrl-p` and choose `Toggle diagnostic logging` to change the current process.
+The Command Palette does not change `config.toml`.
+
+Logs use private files under `$XDG_STATE_HOME/bbr/diagnostics`, with the usual `$HOME/.local/state` fallback.
+Each process owns separate files. Disabling logging stops writes but keeps existing files.
+Logs have no automatic size limit or cleanup. Remove old diagnostic files when you no longer need them.
+Records contain error names, source locations, native codes, and available numeric correlation IDs.
+They exclude Credentials, request and response bodies, authored content, Repository names, Ref names, and user paths.
+See [Diagnostic logging](docs/diagnostic-logging.md) for the record format, coverage, and limits.
 
 `system` is the default Theme and uses the terminal foreground, background, and ANSI palette.
 Fixed Themes are `dark`, `light`, all four `catppuccin-*` flavors, `gruvbox-light`,

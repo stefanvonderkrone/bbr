@@ -9,6 +9,33 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const presentation = @import("presentation.zig");
 
+pub fn checkRecovery(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, command: presentation.CheckRecovery) presentation.OwnedInput {
+    const pr = client.getPullRequest(allocator, command.identity.repository(), command.identity.pullRequestId()) catch |err| return .{ .recovery_checked = .{
+        .command_id = command.command_id,
+        .operation_id = command.operation_id,
+        .identity = command.identity,
+        .outcome = .{ .failed = bbr.diagnostic.Failure.capture(.recovery_check, .execute, .{ .command_id = command.command_id, .operation_id = command.operation_id }, .{ .zig = err }, @src()) },
+    } };
+    return presentation.recoveryCheckSucceeded(command.command_id, command.operation_id, command.identity, pr.source_commit);
+}
+
+pub fn listPullRequests(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, command: presentation.ListPullRequests) presentation.OwnedInput {
+    const summaries = presentation.PullRequestSummaries.create(allocator) catch |err| return .{ .pull_requests_loaded = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .outcome = .{ .failed = bbr.diagnostic.Failure.capture(.picker_list, .prepare, .{ .command_id = command.command_id, .work_id = command.work_id }, .{ .zig = err }, @src()) },
+    } };
+    summaries.prs = client.listPullRequests(summaries.arena.allocator(), command.repositoryName(), .{}) catch |err| {
+        summaries.destroy();
+        return .{ .pull_requests_loaded = .{
+            .command_id = command.command_id,
+            .work_id = command.work_id,
+            .outcome = .{ .failed = bbr.diagnostic.Failure.capture(.picker_list, .execute, .{ .command_id = command.command_id, .work_id = command.work_id }, .{ .zig = err }, @src()) },
+        } };
+    };
+    return .{ .pull_requests_loaded = .{ .command_id = command.command_id, .work_id = command.work_id, .outcome = .{ .loaded = summaries } } };
+}
+
 pub const TerminalHandoff = struct {
     ptr: *anyopaque,
     suspend_fn: *const fn (*anyopaque) anyerror!void,
@@ -63,34 +90,42 @@ pub fn externalEdit(
 
     const temp_base = env.get("TMPDIR") orelse "/tmp";
     var random_bytes: [8]u8 = undefined;
-    io.randomSecure(&random_bytes) catch {
+    io.randomSecure(&random_bytes) catch |err| {
+        completed.evidence = externalEditFailure(command, .prepare, err, @src());
         completed.outcome = .failed;
         return completed;
     };
     const nonce = std.mem.readInt(u64, &random_bytes, .native);
-    const dir_path = std.fmt.allocPrint(a, "{s}/bbr-external-edit-{x}", .{ temp_base, nonce }) catch {
+    const dir_path = std.fmt.allocPrint(a, "{s}/bbr-external-edit-{x}", .{ temp_base, nonce }) catch |err| {
+        completed.evidence = externalEditFailure(command, .prepare, err, @src());
         completed.outcome = .failed;
         return completed;
     };
-    const file_path = std.fmt.allocPrint(a, "{s}/body.md", .{dir_path}) catch {
+    const file_path = std.fmt.allocPrint(a, "{s}/body.md", .{dir_path}) catch |err| {
+        completed.evidence = externalEditFailure(command, .prepare, err, @src());
         completed.outcome = .failed;
         return completed;
     };
-    std.Io.Dir.cwd().createDir(io, dir_path, @enumFromInt(0o700)) catch {
+    std.Io.Dir.cwd().createDir(io, dir_path, @enumFromInt(0o700)) catch |err| {
+        completed.evidence = externalEditFailure(command, .open, err, @src());
         completed.outcome = .failed;
         return completed;
     };
     var retain = true;
-    defer if (!retain) std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    defer if (!retain) std.Io.Dir.cwd().deleteTree(io, dir_path) catch |err| {
+        completed.secondary_evidence = externalEditFailure(command, .cleanup, err, @src());
+    };
     var file = std.Io.Dir.cwd().createFile(io, file_path, .{
         .exclusive = true,
         .permissions = @enumFromInt(0o600),
-    }) catch {
+    }) catch |err| {
+        completed.evidence = externalEditFailure(command, .open, err, @src());
         completed.outcome = .failed;
         retain = false;
         return completed;
     };
-    file.writeStreamingAll(io, command.body) catch {
+    file.writeStreamingAll(io, command.body) catch |err| {
+        completed.evidence = externalEditFailure(command, .write, err, @src());
         file.close(io);
         completed.outcome = .failed;
         retain = false;
@@ -98,26 +133,36 @@ pub fn externalEdit(
     };
     file.close(io);
 
-    handoff.leaveTui() catch {
+    handoff.leaveTui() catch |err| {
+        completed.evidence = externalEditFailure(command, .prepare, err, @src());
         completed.outcome = .{ .restoration_failed = file_path };
         return completed;
     };
     const argv = editorArgv(editor, file_path);
-    var child = std.process.spawn(io, .{ .argv = &argv, .cwd = .inherit }) catch {
+    var child = std.process.spawn(io, .{ .argv = &argv, .cwd = .inherit }) catch |err| {
+        completed.evidence = externalEditFailure(command, .launch, err, @src());
         if (handoff.resumeTui()) |_| {
             completed.outcome = .failed;
             retain = false;
-        } else |_| completed.outcome = .{ .restoration_failed = file_path };
+        } else |restore_error| {
+            completed.secondary_evidence = externalEditFailure(command, .cleanup, restore_error, @src());
+            completed.outcome = .{ .restoration_failed = file_path };
+        }
         return completed;
     };
-    const term = child.wait(io) catch {
+    const term = child.wait(io) catch |err| {
+        completed.evidence = externalEditFailure(command, .execute, err, @src());
         if (handoff.resumeTui()) |_| {
             completed.outcome = .failed;
             retain = false;
-        } else |_| completed.outcome = .{ .restoration_failed = file_path };
+        } else |restore_error| {
+            completed.secondary_evidence = externalEditFailure(command, .cleanup, restore_error, @src());
+            completed.outcome = .{ .restoration_failed = file_path };
+        }
         return completed;
     };
-    if (handoff.resumeTui()) |_| {} else |_| {
+    if (handoff.resumeTui()) |_| {} else |err| {
+        completed.evidence = externalEditFailure(command, .cleanup, err, @src());
         completed.outcome = .{ .restoration_failed = file_path };
         return completed;
     }
@@ -128,6 +173,12 @@ pub fn externalEdit(
             return completed;
         },
         else => {
+            completed.evidence = bbr.diagnostic.Failure.capture(.external_edit, .execute, .{ .command_id = command.command_id, .session_epoch = command.session_epoch }, .{ .git = switch (term) {
+                .signal => |code| .{ .kind = .signal, .code = @intFromEnum(code) },
+                .stopped => |code| .{ .kind = .stopped, .code = @intFromEnum(code) },
+                .unknown => |code| .{ .kind = .unknown, .code = code },
+                .exited => unreachable,
+            } }, @src());
             completed.outcome = .failed;
             retain = false;
             return completed;
@@ -135,6 +186,7 @@ pub fn externalEdit(
     }
     const read_limit = if (command.max_bytes == std.math.maxInt(usize)) command.max_bytes else command.max_bytes + 1;
     const returned = std.Io.Dir.cwd().readFileAlloc(io, file_path, a, .limited(read_limit)) catch |err| {
+        if (err != error.StreamTooLong) completed.evidence = externalEditFailure(command, .read, err, @src());
         completed.outcome = if (err == error.StreamTooLong) .too_large else .failed;
         retain = false;
         return completed;
@@ -159,7 +211,8 @@ pub fn externalEdit(
         retain = false;
         return completed;
     }
-    std.Io.Dir.cwd().deleteTree(io, dir_path) catch {
+    std.Io.Dir.cwd().deleteTree(io, dir_path) catch |err| {
+        completed.evidence = externalEditFailure(command, .cleanup, err, @src());
         completed.outcome = .{ .cleanup_failed = .{ .body = returned, .path = file_path } };
         return completed;
     };
@@ -168,11 +221,15 @@ pub fn externalEdit(
     return completed;
 }
 
+fn externalEditFailure(command: *const presentation.ExternalEdit, phase: bbr.diagnostic.Phase, err: anyerror, comptime source: std.builtin.SourceLocation) bbr.diagnostic.Failure {
+    return bbr.diagnostic.Failure.capture(.external_edit, phase, .{ .command_id = command.command_id, .session_epoch = command.session_epoch }, .{ .zig = err }, source);
+}
+
 /// Consumes Presentation-owned source bytes at the terminal boundary and
 /// reports whether OSC 52 was written successfully.
 pub fn copyToClipboard(vx: vaxis.Vaxis, tty: *std.Io.Writer, command: *presentation.ClipboardCopy) presentation.OwnedInput {
     defer command.destroy();
-    vx.copyToSystemClipboard(tty, command.text, command.allocator) catch return .{ .clipboard_completed = .{ .command_id = command.command_id, .success = false } };
+    vx.copyToSystemClipboard(tty, command.text, command.allocator) catch |err| return .{ .clipboard_completed = .{ .command_id = command.command_id, .success = false, .evidence = bbr.diagnostic.Failure.capture(.clipboard, .write, .{ .command_id = command.command_id }, .{ .zig = err }, @src()) } };
     return .{ .clipboard_completed = .{ .command_id = command.command_id, .success = true } };
 }
 
@@ -197,17 +254,30 @@ pub fn postOutcome(
 /// Consumes `command` whether execution succeeds or fails.
 pub fn executePost(command: *presentation.PostDraft, poster: bbr.review.CommentPoster) presentation.OwnedInput {
     defer command.destroy();
+    var evidence: ?bbr.diagnostic.Failure = null;
+    const context: bbr.diagnostic.Context = .{ .command_id = command.command_id, .operation_id = command.operation_id, .draft_id = command.draft.local_id };
     const result = if (command.dedupe) blk: {
         if (poster.findExisting(command.draft, command.parent)) |checked| {
             break :blk switch (checked.outcome) {
                 .found => |id| bbr.review.PostResult{ .outcome = .{ .posted = id } },
-                .missing => poster.post(command.draft, command.parent) catch bbr.review.PostResult{ .outcome = .ambiguous },
+                .missing => poster.post(command.draft, command.parent) catch |err| failed: {
+                    evidence = bbr.diagnostic.Failure.capture(.submission, .execute, context, .{ .zig = err }, @src());
+                    break :failed bbr.review.PostResult{ .outcome = .ambiguous };
+                },
                 .rejected => |err| bbr.review.PostResult{ .outcome = .{ .rejected = err }, .retry_after_ms = checked.retry_after_ms },
                 .ambiguous => bbr.review.PostResult{ .outcome = .ambiguous },
             };
-        } else |_| break :blk bbr.review.PostResult{ .outcome = .ambiguous };
-    } else poster.post(command.draft, command.parent) catch bbr.review.PostResult{ .outcome = .ambiguous };
+        } else |err| {
+            evidence = bbr.diagnostic.Failure.capture(.submission, .execute, context, .{ .zig = err }, @src());
+            break :blk bbr.review.PostResult{ .outcome = .ambiguous };
+        }
+    } else poster.post(command.draft, command.parent) catch |err| blk: {
+        evidence = bbr.diagnostic.Failure.capture(.submission, .execute, context, .{ .zig = err }, @src());
+        break :blk bbr.review.PostResult{ .outcome = .ambiguous };
+    };
+    if (result.outcome == .rejected) evidence = bbr.diagnostic.Failure.capture(.submission, .rejection, context, .{ .zig = result.outcome.rejected }, @src());
     return .{ .post_draft_completed = .{
+        .evidence = evidence,
         .command_id = command.command_id,
         .operation_id = command.operation_id,
         .identity = command.identity,
@@ -219,25 +289,30 @@ pub fn executePost(command: *presentation.PostDraft, poster: bbr.review.CommentP
 
 pub fn executeCommentEdit(command: *presentation.UpdateComment, client: bbr.bitbucket.Client) presentation.OwnedInput {
     defer command.destroy();
+    var evidence: ?bbr.diagnostic.Failure = null;
     const outcome: presentation.CommentEditOutcome = if (client.updateComment(
         command.allocator,
         command.identity.repository(),
         command.identity.pullRequestId(),
         command.comment_id,
         command.body,
-    )) |_| .updated else |err| switch (err) {
-        error.Unauthorized => .{ .definitive_failure = error.Unauthorized },
-        error.Forbidden => .{ .definitive_failure = error.Forbidden },
-        error.BadRequest => .{ .definitive_failure = error.BadRequest },
-        error.NotFound => .{ .definitive_failure = error.NotFound },
-        error.Conflict => .{ .definitive_failure = error.Conflict },
-        error.RateLimited => .{ .definitive_failure = error.RateLimited },
-        error.ServerError => .{ .definitive_failure = error.ServerError },
-        error.UnexpectedStatus => .{ .definitive_failure = error.UnexpectedStatus },
-        error.MalformedResponse => .{ .definitive_failure = error.MalformedResponse },
-        else => .outcome_unknown,
+    )) |_| .updated else |err| blk: {
+        evidence = bbr.diagnostic.Failure.capture(.mutation, .execute, .{ .command_id = command.command_id }, .{ .zig = err }, @src());
+        break :blk switch (err) {
+            error.Unauthorized => .{ .definitive_failure = error.Unauthorized },
+            error.Forbidden => .{ .definitive_failure = error.Forbidden },
+            error.BadRequest => .{ .definitive_failure = error.BadRequest },
+            error.NotFound => .{ .definitive_failure = error.NotFound },
+            error.Conflict => .{ .definitive_failure = error.Conflict },
+            error.RateLimited => .{ .definitive_failure = error.RateLimited },
+            error.ServerError => .{ .definitive_failure = error.ServerError },
+            error.UnexpectedStatus => .{ .definitive_failure = error.UnexpectedStatus },
+            error.MalformedResponse => .{ .definitive_failure = error.MalformedResponse },
+            else => .outcome_unknown,
+        };
     };
     return .{ .comment_edit_completed = .{
+        .evidence = evidence,
         .command_id = command.command_id,
         .identity = command.identity,
         .comment_id = command.comment_id,
@@ -247,24 +322,29 @@ pub fn executeCommentEdit(command: *presentation.UpdateComment, client: bbr.bitb
 
 pub fn executeCommentDelete(command: *presentation.DeleteComment, client: bbr.bitbucket.Client) presentation.OwnedInput {
     defer command.destroy();
+    var evidence: ?bbr.diagnostic.Failure = null;
     const outcome: presentation.CommentDeleteOutcome = if (client.deleteComment(
         command.allocator,
         command.identity.repository(),
         command.identity.pullRequestId(),
         command.comment_id,
-    )) |_| .deleted else |err| switch (err) {
-        error.NotFound => .not_found,
-        error.Unauthorized => .{ .definitive_failure = error.Unauthorized },
-        error.Forbidden => .{ .definitive_failure = error.Forbidden },
-        error.BadRequest => .{ .definitive_failure = error.BadRequest },
-        error.Conflict => .{ .definitive_failure = error.Conflict },
-        error.RateLimited => .{ .definitive_failure = error.RateLimited },
-        error.ServerError => .{ .definitive_failure = error.ServerError },
-        error.UnexpectedStatus => .{ .definitive_failure = error.UnexpectedStatus },
-        error.MalformedResponse => .{ .definitive_failure = error.MalformedResponse },
-        else => .outcome_unknown,
+    )) |_| .deleted else |err| blk: {
+        if (err != error.NotFound) evidence = bbr.diagnostic.Failure.capture(.mutation, .execute, .{ .command_id = command.command_id }, .{ .zig = err }, @src());
+        break :blk switch (err) {
+            error.NotFound => .not_found,
+            error.Unauthorized => .{ .definitive_failure = error.Unauthorized },
+            error.Forbidden => .{ .definitive_failure = error.Forbidden },
+            error.BadRequest => .{ .definitive_failure = error.BadRequest },
+            error.Conflict => .{ .definitive_failure = error.Conflict },
+            error.RateLimited => .{ .definitive_failure = error.RateLimited },
+            error.ServerError => .{ .definitive_failure = error.ServerError },
+            error.UnexpectedStatus => .{ .definitive_failure = error.UnexpectedStatus },
+            error.MalformedResponse => .{ .definitive_failure = error.MalformedResponse },
+            else => .outcome_unknown,
+        };
     };
     return .{ .comment_delete_completed = .{
+        .evidence = evidence,
         .command_id = command.command_id,
         .identity = command.identity,
         .comment_id = command.comment_id,
@@ -284,7 +364,8 @@ pub fn executeReviewerVerdict(
         command.expectedSourceCommit(),
         command.authenticatedAccountUuid(),
         command.target,
-    ) catch return .{ .reviewer_verdict_changed = .{
+    ) catch |err| return .{ .reviewer_verdict_changed = .{
+        .evidence = bbr.diagnostic.Failure.capture(.verdict, .execute, .{ .command_id = command.command_id }, .{ .zig = err }, @src()),
         .command_id = command.command_id,
         .identity = command.identity,
         .target = command.target,
@@ -299,6 +380,52 @@ pub fn executeReviewerVerdict(
 }
 
 const testing = std.testing;
+
+test "diagnostics Picker and recovery preserve distinct original adapter errors" {
+    for ([_]anyerror{ error.ConnectionReset, error.HostUnreachable }) |err| {
+        var fake: bbr.http.FakeHttpClient = .{ .send_error = err };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+        var repository: [256]u8 = undefined;
+        @memcpy(repository[0..4], "repo");
+        var picker = listPullRequests(testing.allocator, client, .{ .command_id = 31, .work_id = 41, .repository = .{ .bytes = repository, .len = 4 } });
+        defer picker.deinit();
+        try testing.expectEqual(err, picker.pull_requests_loaded.outcome.failed.cause.zig);
+        try testing.expectEqual(@as(?u64, 31), picker.pull_requests_loaded.outcome.failed.context.command_id);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const recovery = checkRecovery(arena.allocator(), client, .{
+            .command_id = 32,
+            .operation_id = 42,
+            .identity = .{ .value = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1) },
+            .source_commit = .{ .bytes = [_]u8{0} ** 64, .len = 0 },
+        });
+        try testing.expectEqual(err, recovery.recovery_checked.outcome.failed.cause.zig);
+        try testing.expectEqual(@as(?u64, 42), recovery.recovery_checked.outcome.failed.context.operation_id);
+    }
+}
+
+test "diagnostics External Edit captures missing private parent before generic failure" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(parent);
+    const missing = try std.fs.path.join(testing.allocator, &.{ parent, "missing", "private" });
+    defer testing.allocator.free(missing);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("GIT_EDITOR", "vi");
+    try env.put("TMPDIR", missing);
+    var handoff = FakeHandoff{};
+    const command = try testExternalEditCommand("secret body", 64);
+    const id = command.command_id;
+    const completed = try externalEdit(testing.io, &env, handoff.value(), command);
+    defer completed.destroy();
+    try testing.expect(completed.outcome == .failed);
+    try testing.expectEqual(error.FileNotFound, completed.evidence.?.cause.zig);
+    try testing.expectEqual(@as(?u64, id), completed.evidence.?.context.command_id);
+    try testing.expectEqual(bbr.diagnostic.Operation.external_edit, completed.evidence.?.operation);
+    try testing.expect(std.mem.endsWith(u8, completed.evidence.?.source.file, "presentation_adapter.zig"));
+}
 
 test "editor resolution uses first non-empty configured value" {
     var env = std.process.Environ.Map.init(testing.allocator);

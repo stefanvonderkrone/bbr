@@ -95,9 +95,10 @@ pub const Session = struct {
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try a.dupe(u8, span.mention);
                 entry.value_ptr.* = "";
-                const user = bb.getUser(scratch.allocator(), span.mention) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => continue,
+                const user = bb.getUser(scratch.allocator(), span.mention) catch |err| {
+                    _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+                    if (err == error.OutOfMemory) return err;
+                    continue;
                 };
                 const name = if (validMentionName(user.display_name)) user.display_name else user.nickname;
                 if (validMentionName(name)) entry.value_ptr.* = try std.fmt.allocPrint(a, "@{s}", .{name});
@@ -280,6 +281,7 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
 
     s.authenticated_account_unauthorized = false;
     s.authenticated_account_uuid = bb.getAuthenticatedAccountUuid(a) catch |err| blk: {
+        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
         s.authenticated_account_unauthorized = err == error.Unauthorized;
         break :blk null;
     };
@@ -326,6 +328,7 @@ fn Branch(comptime T: type) type {
 
 fn acquirePullRequest(branch: *Branch(PullRequest), bb: Client, repo: []const u8, id: u64) void {
     branch.value = bb.getPullRequest(branch.arena.allocator(), repo, id) catch |err| {
+        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
         branch.err = err;
         return;
     };
@@ -333,6 +336,7 @@ fn acquirePullRequest(branch: *Branch(PullRequest), bb: Client, repo: []const u8
 
 fn acquireAccount(branch: *Branch([]u8), bb: Client) void {
     branch.value = bb.getAuthenticatedAccountUuid(branch.arena.allocator()) catch |err| {
+        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
         branch.err = err;
         return;
     };
@@ -340,6 +344,7 @@ fn acquireAccount(branch: *Branch([]u8), bb: Client) void {
 
 fn acquireRawDiff(branch: *Branch([]u8), bb: Client, repo: []const u8, id: u64) void {
     branch.value = bb.getDiff(branch.arena.allocator(), repo, id) catch |err| {
+        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
         branch.err = err;
         return;
     };
@@ -347,6 +352,7 @@ fn acquireRawDiff(branch: *Branch([]u8), bb: Client, repo: []const u8, id: u64) 
 
 fn acquireComments(branch: *Branch([]bbr.review.Comment), bb: Client, repo: []const u8, id: u64, source: []const u8, destination: []const u8) void {
     branch.value = bb.getComments(branch.arena.allocator(), repo, id, .{ .source = source, .destination = destination }) catch |err| {
+        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
         branch.err = err;
         return;
     };
