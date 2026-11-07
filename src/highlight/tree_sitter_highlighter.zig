@@ -45,11 +45,7 @@ pub const TreeSitterHighlighter = struct {
     packages: [std.meta.tags(grammar_match.BuiltInGrammar).len]RuntimePackage = undefined,
     package_count: usize = 0,
 
-    pub fn init(allocator: Allocator, registry: ?*user_grammar.Registry) !TreeSitterHighlighter {
-        return initWithDiagnostics(allocator, registry, .{});
-    }
-
-    pub fn initWithDiagnostics(allocator: Allocator, registry: ?*user_grammar.Registry, diagnostic_handle: diagnostics.Handle) !TreeSitterHighlighter {
+    pub fn init(allocator: Allocator, registry: ?*user_grammar.Registry, diagnostic_handle: diagnostics.Handle) !TreeSitterHighlighter {
         var self: TreeSitterHighlighter = .{ .registry = registry, .diagnostic_handle = diagnostic_handle };
         errdefer self.deinit();
         inline for (std.meta.tags(grammar_match.BuiltInGrammar)) |grammar| {
@@ -353,7 +349,7 @@ test "diagnostics retain UserGrammar load and fallback allocation failures witho
     try tmp.dir.writeFile(io, .{ .sub_path = "fixture/grammar.toml", .data = manifest });
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/fixture", .{&tmp.sub_path});
     defer testing.allocator.free(path);
-    var inspection = try user_grammar.inspect(testing.allocator, io, path);
+    var inspection = try user_grammar.inspect(testing.allocator, io, path, .{});
     const digest = inspection.report.digest;
     inspection.deinit();
     const entries = [_]user_grammar.RegistryEntry{.{
@@ -363,10 +359,10 @@ test "diagnostics retain UserGrammar load and fallback allocation failures witho
         .trusted_digest = digest,
         .receipt = .{ .bundle_digest = digest, .bbr_identity = "test-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
     }};
-    var registry = try user_grammar.Registry.initWithDiagnostics(testing.allocator, io, &entries, &.{}, "test-build", sink.handle(.grammar, .{}));
+    var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build", sink.handle(.grammar, .{}));
     defer registry.deinit();
     try testing.expect(sink.sequence > 0);
-    var highlighter = try TreeSitterHighlighter.initWithDiagnostics(testing.allocator, &registry, sink.handle(.highlighting, .{}));
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, &registry, sink.handle(.highlighting, .{}));
     defer highlighter.deinit();
 
     const built_in = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = 1;\n");
@@ -470,7 +466,7 @@ fn diagnosticBytes(tmp: testing.TmpDir) ![]u8 {
 }
 
 test "JavaScript tracer produces ordered non-overlapping Captures" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = \"yes\";\n");
     defer {
@@ -484,7 +480,7 @@ test "JavaScript tracer produces ordered non-overlapping Captures" {
 }
 
 test "JavaScript BuiltInGrammar executes conditional Captures" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "Widget widget SCREAM console require other\n");
     defer freeResult(result);
@@ -504,7 +500,7 @@ test "JavaScript BuiltInGrammar rejects built-in Captures for local bindings" {
         \\require("x");
         \\function g(require) { require("y"); }
     ;
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
     defer freeResult(result);
@@ -534,7 +530,7 @@ test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed loc
         \\}
         \\console; require();
     ;
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for ([_][]const u8{ "src/a.js", "src/a.ts", "src/a.tsx" }) |path| {
         const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
@@ -556,7 +552,7 @@ test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed loc
 
 test "TypeScript BuiltInGrammars track optional parameter locals" {
     const source = "function f(console?: unknown) { console; }\nconsole;\n";
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for ([_][]const u8{ "src/a.ts", "src/a.tsx" }) |path| {
         const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
@@ -570,7 +566,7 @@ test "TypeScript BuiltInGrammars track optional parameter locals" {
 
 test "local filtering keeps UTF-8 byte offsets" {
     const source = "function f(console) { const π = 0; console; }\nconsole;\n";
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
     defer freeResult(result);
@@ -586,7 +582,7 @@ test "TypeScript and TSX BuiltInGrammars load their queries" {
         .{ .path = "src/a.ts", .source = "interface User { name: string }\n" },
         .{ .path = "src/a.tsx", .source = "const App = () => <main>Hello</main>;\n" },
     };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
@@ -605,7 +601,7 @@ test "remaining BuiltInGrammars load their queries and produce Captures" {
         .{ .path = "data.json", .source = "{\"ready\": true}\n" },
         .{ .path = "config.yaml", .source = "ready: true\n" },
     };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
@@ -630,7 +626,7 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "data.json", .source = "{\"nested\": {\"ready\": true}, \"items\": [1, 2]}\n" },
         .{ .path = "config.yaml", .source = "service:\n  enabled: true\n  ports: [80, 443]\n" },
     };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for (cases) |case| {
         const grammar = grammar_match.selectBuiltIn(case.path, case.source).?;

@@ -233,12 +233,12 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagn
 }
 
 fn writeTrustQuestion(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, path: []const u8, digest: *[32]u8, diagnostic: bbr.diagnostics.Handle) !void {
-    digest.* = try grammar_cli.writeCandidateReportWithDiagnostics(gpa, io, path, writer, diagnostic);
+    digest.* = try grammar_cli.writeCandidateReport(gpa, io, path, writer, diagnostic);
     try writer.writeAll("Trust this exact bundle? [y/N] ");
 }
 
 fn runGrammar(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, args: []const []const u8, interactive_digest: ?[32]u8, diagnostic: bbr.diagnostics.Handle) !void {
-    return grammar_cli.runWithDiagnostics(gpa, io, env, args, interactive_digest, writer, diagnostic);
+    return grammar_cli.run(gpa, io, env, args, interactive_digest, writer, diagnostic);
 }
 
 fn containsTrustArgument(args: []const []const u8) bool {
@@ -313,9 +313,9 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         const grammar_entries = try grammar_data_store.registryEntries(a);
         const grammar_overrides = try grammar_cli.loadOverrides(a, init.io, init.environ_map);
         try grammar_data_store.validateOverrideNames(grammar_overrides);
-        grammar_registry = try @import("highlight/user_grammar.zig").Registry.initWithDiagnostics(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity, diagnostic.forContext(.grammar, .{}));
+        grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity, diagnostic.forContext(.grammar, .{}));
     }
-    var tree_sitter_highlighter = try TreeSitterHighlighter.initWithDiagnostics(gpa, if (grammar_registry) |*registry| registry else null, diagnostic.forContext(.highlighting, .{}));
+    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null, diagnostic.forContext(.highlighting, .{}));
     defer tree_sitter_highlighter.deinit();
 
     app.run(.{
@@ -431,9 +431,9 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
         const grammar_entries = try grammar_data_store.registryEntries(a);
         const grammar_overrides = try grammar_cli.loadOverrides(a, init.io, init.environ_map);
         try grammar_data_store.validateOverrideNames(grammar_overrides);
-        grammar_registry = try @import("highlight/user_grammar.zig").Registry.initWithDiagnostics(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity, diagnostic.forContext(.grammar, .{}));
+        grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity, diagnostic.forContext(.grammar, .{}));
     }
-    var tree_sitter_highlighter = try TreeSitterHighlighter.initWithDiagnostics(gpa, if (grammar_registry) |*registry| registry else null, diagnostic.forContext(.highlighting, .{}));
+    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null, diagnostic.forContext(.highlighting, .{}));
     defer tree_sitter_highlighter.deinit();
     try app.run(.{
         .diagnostic = diagnostic,

@@ -49,7 +49,7 @@ const CountingSource = struct {
         while (active > previous) {
             previous = self.max_active.cmpxchgWeak(previous, active, .release, .monotonic) orelse break;
         }
-        return self.inner.readWithDiagnostics(allocator, commit, path, diagnostic);
+        return self.inner.read(allocator, commit, path, diagnostic);
     }
 };
 

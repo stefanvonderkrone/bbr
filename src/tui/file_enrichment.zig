@@ -10,12 +10,8 @@ pub const BlobSource = struct {
     ptr: *anyopaque,
     read_fn: *const fn (*anyopaque, Allocator, []const u8, []const u8, bbr.diagnostics.Handle) anyerror![]u8,
 
-    pub fn read(self: BlobSource, allocator: Allocator, commit: []const u8, path: []const u8) ![]u8 {
-        return self.read_fn(self.ptr, allocator, commit, path, .{});
-    }
-
     /// `diagnostic` names the File side that asks for the blob, so each attempt record keeps it.
-    pub fn readWithDiagnostics(self: BlobSource, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) ![]u8 {
+    pub fn read(self: BlobSource, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) ![]u8 {
         return self.read_fn(self.ptr, allocator, commit, path, diagnostic);
     }
 };
@@ -314,7 +310,7 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
     errdefer side.arena.deinit();
     const allocator = side.arena.allocator();
 
-    side.blob = source.readWithDiagnostics(allocator, commit, path, diagnostic) catch |err| {
+    side.blob = source.read(allocator, commit, path, diagnostic) catch |err| {
         if (err != error.InvalidPath) _ = diagnostic.failure(.read, .{ .zig = err }, @src());
         if (err == error.OutOfMemory) return error.OutOfMemory;
         side.destroy();
@@ -1663,7 +1659,7 @@ test "a retried remote blob read records its first attempt with the File side" {
     const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
     var remote: RemoteBlobSource = .{ .client = bb, .repo = "repo", .retry_io = testing.io };
     const handle = sideDiagnostic(sink.handle(.file_enrichment, .{ .command_id = 17 }), .new);
-    const blob = try remote.source().readWithDiagnostics(testing.allocator, "source", "file.zig", handle);
+    const blob = try remote.source().read(testing.allocator, "source", "file.zig", handle);
     defer testing.allocator.free(blob);
     try testing.expectEqualStrings("new", blob);
     _ = sink.setEnabled(false);

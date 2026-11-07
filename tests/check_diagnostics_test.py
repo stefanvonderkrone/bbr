@@ -17,6 +17,21 @@ class DiagnosticsCheckTest(unittest.TestCase):
             source.write_text(text)
             return list(checker.violations(root))
 
+    def test_a_with_diagnostics_wrapper_is_rejected(self):
+        # The pair that let writeTrustQuestion drop its Handle after a merge.
+        text = "\n".join((
+            "pub fn writeCandidateReport(a: A, w: *W) ![32]u8 {",
+            "    return writeCandidateReportWithDiagnostics(a, w, .{});",
+            "}",
+            "pub fn writeCandidateReportWithDiagnostics(a: A, w: *W, diagnostic: Handle) ![32]u8 {",
+            "    return report(a, w, diagnostic);",
+            "}",
+        ))
+        found = self.check("src/highlight/grammar_cli.zig", text)
+        self.assertEqual(len(found), 1)
+        self.assertIn("required diagnostics.Handle", found[0])
+        self.assertEqual(self.check("src/highlight/highlighter.zig", "pub fn withDiagnostics(self: H, d: Handle) H {}"), [])
+
     def test_old_highlighting_warning_bypasses_the_sink(self):
         found = self.check("src/tui/presentation.zig", 'std.log.warn("code Highlighting failed: {s}", .{@errorName(err)});')
         self.assertEqual(len(found), 1)

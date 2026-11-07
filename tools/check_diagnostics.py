@@ -53,6 +53,12 @@ def violations(root):
                 owner = declaration[1]
             if STANDARD_LOG.search(line):
                 yield f"{path}:{number}: use a diagnostic Handle or a pure diagnostic Failure, not std.log."
+            if declaration and declaration[1].endswith("WithDiagnostics") and declaration[1] != "WithDiagnostics":
+                base = declaration[1][: -len("WithDiagnostics")]
+                yield (
+                    f"{path}:{number}: do not add {declaration[1]} beside {base}. "
+                    f"Give {base} a required diagnostics.Handle parameter, so no caller can drop it with a silent `.{{}}`."
+                )
             if str(path) == "src/main.zig" and re.search(r"\bstd\.process\.exit\s*\(", line) and owner != "exitFailure":
                 yield f"{path}:{number}: use exitFailure with the real cause and @src() before an error exit."
         if str(path) == "src/persist/sqlite_store.zig":

@@ -173,16 +173,6 @@ pub const Registry = struct {
         entries: []const RegistryEntry,
         overrides: []const MatchOverride,
         bbr_identity: []const u8,
-    ) !Registry {
-        return initWithDiagnostics(allocator, io, entries, overrides, bbr_identity, .{});
-    }
-
-    pub fn initWithDiagnostics(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        entries: []const RegistryEntry,
-        overrides: []const MatchOverride,
-        bbr_identity: []const u8,
         diagnostic_handle: diagnostics.Handle,
     ) !Registry {
         var installations: std.ArrayList(Installation) = .empty;
@@ -194,7 +184,7 @@ pub const Registry = struct {
         for (entries) |entry| {
             const name = try allocator.dupe(u8, entry.name);
             errdefer allocator.free(name);
-            var inspection = inspectWithDiagnostics(allocator, io, entry.path, diagnostic_handle) catch |err| {
+            var inspection = inspect(allocator, io, entry.path, diagnostic_handle) catch |err| {
                 if (entry.enabled) return err;
                 try installations.append(allocator, .{ .name = name, .enabled = false });
                 continue;
@@ -215,7 +205,7 @@ pub const Registry = struct {
             const rules = try effectiveRules(entry.name, inspection.report.rules, overrides);
             if (entry.enabled and !(if (entry.receipt) |receipt| receipt.matches(inspection.report.digest, bbr_identity) else false)) {
                 var digest_buffer: [64]u8 = undefined;
-                try inspection.validateTrustedWithDiagnostics(inspection.report.digestHex(&digest_buffer), diagnostic_handle);
+                try inspection.validateTrusted(inspection.report.digestHex(&digest_buffer), diagnostic_handle);
             }
             try installations.append(allocator, .{
                 .name = name,
@@ -371,11 +361,7 @@ pub const Inspection = struct {
 
     /// Trust is exact and case-insensitive hexadecimal. Native code is loaded
     /// only after this check succeeds.
-    pub fn validateTrusted(self: *Inspection, trusted_sha256: []const u8) !void {
-        return self.validateTrustedWithDiagnostics(trusted_sha256, .{});
-    }
-
-    pub fn validateTrustedWithDiagnostics(self: *Inspection, trusted_sha256: []const u8, diagnostic_handle: diagnostics.Handle) !void {
+    pub fn validateTrusted(self: *Inspection, trusted_sha256: []const u8, diagnostic_handle: diagnostics.Handle) !void {
         var expected: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&expected, "{x}", .{self.report.digest}) catch unreachable;
         if (!std.ascii.eqlIgnoreCase(&expected, trusted_sha256)) return error.UntrustedDigest;
@@ -419,11 +405,7 @@ pub const Inspection = struct {
     }
 };
 
-pub fn inspect(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Inspection {
-    return inspectWithDiagnostics(allocator, io, path, .{});
-}
-
-pub fn inspectWithDiagnostics(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagnostic_handle: diagnostics.Handle) !Inspection {
+pub fn inspect(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagnostic_handle: diagnostics.Handle) !Inspection {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -520,14 +502,10 @@ fn readArchive(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagn
         return error.InvalidArchive;
     };
     if (tar_bytes.len > max_file_bytes) return error.ArchiveTooLarge;
-    return parseTarWithDiagnostics(allocator, tar_bytes, diagnostic_handle);
+    return parseTar(allocator, tar_bytes, diagnostic_handle);
 }
 
-fn parseTar(allocator: std.mem.Allocator, bytes: []const u8) ![]File {
-    return parseTarWithDiagnostics(allocator, bytes, .{});
-}
-
-fn parseTarWithDiagnostics(allocator: std.mem.Allocator, bytes: []const u8, diagnostic_handle: diagnostics.Handle) ![]File {
+fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, diagnostic_handle: diagnostics.Handle) ![]File {
     var files: std.ArrayList(File) = .empty;
     var seen: std.ArrayList([]const u8) = .empty;
     var at: usize = 0;
@@ -917,8 +895,8 @@ test "diagnostics retain malformed gzip cause without archive contents or path" 
     });
     const path = try std.fs.path.join(testing.allocator, &.{ home, "private_archive_path_7a4.tar.gz" });
     defer testing.allocator.free(path);
-    try testing.expectError(error.InvalidArchive, inspect(testing.allocator, testing.io, path));
-    try testing.expectError(error.InvalidArchive, inspectWithDiagnostics(testing.allocator, testing.io, path, sink.handle(.grammar, .{})));
+    try testing.expectError(error.InvalidArchive, inspect(testing.allocator, testing.io, path, .{}));
+    try testing.expectError(error.InvalidArchive, inspect(testing.allocator, testing.io, path, sink.handle(.grammar, .{})));
     var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
     defer dir.close(testing.io);
     var iterator = dir.iterate();
@@ -997,7 +975,7 @@ test "folder inspection validates exact payloads and reports native trust" {
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/bundle", .{&tmp.sub_path});
     defer testing.allocator.free(path);
 
-    var inspection = try inspect(testing.allocator, io, path);
+    var inspection = try inspect(testing.allocator, io, path, .{});
     defer inspection.deinit();
     try testing.expectEqualStrings("fixture", inspection.report.name);
     try testing.expectEqualStrings("1.2.3", inspection.report.version);
@@ -1006,9 +984,9 @@ test "folder inspection validates exact payloads and reports native trust" {
     defer output.deinit();
     try inspection.report.writeTrustPrompt(&output.writer);
     try testing.expect(std.mem.indexOf(u8, output.written(), "native code") != null);
-    try testing.expectError(error.UntrustedDigest, inspection.validateTrusted("00" ** 32));
+    try testing.expectError(error.UntrustedDigest, inspection.validateTrusted("00" ** 32, .{}));
     var trusted_digest: [64]u8 = undefined;
-    try testing.expectError(error.NativeLibraryLoadFailed, inspection.validateTrusted(inspection.report.digestHex(&trusted_digest)));
+    try testing.expectError(error.NativeLibraryLoadFailed, inspection.validateTrusted(inspection.report.digestHex(&trusted_digest), .{}));
 }
 
 test "folder inspection rejects extra files links and changed payload bytes" {
@@ -1023,16 +1001,16 @@ test "folder inspection rejects extra files links and changed payload bytes" {
     try tmp.dir.writeFile(io, .{ .sub_path = "bundle/grammar.toml", .data = manifest });
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/bundle", .{&tmp.sub_path});
     defer testing.allocator.free(path);
-    try testing.expectError(error.PayloadDigestMismatch, inspect(testing.allocator, io, path));
+    try testing.expectError(error.PayloadDigestMismatch, inspect(testing.allocator, io, path, .{}));
 
     try tmp.dir.writeFile(io, .{ .sub_path = "bundle/payload", .data = "expected" });
     try tmp.dir.writeFile(io, .{ .sub_path = "bundle/extra", .data = "x" });
-    try testing.expectError(error.UndeclaredFile, inspect(testing.allocator, io, path));
+    try testing.expectError(error.UndeclaredFile, inspect(testing.allocator, io, path, .{}));
 
     try tmp.dir.symLink(io, "bundle", "linked-bundle", .{ .is_directory = true });
     const linked_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/linked-bundle", .{&tmp.sub_path});
     defer testing.allocator.free(linked_path);
-    try testing.expectError(error.NotDir, inspect(testing.allocator, io, linked_path));
+    try testing.expectError(error.NotDir, inspect(testing.allocator, io, linked_path, .{}));
 }
 
 test "tar parser rejects duplicate unsafe and linked entries" {
@@ -1040,17 +1018,17 @@ test "tar parser rejects duplicate unsafe and linked entries" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const regular = try testTar(allocator, &.{ .{ "grammar.toml", '0', "x" }, .{ "payload", '0', "y" } });
-    const files = try parseTar(allocator, regular);
+    const files = try parseTar(allocator, regular, .{});
     try testing.expectEqual(@as(usize, 2), files.len);
 
     const duplicate = try testTar(allocator, &.{ .{ "x", '0', "a" }, .{ "x", '0', "b" } });
-    try testing.expectError(error.DuplicateArchiveEntry, parseTar(allocator, duplicate));
+    try testing.expectError(error.DuplicateArchiveEntry, parseTar(allocator, duplicate, .{}));
     const unsafe = try testTar(allocator, &.{.{ "../x", '0', "a" }});
-    try testing.expectError(error.UnsafePath, parseTar(allocator, unsafe));
+    try testing.expectError(error.UnsafePath, parseTar(allocator, unsafe, .{}));
     const link = try testTar(allocator, &.{.{ "x", '2', "" }});
-    try testing.expectError(error.NonRegularFile, parseTar(allocator, link));
+    try testing.expectError(error.NonRegularFile, parseTar(allocator, link, .{}));
     const duplicate_dir = try testTar(allocator, &.{ .{ "queries/", '5', "" }, .{ "queries/", '5', "" } });
-    try testing.expectError(error.DuplicateArchiveEntry, parseTar(allocator, duplicate_dir));
+    try testing.expectError(error.DuplicateArchiveEntry, parseTar(allocator, duplicate_dir, .{}));
 }
 
 test "tar.gz inspection uses the same logical bundle" {
@@ -1071,7 +1049,7 @@ test "tar.gz inspection uses the same logical bundle" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "bundle.tar.gz", .data = compressed.written() });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/bundle.tar.gz", .{&tmp.sub_path});
 
-    var inspection = try inspect(testing.allocator, testing.io, path);
+    var inspection = try inspect(testing.allocator, testing.io, path, .{});
     defer inspection.deinit();
     try testing.expectEqualStrings("fixture", inspection.report.name);
 }
@@ -1199,10 +1177,10 @@ test "registry reuses exact receipts and loads a matching UserGrammar on first u
     defer testing.allocator.free(first_path);
     const second_path = try writeRegistryBundle(&tmp, "second", ".other", "also not a library");
     defer testing.allocator.free(second_path);
-    var first_inspection = try inspect(testing.allocator, testing.io, first_path);
+    var first_inspection = try inspect(testing.allocator, testing.io, first_path, .{});
     const first_digest = first_inspection.report.digest;
     first_inspection.deinit();
-    var second_inspection = try inspect(testing.allocator, testing.io, second_path);
+    var second_inspection = try inspect(testing.allocator, testing.io, second_path, .{});
     const second_digest = second_inspection.report.digest;
     second_inspection.deinit();
     const entries = [_]RegistryEntry{
@@ -1212,7 +1190,7 @@ test "registry reuses exact receipts and loads a matching UserGrammar on first u
     var registry = try Registry.init(testing.allocator, testing.io, &entries, &.{.{
         .name = "second",
         .rules = .{ .filenames = &.{"exact.fixture"} },
-    }}, "test-build");
+    }}, "test-build", .{});
     defer registry.deinit();
 
     try testing.expectEqualStrings("second", registry.matchName("src/exact.fixture", "").?);
@@ -1229,7 +1207,7 @@ test "registry rejects stale active receipts but lists invalid inactive installa
     defer tmp.cleanup();
     const path = try writeRegistryBundle(&tmp, "fixture", ".fixture", "not a library");
     defer testing.allocator.free(path);
-    var inspection = try inspect(testing.allocator, testing.io, path);
+    var inspection = try inspect(testing.allocator, testing.io, path, .{});
     const digest = inspection.report.digest;
     inspection.deinit();
 
@@ -1240,13 +1218,13 @@ test "registry rejects stale active receipts but lists invalid inactive installa
         .trusted_digest = digest,
         .receipt = .{ .bundle_digest = digest, .bbr_identity = "old-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
     }};
-    try testing.expectError(error.NativeLibraryLoadFailed, Registry.init(testing.allocator, testing.io, &stale, &.{}, "test-build"));
+    try testing.expectError(error.NativeLibraryLoadFailed, Registry.init(testing.allocator, testing.io, &stale, &.{}, "test-build", .{}));
 
     var payload = try tmp.dir.openFile(testing.io, "fixture/payload", .{ .mode = .write_only });
     try payload.writeStreamingAll(testing.io, "tampered");
     payload.close(testing.io);
     const inactive = [_]RegistryEntry{.{ .name = "fixture", .path = path, .enabled = false, .trusted_digest = digest }};
-    var registry = try Registry.init(testing.allocator, testing.io, &inactive, &.{}, "test-build");
+    var registry = try Registry.init(testing.allocator, testing.io, &inactive, &.{}, "test-build", .{});
     defer registry.deinit();
     const statuses = try registry.statuses(testing.allocator);
     defer testing.allocator.free(statuses);
@@ -1257,14 +1235,14 @@ test "registry rejects stale active receipts but lists invalid inactive installa
     const untampered_path = try writeRegistryBundle(&tmp, "inactive", ".inactive", "bytes");
     defer testing.allocator.free(untampered_path);
     const untrusted_inactive = [_]RegistryEntry{.{ .name = "inactive", .path = untampered_path, .enabled = false, .trusted_digest = @splat(0) }};
-    var untrusted_registry = try Registry.init(testing.allocator, testing.io, &untrusted_inactive, &.{}, "test-build");
+    var untrusted_registry = try Registry.init(testing.allocator, testing.io, &untrusted_inactive, &.{}, "test-build", .{});
     defer untrusted_registry.deinit();
     const untrusted_statuses = try untrusted_registry.statuses(testing.allocator);
     defer testing.allocator.free(untrusted_statuses);
     try testing.expect(!untrusted_statuses[0].valid);
 
     const active = [_]RegistryEntry{.{ .name = "fixture", .path = path, .enabled = true, .trusted_digest = digest }};
-    try testing.expectError(error.PayloadDigestMismatch, Registry.init(testing.allocator, testing.io, &active, &.{}, "test-build"));
+    try testing.expectError(error.PayloadDigestMismatch, Registry.init(testing.allocator, testing.io, &active, &.{}, "test-build", .{}));
 }
 
 fn digestHex(bytes: []const u8) [64]u8 {
