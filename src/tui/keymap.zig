@@ -429,7 +429,9 @@ fn keyCode(name: []const u8) ?u21 {
     };
     inline for (names) |entry| if (std.mem.eql(u8, name, entry[0])) return entry[1];
     if (name.len >= 2 and name[0] == 'f') {
-        const n = std.fmt.parseInt(u8, name[1..], 10) catch return null;
+        const n = std.fmt.parseInt(u8, name[1..], 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return null,
+        };
         if (n >= 1 and n <= 35) return vaxis.Key.f1 + n - 1;
     }
     return null;

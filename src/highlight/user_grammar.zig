@@ -870,7 +870,9 @@ fn validSymbol(symbol: []const u8) bool {
 }
 
 fn hasTerminalControl(value: []const u8) bool {
-    var view = std.unicode.Utf8View.init(value) catch return true;
+    var view = std.unicode.Utf8View.init(value) catch |err| switch (err) {
+        error.InvalidUtf8 => return true,
+    };
     var iterator = view.iterator();
     while (iterator.nextCodepoint()) |codepoint| {
         if (codepoint <= 0x1f or codepoint >= 0x7f and codepoint <= 0x9f or codepoint >= 0x202a and codepoint <= 0x202e or codepoint >= 0x2066 and codepoint <= 0x2069) return true;

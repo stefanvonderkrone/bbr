@@ -503,6 +503,11 @@ def load_state():
     return json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
 
 
+def write_state(state):
+    rows = [f"{json.dumps(key)}: {json.dumps(value, sort_keys=True)}" for key, value in sorted(state.items())]
+    STATE.write_text("{\n" + ",\n".join(rows) + "\n}\n", encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--group", action="append", choices=GROUPS, default=[])
@@ -572,7 +577,7 @@ def main():
             "names": site.names,
             "reason": site.reason,
         }
-    STATE.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    write_state(state)
 
     resolved = [site for site in selected if site.state == "resolved"]
     reverted = [site for site in selected if site.state == "reverted"]

@@ -64,7 +64,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, kind, "remote")) {
         const repo = arguments.next() orelse return usage();
-        const id = std.fmt.parseInt(u64, arguments.next() orelse return usage(), 10) catch return usage();
+        const id = std.fmt.parseInt(u64, arguments.next() orelse return usage(), 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return usage(),
+        };
         if (arguments.next() != null) return usage();
         var owned = bbr.bitbucket.auth.resolve(allocator, init.io, init.environ_map, null) catch return error.MissingCredential;
         defer owned.deinit(allocator);

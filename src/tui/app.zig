@@ -244,7 +244,9 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
 }
 
 fn pickerTickWorker(loop: *Loop, future_id: u64, scope: presentation.WorkId, io: std.Io) void {
-    io.sleep(std.Io.Duration.fromMilliseconds(picker_tick_interval_ms), .awake) catch return;
+    io.sleep(std.Io.Duration.fromMilliseconds(picker_tick_interval_ms), .awake) catch |err| switch (err) {
+        error.Canceled => return,
+    };
     loop.postEvent(.{ .picker_tick = .{ .future_id = future_id, .scope = scope } }) catch {};
 }
 
@@ -354,7 +356,9 @@ fn presentationStatus(
     };
     if (projection.shutting_down) {
         if (projection.submission) |submission|
-            return std.fmt.allocPrint(frame, "finishing Submission for {s}#{d}", .{ submission.key.repository(), submission.key.pull_request_id }) catch "finishing Submission";
+            return std.fmt.allocPrint(frame, "finishing Submission for {s}#{d}", .{ submission.key.repository(), submission.key.pull_request_id }) catch |err| switch (err) {
+                error.OutOfMemory => "finishing Submission",
+            };
         return "shutting down…";
     }
     if (projection.submission) |submission| {
@@ -364,7 +368,9 @@ fn presentationStatus(
                 submission.key.pull_request_id,
                 submission.completed,
                 submission.total,
-            }) catch "submitting another pull request…";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "submitting another pull request…",
+            };
     }
     if (projection.submission_result) |result| {
         if (visible_key == null or !presentation.OwnedReviewIdentity.eql(result.key, visible_key.?))
@@ -374,7 +380,9 @@ fn presentationStatus(
                 result.posted,
                 result.failed + result.outcome_unknown,
                 result.skipped,
-            }) catch "submission finished for another pull request";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "submission finished for another pull request",
+            };
     }
     if (projection.reviewer_verdict_result) |result| {
         if (visible_key == null or !presentation.OwnedReviewIdentity.eql(result.key, visible_key.?))
@@ -382,7 +390,9 @@ fn presentationStatus(
                 result.key.repository(),
                 result.key.pull_request_id,
                 reviewerVerdictOutcomeLabel(result.outcome),
-            }) catch "Reviewer Verdict changed for another pull request";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "Reviewer Verdict changed for another pull request",
+            };
         return switch (result.outcome) {
             .completed => |completed| switch (completed) {
                 .success, .reconciled_success => "Reviewer Verdict changed",
@@ -401,7 +411,9 @@ fn presentationStatus(
                 result.key.pull_request_id,
                 result.comment_id,
                 @tagName(result.outcome),
-            }) catch "Comment edit finished for another pull request";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "Comment edit finished for another pull request",
+            };
         return switch (result.outcome) {
             .updated => "Bitbucket Comment updated",
             .failed => "Bitbucket Comment edit failed",
@@ -416,7 +428,9 @@ fn presentationStatus(
                 result.key.pull_request_id,
                 result.comment_id,
                 @tagName(result.outcome),
-            }) catch "Comment deletion finished for another pull request";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "Comment deletion finished for another pull request",
+            };
         return switch (result.outcome) {
             .deleted => "Bitbucket Comment deleted",
             .failed => "Bitbucket Comment deletion failed",
@@ -428,11 +442,15 @@ fn presentationStatus(
         .recoverable => std.fmt.allocPrint(frame, "interrupted Submission for {s}#{d} · Y resume", .{
             recovery.key.repository(),
             recovery.key.pull_request_id,
-        }) catch "interrupted Submission · Y resume",
+        }) catch |err| switch (err) {
+            error.OutOfMemory => "interrupted Submission · Y resume",
+        },
         .running_elsewhere => std.fmt.allocPrint(frame, "{s}#{d} is submitting in another bbr instance", .{
             recovery.key.repository(),
             recovery.key.pull_request_id,
-        }) catch "Submission owned by another bbr instance",
+        }) catch |err| switch (err) {
+            error.OutOfMemory => "Submission owned by another bbr instance",
+        },
     };
     if (projection.replacement_error) |err| return @tagName(err);
     return null;
@@ -458,12 +476,20 @@ fn formatBufferSearchStatus(frame: std.mem.Allocator, width: u16, action_error: 
         else => "",
     };
     const count = if (search_projection.total == 0)
-        (std.fmt.allocPrint(frame, " 0/0", .{}) catch "")
+        (std.fmt.allocPrint(frame, " 0/0", .{}) catch |err| switch (err) {
+            error.OutOfMemory => "",
+        })
     else if (search_projection.active) |active|
-        (std.fmt.allocPrint(frame, " {d}/{d}", .{ active, search_projection.total }) catch "")
+        (std.fmt.allocPrint(frame, " {d}/{d}", .{ active, search_projection.total }) catch |err| switch (err) {
+            error.OutOfMemory => "",
+        })
     else
-        (std.fmt.allocPrint(frame, " -/{d}", .{search_projection.total}) catch "");
-    const verbose_suffix = std.fmt.allocPrint(frame, "{s}{s}", .{ count, message }) catch count;
+        (std.fmt.allocPrint(frame, " -/{d}", .{search_projection.total}) catch |err| switch (err) {
+            error.OutOfMemory => "",
+        });
+    const verbose_suffix = std.fmt.allocPrint(frame, "{s}{s}", .{ count, message }) catch |err| switch (err) {
+        error.OutOfMemory => count,
+    };
     const suffix = if (vaxis.gwidth.gwidth(verbose_suffix, .unicode) + 2 <= width)
         verbose_suffix
     else
@@ -472,10 +498,14 @@ fn formatBufferSearchStatus(frame: std.mem.Allocator, width: u16, action_error: 
     const available = @as(usize, width) -| fixed_width;
     var query_start: usize = 0;
     while (query_start < search_projection.query.len and vaxis.gwidth.gwidth(search_projection.query[query_start..], .unicode) > available) {
-        const length = std.unicode.utf8ByteSequenceLength(search_projection.query[query_start]) catch 1;
+        const length = std.unicode.utf8ByteSequenceLength(search_projection.query[query_start]) catch |err| switch (err) {
+            error.Utf8InvalidStartByte => 1,
+        };
         query_start += length;
     }
-    return std.fmt.allocPrint(frame, "/{s}{s}", .{ search_projection.query[query_start..], suffix }) catch "/";
+    return std.fmt.allocPrint(frame, "/{s}{s}", .{ search_projection.query[query_start..], suffix }) catch |err| switch (err) {
+        error.OutOfMemory => "/",
+    };
 }
 
 fn reviewerVerdictOutcomeLabel(outcome: presentation.ReviewerVerdictCommandOutcome) []const u8 {
@@ -562,16 +592,24 @@ fn deleteConfirmationText(
 ) []const u8 {
     if (confirmation.comment_id) |comment_id| {
         if (confirmation.root_has_replies)
-            return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d}? Bitbucket removes its body, retains a Deleted Comment tombstone, and keeps {d} Reply/Replies.", .{ comment_id, confirmation.descendant_count }) catch "Delete this Bitbucket Comment remotely?";
-        return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d} from Bitbucket?", .{comment_id}) catch "Delete this Bitbucket Comment remotely?";
+            return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d}? Bitbucket removes its body, retains a Deleted Comment tombstone, and keeps {d} Reply/Replies.", .{ comment_id, confirmation.descendant_count }) catch |err| switch (err) {
+                error.OutOfMemory => "Delete this Bitbucket Comment remotely?",
+            };
+        return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d} from Bitbucket?", .{comment_id}) catch |err| switch (err) {
+            error.OutOfMemory => "Delete this Bitbucket Comment remotely?",
+        };
     }
     const fallback = "Delete this local Draft and every Reply below it?";
     if (confirmation.descendant_count == 0)
-        return std.fmt.allocPrint(frame, "Delete local Draft #{d}? It has no Replies.", .{confirmation.temp_id}) catch fallback;
+        return std.fmt.allocPrint(frame, "Delete local Draft #{d}? It has no Replies.", .{confirmation.temp_id}) catch |err| switch (err) {
+            error.OutOfMemory => fallback,
+        };
     return std.fmt.allocPrint(frame, "Delete local Draft #{d} and its {d} Reply Draft(s)?", .{
         confirmation.temp_id,
         confirmation.descendant_count,
-    }) catch fallback;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => fallback,
+    };
 }
 
 /// `Re-anchor local Draft #7 → src/f.zig new 12-14 · Enter accept · Esc cancel`
@@ -586,11 +624,15 @@ fn reanchorStatus(
         @tagName(candidate.side),
         candidate.top,
         candidate.bottom,
-    }) catch return fallback else actionErrorText(reanchor.refusal orelse projection.action_error orelse .action_refused);
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return fallback,
+    } else actionErrorText(reanchor.refusal orelse projection.action_error orelse .action_refused);
     return std.fmt.allocPrint(frame, "Re-anchor local Draft #{d} → {s} · Enter accept · Esc cancel", .{
         reanchor.temp_id,
         detail,
-    }) catch fallback;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => fallback,
+    };
 }
 
 fn portableKey(key: vaxis.Key) keymap.KeyStroke {
@@ -1320,7 +1362,9 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
         if (facts.status_msg) |message| items.add(.search, message, if (facts.search_has_no_matches) .no_match else .message);
     } else {
         if (facts.header.pull_request_id) |id| {
-            items.add(.title, std.fmt.allocPrint(frame, "#{d}", .{id}) catch "#", .pull_request);
+            items.add(.title, std.fmt.allocPrint(frame, "#{d}", .{id}) catch |err| switch (err) {
+                error.OutOfMemory => "#",
+            }, .pull_request);
             items.add(.title, " ", .bar);
             items.add(.verdict, reviewerVerdictLabel(facts.reviewer_verdict), if (facts.reviewer_verdict) |verdict| switch (verdict) {
                 .approved => .verdict_approved,
@@ -1332,7 +1376,9 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
         items.add(.refs, facts.header.source_ref, .ref);
         items.add(.refs, " → ", .separator);
         items.add(.refs, facts.header.base_ref, .ref);
-        items.add(.position, std.fmt.allocPrint(frame, "{d}/{d}", .{ facts.position, facts.total }) catch "", .position);
+        items.add(.position, std.fmt.allocPrint(frame, "{d}/{d}", .{ facts.position, facts.total }) catch |err| switch (err) {
+            error.OutOfMemory => "",
+        }, .position);
         items.position_width = @intCast(std.fmt.count("{d}/{d}", .{ facts.total, facts.total }));
         if (diagnosticStatus(facts.diagnostic_state)) |text| items.add(.diagnostics, text, .message);
     }
@@ -1356,7 +1402,9 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
     } else {
         if (facts.draft_count > 0) {
             items.add(.submit, "X", .key);
-            items.add(.submit, std.fmt.allocPrint(frame, " submit {d}", .{facts.draft_count}) catch " submit", .drafts);
+            items.add(.submit, std.fmt.allocPrint(frame, " submit {d}", .{facts.draft_count}) catch |err| switch (err) {
+                error.OutOfMemory => " submit",
+            }, .drafts);
         }
         items.hint(.comment, "c/i", " comment");
         items.hint(.file, "[ ]", " file");
@@ -1783,7 +1831,9 @@ test "Picker tick scheduler starts only while loading and stops on every scope e
 }
 
 fn testSleepingPickerTick(io: std.Io) void {
-    io.sleep(std.Io.Duration.fromSeconds(60), .awake) catch return;
+    io.sleep(std.Io.Duration.fromSeconds(60), .awake) catch |err| switch (err) {
+        error.Canceled => return,
+    };
 }
 
 test "stopping a Picker tick cancels and reaps its sleeping future" {

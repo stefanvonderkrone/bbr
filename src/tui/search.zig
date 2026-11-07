@@ -456,7 +456,9 @@ fn equalScalar(query: Query, needle: u21, candidate: u21) bool {
 }
 
 pub fn containsLiteral(query: Query, text: []const u8) bool {
-    const text_view = std.unicode.Utf8View.init(text) catch return false;
+    const text_view = std.unicode.Utf8View.init(text) catch |err| switch (err) {
+        error.InvalidUtf8 => return false,
+    };
     if (query.scalars.len == 0) return true;
     var starts = text_view.iterator();
     while (starts.i < text.len) {
@@ -502,7 +504,9 @@ pub fn lastScalarStart(text: []const u8) usize {
     if (text.len == 0) return 0;
     var start = text.len - 1;
     while (start > 0 and text.len - start < 4 and text[start] & 0xC0 == 0x80) start -= 1;
-    const len = std.unicode.utf8ByteSequenceLength(text[start]) catch return text.len - 1;
+    const len = std.unicode.utf8ByteSequenceLength(text[start]) catch |err| switch (err) {
+        error.Utf8InvalidStartByte => return text.len - 1,
+    };
     return if (start + len == text.len) start else text.len - 1;
 }
 

@@ -200,14 +200,18 @@ pub fn parseRetryAfter(value: []const u8, now_seconds: i64) ?u64 {
     const trimmed = std.mem.trim(u8, value, " \t");
     if (trimmed.len == 0) return null;
     if (std.fmt.parseInt(u64, trimmed, 10)) |seconds| {
-        const milliseconds = std.math.mul(u64, seconds, std.time.ms_per_s) catch return null;
+        const milliseconds = std.math.mul(u64, seconds, std.time.ms_per_s) catch |err| switch (err) {
+            error.Overflow => return null,
+        };
         return if (milliseconds <= std.math.maxInt(i64)) milliseconds else null;
     } else |_| {}
 
     const target = parseHttpDate(trimmed) orelse return null;
     if (target <= now_seconds) return null;
     const delay: u64 = @intCast(target - now_seconds);
-    const milliseconds = std.math.mul(u64, delay, std.time.ms_per_s) catch return null;
+    const milliseconds = std.math.mul(u64, delay, std.time.ms_per_s) catch |err| switch (err) {
+        error.Overflow => return null,
+    };
     return if (milliseconds <= std.math.maxInt(i64)) milliseconds else null;
 }
 
@@ -217,12 +221,22 @@ fn parseHttpDate(value: []const u8) ?i64 {
         value[7] != ' ' or value[11] != ' ' or value[16] != ' ' or
         value[19] != ':' or value[22] != ':' or !std.mem.eql(u8, value[25..], " GMT")) return null;
     const weekday = parseWeekday(value[0..3]) orelse return null;
-    const day = std.fmt.parseInt(u8, value[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, value[5..7], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
     const month = parseMonth(value[8..11]) orelse return null;
-    const year = std.fmt.parseInt(u16, value[12..16], 10) catch return null;
-    const hour = std.fmt.parseInt(u8, value[17..19], 10) catch return null;
-    const minute = std.fmt.parseInt(u8, value[20..22], 10) catch return null;
-    const second = std.fmt.parseInt(u8, value[23..25], 10) catch return null;
+    const year = std.fmt.parseInt(u16, value[12..16], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
+    const hour = std.fmt.parseInt(u8, value[17..19], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
+    const minute = std.fmt.parseInt(u8, value[20..22], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
+    const second = std.fmt.parseInt(u8, value[23..25], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
     if (year < 1970 or day == 0 or day > daysInMonth(year, month) or hour > 23 or minute > 59 or second > 59) return null;
 
     var days: i64 = 0;

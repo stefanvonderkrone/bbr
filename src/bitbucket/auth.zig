@@ -467,7 +467,9 @@ fn writeParseDiagnostic(writer: *std.Io.Writer, path: []const u8, location: Pars
 fn reportParseDiagnostic(io: std.Io, path: []const u8, location: ParseLocation) void {
     var buffer: [256]u8 = undefined;
     var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
-    writeParseDiagnostic(&writer.interface, path, location) catch return;
+    writeParseDiagnostic(&writer.interface, path, location) catch |err| switch (err) {
+        error.WriteFailed => return,
+    };
     writer.interface.flush() catch {};
 }
 
@@ -477,7 +479,9 @@ const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
 fn warnStorage(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buffer: [256]u8 = undefined;
     var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
-    writer.interface.print("warning: " ++ fmt ++ "\n", args) catch return;
+    writer.interface.print("warning: " ++ fmt ++ "\n", args) catch |err| switch (err) {
+        error.WriteFailed => return,
+    };
     writer.interface.flush() catch {};
 }
 

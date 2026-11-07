@@ -55,7 +55,9 @@ pub const Client = struct {
             const detail = source orelse return;
             self.reason = detail.reason;
             self.reported_error = detail.reported_error;
-            if (detail.message) |message| self.message = self.allocator.dupe(u8, message) catch null;
+            if (detail.message) |message| self.message = self.allocator.dupe(u8, message) catch |err| switch (err) {
+                error.OutOfMemory => null,
+            };
         }
 
         fn record(self: *ErrorDetail, reason: ApiError, body: []const u8, token: []const u8, headers: []const httpc.Header) void {
@@ -82,15 +84,21 @@ pub const Client = struct {
                     if (std.mem.startsWith(u8, remaining, value)) secret_len = @max(secret_len, value.len);
                 }
                 if (secret_len != 0) {
-                    redacted.appendSlice(self.allocator, "[redacted]") catch return;
+                    redacted.appendSlice(self.allocator, "[redacted]") catch |err| switch (err) {
+                        error.OutOfMemory => return,
+                    };
                     position += secret_len;
                 } else {
                     const byte = message[position];
-                    redacted.append(self.allocator, if (byte < 0x20 or byte == 0x7f) ' ' else byte) catch return;
+                    redacted.append(self.allocator, if (byte < 0x20 or byte == 0x7f) ' ' else byte) catch |err| switch (err) {
+                        error.OutOfMemory => return,
+                    };
                     position += 1;
                 }
             }
-            self.message = redacted.toOwnedSlice(self.allocator) catch return;
+            self.message = redacted.toOwnedSlice(self.allocator) catch |err| switch (err) {
+                error.OutOfMemory => return,
+            };
         }
     };
 
@@ -2082,7 +2090,9 @@ fn numberedNext(next: []const u8, first: []const u8, expected: u32) bool {
     if (!std.mem.startsWith(u8, next, path) or next.len <= path.len or next[path.len] != '?') return false;
     var query = std.mem.splitScalar(u8, next[path.len + 1 ..], '&');
     while (query.next()) |pair| {
-        if (std.mem.startsWith(u8, pair, "page=")) return (std.fmt.parseInt(u32, pair["page=".len..], 10) catch return false) == expected;
+        if (std.mem.startsWith(u8, pair, "page=")) return (std.fmt.parseInt(u32, pair["page=".len..], 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return false,
+        }) == expected;
     }
     return false;
 }

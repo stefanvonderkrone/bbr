@@ -117,9 +117,11 @@ pub const GitAnchorResolver = struct {
             try self.unavailable_transitions.put(cache, key, {});
             return null;
         };
-        const parsed_transition = parser.parse(cache, raw) catch {
-            try self.unavailable_transitions.put(cache, key, {});
-            return null;
+        const parsed_transition = parser.parse(cache, raw) catch |err| switch (err) {
+            error.MalformedHunkHeader, error.OutOfMemory, error.UnexpectedLine => {
+                try self.unavailable_transitions.put(cache, key, {});
+                return null;
+            },
         };
         try self.transitions.put(cache, key, parsed_transition);
         return parsed_transition;
@@ -136,9 +138,11 @@ pub const GitAnchorResolver = struct {
                 try self.unavailable_transitions.put(cache, key, {});
                 return .unavailable;
             };
-            const parsed_transition = parser.parse(cache, raw) catch {
-                try self.unavailable_transitions.put(cache, key, {});
-                return .unavailable;
+            const parsed_transition = parser.parse(cache, raw) catch |err| switch (err) {
+                error.MalformedHunkHeader, error.OutOfMemory, error.UnexpectedLine => {
+                    try self.unavailable_transitions.put(cache, key, {});
+                    return .unavailable;
+                },
             };
             try self.transitions.put(cache, key, parsed_transition);
             break :blk parsed_transition;

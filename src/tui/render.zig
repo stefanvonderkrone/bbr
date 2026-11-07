@@ -426,7 +426,9 @@ fn drawVisualPane(
     nav: Nav,
 ) void {
     const sel = nav.selection() orelse .{ nav.cursor, nav.cursor };
-    const path = if (nav.cursor < visual_rows.len) buf.activePath(scratch, visual_rows[nav.cursor].buffer_index) catch buffer_mod.ActivePath{} else buffer_mod.ActivePath{};
+    const path = if (nav.cursor < visual_rows.len) buf.activePath(scratch, visual_rows[nav.cursor].buffer_index) catch |err| switch (err) {
+        error.OutOfMemory => buffer_mod.ActivePath{},
+    } else buffer_mod.ActivePath{};
     const ancestry_theme = ancestryRowTheme(theme);
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
@@ -828,9 +830,11 @@ fn drawLineBodyText(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_
         if (offset < source_end and run_end > source_start) count += 1;
         offset = run_end;
     }
-    const segs = scratch.alloc(vaxis.Segment, count) catch {
-        _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
-        return;
+    const segs = scratch.alloc(vaxis.Segment, count) catch |err| switch (err) {
+        error.OutOfMemory => {
+            _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
+            return;
+        },
     };
     offset = 0;
     var index: usize = 0;
@@ -894,7 +898,9 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
         view_paint.rail(win, rail.column, r, if (target) |path_card| theme.reviewCardStyle(path_card.role, .body, .{}) else dim);
     }
     if (card.part.isBorder() or card.segments.len == 0) return;
-    const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch return;
+    const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
     var links: TerminalLinks = .{ .scratch = scratch, .owner = card.owner };
     var column: usize = 0;
     for (card.segments, 0..) |segment, index| {
@@ -949,7 +955,9 @@ const TerminalLinks = struct {
             .comment => |value| value,
             .draft => |value| value,
         };
-        const params = std.fmt.allocPrint(self.scratch, "id=bbr-{s}-{d}-{d}", .{ @tagName(self.owner), id, link.start }) catch return .{};
+        const params = std.fmt.allocPrint(self.scratch, "id=bbr-{s}-{d}-{d}", .{ @tagName(self.owner), id, link.start }) catch |err| switch (err) {
+            error.OutOfMemory => return .{},
+        };
         self.link = .{ .uri = link.destination, .params = params };
         return self.link;
     }
@@ -1073,7 +1081,9 @@ fn listRow(
                 formatLabel(scratch, "  {s} ({s})", .{ command.description, label }, command.description)
             else
                 formatLabel(scratch, "  {s}", .{command.description}, command.description);
-            const segments = scratch.alloc(vaxis.Segment, 3) catch return &.{};
+            const segments = scratch.alloc(vaxis.Segment, 3) catch |err| switch (err) {
+                error.OutOfMemory => return &.{},
+            };
             segments[0] = .{ .text = marker, .style = row_style };
             segments[1] = .{ .text = command.title, .style = title_style };
             segments[2] = .{ .text = description, .style = row_style };
@@ -1093,7 +1103,9 @@ fn listRow(
             break :blk formatLabel(scratch, "{s}{s}{s}", .{ marker, id.name(), suffix }, id.name());
         },
     };
-    const segments = scratch.alloc(vaxis.Segment, 1) catch return &.{};
+    const segments = scratch.alloc(vaxis.Segment, 1) catch |err| switch (err) {
+        error.OutOfMemory => return &.{},
+    };
     segments[0] = .{ .text = text, .style = style };
     return segments;
 }
@@ -1244,7 +1256,9 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
             var offset: usize = 0;
             var skipped: usize = 0;
             while (offset < line.len and skipped < horizontal) {
-                const scalar_length = std.unicode.utf8ByteSequenceLength(line[offset]) catch 1;
+                const scalar_length = std.unicode.utf8ByteSequenceLength(line[offset]) catch |err| switch (err) {
+                    error.Utf8InvalidStartByte => 1,
+                };
                 offset += @min(scalar_length, line.len - offset);
                 skipped += 1;
             }
@@ -1252,8 +1266,9 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
             while (span_cursor < spans.len and spans[span_cursor].line < line_number) span_cursor += 1;
             const first_span = span_cursor;
             while (span_cursor < spans.len and spans[span_cursor].line == line_number) span_cursor += 1;
-            const decorated = bbr.highlight.decoration.decorate(scratch, line, spans[first_span..span_cursor], &.{}) catch
-                bbr.highlight.LineDecoration{ .runs = &.{.{ .text = line }} };
+            const decorated = bbr.highlight.decoration.decorate(scratch, line, spans[first_span..span_cursor], &.{}) catch |err| switch (err) {
+                error.InvalidEmphasis, error.InvalidSpan, error.OutOfMemory => bbr.highlight.LineDecoration{ .runs = &.{.{ .text = line }} },
+            };
             var segments: std.ArrayList(vaxis.Segment) = .empty;
             var run_start: usize = 0;
             for (decorated.runs) |run| {
@@ -1283,12 +1298,16 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
                         segment_style.bg = theme.search_active;
                         segment_style.bold = true;
                     }
-                    segments.append(scratch, .{ .text = line[cursor..segment_end], .style = theme.resolveStyle(segment_style) }) catch return;
+                    segments.append(scratch, .{ .text = line[cursor..segment_end], .style = theme.resolveStyle(segment_style) }) catch |err| switch (err) {
+                        error.OutOfMemory => return,
+                    };
                     cursor = segment_end;
                 }
                 run_start = run_end;
             }
-            if (segments.items.len == 0) segments.append(scratch, .{ .text = "", .style = style }) catch return;
+            if (segments.items.len == 0) segments.append(scratch, .{ .text = "", .style = style }) catch |err| switch (err) {
+                error.OutOfMemory => return,
+            };
             _ = preview.print(segments.items, .{ .row_offset = row, .wrap = .none });
             if (line_number == matched_line) tintReviewSearchPreviewRow(preview, row, theme);
             row += 1;
@@ -1338,12 +1357,20 @@ fn shortSearchPath(scratch: std.mem.Allocator, path: []const u8, width: usize) [
         var dirs = std.mem.splitScalar(u8, path[0..last_slash.?], '/');
         while (dirs.next()) |dir| {
             if (dir.len > 0) {
-                const length = std.unicode.utf8ByteSequenceLength(dir[0]) catch 1;
-                compact.appendSlice(scratch, dir[0..@min(dir.len, length)]) catch return filename;
+                const length = std.unicode.utf8ByteSequenceLength(dir[0]) catch |err| switch (err) {
+                    error.Utf8InvalidStartByte => 1,
+                };
+                compact.appendSlice(scratch, dir[0..@min(dir.len, length)]) catch |err| switch (err) {
+                    error.OutOfMemory => return filename,
+                };
             }
-            compact.append(scratch, '/') catch return filename;
+            compact.append(scratch, '/') catch |err| switch (err) {
+                error.OutOfMemory => return filename,
+            };
         }
-        compact.appendSlice(scratch, filename) catch return filename;
+        compact.appendSlice(scratch, filename) catch |err| switch (err) {
+            error.OutOfMemory => return filename,
+        };
         if (searchCellWidth(compact.items) <= width) return compact.items;
         var remaining: []const u8 = compact.items;
         while (std.mem.indexOfScalar(u8, remaining, '/')) |slash| {
@@ -1356,7 +1383,9 @@ fn shortSearchPath(scratch: std.mem.Allocator, path: []const u8, width: usize) [
     if (width == 1) return "…";
     var start: usize = 0;
     while (start < filename.len and searchCellWidth(filename[start..]) + 1 > width) {
-        start += @min(filename.len - start, std.unicode.utf8ByteSequenceLength(filename[start]) catch 1);
+        start += @min(filename.len - start, std.unicode.utf8ByteSequenceLength(filename[start]) catch |err| switch (err) {
+            error.Utf8InvalidStartByte => 1,
+        });
     }
     return formatLabel(scratch, "…{s}", .{filename[start..]}, filename[start..]);
 }
@@ -1419,7 +1448,9 @@ test "mention labels and filtered emoji paint in Review Search previews" {
 fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result: presentation.ReviewSearchResult, scroll: usize, theme: Theme, metrics: @import("cell_metrics.zig").CellMetrics) void {
     const owner = result.occurrence.location.review_body;
     const card_mod = @import("review_card.zig");
-    const body = card_mod.ReviewBody.parseWithMentions(scratch, result.body, result.mention_names) catch return;
+    const body = card_mod.ReviewBody.parseWithMentions(scratch, result.body, result.mention_names) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
     const comment: bbr.review.Comment = .{ .id = if (owner.owner == .comment) owner.owner.comment else 0, .author = result.source, .body = result.body };
     const draft: bbr.review.Draft = .{ .local_id = if (owner.owner == .draft) owner.owner.draft else 0, .kind = .comment, .body = result.body };
     const rows = card_mod.projectPreview(scratch, body, .{
@@ -1430,12 +1461,16 @@ fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result
         .content_width = win.width,
         .metrics = metrics,
         .collapsed_rows = 0,
-    }, scroll, win.height) catch return;
+    }, scroll, win.height) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
     var row: u16 = 0;
     for (rows) |card| {
         const code = card.part == .code_body or card.part == .suggestion_body or card.part == .suggestion_label;
         fillReviewCardBackground(win, row, card, 0, if (code and card.code_area == null) theme.reviewCardStyle(card.role, card.part, .{}) else theme.picker, theme.reviewCardStyle(card.role, card.part, .{}));
-        const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch return;
+        const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch |err| switch (err) {
+            error.OutOfMemory => return,
+        };
         var links: TerminalLinks = .{ .scratch = scratch, .owner = card.owner };
         var column: usize = 0;
         var matched_row = false;
@@ -2145,7 +2180,9 @@ pub fn drawSubmissionTree(
 
 fn tryIndent(scratch: std.mem.Allocator, depth: usize) []const u8 {
     const amount = @min(depth * 2, 20);
-    const result = scratch.alloc(u8, amount) catch return "";
+    const result = scratch.alloc(u8, amount) catch |err| switch (err) {
+        error.OutOfMemory => return "",
+    };
     @memset(result, ' ');
     return result;
 }
@@ -2384,7 +2421,9 @@ fn drawSideGutter(win: vaxis.Window, row: u16, no: ?u32, style: vaxis.Style) voi
 }
 
 fn formatNumCol(output: []u8, no: ?u32) usize {
-    if (no) |number| return (std.fmt.bufPrint(output, "{d: >4}", .{number}) catch return 0).len;
+    if (no) |number| return (std.fmt.bufPrint(output, "{d: >4}", .{number}) catch |err| switch (err) {
+        error.NoSpaceLeft => return 0,
+    }).len;
     @memcpy(output[0..4], "    ");
     return 4;
 }
