@@ -9,15 +9,16 @@ import check_diagnostics as checker
 
 
 class DiagnosticsCheckTest(unittest.TestCase):
-    def check(self, path, text, baseline=None):
+    def check(self, path, text, baseline=None, record_baseline=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / path
             source.parent.mkdir(parents=True)
             source.write_text(text)
-            if baseline is not None:
-                (root / "tools").mkdir()
-                (root / checker.CATCH_BASELINE).write_text(baseline)
+            for name, counts in ((checker.CATCH_BASELINE, baseline), (checker.RECORD_BASELINE, record_baseline)):
+                if counts is not None:
+                    (root / "tools").mkdir(exist_ok=True)
+                    (root / name).write_text(counts)
             return list(checker.violations(root))
 
     def test_a_with_diagnostics_wrapper_is_rejected(self):
@@ -106,6 +107,76 @@ class DiagnosticsCheckTest(unittest.TestCase):
         found = self.check("src/tui/presentation.zig", text, "2 src/tui/presentation.zig\n")
         self.assertEqual(len(found), 1)
         self.assertIn("Lower the count", found[0])
+
+    def test_a_record_before_returning_the_cause_or_another_error_is_rejected(self):
+        # runMain records the config load failure, and main records it again.
+        main_117 = "\n".join((
+            "            var loaded = config.loadSnapshot(gpa, snapshot) catch |err| {",
+            "                _ = diagnostic.forContext(.configuration, .{}).failure(.read, .{ .zig = err }, @src());",
+            "                return err;",
+            "            };",
+        ))
+        found = self.check("src/main.zig", main_117)
+        self.assertEqual(len(found), 1)
+        self.assertIn("diagnostic.fail", found[0])
+        self.assertIn("error.Reported", found[0])
+        self.assertEqual(self.check("src/main.zig", main_117, record_baseline="1 src/main.zig\n"), [])
+        found = self.check("src/main.zig", main_117, record_baseline="2 src/main.zig\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn(f"Lower the count in {checker.RECORD_BASELINE}", found[0])
+        for text in (
+            "dlopen(path) catch |err| {\n    _ = diagnostic_handle.failure(.open, .{ .zig = err }, @src());\n    return error.NativeLibraryLoadFailed;\n};",
+            "x() catch |err| switch (err) {\n    error.ReadFailed => {\n        _ = diagnostic_handle.failure(.read, .{ .zig = reader.err.? }, @src());\n        return reader.err.?;\n    },\n    else => |other| return other,\n};",
+            "x() catch |err| {\n    _ = diagnostic.failure(.read, .{ .zig = err }, @src());\n    return @as(anyerror!void, err);\n};",
+            "x() catch |err| {\n    _ = diagnostic.failure(.read, .{ .zig = err }, @src());\n    return switch (err) {\n        error.MissingToken => error.MissingCredential,\n        else => err,\n    };\n};",
+            "x() catch |err| {\n    _ = self.diagnostic.failure(.launch, .{ .zig = err }, evidence.source);\n    return on_fail;\n};",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(len(self.check("src/highlight/user_grammar.zig", text)), 1)
+
+    def test_an_errdefer_that_records_is_rejected(self):
+        found = self.check("src/bitbucket/client.zig", "    errdefer |err| _ = diagnostic.failure(.decode, .{ .zig = err }, source);")
+        self.assertEqual(len(found), 1)
+        self.assertIn("diagnostic.fail", found[0])
+
+    def test_a_return_through_fail_is_allowed(self):
+        for text in (
+            "var loaded = config.loadSnapshot(gpa, snapshot) catch |err|\n    return diagnostic.forContext(.configuration, .{}).fail(.read, .{ .zig = err }, @src());",
+            "x() catch |err| {\n    _ = diagnostic.failure(.read, .{ .zig = err }, @src());\n    return error.Reported;\n};",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.check("src/main.zig", text), [])
+
+    def test_a_record_without_a_return_is_allowed(self):
+        for text in (
+            "x() catch |err| self.reportFailure(.submission, .prepare, err, @src());",
+            "x() catch |err| {\n    _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());\n    continue;\n};",
+            # exitFailure records and never returns, so the return comes before any record.
+            "status() catch |err| {\n    if (err == error.StdoutClosed) return err;\n    exitFailure(diagnostic, err, @src());\n};",
+            "x() catch |err| switch (err) {\n    error.ReadFailed => self.reportFailure(.grammar, .read, err, @src()),\n    else => |other| return other,\n};",
+            "x() catch |err| {\n    _ = diagnostic.failure(.read, .{ .zig = err }, @src());\n    return .{ .fetch_failed = err };\n};",
+            # The nested catch returns OutOfMemory for the await, not for the recorded launch error.
+            "\n".join((
+                "const pair = start() catch |launch_error| {",
+                "    _ = req.diagnostic.failure(.launch, .{ .zig = launch_error }, @src());",
+                "    const old = old_future.await(io) catch |err| switch (err) {",
+                "        error.OutOfMemory => return error.OutOfMemory,",
+                "    };",
+                "    return .{ .old = old };",
+                "};",
+            )),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.check("src/tui/file_enrichment.zig", text), [])
+
+    def test_a_return_without_a_record_is_allowed(self):
+        for text in (
+            "x() catch |err| return err;",
+            "x() catch |err| switch (err) { error.OutOfMemory => return error.OutOfMemory };",
+            "x() catch |err| {\n    side.destroy();\n    return err;\n};",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.check("src/tui/file_enrichment.zig", text), [])
 
     def test_old_highlighting_warning_bypasses_the_sink(self):
         found = self.check("src/tui/presentation.zig", 'std.log.warn("code Highlighting failed: {s}", .{@errorName(err)});')

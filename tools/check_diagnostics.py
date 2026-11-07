@@ -3,6 +3,7 @@
 from pathlib import Path
 import re
 import sys
+from typing import Callable, NamedTuple
 
 import count_baseline
 from source_lines import zig_files
@@ -14,8 +15,18 @@ STANDARD_LOG = re.compile(r"\bstd\s*\.\s*log\s*\.")
 CAUSE_DROP = re.compile(r"\bcatch\b(?!\s*\|\s*[A-Za-z_]\w*\s*\|)")
 CATCH_CAPTURE = re.compile(r"\bcatch\s*\|\s*([A-Za-z_]\w*)\s*\|")
 CATCH_BASELINE = "tools/diagnostic_catch_baseline.txt"
+# An `errdefer |err|` runs only on an error return, so a record in it always propagates the error.
+RECORDING_HANDLER = re.compile(r"\b(?:catch|errdefer)\s*\|\s*([A-Za-z_]\w*)\s*\|")
+NESTED_CATCH = re.compile(r"\bcatch\b(?:\s*\|\s*[A-Za-z_]\w*\s*\|)?")
+# exitFailure also records, but it never returns.
+RECORD = re.compile(r"(?:\.\s*(?:failure|record)|\breportFailure)\s*\(")
+RECORD_BASELINE = "tools/diagnostic_record_baseline.txt"
+RETURN = re.compile(r"\breturn\b")
+NO_NEW_ERROR = re.compile(r"(?:\.|\d|(?:null|true|false|undefined|try)\b|error\.Reported\b|(?!(?:if|switch)\b)[A-Za-z_][\w.]*\s*\()")
 # A SQLite result call must be the first argument of a `native` call on any receiver.
 NATIVE_WRAPPER = re.compile(r"\b\w+(?:\s*\.\s*\w+)*\s*\.\s*native\s*\(\s*$")
+OPENS = "([{"
+CLOSES = ")]}"
 
 
 def production(lines):
@@ -37,15 +48,70 @@ def unwrapped_sqlite_results(lines):
     The check reads the production code as one text, so a wrapper that opens on an
     earlier line still counts, and an unrelated `native` call on the same line does not.
     """
+    text, line_of = joined(lines)
+    for match in SQLITE_RESULT.finditer(text):
+        if NATIVE_WRAPPER.search(text[: match.start()]):
+            continue
+        yield line_of(match.start())
+
+
+def joined(lines):
+    """The `(number, line)` pairs as one text, and a function from an offset in it to its line number."""
     numbers = []
     text = ""
     for number, line in lines:
         numbers.append((len(text), number))
         text += line + "\n"
-    for match in SQLITE_RESULT.finditer(text):
-        if NATIVE_WRAPPER.search(text[: match.start()]):
-            continue
-        yield max(number for start, number in numbers if start <= match.start())
+    return text, lambda offset: max(number for start, number in numbers if start <= offset)
+
+
+def handler_end(text, start):
+    """The index after the handler that begins at `start`."""
+    depth = 0
+    index = start
+    block = text[start:].lstrip().startswith("{")
+    while index < len(text):
+        char = text[index]
+        if char in OPENS:
+            depth += 1
+        elif char in CLOSES:
+            if depth == 0:
+                return index
+            depth -= 1
+            if depth == 0 and block:
+                return index + 1
+        elif char in ";," and depth == 0:
+            return index
+        index += 1
+    return index
+
+
+def switch_spans(handler, name):
+    """The `(start, end)` of the body of each `switch (name) { ... }` in `handler`."""
+    pattern = re.compile(r"\bswitch\s*\(\s*" + re.escape(name) + r"\s*\)\s*\{")
+    for match in pattern.finditer(handler):
+        depth = 1
+        index = match.end()
+        while index < len(handler) and depth:
+            depth += handler[index] in OPENS
+            depth -= handler[index] in CLOSES
+            index += 1
+        if depth == 0:
+            yield match.end(), index - 1
+
+
+def prongs(body):
+    depth = 0
+    start = 0
+    for index, char in enumerate(body):
+        if char in OPENS:
+            depth += 1
+        elif char in CLOSES:
+            depth -= 1
+        elif char == "," and depth == 0:
+            yield body[start:index]
+            start = index + 1
+    yield body[start:]
 
 
 def cause_drops(lines):
@@ -54,53 +120,6 @@ def cause_drops(lines):
     The scan reads the lines as one text, so a handler on the next line stays
     inside the catch.
     """
-    opens = "([{"
-    closes = ")]}"
-
-    def handler_end(text, start):
-        """The index after the handler that begins at `start`."""
-        depth = 0
-        index = start
-        block = text[start:].lstrip().startswith("{")
-        while index < len(text):
-            char = text[index]
-            if char in opens:
-                depth += 1
-            elif char in closes:
-                if depth == 0:
-                    return index
-                depth -= 1
-                if depth == 0 and block:
-                    return index + 1
-            elif char in ";," and depth == 0:
-                return index
-            index += 1
-        return index
-
-    def switch_bodies(handler, name):
-        pattern = re.compile(r"\bswitch\s*\(\s*" + re.escape(name) + r"\s*\)\s*\{")
-        for match in pattern.finditer(handler):
-            depth = 1
-            index = match.end()
-            while index < len(handler) and depth:
-                depth += handler[index] in opens
-                depth -= handler[index] in closes
-                index += 1
-            if depth == 0:
-                yield handler[match.end() : index - 1]
-
-    def prongs(body):
-        depth = 0
-        start = 0
-        for index, char in enumerate(body):
-            if char in opens:
-                depth += 1
-            elif char in closes:
-                depth -= 1
-            elif char == "," and depth == 0:
-                yield body[start:index]
-                start = index + 1
-        yield body[start:]
 
     def else_drops(body, name):
         for prong in prongs(body):
@@ -117,15 +136,7 @@ def cause_drops(lines):
                 return True
         return False
 
-    numbers = []
-    text = ""
-    for number, line in lines:
-        numbers.append((len(text), number))
-        text += line + "\n"
-
-    def line_of(offset):
-        return max(number for start, number in numbers if start <= offset)
-
+    text, line_of = joined(lines)
     for match in CAUSE_DROP.finditer(text):
         yield line_of(match.start()), "uncaptured"
     for match in CATCH_CAPTURE.finditer(text):
@@ -133,46 +144,113 @@ def cause_drops(lines):
         handler = text[match.end() : handler_end(text, match.end())]
         if re.search(r"\b_\s*=\s*" + re.escape(name) + r"\s*;", handler):
             yield line_of(match.start()), "discarded"
-        elif any(else_drops(body, name) for body in switch_bodies(handler, name)):
+        elif any(else_drops(handler[start:end], name) for start, end in switch_spans(handler, name)):
             # The switch subject is not a use. Any other reference means the cause flows.
             without_subjects = re.sub(r"\bswitch\s*\(\s*" + re.escape(name) + r"\s*\)", "", handler)
             if re.search(r"\b" + re.escape(name) + r"\b", without_subjects) is None:
                 yield line_of(match.start()), "unchecked_else"
 
 
-def cause_drop_counts(root):
-    """The number of production catch sites that drop their cause in each Zig file under src/."""
-    counts = {}
-    for path, lines in zig_files(root, ("src",), literals=False):
-        count = sum(1 for _ in cause_drops(production(lines)))
-        if count:
-            counts[str(path)] = count
-    return counts
+def returns_error(code):
+    """Whether a `return` in `code` can return an error.
+
+    `return;`, a literal, `null`, a function call, `try`, and `error.Reported` return no
+    new error. Any other operand, such as the capture, `error.X`, `@as(T, err)`, an
+    `if` or a `switch`, or a variable that holds an error, can.
+    """
+    for match in RETURN.finditer(code):
+        operand = code[match.end() : handler_end(code, match.end())].strip()
+        if operand and not NO_NEW_ERROR.match(operand):
+            return True
+    return False
 
 
-def cause_drop_changes(root):
-    """A ratchet: a file may not gain a `catch` that drops its cause, and a removed one lowers the baseline."""
-    baseline = count_baseline.read(root / CATCH_BASELINE)
-    counts = cause_drop_counts(root)
-    for name in sorted(set(baseline) | set(counts)):
-        allowed = baseline.get(name, 0)
-        found = counts.get(name, 0)
-        if found > allowed:
-            yield (
-                f"{name}: {found} `catch` sites drop their cause, {allowed} allowed. "
-                "Name each dropped error in a switch prong with no `else`, or record the cause through a diagnostics.Handle or Presentation.reportFailure. "
-                f"For an expected outcome, raise the count in {CATCH_BASELINE} in the same change and say why in the commit."
-            )
-        elif found < allowed:
-            yield f"{name}: {found} `catch` sites drop their cause, {allowed} allowed. Lower the count in {CATCH_BASELINE} to {found}."
+def recorded_returns(lines):
+    """The line of each handler that records a failure and then returns an error.
+
+    A handler is the code after `catch |err|` or `errdefer |err|`. The scan leaves out
+    the handlers of catches nested inside it, because those concern another failure.
+    In a `switch (err)`, a prong that records and another prong that returns are not a
+    record before a return. A record in an `errdefer` always comes before the return.
+    """
+    text, line_of = joined(lines)
+    for match in RECORDING_HANDLER.finditer(text):
+        handler = text[match.end() : handler_end(text, match.end())]
+        own = ""
+        index = 0
+        for nested in NESTED_CATCH.finditer(handler):
+            if nested.start() >= index:
+                own += handler[index : nested.start()]
+                index = handler_end(handler, nested.end())
+        own += handler[index:]
+        if match[0].startswith("errdefer"):
+            if RECORD.search(own):
+                yield line_of(match.start())
+            continue
+        spans = []
+        for start, end in switch_spans(own, match[1]):
+            if not spans or start >= spans[-1][1]:
+                spans.append((start, end))
+        shared = own
+        for start, end in reversed(spans):
+            shared = shared[:start] + shared[end:]
+        units = [shared + prong for start, end in spans for prong in prongs(own[start:end])] or [shared]
+        if any(RECORD.search(unit) and returns_error(unit) for unit in units):
+            yield line_of(match.start())
 
 
-def write_baseline(root):
-    count_baseline.write(
-        root / CATCH_BASELINE,
+class Ratchet(NamedTuple):
+    baseline: str
+    write_flag: str
+    scan: Callable
+    finding: str
+    fix: str
+    header: str
+
+
+RATCHETS = (
+    Ratchet(
+        CATCH_BASELINE,
+        "--write-catch-baseline",
+        cause_drops,
+        "`catch` sites drop their cause",
+        "Name each dropped error in a switch prong with no `else`, or record the cause through a diagnostics.Handle or Presentation.reportFailure. "
+        f"For an expected outcome, raise the count in {CATCH_BASELINE} in the same change and say why in the commit.",
         "Production `catch` sites that drop their cause (uncaptured, discarded, or unchecked `else`), per file. tools/check_diagnostics.py fails when a count changes.",
-        cause_drop_counts(root),
-    )
+    ),
+    Ratchet(
+        RECORD_BASELINE,
+        "--write-record-baseline",
+        recorded_returns,
+        "`catch` or `errdefer` handlers record a failure and then return an error",
+        "Return `diagnostic.fail(phase, cause, @src())` on the diagnostics.Handle. It records once and returns error.Reported, which callers propagate with `try`. "
+        "Otherwise return the error without recording it, so the boundary records it once.",
+        "Production `catch` and `errdefer` handlers that record a failure and then return an error, per file. tools/check_diagnostics.py fails when a count changes.",
+    ),
+)
+
+
+def counts(root, scan):
+    """The number of findings of `scan` in the production code of each Zig file under src/."""
+    found = {}
+    for path, lines in zig_files(root, ("src",), literals=False):
+        count = sum(1 for _ in scan(production(lines)))
+        if count:
+            found[str(path)] = count
+    return found
+
+
+def ratchet_changes(root, ratchet):
+    """A file may not gain a finding, and a removed finding lowers the baseline."""
+    baseline = count_baseline.read(root / ratchet.baseline)
+    found_counts = counts(root, ratchet.scan)
+    for name in sorted(set(baseline) | set(found_counts)):
+        allowed = baseline.get(name, 0)
+        found = found_counts.get(name, 0)
+        if found > allowed:
+            yield f"{name}: {found} {ratchet.finding}, {allowed} allowed. {ratchet.fix}"
+        elif found < allowed:
+            yield f"{name}: {found} {ratchet.finding}, {allowed} allowed. Lower the count in {ratchet.baseline} to {found}."
 
 
 def violations(root):
@@ -196,7 +274,8 @@ def violations(root):
         if str(path) == "src/persist/sqlite_store.zig":
             for number in unwrapped_sqlite_results(production_lines):
                 yield f"{path}:{number}: pass the SQLite result through SqliteStore.native before conversion or disposal."
-    yield from cause_drop_changes(root)
+    for ratchet in RATCHETS:
+        yield from ratchet_changes(root, ratchet)
     for path, lines in zig_files(root, ("src",), literals=True):
         for number, line in enumerate(lines, 1):
             if "bbr-submit-response.log" in line:
@@ -204,9 +283,11 @@ def violations(root):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--write-catch-baseline":
-        write_baseline(Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).resolve().parents[1])
-        return 0
+    for ratchet in RATCHETS:
+        if len(sys.argv) > 1 and sys.argv[1] == ratchet.write_flag:
+            root = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).resolve().parents[1]
+            count_baseline.write(root / ratchet.baseline, ratchet.header, counts(root, ratchet.scan))
+            return 0
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
     found = list(violations(root))
     for message in found:
