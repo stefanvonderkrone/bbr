@@ -219,6 +219,15 @@ pub fn build(b: *std.Build) void {
     stdio_writers.addFileArg(b.path("tools/check_stdio_writers.py"));
     stdio_writers.addDirectoryArg(b.path("."));
     const test_step = b.step("test", "Run tests");
+    // The core module is C-free. A macOS build links libc implicitly, so a libc call in
+    // core compiles there and fails only in the Linux CI jobs. Every host also compiles
+    // the core tests for Linux, so that mistake fails in a local `zig build test`.
+    const core_linux_tests = b.addTest(.{ .name = "core-linux-tests", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux }),
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&core_linux_tests.step);
     const diagnostic_check = b.addSystemCommand(&.{"python3"});
     diagnostic_check.addFileArg(b.path("tools/check_diagnostics.py"));
     diagnostic_check.addDirectoryArg(b.path("."));
