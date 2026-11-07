@@ -4,12 +4,12 @@
 1 src/benchmark/frame_paint.zig
 2 src/benchmark/main.zig
 7 src/bitbucket/auth.zig
-18 src/bitbucket/client.zig
+17 src/bitbucket/client.zig
 1 src/bitbucket/url.zig
 4 src/diff/parser.zig
 3 src/git/client.zig
-3 src/highlight/tree_sitter_highlighter.zig
-7 src/highlight/user_grammar.zig
+2 src/highlight/tree_sitter_highlighter.zig
+1 src/highlight/user_grammar.zig
 9 src/http/std_client.zig
 3 src/logging_config.zig
 2 src/main.zig
@@ -29,5 +29,4 @@
 2 src/tui/review_body.zig
 2 src/tui/review_card.zig
 8 src/tui/search.zig
-1 src/tui/theme.zig
 2 src/tui/unicode_case.zig

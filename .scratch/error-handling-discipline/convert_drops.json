@@ -110,6 +110,16 @@
   "reason": "39 names",
   "state": "reverted"
  },
+ "src/bitbucket/client.zig:1eeda8f91773:1": {
+  "group": "unreachable",
+  "line": 1993,
+  "names": [
+   "DivisionByZero"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": null,
+  "state": "resolved"
+ },
  "src/bitbucket/client.zig:2cb979542392:1": {
   "group": "return-error",
   "line": 546,
@@ -364,6 +374,26 @@
   "reason": null,
   "state": "resolved"
  },
+ "src/highlight/tree_sitter_highlighter.zig:a3e62e0f5b99:1": {
+  "group": "unreachable",
+  "line": 781,
+  "names": [
+   "NoSpaceLeft"
+  ],
+  "path": "src/highlight/tree_sitter_highlighter.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/user_grammar.zig:05f1174f3ed3:1": {
+  "group": "unreachable",
+  "line": 366,
+  "names": [
+   "NoSpaceLeft"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
  "src/highlight/user_grammar.zig:40c3a668cade:1": {
   "group": "return-error",
   "line": 684,
@@ -375,12 +405,62 @@
   "reason": null,
   "state": "resolved"
  },
+ "src/highlight/user_grammar.zig:47e0be01400b:1": {
+  "group": "unreachable",
+  "line": 331,
+  "names": [
+   "NoSpaceLeft"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
  "src/highlight/user_grammar.zig:6f2a93e0fd14:1": {
   "group": "return-error",
   "line": 650,
   "names": [
    "InvalidCharacter",
    "Overflow"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/user_grammar.zig:a3e62e0f5b99:1": {
+  "group": "unreachable",
+  "line": 1260,
+  "names": [
+   "NoSpaceLeft"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/user_grammar.zig:a645efe94a74:1": {
+  "group": "unreachable",
+  "line": 1318,
+  "names": [
+   "NoSpaceLeft"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/user_grammar.zig:a8d82f73c79a:1": {
+  "group": "unreachable",
+  "line": 1317,
+  "names": [
+   "NoSpaceLeft"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/user_grammar.zig:b752c2666daa:1": {
+  "group": "unreachable",
+  "line": 1324,
+  "names": [
+   "NoSpaceLeft"
   ],
   "path": "src/highlight/user_grammar.zig",
   "reason": null,
@@ -1215,6 +1295,70 @@
    "InvalidUtf8"
   ],
   "path": "src/tui/search.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/tui/search.zig:96f3691b1071:1": {
+  "group": "unreachable",
+  "line": 446,
+  "names": [
+   "Utf8CodepointTooLarge",
+   "Utf8EncodesSurrogateHalf",
+   "Utf8ExpectedContinuation",
+   "Utf8OverlongEncoding"
+  ],
+  "path": "src/tui/search.zig",
+  "reason": "4 names",
+  "state": "reverted"
+ },
+ "src/tui/search.zig:bc82d5186190:1": {
+  "group": "unreachable",
+  "line": 980,
+  "names": [
+   "TruncatedInput",
+   "Utf8CodepointTooLarge",
+   "Utf8EncodesSurrogateHalf",
+   "Utf8ExpectedContinuation",
+   "Utf8InvalidStartByte",
+   "Utf8OverlongEncoding"
+  ],
+  "path": "src/tui/search.zig",
+  "reason": "6 names",
+  "state": "reverted"
+ },
+ "src/tui/search.zig:cc29867d8866:1": {
+  "group": "unreachable",
+  "line": 522,
+  "names": [
+   "Utf8CodepointTooLarge",
+   "Utf8EncodesSurrogateHalf",
+   "Utf8ExpectedContinuation",
+   "Utf8OverlongEncoding"
+  ],
+  "path": "src/tui/search.zig",
+  "reason": "4 names",
+  "state": "reverted"
+ },
+ "src/tui/search.zig:eab2f6f704ad:1": {
+  "group": "unreachable",
+  "line": 891,
+  "names": [
+   "Utf8CodepointTooLarge",
+   "Utf8EncodesSurrogateHalf",
+   "Utf8ExpectedContinuation",
+   "Utf8OverlongEncoding"
+  ],
+  "path": "src/tui/search.zig",
+  "reason": "4 names",
+  "state": "reverted"
+ },
+ "src/tui/theme.zig:e6606c2d8f35:1": {
+  "group": "unreachable",
+  "line": 781,
+  "names": [
+   "TestUnexpectedResult"
+  ],
+  "path": "src/tui/theme.zig",
   "reason": null,
   "state": "resolved"
  }

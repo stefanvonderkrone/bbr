@@ -1990,7 +1990,9 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                 list.pagelen = page.pagelen orelse self.options.pagelen;
                 if (list.pagelen == 0 or list.pagelen > self.options.pagelen) return error.MalformedResponse;
                 if (page.next) |next| if (page.size) |size| if (numberedNext(next, list.first, page_number + 1)) {
-                    const total = std.math.cast(u32, std.math.divCeil(usize, size, list.pagelen) catch unreachable) orelse return error.MalformedResponse;
+                    const total = std.math.cast(u32, std.math.divCeil(usize, size, list.pagelen) catch |err| switch (err) {
+                        error.DivisionByZero => unreachable,
+                    }) orelse return error.MalformedResponse;
                     list.known = @max(1, total -| (self.options.first_page - 1));
                 };
             } else if (page.pagelen orelse list.pagelen != list.pagelen) return error.MalformedResponse;

@@ -328,7 +328,9 @@ pub const Report = struct {
     affected_built_in_grammars: []const []const u8,
 
     pub fn digestHex(self: Report, buffer: *[64]u8) []const u8 {
-        return std.fmt.bufPrint(buffer, "{x}", .{self.digest}) catch unreachable;
+        return std.fmt.bufPrint(buffer, "{x}", .{self.digest}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
     }
 
     pub fn writeTrustPrompt(self: Report, writer: *std.Io.Writer) !void {
@@ -363,7 +365,9 @@ pub const Inspection = struct {
     /// only after this check succeeds.
     pub fn validateTrusted(self: *Inspection, trusted_sha256: []const u8, diagnostic_handle: diagnostics.Handle) !void {
         var expected: [64]u8 = undefined;
-        _ = std.fmt.bufPrint(&expected, "{x}", .{self.report.digest}) catch unreachable;
+        _ = std.fmt.bufPrint(&expected, "{x}", .{self.report.digest}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         if (!std.ascii.eqlIgnoreCase(&expected, trusted_sha256)) return error.UntrustedDigest;
         const temporary = try self.writeTemporaryLibrary(diagnostic_handle);
         defer std.Io.Dir.cwd().deleteTree(self.io, temporary.root) catch |err| {
@@ -1257,7 +1261,9 @@ fn digestHex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     var result: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch unreachable;
+    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
     return result;
 }
 
@@ -1314,14 +1320,20 @@ fn testTar(allocator: std.mem.Allocator, entries: []const TarTestEntry) ![]u8 {
     for (entries) |entry| {
         var header: [512]u8 = @splat(0);
         @memcpy(header[0..entry[0].len], entry[0]);
-        _ = std.fmt.bufPrint(header[100..108], "{o:0>7}\x00", .{@as(usize, 0o644)}) catch unreachable;
-        _ = std.fmt.bufPrint(header[124..136], "{o:0>11}\x00", .{entry[2].len}) catch unreachable;
+        _ = std.fmt.bufPrint(header[100..108], "{o:0>7}\x00", .{@as(usize, 0o644)}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
+        _ = std.fmt.bufPrint(header[124..136], "{o:0>11}\x00", .{entry[2].len}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         @memset(header[148..156], ' ');
         header[156] = entry[1];
         @memcpy(header[257..263], "ustar\x00");
         var checksum: usize = 0;
         for (header) |byte| checksum += byte;
-        _ = std.fmt.bufPrint(header[148..156], "{o:0>6}\x00 ", .{checksum}) catch unreachable;
+        _ = std.fmt.bufPrint(header[148..156], "{o:0>6}\x00 ", .{checksum}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         try output.appendSlice(allocator, &header);
         try output.appendSlice(allocator, entry[2]);
         try output.appendNTimes(allocator, 0, std.mem.alignForward(usize, entry[2].len, 512) - entry[2].len);
