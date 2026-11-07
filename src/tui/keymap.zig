@@ -183,6 +183,7 @@ pub fn helpSection(a: Action) HelpSection {
         .open_pull_request_picker,
         .open_command_palette,
         .open_theme_overlay,
+        .toggle_diagnostic_logging,
         .confirm_picker,
         => .general,
     };
@@ -480,6 +481,10 @@ fn validateBindings(bindings: []const Binding) !void {
 }
 
 pub fn supportsContext(action: Action, context: InteractionContext) bool {
+    if (action == .toggle_diagnostic_logging) return switch (context) {
+        .diff, .diff_source, .diff_disclosure, .diff_review_card, .sidebar, .sidebar_directory, .sidebar_file => true,
+        else => false,
+    };
     return switch (context) {
         .composer => action == .external_edit,
         .help, .unknown_resolution, .delete_confirmation, .buffer_search_input => false,

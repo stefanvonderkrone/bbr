@@ -42,7 +42,8 @@ fn isHelp(a: []const u8) bool {
 }
 
 /// Entry from `main.zig`: `bbr completion [...]`. No credentials needed.
-pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
+pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
+    errdefer |err| _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(gpa);
     while (it.next()) |a| try args.append(gpa, a);
@@ -59,15 +60,15 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         } else if (shell == null and !std.mem.startsWith(u8, a, "-")) {
             shell = a;
         } else {
-            return fail(init, "bbr completion: bad options (UnknownFlag)\n");
+            return fail(init, diagnostic, "bbr completion: bad options (UnknownFlag)\n");
         }
     }
 
     if (help_only and shell == null and !list_profiles) return bbr.stdout.writeAll(init.io, completion_help);
     if (list_profiles and shell == null) return listProfiles(init, gpa);
-    if (list_profiles) return fail(init, "bbr completion: bad options (UnknownFlag)\n");
+    if (list_profiles) return fail(init, diagnostic, "bbr completion: bad options (UnknownFlag)\n");
 
-    const name = shell orelse return fail(init, "bbr completion: a shell name is required (bash|zsh|fish)\n");
+    const name = shell orelse return fail(init, diagnostic, "bbr completion: a shell name is required (bash|zsh|fish)\n");
     const script = if (std.mem.eql(u8, name, "bash"))
         bash_script
     else if (std.mem.eql(u8, name, "zsh"))
@@ -75,15 +76,19 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
     else if (std.mem.eql(u8, name, "fish"))
         fish_script
     else
-        return fail(init, "bbr completion: unknown shell (bash|zsh|fish)\n");
+        return fail(init, diagnostic, "bbr completion: unknown shell (bash|zsh|fish)\n");
     return bbr.stdout.writeAll(init.io, script);
 }
 
-fn fail(init: std.process.Init, comptime message: []const u8) error{UnknownFlag} {
+fn fail(init: std.process.Init, diagnostic: bbr.diagnostics.Handle, comptime message: []const u8) error{UnknownFlag}!void {
     var buf: [512]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
-    stderr.interface.writeAll(message) catch {};
-    stderr.interface.flush() catch {};
+    stderr.interface.writeAll(message) catch |err| {
+        _ = diagnostic.failure(.write, .{ .zig = err }, @src());
+    };
+    stderr.interface.flush() catch |err| {
+        _ = diagnostic.failure(.write, .{ .zig = err }, @src());
+    };
     return error.UnknownFlag;
 }
 

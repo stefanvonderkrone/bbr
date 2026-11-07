@@ -16,7 +16,7 @@ const TestBlobSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(_: *anyopaque, allocator: std.mem.Allocator, commit: []const u8, _: []const u8) anyerror![]u8 {
+    fn read(_: *anyopaque, allocator: std.mem.Allocator, commit: []const u8, _: []const u8, _: bbr.diagnostics.Handle) anyerror![]u8 {
         return allocator.dupe(u8, if (std.mem.eql(u8, commit, "source")) "new value\n" else "old value\n");
     }
 };
@@ -26,7 +26,7 @@ const TestHighlighter = struct {
         return .{ .ptr = self, .vtable = &.{ .highlight = highlight } };
     }
 
-    fn highlight(_: *anyopaque, allocator: std.mem.Allocator, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(_: *anyopaque, allocator: std.mem.Allocator, _: std.mem.Allocator, _: []const u8, _: []const u8, _: bbr.diagnostics.Handle) anyerror!bbr.highlight.HighlightResult {
         return .{ .spans = try allocator.dupe(bbr.highlight.Span, &.{.{
             .line = 1,
             .start = 0,

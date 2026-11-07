@@ -4,6 +4,7 @@ const std = @import("std");
 const xdg = @import("bbr").xdg;
 const user_grammar = @import("user_grammar.zig");
 const c = @import("query_predicates.zig").c;
+const diagnostics = @import("bbr").diagnostics;
 
 pub const bbr_identity = "bbr-m17-v1";
 
@@ -22,6 +23,7 @@ pub const Store = struct {
     root_path: []const u8,
     dir: std.Io.Dir,
     entries: std.ArrayList(Entry) = .empty,
+    diagnostic_handle: diagnostics.Handle = .{},
 
     pub fn open(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !Store {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -111,8 +113,14 @@ pub const Store = struct {
         defer atomic.deinit(self.io);
         var buffer: [4096]u8 = undefined;
         var writer = atomic.file.writer(self.io, &buffer);
-        try writer.interface.writeAll(output.items);
-        try writer.interface.flush();
+        writer.interface.writeAll(output.items) catch |err| {
+            _ = self.diagnostic_handle.failure(.write, .{ .zig = writer.err orelse err }, @src());
+            return err;
+        };
+        writer.interface.flush() catch |err| {
+            _ = self.diagnostic_handle.failure(.write, .{ .zig = writer.err orelse err }, @src());
+            return err;
+        };
         try atomic.replace(self.io);
     }
 
@@ -193,10 +201,12 @@ pub fn run(
     args: []const []const u8,
     interactive_digest: ?[32]u8,
     writer: *std.Io.Writer,
+    diagnostic_handle: diagnostics.Handle,
 ) !void {
     if (args.len == 0) return error.InvalidGrammarCommand;
-    if (std.mem.eql(u8, args[0], "check") and args.len >= 2 and try isCandidatePath(io, args[1])) return checkCandidate(allocator, io, args, writer);
+    if (std.mem.eql(u8, args[0], "check") and args.len >= 2 and try isCandidatePath(io, args[1])) return checkCandidate(allocator, io, args, writer, diagnostic_handle);
     var store = try Store.open(allocator, io, env);
+    store.diagnostic_handle = diagnostic_handle;
     defer store.deinit();
     const command = args[0];
     if (std.mem.eql(u8, command, "list")) {
@@ -209,13 +219,13 @@ pub fn run(
         const entry = store.entries.items[index];
         const target = try std.fs.path.join(allocator, &.{ store.root_path, entry.name });
         defer allocator.free(target);
-        var inspection = try user_grammar.inspect(allocator, io, target);
+        var inspection = try user_grammar.inspect(allocator, io, target, diagnostic_handle);
         defer inspection.deinit();
         if (!std.crypto.timing_safe.eql([32]u8, entry.digest, inspection.report.digest)) return error.UntrustedDigest;
         try inspection.report.writeTrustPrompt(writer);
         if (args.len == 4) {
             if (!std.mem.eql(u8, args[2], "--trust-sha256")) return error.InvalidGrammarCommand;
-            try inspection.validateTrusted(args[3]);
+            try inspection.validateTrusted(args[3], diagnostic_handle);
             try writer.writeAll("valid\n");
         }
         return;
@@ -245,25 +255,30 @@ pub fn run(
         defer allocator.free(removed_name);
         try store.dir.rename(removed.name, store.dir, removed_name, io);
         store.writeRegistry() catch |err| {
+            _ = diagnostic_handle.failure(.write, .{ .zig = err }, @src());
             try store.entries.insert(store.arena.allocator(), index, removed);
-            store.dir.rename(removed_name, store.dir, removed.name, io) catch {};
+            store.dir.rename(removed_name, store.dir, removed.name, io) catch |rollback_err| {
+                _ = diagnostic_handle.failure(.cleanup, .{ .zig = rollback_err }, @src());
+            };
             return err;
         };
-        store.dir.deleteTree(io, removed_name) catch {};
+        store.dir.deleteTree(io, removed_name) catch |err| {
+            _ = diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
+        };
         try writer.print("{s} removed\n", .{removed.name});
         return;
     }
     return error.InvalidGrammarCommand;
 }
 
-fn checkCandidate(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer) !void {
+fn checkCandidate(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, diagnostic_handle: diagnostics.Handle) !void {
     if (args.len != 2 and args.len != 4) return error.InvalidGrammarCommand;
-    var inspection = try user_grammar.inspect(allocator, io, args[1]);
+    var inspection = try user_grammar.inspect(allocator, io, args[1], diagnostic_handle);
     defer inspection.deinit();
     try inspection.report.writeTrustPrompt(writer);
     if (args.len == 4) {
         if (!std.mem.eql(u8, args[2], "--trust-sha256")) return error.InvalidGrammarCommand;
-        try inspection.validateTrusted(args[3]);
+        try inspection.validateTrusted(args[3], diagnostic_handle);
         try writer.writeAll("valid\n");
     }
 }
@@ -278,8 +293,8 @@ fn isCandidatePath(io: std.Io, path: []const u8) !bool {
     return true;
 }
 
-pub fn writeCandidateReport(allocator: std.mem.Allocator, io: std.Io, path: []const u8, writer: *std.Io.Writer) ![32]u8 {
-    var inspection = try user_grammar.inspect(allocator, io, path);
+pub fn writeCandidateReport(allocator: std.mem.Allocator, io: std.Io, path: []const u8, writer: *std.Io.Writer, diagnostic_handle: diagnostics.Handle) ![32]u8 {
+    var inspection = try user_grammar.inspect(allocator, io, path, diagnostic_handle);
     defer inspection.deinit();
     try inspection.report.writeTrustPrompt(writer);
     return inspection.report.digest;
@@ -290,7 +305,7 @@ fn installOrUpdate(allocator: std.mem.Allocator, store: *Store, args: []const []
     if (args.len != path_index + 1 and args.len != path_index + 3) return error.InvalidGrammarCommand;
     const requested_name = if (update) args[1] else null;
     if (requested_name) |name| if (store.indexOf(name) == null) return error.UserGrammarNotInstalled;
-    var inspection = try user_grammar.inspect(allocator, store.io, args[path_index]);
+    var inspection = try user_grammar.inspect(allocator, store.io, args[path_index], store.diagnostic_handle);
     defer inspection.deinit();
     if (requested_name) |name| if (!std.mem.eql(u8, name, inspection.report.name)) return error.UserGrammarIdentityMismatch;
     const existing = store.indexOf(inspection.report.name);
@@ -299,11 +314,11 @@ fn installOrUpdate(allocator: std.mem.Allocator, store: *Store, args: []const []
     var digest_buffer: [64]u8 = undefined;
     if (args.len == path_index + 3) {
         if (!std.mem.eql(u8, args[path_index + 1], "--trust-sha256")) return error.InvalidGrammarCommand;
-        try inspection.validateTrusted(args[path_index + 2]);
+        try inspection.validateTrusted(args[path_index + 2], store.diagnostic_handle);
     } else {
         const approved = interactive_digest orelse return error.TrustDeclined;
         if (!std.crypto.timing_safe.eql([32]u8, approved, inspection.report.digest)) return error.BundleChangedAfterTrustPrompt;
-        try inspection.validateTrusted(inspection.report.digestHex(&digest_buffer));
+        try inspection.validateTrusted(inspection.report.digestHex(&digest_buffer), store.diagnostic_handle);
     }
 
     var random: [8]u8 = undefined;
@@ -311,7 +326,9 @@ fn installOrUpdate(allocator: std.mem.Allocator, store: *Store, args: []const []
     const stage_name = try std.fmt.allocPrint(allocator, ".candidate-{x}", .{random});
     defer allocator.free(stage_name);
     try store.dir.createDir(store.io, stage_name, .default_dir);
-    errdefer store.dir.deleteTree(store.io, stage_name) catch {};
+    errdefer store.dir.deleteTree(store.io, stage_name) catch |err| {
+        _ = store.diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
+    };
     var stage_dir = try store.dir.openDir(store.io, stage_name, .{});
     defer stage_dir.close(store.io);
     try inspection.writeBundle(stage_dir);
@@ -338,12 +355,18 @@ fn installOrUpdate(allocator: std.mem.Allocator, store: *Store, args: []const []
     const backup_name = try std.fmt.allocPrint(allocator, ".previous-{x}", .{random});
     defer allocator.free(backup_name);
     if (update) try store.dir.rename(entry.name, store.dir, backup_name, store.io);
-    errdefer if (!published and update) store.dir.rename(backup_name, store.dir, entry.name, store.io) catch {};
+    errdefer if (!published and update) store.dir.rename(backup_name, store.dir, entry.name, store.io) catch |err| {
+        _ = store.diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
+    };
     try store.dir.rename(stage_name, store.dir, entry.name, store.io);
-    errdefer if (!published) store.dir.deleteTree(store.io, entry.name) catch {};
+    errdefer if (!published) store.dir.deleteTree(store.io, entry.name) catch |err| {
+        _ = store.diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
+    };
     try store.writeRegistry();
     published = true;
-    if (update) store.dir.deleteTree(store.io, backup_name) catch {};
+    if (update) store.dir.deleteTree(store.io, backup_name) catch |err| {
+        _ = store.diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
+    };
     try writer.print("{s} {s} and enabled\n", .{ entry.name, if (update) "updated" else "installed" });
 }
 
@@ -360,7 +383,7 @@ fn validateRegistryWithPath(allocator: std.mem.Allocator, store: *Store, staged_
     };
     const overrides = try loadOverrides(store.arena.allocator(), store.io, store.env);
     try store.validateOverrideNames(overrides);
-    var registry = try user_grammar.Registry.init(allocator, store.io, entries, overrides, bbr_identity);
+    var registry = try user_grammar.Registry.init(allocator, store.io, entries, overrides, bbr_identity, store.diagnostic_handle);
     registry.deinit();
 }
 
@@ -369,7 +392,7 @@ fn list(allocator: std.mem.Allocator, store: *Store, writer: *std.Io.Writer) !vo
     defer Store.freeRegistryEntries(allocator, entries);
     const overrides = try loadOverrides(store.arena.allocator(), store.io, store.env);
     try store.validateOverrideNames(overrides);
-    var registry = try user_grammar.Registry.init(allocator, store.io, entries, overrides, bbr_identity);
+    var registry = try user_grammar.Registry.init(allocator, store.io, entries, overrides, bbr_identity, store.diagnostic_handle);
     defer registry.deinit();
     const statuses = try registry.statuses(allocator);
     defer allocator.free(statuses);
@@ -420,8 +443,8 @@ test "lifecycle preconditions preserve registry" {
     try env.put("XDG_DATA_HOME", base);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try std.testing.expectError(error.UserGrammarNotInstalled, run(std.testing.allocator, std.testing.io, &env, &.{ "update", "missing", "bundle" }, null, &output.writer));
-    try std.testing.expectError(error.UserGrammarNotInstalled, run(std.testing.allocator, std.testing.io, &env, &.{ "enable", "missing" }, null, &output.writer));
+    try std.testing.expectError(error.UserGrammarNotInstalled, run(std.testing.allocator, std.testing.io, &env, &.{ "update", "missing", "bundle" }, null, &output.writer, .{}));
+    try std.testing.expectError(error.UserGrammarNotInstalled, run(std.testing.allocator, std.testing.io, &env, &.{ "enable", "missing" }, null, &output.writer, .{}));
     var store = try Store.open(std.testing.allocator, std.testing.io, &env);
     defer store.deinit();
     try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);

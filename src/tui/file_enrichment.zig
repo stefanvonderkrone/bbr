@@ -8,10 +8,11 @@ const Allocator = std.mem.Allocator;
 
 pub const BlobSource = struct {
     ptr: *anyopaque,
-    read_fn: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror![]u8,
+    read_fn: *const fn (*anyopaque, Allocator, []const u8, []const u8, bbr.diagnostics.Handle) anyerror![]u8,
 
-    pub fn read(self: BlobSource, allocator: Allocator, commit: []const u8, path: []const u8) ![]u8 {
-        return self.read_fn(self.ptr, allocator, commit, path);
+    /// `diagnostic` names the File side that asks for the blob, so each attempt record keeps it.
+    pub fn read(self: BlobSource, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) ![]u8 {
+        return self.read_fn(self.ptr, allocator, commit, path, diagnostic);
     }
 };
 
@@ -24,11 +25,16 @@ pub const RemoteBlobSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, request: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *RemoteBlobSource = @ptrCast(@alignCast(ptr));
+        const diagnostic = if (request.sink != null) request else self.client.diagnostic;
         if (self.retry_io) |io| {
             for (0..2) |attempt| {
-                const response = self.client.getFileBlobAttempt(allocator, self.repo, commit, path) catch |err| {
+                var context = diagnostic.context;
+                context.attempt = @intCast(attempt + 1);
+                const client = self.client.withDiagnostics(diagnostic.forContext(.file_enrichment, context));
+                const response = client.getFileBlobAttempt(allocator, self.repo, commit, path) catch |err| {
+                    if (err != error.InvalidPath) _ = client.diagnostic.failure(.read, .{ .zig = err }, @src());
                     if (attempt == 0 and err != error.OutOfMemory and err != error.InvalidPath) {
                         io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch {};
                         continue;
@@ -48,7 +54,7 @@ pub const RemoteBlobSource = struct {
             }
             unreachable;
         }
-        return self.client.getFileBlob(allocator, self.repo, commit, path);
+        return self.client.withDiagnostics(diagnostic).getFileBlob(allocator, self.repo, commit, path);
     }
 };
 
@@ -63,13 +69,14 @@ pub const GitBlobSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, _: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *GitBlobSource = @ptrCast(@alignCast(ptr));
         return self.client.blob(allocator, commit, path);
     }
 };
 
 pub const Request = struct {
+    diagnostic: bbr.diagnostics.Handle = .{},
     repo: []const u8,
     status: bbr.diff.FileStatus,
     source_commit: []const u8,
@@ -236,13 +243,16 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
     if (req.status == .added or req.status == .removed)
         return enrichFrom(backing, source, highlighter, req);
 
-    var old_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old }) catch
+    var old_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old, sideDiagnostic(req.diagnostic, .old) }) catch |err| {
+        _ = req.diagnostic.failure(.launch, .{ .zig = err }, @src());
         return enrichFrom(backing, source, highlighter, req);
-    var new_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new }) catch {
+    };
+    var new_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new) }) catch |launch_error| {
+        _ = req.diagnostic.failure(.launch, .{ .zig = launch_error }, @src());
         const old = old_future.await(io) catch return error.OutOfMemory;
         return .{
             .old = old,
-            .new = enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new) catch |err| {
+            .new = enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new)) catch |err| {
                 var cleanup = old;
                 cleanup.deinit();
                 return err;
@@ -266,32 +276,42 @@ pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highl
     var result: Result = .{ .old = .absent, .new = .absent };
     errdefer result.deinit();
     if (req.status != .added) {
-        result.old = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old);
+        result.old = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old, sideDiagnostic(req.diagnostic, .old));
     }
     if (req.status != .removed) {
-        result.new = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new);
+        result.new = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new));
     }
     return result;
 }
 
-fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, known: ?bbr.diff.FileContentStatus) error{OutOfMemory}!SideResult {
+fn sideDiagnostic(handle: bbr.diagnostics.Handle, side: @FieldType(bbr.diagnostic.Context, "side")) bbr.diagnostics.Handle {
+    var context = handle.context;
+    context.side = side;
+    return handle.forContext(.file_enrichment, context);
+}
+
+fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, known: ?bbr.diff.FileContentStatus, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
     const status: bbr.diff.FileContentStatus = known orelse .{ .text = null };
     return switch (status) {
         .binary => |size| .{ .binary = size },
         .unavailable => .{ .unavailable = status },
-        .text => enrichSide(backing, source, highlighter, max_file_bytes, commit, path),
+        .text => enrichSide(backing, source, highlighter, max_file_bytes, commit, path, diagnostic),
     };
 }
 
-fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8) error{OutOfMemory}!SideResult {
-    const side = try backing.create(OwnedSide);
+fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
+    const side = backing.create(OwnedSide) catch |err| {
+        _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
+        return err;
+    };
     errdefer backing.destroy(side);
     side.references = .init(1);
     side.arena = std.heap.ArenaAllocator.init(backing);
     errdefer side.arena.deinit();
     const allocator = side.arena.allocator();
 
-    side.blob = source.read(allocator, commit, path) catch |err| {
+    side.blob = source.read(allocator, commit, path, diagnostic) catch |err| {
+        if (err != error.InvalidPath) _ = diagnostic.failure(.read, .{ .zig = err }, @src());
         if (err == error.OutOfMemory) return error.OutOfMemory;
         side.destroy();
         if (err == error.InvalidPath) return .{ .unavailable = .{ .unavailable = .{ .reason = .invalid_path } } };
@@ -309,7 +329,8 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
     }
     var scratch = std.heap.ArenaAllocator.init(backing);
     defer scratch.deinit();
-    const highlights = highlighter.highlightWithScratch(allocator, scratch.allocator(), path, side.blob) catch |err| {
+    const highlights = highlighter.withDiagnostics(diagnostic.forContext(.highlighting, diagnostic.context)).highlightWithScratch(allocator, scratch.allocator(), path, side.blob) catch |err| {
+        _ = diagnostic.forContext(.highlighting, diagnostic.context).failure(.execute, .{ .zig = err }, @src());
         if (err == error.OutOfMemory) return error.OutOfMemory;
         side.highlighting = .{ .failed = err };
         side.retained_bytes = retainedBytes(side);
@@ -1074,7 +1095,7 @@ const ScriptedHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(ptr: *anyopaque, allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(ptr: *anyopaque, allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, _: []const u8, _: []const u8, _: bbr.diagnostics.Handle) anyerror!bbr.highlight.HighlightResult {
         const self: *ScriptedHighlighter = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         const scratch = try scratch_allocator.alloc(u8, self.scratch_bytes);
@@ -1097,7 +1118,7 @@ const FailingHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: []const u8, _: []const u8, _: bbr.diagnostics.Handle) anyerror!bbr.highlight.HighlightResult {
         return error.InvalidCapture;
     }
 };
@@ -1109,7 +1130,7 @@ const CountingBlobSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror![]u8 {
+    fn read(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *CountingBlobSource = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         return error.UnexpectedRead;
@@ -1126,7 +1147,7 @@ const ExpectedBlobSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, _: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *ExpectedBlobSource = @ptrCast(@alignCast(ptr));
         if (self.calls >= self.expected.len) return error.UnexpectedRead;
         const expected = self.expected[self.calls];
@@ -1146,7 +1167,7 @@ const OverlapBlobSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, _: []const u8) anyerror![]u8 {
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, _: []const u8, _: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *OverlapBlobSource = @ptrCast(@alignCast(ptr));
         _ = self.calls.fetchAdd(1, .acq_rel);
         const active = self.active.fetchAdd(1, .acq_rel) + 1;
@@ -1334,7 +1355,17 @@ test "local Git content keeps each side independent and uses exact commits and p
     try testing.expectEqual(@as(usize, 2), fake_git.blob_calls);
 }
 
-test "local Git acquisition failure becomes a placeholder while readable text survives Highlighting failure" {
+test "diagnostics local acquisition and Highlighting failures retain their own File sides" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
     const fixtures = [_]bbr.git.FakeGitClient.BlobFixture{
         .{ .commit = "base", .path = "src/main.zig", .outcome = .{ .failure = error.BlobNotFound } },
         .{ .commit = "source", .path = "src/main.zig", .outcome = .{ .content = "readable\n" } },
@@ -1343,6 +1374,7 @@ test "local Git acquisition failure becomes a placeholder while readable text su
     var source: GitBlobSource = .{ .client = fake_git.gitClient() };
     var failing = FailingHighlighter{};
     var result = try enrichFrom(testing.allocator, source.source(), failing.highlighter(), .{
+        .diagnostic = sink.handle(.file_enrichment, .{ .command_id = 17, .session_epoch = 19, .file_index = 23 }),
         .repo = "",
         .status = .modified,
         .source_commit = "source",
@@ -1365,6 +1397,32 @@ test "local Git acquisition failure becomes a placeholder while readable text su
     try testing.expectEqual(@as(?usize, "readable\n".len), content.new.?.text);
     try testing.expectEqualStrings("readable\n", storage.file(0).new.content.blob);
     try testing.expect(storage.file(0).new.content.highlighting == .failed);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var fetch_recorded = false;
+    var highlight_recorded = false;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "BlobNotFound") != null) {
+            fetch_recorded = true;
+            try testing.expect(std.mem.indexOf(u8, line, "side=old") != null);
+        }
+        if (std.mem.indexOf(u8, line, "InvalidCapture") != null) {
+            highlight_recorded = true;
+            try testing.expect(std.mem.indexOf(u8, line, "side=new") != null);
+        }
+        if (std.mem.indexOf(u8, line, "BlobNotFound") != null or std.mem.indexOf(u8, line, "InvalidCapture") != null) {
+            for ([_][]const u8{ "command_id=17", "session_epoch=19", "file_index=23" }) |needle|
+                try testing.expect(std.mem.indexOf(u8, line, needle) != null);
+        }
+    }
+    try testing.expect(fetch_recorded and highlight_recorded);
+    try testing.expect(std.mem.indexOf(u8, bytes, "src/main.zig") == null);
 }
 
 test "fetched content remains usable when Highlighting fails" {
@@ -1580,6 +1638,47 @@ test "each classified ApiError stays on its failed side" {
         try testing.expectEqual(case.expected, result.old.fetch_failed);
         try testing.expectEqualStrings("new", result.new.owned.blob);
     }
+}
+
+test "a retried remote blob read records its first attempt with the File side" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 503, .body = "failure" },
+        .{ .status = 200, .body = "new" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var remote: RemoteBlobSource = .{ .client = bb, .repo = "repo", .retry_io = testing.io };
+    const handle = sideDiagnostic(sink.handle(.file_enrichment, .{ .command_id = 17 }), .new);
+    const blob = try remote.source().read(testing.allocator, "source", "file.zig", handle);
+    defer testing.allocator.free(blob);
+    try testing.expectEqualStrings("new", blob);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    _ = lines.next();
+    var records: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        records += 1;
+        for ([_][]const u8{ "command_id=17", "side=new", "attempt=1" }) |needle|
+            try testing.expect(std.mem.indexOf(u8, line, needle) != null);
+    }
+    try testing.expect(records > 0);
 }
 
 test "File Content Status is independent per expected side and from Highlighting" {
