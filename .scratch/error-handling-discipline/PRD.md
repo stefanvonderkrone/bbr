@@ -45,3 +45,4 @@ These come from research.md. Each issue names the questions that it must answer 
 - [02 Convert the large drop groups](issues/02-convert-large-drop-groups.md)
 - [03 State the try boundary rule](issues/03-state-try-boundary-rule.md)
 - [04 Ban error comparisons and require a Canceled prong](issues/04-ban-error-comparisons-require-canceled-prong.md)
+- [05 Fix the out-of-memory mislabels](issues/05-fix-out-of-memory-mislabels.md)
