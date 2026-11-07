@@ -434,7 +434,9 @@ fn scalarRegions(allocator: std.mem.Allocator, scalars: []const Scalar, boundari
 }
 
 fn decode(allocator: std.mem.Allocator, text: []const u8) ![]Scalar {
-    const view = std.unicode.Utf8View.init(text) catch return error.InvalidUtf8;
+    const view = std.unicode.Utf8View.init(text) catch |err| switch (err) {
+        error.InvalidUtf8 => return error.InvalidUtf8,
+    };
     var scalars: std.ArrayList(Scalar) = .empty;
     errdefer scalars.deinit(allocator);
     var iterator = view.iterator();

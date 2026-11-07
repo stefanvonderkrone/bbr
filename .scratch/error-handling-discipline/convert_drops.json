@@ -1,4 +1,472 @@
 {
+ "src/api/args.zig:448e2ff3b6fd:1": {
+  "group": "return-error",
+  "line": 72,
+  "names": [
+   "InvalidCharacter",
+   "Overflow"
+  ],
+  "path": "src/api/args.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/api/args.zig:623c921214ae:1": {
+  "group": "return-error",
+  "line": 76,
+  "names": [
+   "InvalidCharacter",
+   "Overflow"
+  ],
+  "path": "src/api/args.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/api/args.zig:df1a4ae80cae:1": {
+  "group": "return-error",
+  "line": 68,
+  "names": [
+   "InvalidCharacter",
+   "Overflow"
+  ],
+  "path": "src/api/args.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/api/cli.zig:931b555e2fbe:1": {
+  "group": "return-error",
+  "line": 1195,
+  "names": [
+   "WriteFailed"
+  ],
+  "path": "src/api/cli.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/api/cli.zig:d179843e2115:1": {
+  "group": "return-error",
+  "line": 1198,
+  "names": [
+   "WriteFailed"
+  ],
+  "path": "src/api/cli.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/benchmark/file_acquisition.zig:222fa1994279:1": {
+  "group": "return-error",
+  "line": 132,
+  "names": [
+   "Canceled"
+  ],
+  "path": "src/benchmark/file_acquisition.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/benchmark/file_acquisition.zig:3bdb998444dd:1": {
+  "group": "return-error",
+  "line": 69,
+  "names": [
+   "AccessDenied",
+   "AntivirusInterference",
+   "BadPathName",
+   "Canceled",
+   "ConnectionResetByPeer",
+   "DeviceBusy",
+   "FileBusy",
+   "FileLocksUnsupported",
+   "FileNotFound",
+   "FileTooBig",
+   "InputOutput",
+   "InvalidAuthFile",
+   "InvalidProfileName",
+   "IsDir",
+   "LockViolation",
+   "MissingToken",
+   "MissingUsername",
+   "MissingWorkspace",
+   "NameTooLong",
+   "NetworkNotFound",
+   "NoDevice",
+   "NoSpaceLeft",
+   "NotDir",
+   "NotOpenForReading",
+   "OutOfMemory",
+   "PathAlreadyExists",
+   "PermissionDenied",
+   "PipeBusy",
+   "ProcessFdQuotaExceeded",
+   "ReadOnlyFileSystem",
+   "SocketUnconnected",
+   "StreamTooLong",
+   "Streaming",
+   "SymLinkLoop",
+   "SystemFdQuotaExceeded",
+   "SystemResources",
+   "Unexpected",
+   "UnsafeAuthTarget",
+   "WouldBlock"
+  ],
+  "path": "src/benchmark/file_acquisition.zig",
+  "reason": "39 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/client.zig:2cb979542392:1": {
+  "group": "return-error",
+  "line": 546,
+  "names": [
+   "BufferUnderrun",
+   "DuplicateField",
+   "InvalidCharacter",
+   "InvalidEnumTag",
+   "InvalidNumber",
+   "LengthMismatch",
+   "MissingField",
+   "OutOfMemory",
+   "Overflow",
+   "SyntaxError",
+   "UnexpectedEndOfInput",
+   "UnexpectedToken",
+   "UnknownField",
+   "ValueTooLong"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": "14 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/client.zig:2cb979542392:2": {
+  "group": "return-error",
+  "line": 1529,
+  "names": [
+   "BufferUnderrun",
+   "DuplicateField",
+   "InvalidCharacter",
+   "InvalidEnumTag",
+   "InvalidNumber",
+   "LengthMismatch",
+   "MissingField",
+   "OutOfMemory",
+   "Overflow",
+   "SyntaxError",
+   "UnexpectedEndOfInput",
+   "UnexpectedToken",
+   "UnknownField",
+   "ValueTooLong"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": "14 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/client.zig:435d08c0c89c:1": {
+  "group": "return-error",
+  "line": 604,
+  "names": [
+   "BufferUnderrun",
+   "DuplicateField",
+   "InvalidCharacter",
+   "InvalidEnumTag",
+   "InvalidNumber",
+   "LengthMismatch",
+   "MissingField",
+   "OutOfMemory",
+   "Overflow",
+   "SyntaxError",
+   "UnexpectedEndOfInput",
+   "UnexpectedToken",
+   "UnknownField",
+   "ValueTooLong"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": "14 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/client.zig:435d08c0c89c:2": {
+  "group": "return-error",
+  "line": 1081,
+  "names": [
+   "BufferUnderrun",
+   "DuplicateField",
+   "InvalidCharacter",
+   "InvalidEnumTag",
+   "InvalidNumber",
+   "LengthMismatch",
+   "MissingField",
+   "OutOfMemory",
+   "Overflow",
+   "SyntaxError",
+   "UnexpectedEndOfInput",
+   "UnexpectedToken",
+   "UnknownField",
+   "ValueTooLong"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": "14 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/client.zig:435d08c0c89c:3": {
+  "group": "return-error",
+  "line": 1157,
+  "names": [
+   "BufferUnderrun",
+   "DuplicateField",
+   "InvalidCharacter",
+   "InvalidEnumTag",
+   "InvalidNumber",
+   "LengthMismatch",
+   "MissingField",
+   "OutOfMemory",
+   "Overflow",
+   "SyntaxError",
+   "UnexpectedEndOfInput",
+   "UnexpectedToken",
+   "UnknownField",
+   "ValueTooLong"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": "14 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/client.zig:435d08c0c89c:4": {
+  "group": "return-error",
+  "line": 1368,
+  "names": [
+   "BufferUnderrun",
+   "DuplicateField",
+   "InvalidCharacter",
+   "InvalidEnumTag",
+   "InvalidNumber",
+   "LengthMismatch",
+   "MissingField",
+   "OutOfMemory",
+   "Overflow",
+   "SyntaxError",
+   "UnexpectedEndOfInput",
+   "UnexpectedToken",
+   "UnknownField",
+   "ValueTooLong"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": "14 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/client.zig:435d08c0c89c:5": {
+  "group": "return-error",
+  "line": 1476,
+  "names": [
+   "BufferUnderrun",
+   "DuplicateField",
+   "InvalidCharacter",
+   "InvalidEnumTag",
+   "InvalidNumber",
+   "LengthMismatch",
+   "MissingField",
+   "OutOfMemory",
+   "Overflow",
+   "SyntaxError",
+   "UnexpectedEndOfInput",
+   "UnexpectedToken",
+   "UnknownField",
+   "ValueTooLong"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": "14 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/client.zig:435d08c0c89c:6": {
+  "group": "return-error",
+  "line": 1578,
+  "names": [
+   "BufferUnderrun",
+   "DuplicateField",
+   "InvalidCharacter",
+   "InvalidEnumTag",
+   "InvalidNumber",
+   "LengthMismatch",
+   "MissingField",
+   "OutOfMemory",
+   "Overflow",
+   "SyntaxError",
+   "UnexpectedEndOfInput",
+   "UnexpectedToken",
+   "UnknownField",
+   "ValueTooLong"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": "14 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/client.zig:7938b4ef1f7a:1": {
+  "group": "return-error",
+  "line": 392,
+  "names": [
+   "BufferUnderrun",
+   "DuplicateField",
+   "InvalidCharacter",
+   "InvalidEnumTag",
+   "InvalidNumber",
+   "LengthMismatch",
+   "MissingField",
+   "OutOfMemory",
+   "Overflow",
+   "SyntaxError",
+   "UnexpectedEndOfInput",
+   "UnexpectedToken",
+   "UnknownField",
+   "ValueTooLong"
+  ],
+  "path": "src/bitbucket/client.zig",
+  "reason": "14 names",
+  "state": "reverted"
+ },
+ "src/bitbucket/url.zig:4bc10da70d62:1": {
+  "group": "return-error",
+  "line": 60,
+  "names": [
+   "InvalidCharacter",
+   "Overflow"
+  ],
+  "path": "src/bitbucket/url.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/bitbucket/url.zig:b778c00728b5:1": {
+  "group": "return-error",
+  "line": 34,
+  "names": [
+   "InvalidFormat",
+   "InvalidHostName",
+   "InvalidPort",
+   "UnexpectedCharacter"
+  ],
+  "path": "src/bitbucket/url.zig",
+  "reason": "4 names",
+  "state": "reverted"
+ },
+ "src/highlight/grammar_cli.zig:a5379abae382:1": {
+  "group": "return-error",
+  "line": 426,
+  "names": [
+   "InvalidCharacter",
+   "InvalidLength",
+   "NoSpaceLeft"
+  ],
+  "path": "src/highlight/grammar_cli.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/grammar_cli.zig:c9c8df83c091:1": {
+  "group": "return-error",
+  "line": 97,
+  "names": [
+   "InvalidCharacter",
+   "Overflow"
+  ],
+  "path": "src/highlight/grammar_cli.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/user_grammar.zig:40c3a668cade:1": {
+  "group": "return-error",
+  "line": 684,
+  "names": [
+   "InvalidVersion",
+   "Overflow"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/user_grammar.zig:6f2a93e0fd14:1": {
+  "group": "return-error",
+  "line": 650,
+  "names": [
+   "InvalidCharacter",
+   "Overflow"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/user_grammar.zig:d0a59c4b5481:1": {
+  "group": "return-error",
+  "line": 874,
+  "names": [
+   "InvalidCharacter",
+   "InvalidLength",
+   "NoSpaceLeft"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/highlight/user_grammar.zig:e421c9ed8acc:1": {
+  "group": "return-error",
+  "line": 471,
+  "names": [
+   "Overflow"
+  ],
+  "path": "src/highlight/user_grammar.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/http/std_client.zig:f83d77f4b52d:1": {
+  "group": "return-error",
+  "line": 172,
+  "path": "src/http/std_client.zig",
+  "reason": "chained catch",
+  "state": "skipped"
+ },
+ "src/persist/sqlite_store.zig:49523a6abdf6:1": {
+  "group": "return-error",
+  "line": 616,
+  "names": [
+   "AnchorRangeDescending",
+   "AnchorRangeTooLong",
+   "AnchorSideAmbiguous"
+  ],
+  "path": "src/persist/sqlite_store.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/review/store.zig:49523a6abdf6:1": {
+  "group": "return-error",
+  "line": 615,
+  "names": [
+   "AnchorRangeDescending",
+   "AnchorRangeTooLong",
+   "AnchorSideAmbiguous"
+  ],
+  "path": "src/review/store.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/tui/file_enrichment.zig:709f1be17d10:1": {
+  "group": "return-error",
+  "line": 252,
+  "names": [
+   "OutOfMemory"
+  ],
+  "path": "src/tui/file_enrichment.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/tui/file_enrichment.zig:b621f7b8451e:1": {
+  "group": "return-error",
+  "line": 263,
+  "names": [],
+  "path": "src/tui/file_enrichment.zig",
+  "reason": "ast-check: capture 'err' shadows capture from outer scope",
+  "state": "reverted"
+ },
+ "src/tui/file_enrichment.zig:ea193e2cf9a3:1": {
+  "group": "return-error",
+  "line": 271,
+  "names": [
+   "OutOfMemory"
+  ],
+  "path": "src/tui/file_enrichment.zig",
+  "reason": null,
+  "state": "resolved"
+ },
  "src/tui/presentation.zig:02ace3947b30:1": {
   "group": "oom-block",
   "line": 9224,
@@ -737,6 +1205,16 @@
    "OutOfMemory"
   ],
   "path": "src/tui/presentation.zig",
+  "reason": null,
+  "state": "resolved"
+ },
+ "src/tui/search.zig:5f73e4a88f30:1": {
+  "group": "return-error",
+  "line": 437,
+  "names": [
+   "InvalidUtf8"
+  ],
+  "path": "src/tui/search.zig",
   "reason": null,
   "state": "resolved"
  }

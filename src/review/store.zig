@@ -612,7 +612,9 @@ pub const InMemoryStore = struct {
             self.fail_next_reanchor = false;
             return error.InjectedReanchorFailure;
         }
-        reanchor.anchor.validateShape() catch return error.InvalidAnchor;
+        reanchor.anchor.validateShape() catch |err| switch (err) {
+            error.AnchorRangeDescending, error.AnchorRangeTooLong, error.AnchorSideAmbiguous => return error.InvalidAnchor,
+        };
         // One check-and-replace step, like a body edit: no partially re-anchored
         // Draft is observable between the rechecks and the replacement.
         if (self.active_submission) |run| {

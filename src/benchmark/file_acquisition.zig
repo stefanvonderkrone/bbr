@@ -129,7 +129,9 @@ fn runFixture(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture) !void 
             samples[limit_index][sample_index] = try runSample(io, allocator, fixture, order, limits[limit_index]);
             run_count += 1;
             if (fixture.remote and run_count < samples_per_limit * limits.len)
-                io.sleep(std.Io.Duration.fromSeconds(10), .awake) catch return error.SleepFailed;
+                io.sleep(std.Io.Duration.fromSeconds(10), .awake) catch |err| switch (err) {
+                    error.Canceled => return error.SleepFailed,
+                };
         }
     }
 

@@ -613,7 +613,9 @@ pub const SqliteStore = struct {
     /// row are untouched.
     fn reanchorDraftImpl(ptr: *anyopaque, key: RemoteReviewIdentity, reanchor: DraftReanchor) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
-        reanchor.anchor.validateShape() catch return error.InvalidAnchor;
+        reanchor.anchor.validateShape() catch |err| switch (err) {
+            error.AnchorRangeDescending, error.AnchorRangeTooLong, error.AnchorSideAmbiguous => return error.InvalidAnchor,
+        };
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
         if (try self.draftMutationLocked(key, reanchor.temp_id, null)) return error.DraftLocked;

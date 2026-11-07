@@ -94,7 +94,9 @@ pub const Store = struct {
                 .enabled = enabled[0] == '1',
                 .digest = try parseDigest(digest_hex),
                 .receipt_identity = identity,
-                .receipt_tree_sitter = std.fmt.parseInt(u32, tree_sitter, 10) catch return error.InvalidUserGrammarRegistry,
+                .receipt_tree_sitter = std.fmt.parseInt(u32, tree_sitter, 10) catch |err| switch (err) {
+                    error.InvalidCharacter, error.Overflow => return error.InvalidUserGrammarRegistry,
+                },
             });
         }
     }
@@ -423,7 +425,9 @@ fn refuseConfiguredReference(allocator: std.mem.Allocator, io: std.Io, env: *con
 fn parseDigest(hex: []const u8) ![32]u8 {
     if (hex.len != 64) return error.InvalidUserGrammarRegistry;
     var digest: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&digest, hex) catch return error.InvalidUserGrammarRegistry;
+    _ = std.fmt.hexToBytes(&digest, hex) catch |err| switch (err) {
+        error.InvalidCharacter, error.InvalidLength, error.NoSpaceLeft => return error.InvalidUserGrammarRegistry,
+    };
     return digest;
 }
 

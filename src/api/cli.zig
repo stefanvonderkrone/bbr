@@ -1192,10 +1192,14 @@ const TestOutput = struct {
         const buffer: []u8 = if (file.handle == std.Io.File.stdout().handle) &self.stdout_buffer else &self.stderr_buffer;
         const len: *usize = if (file.handle == std.Io.File.stdout().handle) &self.stdout_len else &self.stderr_len;
         var writer = std.Io.Writer.fixed(buffer[len.*..]);
-        writer.writeAll(header) catch return error.NoSpaceLeft;
+        writer.writeAll(header) catch |err| switch (err) {
+            error.WriteFailed => return error.NoSpaceLeft,
+        };
         for (data, 0..) |part, index| {
             const repetitions = if (index + 1 == data.len) splat else 1;
-            for (0..repetitions) |_| writer.writeAll(part) catch return error.NoSpaceLeft;
+            for (0..repetitions) |_| writer.writeAll(part) catch |err| switch (err) {
+                error.WriteFailed => return error.NoSpaceLeft,
+            };
         }
         const written = writer.buffered().len;
         len.* += written;

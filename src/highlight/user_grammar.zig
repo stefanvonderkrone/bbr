@@ -468,7 +468,9 @@ fn readFolder(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagno
         const file_path = try allocator.dupe(u8, entry.path);
         if (!safePath(file_path)) return error.UnsafePath;
         const bytes = try readRegularFile(allocator, io, dir, file_path, diagnostic_handle);
-        total_bytes = std.math.add(usize, total_bytes, bytes.len) catch return error.BundleTooLarge;
+        total_bytes = std.math.add(usize, total_bytes, bytes.len) catch |err| switch (err) {
+            error.Overflow => return error.BundleTooLarge,
+        };
         if (total_bytes > max_file_bytes or files.items.len >= 1024) return error.BundleTooLarge;
         try files.append(allocator, .{ .path = file_path, .bytes = bytes });
     }
@@ -647,7 +649,9 @@ fn parseManifest(allocator: std.mem.Allocator, source: []const u8) !Manifest {
 fn setRootField(manifest: *Manifest, key: []const u8, raw: []const u8) !void {
     if (std.mem.eql(u8, key, "tree_sitter_abi")) {
         if (manifest.tree_sitter_abi != null) return error.DuplicateManifestField;
-        manifest.tree_sitter_abi = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidManifest;
+        manifest.tree_sitter_abi = std.fmt.parseInt(u32, raw, 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return error.InvalidManifest,
+        };
         return;
     }
     const value = try parseString(raw);
@@ -681,7 +685,9 @@ fn parseStringArray(allocator: std.mem.Allocator, raw: []const u8, output: *std.
 
 fn validateManifest(manifest: Manifest) !void {
     if (!validName(manifest.name) or manifest.version.len == 0 or !validSymbol(manifest.symbol)) return error.InvalidGrammarIdentity;
-    _ = std.SemanticVersion.parse(manifest.version) catch return error.InvalidGrammarVersion;
+    _ = std.SemanticVersion.parse(manifest.version) catch |err| switch (err) {
+        error.InvalidVersion, error.Overflow => return error.InvalidGrammarVersion,
+    };
     if (!std.mem.eql(u8, manifest.os, @tagName(builtin.os.tag)) or !std.mem.eql(u8, manifest.arch, @tagName(builtin.cpu.arch))) return error.TargetMismatch;
     if (manifest.tree_sitter_abi == null or manifest.library.len == 0 or manifest.highlight_query.len == 0) return error.InvalidManifest;
     if (manifest.tree_sitter_abi.? < c.TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION or manifest.tree_sitter_abi.? > c.TREE_SITTER_LANGUAGE_VERSION) return error.TreeSitterAbiMismatch;
@@ -871,7 +877,9 @@ fn hasTerminalControl(value: []const u8) bool {
 fn parseDigest(hex: []const u8) ![32]u8 {
     if (hex.len != 64) return error.InvalidDigest;
     var digest: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&digest, hex) catch return error.InvalidDigest;
+    _ = std.fmt.hexToBytes(&digest, hex) catch |err| switch (err) {
+        error.InvalidCharacter, error.InvalidLength, error.NoSpaceLeft => return error.InvalidDigest,
+    };
     return digest;
 }
 

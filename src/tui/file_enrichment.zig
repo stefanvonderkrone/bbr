@@ -249,7 +249,9 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
     };
     var new_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new) }) catch |launch_error| {
         _ = req.diagnostic.failure(.launch, .{ .zig = launch_error }, @src());
-        const old = old_future.await(io) catch return error.OutOfMemory;
+        const old = old_future.await(io) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
         return .{
             .old = old,
             .new = enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new)) catch |err| {
@@ -268,7 +270,9 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
         var cleanup = old;
         cleanup.deinit();
     }
-    const new = new_future.await(io) catch return error.OutOfMemory;
+    const new = new_future.await(io) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     return .{ .old = old, .new = new };
 }
 
