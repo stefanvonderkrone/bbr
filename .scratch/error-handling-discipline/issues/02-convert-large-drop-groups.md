@@ -87,6 +87,8 @@ A cap of four would admit 21 more sites: 11 SQLite ROLLBACK cleanups, 4 UTF-8 re
 Commit `a4439c1` converts those 11 ROLLBACK cleanups.
 The cap of 4 applies only to those ROLLBACK cleanups.
 A checked switch names only SqliteError members and hides no label.
+`SqliteStore.native` records the failed ROLLBACK, and the transaction error still propagates.
+After a failed ROLLBACK, the next `BEGIN IMMEDIATE` fails and is recorded, so no write joins the open transaction.
 
 Checks: `zig build test` passed with exit 0 before each commit.
 `python3 tools/check_diagnostics.py` passed.
