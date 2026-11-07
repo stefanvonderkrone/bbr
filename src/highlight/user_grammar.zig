@@ -1325,6 +1325,7 @@ fn testTar(allocator: std.mem.Allocator, entries: []const TarTestEntry) ![]u8 {
         _ = std.fmt.bufPrint(header[100..108], "{o:0>7}\x00", .{@as(usize, 0o644)}) catch |err| switch (err) {
             error.NoSpaceLeft => unreachable,
         };
+        std.debug.assert(entry[2].len <= 0o77777777777);
         _ = std.fmt.bufPrint(header[124..136], "{o:0>11}\x00", .{entry[2].len}) catch |err| switch (err) {
             error.NoSpaceLeft => unreachable,
         };
@@ -1333,6 +1334,7 @@ fn testTar(allocator: std.mem.Allocator, entries: []const TarTestEntry) ![]u8 {
         @memcpy(header[257..263], "ustar\x00");
         var checksum: usize = 0;
         for (header) |byte| checksum += byte;
+        std.debug.assert(checksum <= 0o777777);
         _ = std.fmt.bufPrint(header[148..156], "{o:0>6}\x00 ", .{checksum}) catch |err| switch (err) {
             error.NoSpaceLeft => unreachable,
         };
