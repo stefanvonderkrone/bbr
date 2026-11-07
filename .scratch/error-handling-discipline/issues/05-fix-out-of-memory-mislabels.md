@@ -14,13 +14,14 @@ The codemod of issue 02 found these sites and left them unconverted.
 ## Sites
 
 - `src/tui/presentation.zig:7064` reports out of memory, but `createPersisted` can also fail with `error.DraftNotFound`.
-- `src/tui/presentation.zig:8485` and `src/tui/presentation.zig:10211` report out of memory for the text errors `InvalidUtf8`, `LineEnding`, `Nul`, and `TooLong`.
+- `src/tui/presentation.zig:8485` `ScanReviewSource.create` reports out of memory for the text errors `InvalidUtf8`, `LineEnding`, `Nul`, and `TooLong`.
+- `src/tui/presentation.zig:10211` `search.Query.init` in `retryStaleBufferDisclosure` reports out of memory for those same text errors.
 - `src/tui/presentation.zig:10995` reports out of memory, but `retryPost` can also fail with `error.DraftNotFound` and `error.InvalidSubmissionState`.
 - Nine `parseJson` call sites in `src/bitbucket/client.zig` turn `error.OutOfMemory` into `error.MalformedResponse`. Line 1667 keeps `error.OutOfMemory`.
 - `src/tui/config.zig:153` returns a read failure as `error.WriteFailed`.
 - `src/tui/presentation.zig:13346` returns `error.AnchorRangeDescending` as `error.MixedSides`.
 
-The line numbers refer to commit `ee1662a`.
+The line numbers match the checker after commit `d32d9a3`. They did not move from `ee1662a`.
 
 ## Work
 

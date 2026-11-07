@@ -54,7 +54,7 @@ Some residue sites record the cause in the callee, where the lint cannot see it,
 
 ## Completion
 
-The baseline fell from 391 to 70 sites in six commits:
+The baseline fell from 391 to 59 sites in seven commits:
 
 | Commit | Group | Before | After |
 | --- | --- | --- | --- |
@@ -64,6 +64,7 @@ The baseline fell from 391 to 70 sites in six commits:
 | `d73bdaa` | `catch unreachable` | 232 | 223 |
 | `f3661b0` | value, return, and block fallbacks | 223 | 79 |
 | `e27dbc6` | `catch {}`, read by hand, converted by the codemod | 79 | 70 |
+| `a4439c1` | SQLite ROLLBACK cleanups, cap 4 for that group only | 70 | 59 |
 
 [convert_drops.py](../convert_drops.py) is the codemod.
 It writes `catch |err| if (false) H else switch (err) {}` for each site, runs `zig build analyze` through [check_build.zig](../check_build.zig), and writes the names from the `unhandled error value` notes as one prong whose body is the old handler `H`.
@@ -83,15 +84,19 @@ The 10 captured `else` drops were outside the codemod.
 
 The 40 sites over the cap have these set sizes: 21 have four names, 5 have six, 1 has nine, 11 have fourteen, 1 has thirty-nine, and 1 has forty-five.
 A cap of four would admit 21 more sites: 11 SQLite ROLLBACK cleanups, 4 UTF-8 reads, 2 URL parses, 3 config key parses, and the CPU count fallback.
+Commit `a4439c1` converts those 11 ROLLBACK cleanups.
+The cap of 4 applies only to those ROLLBACK cleanups.
+A checked switch names only SqliteError members and hides no label.
 
 Checks: `zig build test` passed with exit 0 before each commit.
 `python3 tools/check_diagnostics.py` passed.
 No test file changed.
-No separate code review ran in this session. `--verify` is the mechanical proof for the five codemod commits, and the `formatLabel` commit only moves each fallback into the call.
+No separate code review ran in the first session. `--verify` is the mechanical proof for the codemod commits, including `a4439c1`, and the `formatLabel` commit only moves each fallback into the call.
 
 ## Comments
 
-Residue: each site that still drops its cause, at the line of `e27dbc6`, with its reason.
+Residue: each site that still drops its cause, at the line the checker reports after `d32d9a3`, with its reason.
+Those lines did not move from `e27dbc6`.
 Each reason says why the handler leaves a valid state, or what a review must check.
 
 Sets with more than three names:
@@ -111,7 +116,7 @@ Sets with more than three names:
 - `src/bitbucket/client.zig:1486` The same `parseJson` translation and OutOfMemory finding.
 - `src/bitbucket/client.zig:1539` The same `parseJson` translation and OutOfMemory finding.
 - `src/bitbucket/client.zig:1588` The same `parseJson` translation and OutOfMemory finding.
-- `src/bitbucket/url.zig:34` `std.Uri.parse` has four names. Each is a malformed URL, and MalformedUrl is the documented parse error.
+- `src/bitbucket/url.zig:34` `std.Uri.parse` has four names. The handler returns MalformedUrl. The doc comment documents MalformedUrl as a missing or non-numeric PR id segment, not as those four parse errors.
 - `src/logging_config.zig:30` The key parse has four syntax errors. The caller reports the invalid line.
 - `src/tui/config.zig:227` The key parse has four syntax errors. The line is not a theme assignment, and the rewrite keeps scanning.
 - `src/tui/config.zig:313` The key parse has four syntax errors. The parser records a config diagnostic and skips the line.
@@ -123,7 +128,7 @@ Sets with more than three names:
 - `src/tui/search.zig:526` `utf8Decode` has four names. `unreachable` relies on the caller of `wordStart` to pass valid UTF-8, because the view is unchecked. A review must confirm each caller.
 - `src/tui/search.zig:895` The same unchecked view in `advanceGreedy`. A review must confirm each caller.
 - `src/tui/search.zig:984` `utf8CountCodepoints` has six names. `unreachable` relies on valid UTF-8 candidate text and alternatives. A review must confirm the source.
-- `src/tui/search.zig:1180` `utf8CountCodepoints` has six names. A display column falls back to 0.
+- `src/tui/search.zig:1180` `utf8CountCodepoints` has six names. The column falls back to the span start, not to 0.
 - `src/tui/search.zig:1308` `utf8CountCodepoints` has six names. The authored column falls back to a byte count.
 
 Callees that return `anyerror`:
@@ -155,7 +160,7 @@ Out-of-memory mislabels, which are findings:
 
 - `src/tui/presentation.zig:7064` `SubmissionTree.createPersisted` can also fail with DraftNotFound. The handler reports out of memory.
 - `src/tui/presentation.zig:8485` `ScanReviewSource.create` can also fail with InvalidUtf8, LineEnding, Nul, and TooLong. The handler reports out of memory.
-- `src/tui/presentation.zig:10211` `queueBufferSearchOpening` can fail with the same four text errors. The handler reports out of memory.
+- `src/tui/presentation.zig:10211` `search.Query.init` in `retryStaleBufferDisclosure` can fail with InvalidUtf8, LineEnding, Nul, and TooLong. The handler reports out of memory.
 - `src/tui/presentation.zig:10995` `DurableSubmission.retryPost` can also fail with DraftNotFound and InvalidSubmissionState. The handler reports out of memory.
 
 Captured `else` drops from issue 01:
