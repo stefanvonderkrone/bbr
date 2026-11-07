@@ -152,6 +152,7 @@
 "src/tui/presentation.zig:0399ac544e2c:1": {"group": "oom-block", "line": 9770, "names": ["OutOfMemory"], "path": "src/tui/presentation.zig", "reason": null, "state": "resolved"},
 "src/tui/presentation.zig:0472229177d4:1": {"group": "fallback", "line": 9832, "names": ["OutOfMemory"], "path": "src/tui/presentation.zig", "reason": null, "state": "resolved"},
 "src/tui/presentation.zig:0aa7a14149b1:1": {"group": "oom-block", "line": 9008, "names": ["OutOfMemory"], "path": "src/tui/presentation.zig", "reason": null, "state": "resolved"},
+"src/tui/presentation.zig:0aa7a14149b1:1@8241": {"group": "oom-block", "line": 8241, "names": ["OutOfMemory"], "path": "src/tui/presentation.zig", "reason": null, "state": "resolved"},
 "src/tui/presentation.zig:0ce3d380c53d:1": {"group": "fallback", "line": 9572, "names": ["OutOfMemory"], "path": "src/tui/presentation.zig", "reason": null, "state": "resolved"},
 "src/tui/presentation.zig:103f331fa6c6:1": {"group": "oom-block", "line": 9901, "names": ["OutOfMemory"], "path": "src/tui/presentation.zig", "reason": null, "state": "resolved"},
 "src/tui/presentation.zig:1606320cce7c:1": {"group": "oom-block", "line": 6951, "names": ["OutOfMemory"], "path": "src/tui/presentation.zig", "reason": null, "state": "resolved"},

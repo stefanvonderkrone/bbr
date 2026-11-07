@@ -569,7 +569,11 @@ def main():
         raise SystemExit("analysis fails after the conversion")
 
     for site in selected:
-        state[site.key] = {
+        key = site.key
+        # A converted site leaves the drop list, so a later twin with the same text gets its key.
+        if site.state == "resolved" and (state.get(key) or {}).get("state") == "resolved":
+            key = f"{key}@{site.line}"
+        state[key] = {
             "path": site.path,
             "line": site.line,
             "group": site.group,
