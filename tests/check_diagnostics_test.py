@@ -43,6 +43,58 @@ class DiagnosticsCheckTest(unittest.TestCase):
         self.assertIn("reportFailure", found[0])
         self.assertEqual(self.check("src/tui/presentation.zig", text, "1 src/tui/presentation.zig\n"), [])
 
+    def test_a_named_switch_without_else_is_not_a_drop(self):
+        text = "\n".join((
+            "x() catch |err| switch (err) { error.OutOfMemory => fallback };",
+            "y() catch |err|",
+            "    switch (err) {",
+            "        error.OutOfMemory => fallback,",
+            "    };",
+        ))
+        self.assertEqual(self.check("src/tui/config.zig", text), [])
+
+    def test_a_discarded_capture_is_a_drop(self):
+        found = self.check("src/tui/config.zig", "x() catch |err| { _ = err; return error.WriteFailed; };")
+        self.assertEqual(len(found), 1)
+        self.assertIn("no `else`", found[0])
+
+    def test_an_else_prong_that_drops_the_cause_is_rejected(self):
+        text = "\n".join((
+            "    writeAtomically(allocator, io, config_path, next) catch |err| return switch (err) {",
+            "        error.OutOfMemory => error.OutOfMemory,",
+            "        else => error.WriteFailed,",
+            "    };",
+        ))
+        found = self.check("src/tui/config.zig", text)
+        self.assertEqual(len(found), 1)
+        self.assertIn("no `else`", found[0])
+
+    def test_a_handler_that_records_the_cause_before_an_else_is_not_a_drop(self):
+        text = "\n".join((
+            "self.queueCandidateSession(session, replacement.intent, replacement.key) catch |err| {",
+            "    self.reportFailure(.session_load, .prepare, err, @src());",
+            "    self.failReplacement(replacement, switch (err) {",
+            "        error.OutOfMemory => .out_of_memory,",
+            "        else => .pending_review_load_failed,",
+            "    });",
+            "};",
+        ))
+        self.assertEqual(self.check("src/tui/presentation.zig", text), [])
+
+    def test_an_else_prong_that_keeps_the_cause_is_not_a_drop(self):
+        for text in (
+            "x() catch |err| switch (err) { else => |e| return e };",
+            "x() catch |err| switch (err) { else => return err };",
+            "x() catch |err| switch (err) { else => self.reportFailure(.x, .y, err, @src()) };",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.check("src/tui/config.zig", text), [])
+
+    def test_an_uncaptured_handler_on_the_next_line_is_a_drop(self):
+        found = self.check("src/tui/config.zig", "x() catch\n    return error.X;")
+        self.assertEqual(len(found), 1)
+        self.assertIn("drop their cause", found[0])
+
     def test_a_captured_cause_and_test_blocks_are_allowed_and_a_removed_drop_lowers_the_baseline(self):
         text = "\n".join((
             "x() catch |err| self.reportFailure(.submission, .prepare, err, @src());",

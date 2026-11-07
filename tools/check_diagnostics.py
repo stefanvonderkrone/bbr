@@ -10,8 +10,9 @@ from source_lines import zig_files
 
 SQLITE_RESULT = re.compile(r"\bc\.sqlite3_(?:exec|prepare_v2|step|reset|finalize|bind_\w+)\s*\(")
 STANDARD_LOG = re.compile(r"\bstd\s*\.\s*log\s*\.")
-# A `catch` without a named capture drops the cause: `catch {}`, `catch return ...`, `catch |_|`.
-CAUSE_DROP = re.compile(r"\bcatch\b(?!\s*\|\s*[A-Za-z]\w*\s*\|)")
+# `|name|` may start on the next line.
+CAUSE_DROP = re.compile(r"\bcatch\b(?!\s*\|\s*[A-Za-z_]\w*\s*\|)")
+CATCH_CAPTURE = re.compile(r"\bcatch\s*\|\s*([A-Za-z_]\w*)\s*\|")
 CATCH_BASELINE = "tools/diagnostic_catch_baseline.txt"
 # A SQLite result call must be the first argument of a `native` call on any receiver.
 NATIVE_WRAPPER = re.compile(r"\b\w+(?:\s*\.\s*\w+)*\s*\.\s*native\s*\(\s*$")
@@ -47,11 +48,103 @@ def unwrapped_sqlite_results(lines):
         yield max(number for start, number in numbers if start <= match.start())
 
 
+def cause_drops(lines):
+    """Each catch that drops its cause, as `(line, kind)`.
+
+    The scan reads the lines as one text, so a handler on the next line stays
+    inside the catch.
+    """
+    opens = "([{"
+    closes = ")]}"
+
+    def handler_end(text, start):
+        """The index after the handler that begins at `start`."""
+        depth = 0
+        index = start
+        block = text[start:].lstrip().startswith("{")
+        while index < len(text):
+            char = text[index]
+            if char in opens:
+                depth += 1
+            elif char in closes:
+                if depth == 0:
+                    return index
+                depth -= 1
+                if depth == 0 and block:
+                    return index + 1
+            elif char in ";," and depth == 0:
+                return index
+            index += 1
+        return index
+
+    def switch_bodies(handler, name):
+        pattern = re.compile(r"\bswitch\s*\(\s*" + re.escape(name) + r"\s*\)\s*\{")
+        for match in pattern.finditer(handler):
+            depth = 1
+            index = match.end()
+            while index < len(handler) and depth:
+                depth += handler[index] in opens
+                depth -= handler[index] in closes
+                index += 1
+            if depth == 0:
+                yield handler[match.end() : index - 1]
+
+    def prongs(body):
+        depth = 0
+        start = 0
+        for index, char in enumerate(body):
+            if char in opens:
+                depth += 1
+            elif char in closes:
+                depth -= 1
+            elif char == "," and depth == 0:
+                yield body[start:index]
+                start = index + 1
+        yield body[start:]
+
+    def else_drops(body, name):
+        for prong in prongs(body):
+            head, arrow, rest = prong.partition("=>")
+            if not arrow or head.strip() != "else":
+                continue
+            payload = re.match(r"\s*\|\s*(\w+)\s*\|", rest)
+            names = {name}
+            used = rest
+            if payload:
+                names.add(payload[1])
+                used = rest[payload.end() :]
+            if not any(re.search(r"\b" + re.escape(item) + r"\b", used) for item in names):
+                return True
+        return False
+
+    numbers = []
+    text = ""
+    for number, line in lines:
+        numbers.append((len(text), number))
+        text += line + "\n"
+
+    def line_of(offset):
+        return max(number for start, number in numbers if start <= offset)
+
+    for match in CAUSE_DROP.finditer(text):
+        yield line_of(match.start()), "uncaptured"
+    for match in CATCH_CAPTURE.finditer(text):
+        name = match[1]
+        handler = text[match.end() : handler_end(text, match.end())]
+        if re.search(r"\b_\s*=\s*" + re.escape(name) + r"\s*;", handler):
+            yield line_of(match.start()), "discarded"
+        elif any(else_drops(body, name) for body in switch_bodies(handler, name)):
+            # The switch subject is not a use. Any other reference means the cause flows.
+            without_subjects = re.sub(r"\bswitch\s*\(\s*" + re.escape(name) + r"\s*\)", "", handler)
+            if re.search(r"\b" + re.escape(name) + r"\b", without_subjects) is None:
+                yield line_of(match.start()), "unchecked_else"
+
+
 def cause_drop_counts(root):
-    """The number of production `catch` sites without a named capture in each Zig file under src/."""
+    """The number of production catch sites that drop their cause in each Zig file under src/."""
     counts = {}
     for path, lines in zig_files(root, ("src",), literals=False):
-        count = sum(len(CAUSE_DROP.findall(line)) for _, line in production(lines))
+        count = sum(1 for _ in cause_drops(production(lines)))
         if count:
             counts[str(path)] = count
     return counts
@@ -67,7 +160,7 @@ def cause_drop_changes(root):
         if found > allowed:
             yield (
                 f"{name}: {found} `catch` sites drop their cause, {allowed} allowed. "
-                "Capture the error with `catch |err|` and record it through a diagnostics.Handle or Presentation.reportFailure. "
+                "Name each dropped error in a switch prong with no `else`, or record the cause through a diagnostics.Handle or Presentation.reportFailure. "
                 f"For an expected outcome, raise the count in {CATCH_BASELINE} in the same change and say why in the commit."
             )
         elif found < allowed:
@@ -77,7 +170,7 @@ def cause_drop_changes(root):
 def write_baseline(root):
     count_baseline.write(
         root / CATCH_BASELINE,
-        "Production `catch` sites without a named capture, per file. tools/check_diagnostics.py fails when a count changes.",
+        "Production `catch` sites that drop their cause (uncaptured, discarded, or unchecked `else`), per file. tools/check_diagnostics.py fails when a count changes.",
         cause_drop_counts(root),
     )
 

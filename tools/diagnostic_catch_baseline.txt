@@ -1,4 +1,4 @@
-# Production `catch` sites without a named capture, per file. tools/check_diagnostics.py fails when a count changes.
+# Production `catch` sites that drop their cause (uncaptured, discarded, or unchecked `else`), per file. tools/check_diagnostics.py fails when a count changes.
 3 src/api/args.zig
 2 src/api/cli.zig
 1 src/api/workspaces.zig
@@ -6,7 +6,7 @@
 1 src/benchmark/frame_paint.zig
 2 src/benchmark/main.zig
 7 src/bitbucket/auth.zig
-17 src/bitbucket/client.zig
+18 src/bitbucket/client.zig
 2 src/bitbucket/url.zig
 4 src/diff/parser.zig
 3 src/git/client.zig
@@ -18,16 +18,17 @@
 2 src/main.zig
 12 src/persist/sqlite_store.zig
 4 src/review/anchor.zig
+1 src/review/draft.zig
 1 src/review/store.zig
 26 src/tui/app.zig
-17 src/tui/config.zig
+20 src/tui/config.zig
 1 src/tui/emoji.zig
 5 src/tui/file_enrichment.zig
 2 src/tui/frame.zig
 1 src/tui/help.zig
 1 src/tui/keymap.zig
 2 src/tui/list_overlay.zig
-125 src/tui/presentation.zig
+130 src/tui/presentation.zig
 92 src/tui/render.zig
 2 src/tui/review_body.zig
 2 src/tui/review_card.zig
