@@ -8,7 +8,7 @@ Parent: ../PRD.md
 ## Goal
 
 Convert the large groups of cause-dropping `catch` sites to the sanctioned form of issue 01, or to a helper that holds it.
-The baseline in `tools/diagnostic_catch_baseline.txt` then falls from 381 to fewer than 100 sites.
+The baseline in `tools/diagnostic_catch_baseline.txt` then falls from 391 to fewer than 100 sites.
 The remaining sites are the real review list.
 
 ## Groups
