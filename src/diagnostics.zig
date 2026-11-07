@@ -24,6 +24,13 @@ pub const Handle = struct {
         return result;
     }
 
+    /// Records the Failure and returns `error.Reported`. Callers propagate it with `try`,
+    /// and a boundary skips it, so no layer records the same failure again.
+    pub fn fail(self: Handle, phase: Phase, cause: Cause, comptime source: std.builtin.SourceLocation) error{Reported} {
+        _ = self.failure(phase, cause, source);
+        return error.Reported;
+    }
+
     pub fn record(self: Handle, failure_value: Failure) void {
         if (self.sink) |sink| sink.record(failure_value);
     }
@@ -207,6 +214,40 @@ test "diagnostics private files retain original safe evidence and disable is a b
     var fresh = dir.iterate();
     _ = try fresh.next(testing.io);
     try testing.expect((try fresh.next(testing.io)) != null);
+}
+
+fn failingLeaf(handle: Handle) error{Reported}!void {
+    return handle.fail(.read, .{ .zig = error.LeafFailure }, @src());
+}
+
+fn propagatingCaller(handle: Handle) error{Reported}!void {
+    try failingLeaf(handle);
+}
+
+test "diagnostics fail records the leaf cause once and propagates error.Reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testHome(&env, tmp);
+    var sink = Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    try testing.expectError(error.Reported, propagatingCaller(sink.handle(.grammar, .{})));
+    try testing.expectError(error.Reported, propagatingCaller(.{}));
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only, "operation=grammar phase=read source=diagnostics.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=LeafFailure"));
 }
 
 fn writeMany(handle: Handle) void {
