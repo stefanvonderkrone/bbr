@@ -28,7 +28,7 @@
 1 src/tui/help.zig
 1 src/tui/keymap.zig
 2 src/tui/list_overlay.zig
-130 src/tui/presentation.zig
+60 src/tui/presentation.zig
 21 src/tui/render.zig
 2 src/tui/review_body.zig
 2 src/tui/review_card.zig
