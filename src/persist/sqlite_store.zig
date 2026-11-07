@@ -343,7 +343,9 @@ pub const SqliteStore = struct {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         if (aliases.len == 0) return error.NoRepositoryAlias;
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
 
         var resolved: ?bbr.review.ReviewRepositoryId = null;
         for (aliases) |alias| {
@@ -384,7 +386,9 @@ pub const SqliteStore = struct {
     fn reserveTempIdImpl(ptr: *anyopaque, key: RemoteReviewIdentity) anyerror!TempId {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
 
         var query: ?*c.sqlite3_stmt = null;
         if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT next_id FROM draft_temp_ids WHERE workspace=? AND repository=? AND pr_id=?;", -1, &query, null), .prepare, @src()) != c.SQLITE_OK)
@@ -428,7 +432,9 @@ pub const SqliteStore = struct {
     fn putImpl(ptr: *anyopaque, key: RemoteReviewIdentity, incoming: Draft) anyerror!?Parent {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
         if (try self.draftMutationLocked(key, incoming.local_id, incoming.target)) return error.DraftLocked;
         var d = incoming;
         if (d.parent) |parent| if (parent == .draft and !try self.draftExists(key, parent.draft)) {
@@ -561,7 +567,9 @@ pub const SqliteStore = struct {
     fn editDraftBodyImpl(ptr: *anyopaque, key: RemoteReviewIdentity, edit: DraftBodyEdit) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
         if (try self.draftMutationLocked(key, edit.temp_id, null)) return error.DraftLocked;
 
         var query: ?*c.sqlite3_stmt = null;
@@ -617,7 +625,9 @@ pub const SqliteStore = struct {
             error.AnchorRangeDescending, error.AnchorRangeTooLong, error.AnchorSideAmbiguous => return error.InvalidAnchor,
         };
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
         if (try self.draftMutationLocked(key, reanchor.temp_id, null)) return error.DraftLocked;
 
         var query: ?*c.sqlite3_stmt = null;
@@ -686,7 +696,9 @@ pub const SqliteStore = struct {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try bbr.review.validateCascadeShape(deletion);
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
 
         var root: ?*c.sqlite3_stmt = null;
         if (self.native(c.sqlite3_prepare_v2(self.db, "SELECT parent_kind, parent_id FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &root, null), .prepare, @src()) != c.SQLITE_OK)
@@ -830,7 +842,9 @@ pub const SqliteStore = struct {
         if (items.len == 0) return error.EmptySubmission;
         const first_temp_id = items[0].temp_id;
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
         if (try self.hasActiveSubmission()) return error.SubmissionAlreadyActive;
 
         var carryover: ?bbr.review.SubmissionRetryCheckpoint = null;
@@ -1050,7 +1064,9 @@ pub const SqliteStore = struct {
     fn resolveUnknownImpl(ptr: *anyopaque, key: RemoteReviewIdentity, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
         var stmt: ?*c.sqlite3_stmt = null;
         const sql =
             \\UPDATE drafts SET state_kind=?, state_id=?, state_err=NULL
@@ -1089,7 +1105,9 @@ pub const SqliteStore = struct {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         if (next_temp_id == completed_temp_id) return error.InvalidSubmissionCheckpoint;
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
 
         if (next_temp_id) |next_id| {
             var order: ?*c.sqlite3_stmt = null;
@@ -1185,7 +1203,9 @@ pub const SqliteStore = struct {
     fn completeSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
 
         if (completion == .aborted) {
             var restore: ?*c.sqlite3_stmt = null;
@@ -1323,7 +1343,9 @@ pub const SqliteStore = struct {
     fn abandonSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step => {},
+        };
 
         var draft: ?*c.sqlite3_stmt = null;
         const draft_sql =

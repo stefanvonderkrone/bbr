@@ -10,7 +10,6 @@
 2 src/http/std_client.zig
 1 src/logging_config.zig
 2 src/main.zig
-11 src/persist/sqlite_store.zig
 2 src/review/anchor.zig
 1 src/review/draft.zig
 7 src/tui/config.zig
