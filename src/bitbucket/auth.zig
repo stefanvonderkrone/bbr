@@ -470,7 +470,9 @@ fn reportParseDiagnostic(io: std.Io, path: []const u8, location: ParseLocation) 
     writeParseDiagnostic(&writer.interface, path, location) catch |err| switch (err) {
         error.WriteFailed => return,
     };
-    writer.interface.flush() catch {};
+    writer.interface.flush() catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
 }
 
 const file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
@@ -482,7 +484,9 @@ fn warnStorage(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     writer.interface.print("warning: " ++ fmt ++ "\n", args) catch |err| switch (err) {
         error.WriteFailed => return,
     };
-    writer.interface.flush() catch {};
+    writer.interface.flush() catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
 }
 
 /// Ensure the `bbr` data directory exists and is private (`0700`).

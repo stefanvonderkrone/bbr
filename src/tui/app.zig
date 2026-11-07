@@ -247,7 +247,9 @@ fn pickerTickWorker(loop: *Loop, future_id: u64, scope: presentation.WorkId, io:
     io.sleep(std.Io.Duration.fromMilliseconds(picker_tick_interval_ms), .awake) catch |err| switch (err) {
         error.Canceled => return,
     };
-    loop.postEvent(.{ .picker_tick = .{ .future_id = future_id, .scope = scope } }) catch {};
+    loop.postEvent(.{ .picker_tick = .{ .future_id = future_id, .scope = scope } }) catch |err| switch (err) {
+        error.Canceled => {},
+    };
 }
 
 fn pickerTickTransition(scope: ?presentation.WorkId, active: ?PickerTickWork) PickerTickTransition {

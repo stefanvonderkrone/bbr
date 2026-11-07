@@ -165,7 +165,9 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
     const Selected = union(enum) { file: Completion };
     var completion_buffer: [limits[limits.len - 1]]Selected = undefined;
     var select = std.Io.Select(Selected).init(io, &completion_buffer);
-    defer select.group.await(io) catch {};
+    defer select.group.await(io) catch |err| switch (err) {
+        error.Canceled => {},
+    };
     const start = std.Io.Clock.awake.now(io);
     var first_file_ms: u64 = 0;
     var next: usize = 0;

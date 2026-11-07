@@ -45,7 +45,9 @@ pub const RemoteBlobSource = struct {
                     .content => |bytes| return bytes,
                     .rejected => |failure| {
                         if (attempt == 0 and (failure.reason == error.RateLimited or failure.reason == error.ServerError)) {
-                            io.sleep(std.Io.Duration.fromMilliseconds(if (failure.reason == error.RateLimited) rateLimitRetryMs(failure.retry_after_ms) else 100), .awake) catch {};
+                            io.sleep(std.Io.Duration.fromMilliseconds(if (failure.reason == error.RateLimited) rateLimitRetryMs(failure.retry_after_ms) else 100), .awake) catch |err| switch (err) {
+                                error.Canceled => {},
+                            };
                             continue;
                         }
                         return failure.reason;

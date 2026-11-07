@@ -11759,12 +11759,16 @@ pub const Presentation = struct {
 
     fn setComposerFooter(self: *Presentation, text: []const u8) void {
         self.composer_footer.clearRetainingCapacity();
-        self.composer_footer.appendSlice(self.allocator, text) catch {};
+        self.composer_footer.appendSlice(self.allocator, text) catch |err| switch (err) {
+            error.OutOfMemory => {},
+        };
     }
 
     fn setComposerFooterFmt(self: *Presentation, comptime fmt: []const u8, args: anytype) void {
         self.composer_footer.clearRetainingCapacity();
-        self.composer_footer.print(self.allocator, fmt, args) catch {};
+        self.composer_footer.print(self.allocator, fmt, args) catch |err| switch (err) {
+            error.OutOfMemory => {},
+        };
     }
 
     fn codeBodySource(published: *Published, owner: review_card.Owner) ?[]const u8 {

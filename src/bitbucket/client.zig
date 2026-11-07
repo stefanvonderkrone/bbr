@@ -978,7 +978,9 @@ pub const Client = struct {
         defer if (protection) |previous| {
             _ = io.swapCancelProtection(previous);
         };
-        defer select.group.await(io) catch {};
+        defer select.group.await(io) catch |err| switch (err) {
+            error.Canceled => {},
+        };
         var concurrent = opts.concurrency > 1;
         var active: usize = 0;
         while (true) {
