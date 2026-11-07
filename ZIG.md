@@ -233,6 +233,21 @@ For an inclusive byte limit, pass `.limited(max_bytes + 1)`.
 The API text-file helper uses this rule to accept exactly 1 MiB and reject larger files.
 Verified in `std/Io/Dir.zig:1326-1338` and `std/Io/Reader.zig:367-386`.
 
+`std.Io.Dir.openFile` sets `O_NONBLOCK` only for a lock with `lock_nonblocking`
+(`std/Io/Dir.zig:547`, `std/Io/Threaded.zig:4821-4832`). A plain open of a FIFO blocks until a writer appears.
+To refuse a FIFO without a race, call `std.posix.openat(AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0)`
+(`std/posix.zig:441`), wrap the descriptor as `std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }`,
+and check `file.stat(io).kind` before the read.
+`O_NONBLOCK` has no effect on reads of a regular file.
+
+A `std.Io.File.Reader` stores the real read error in its `err` field (`std/Io/File/Reader.zig:19`).
+Its interface returns only `error.ReadFailed`, so map `ReadFailed` to `reader.err.?`.
+
+`std.Io.CancelProtection` (`std/Io.zig:1322-1343`): in the `.blocked` state, no `Io` function returns
+`error.Canceled`. Wrap a write that must finish in `io.swapCancelProtection(.blocked)` and restore the old state.
+
+`std.os.linux.mknodat` (`std/os/linux.zig:990`) creates a FIFO on Linux without libc.
+
 ## 6. Testing
 
 - `test "name" { ... }` blocks compiled and run by `zig build test`; `std.testing`
@@ -386,6 +401,10 @@ To preserve a file symlink, create the atomic file in the resolved target direct
 - [ ] Directory handles still need `.iterate = true` for `setPermissions` on Linux?
 - [ ] `Dir.readLink`, `realPathFileAlloc`, and `File.Atomic.replace` still preserve the documented path and rename behavior?
 - [ ] `std.posix.tcgetattr`, `tcsetattr`, and the `ECHO` and `ECHONL` fields unchanged?
+- [ ] `Dir.openFile` still sets `O_NONBLOCK` only with a lock? If it gains a nonblocking option, use it in `Snapshot.readRegular`.
+- [ ] `File.Reader.err` still holds the cause behind `error.ReadFailed`?
+- [ ] `io.swapCancelProtection(.blocked)` still suppresses `error.Canceled` in every `Io` call?
+- [ ] `std.os.linux.mknodat` signature unchanged?
 - [ ] libvaxis still builds against the new toolchain; re-pin its commit.
 - [ ] libvaxis `Vaxis.copyToSystemClipboard` signature and OSC 52 behavior unchanged?
 - [ ] `Io.Clock.awake` / `Timestamp.untilNow` / `Duration.toNanoseconds` unchanged?
