@@ -134,5 +134,6 @@ test "API lifecycle branch flags support interleaved values and reject invalid w
 
 test "list-branches help states the concurrency default of its parser" {
     try std.testing.expectEqual(pages.default_concurrency, (try parse(&.{"--repository=sample"}, .list)).concurrency.?);
+    try std.testing.expectEqual(@as(usize, 1), (try parse(&.{ "--repository=sample", "--concurrency=1" }, .list)).concurrency.?);
     try std.testing.expect(std.mem.indexOf(u8, list_help, pages.concurrencyHelp(pages.default_concurrency)) != null);
 }

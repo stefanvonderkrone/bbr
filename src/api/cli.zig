@@ -968,6 +968,58 @@ test "a failed Author or Default Reviewer read sends no PullRequest write" {
     }
 }
 
+test "--default-reviewers refuses an unknown Author before the PullRequest write" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const authorless_pr =
+        \\{"id":42,"title":"Review","state":"OPEN","source":{"branch":{"name":"feature"}},"destination":{"branch":{"name":"main"}}}
+    ;
+    for ([_]struct { verb: []const u8, args: []const []const u8, author: bbr.http.Canned }{
+        .{ .verb = "create-pull-request", .args = &.{ "--repository=sample", "--title=Review", "--source-branch=feature", "--default-reviewers" }, .author = .{ .body = "{\"uuid\":\"\"}" } },
+        .{ .verb = "update-pull-request", .args = &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers" }, .author = .{ .body = authorless_pr } },
+    }) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &.{case.author}, .max_calls = 1 };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try std.testing.expectError(error.MalformedResponse, findVerb(case.verb).?.handler(output.init(&env, &arena), bb, case.args, true));
+        try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+        try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+    }
+}
+
+test "--default-reviewers reads every Default Reviewer page before the PullRequest write" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const first_page = "{\"values\":[{\"uuid\":\"{ada}\",\"display_name\":\"Ada\"}],\"next\":\"" ++ bbr.bitbucket.base_url ++ "/repositories/demo/sample/default-reviewers?pagelen=100&cursor=two\"}";
+    const later_page = "{\"values\":[{\"uuid\":\"{bob}\",\"display_name\":\"Bob\"}]}";
+    for ([_]struct { verb: []const u8, args: []const []const u8, author: bbr.http.Canned, method: bbr.http.client.Method }{
+        .{ .verb = "create-pull-request", .args = &.{ "--repository=sample", "--title=Review", "--source-branch=feature", "--default-reviewers" }, .author = .{ .body = "{\"uuid\":\"{author}\"}" }, .method = .POST },
+        .{ .verb = "update-pull-request", .args = &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers" }, .author = .{ .body = reviewed_pr }, .method = .PUT },
+    }) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &.{ case.author, .{ .body = first_page }, .{ .body = later_page }, .{ .body = reviewed_pr } } };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try findVerb(case.verb).?.handler(output.init(&env, &arena), bb, case.args, true);
+        try std.testing.expectEqual(@as(usize, 4), fake.call_count);
+        try std.testing.expectEqual(case.method, fake.methodAt(3).?);
+        try expectSentReviewers(&fake, &.{ "{ada}", "{bob}" });
+
+        var failing: bbr.http.FakeHttpClient = .{ .responses = &.{ case.author, .{ .body = first_page }, .{ .status = 500 } }, .max_calls = 3 };
+        const failing_bb = bbr.bitbucket.Client.init(failing.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var failed: TestOutput = .{};
+        try std.testing.expectError(error.ServerError, findVerb(case.verb).?.handler(failed.init(&env, &arena), failing_bb, case.args, true));
+        try std.testing.expectEqual(@as(usize, 3), failing.call_count);
+        for (0..3) |index| try std.testing.expectEqual(bbr.http.client.Method.GET, failing.methodAt(index).?);
+        try std.testing.expectEqual(@as(usize, 0), failed.stdout_len);
+    }
+}
+
 test "get-user prints public identity as JSON and human text" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);

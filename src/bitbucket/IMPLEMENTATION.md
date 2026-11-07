@@ -59,7 +59,7 @@ Live checks on Workspace `check24` and Repository `pr-webapp` on 31 October 2026
 | `/user/workspaces` | 100 | `pagelen=1000` returned HTTP 200 with `pagelen` 1000. |
 | `.../default-reviewers` and `.../effective-default-reviewers` | 100 | `pagelen=101` returned HTTP 400 "Invalid pagelen" on both endpoints. `pagelen=1000` also returned HTTP 400 on the plain endpoint. |
 
-The last three endpoints accepted every size, and the test lists were too short to show a clamp.
+The PullRequest tasks, commit PullRequests, and user Workspaces endpoints accepted every size, and the test lists were too short to show a clamp.
 They use 100, the maximum that the Bitbucket API reference states for most lists.
 A clamp would not break a list, because the commands follow the `next` links.
 

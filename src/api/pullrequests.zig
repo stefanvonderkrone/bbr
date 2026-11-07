@@ -444,6 +444,7 @@ fn mutatePullRequest(a: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client,
 /// `pr_id` is null on create, where the Authenticated Account becomes the Author.
 fn withDefaultReviewers(a: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client, repository: []const u8, pr_id: ?u64, defaults: DefaultReviewerFlags) ![]const []const u8 {
     const author = if (pr_id) |id| (try bb.getPullRequest(a, repository, id)).author_uuid else try bb.getAuthenticatedAccountUuid(a);
+    if (author.len == 0) return error.MalformedResponse;
     const concurrency = ws.effectiveConcurrency(repositories.default_reviewers_concurrency, std.Thread.getCpuCount());
     const listed = try bb.listDefaultReviewers(io, a, repository, defaults.effective, .{}, concurrency);
     const selection = try mergeReviewerUuids(a, listed, defaults.add, author);
