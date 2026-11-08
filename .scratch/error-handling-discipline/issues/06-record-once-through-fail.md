@@ -1,6 +1,7 @@
 # Record each failure once through fail
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/error-handling-discipline (branch feat/record-once)
 Type: implementation
 Blocked by: 03
 Parent: ../PRD.md
@@ -37,8 +38,9 @@ Notes on some sites:
 
 - `src/main.zig:51` is `main`. It is the CLI boundary, so it ends through `exitFailure` instead of a record and a return.
 - `src/api/cli.zig:314` and `321` show the message through `printError` before they return. They can return through `fail` after `printError`.
-- `src/highlight/user_grammar.zig:279` and `377` translate the `std.DynLib.open` error to `error.NativeLibraryLoadFailed`. The CLI shows that name, because the Zig start code logs the name of an error that `main` returns. ADR-0014 says that such a site has no choice without a loss. Decide it here, and write the reason in the Completion section.
+- `src/highlight/user_grammar.zig:279` and `377` translate the `std.DynLib.open` error to `error.NativeLibraryLoadFailed`. The CLI shows that name, because the Zig start code logs the name of an error that `main` returns.
 - `src/api/cli.zig:339` translates `error.MissingUsername`, `error.MissingToken`, and `error.MissingWorkspace` to `error.MissingCredential`, and `writeError` branches on that name. This is a translation site whose new name a boundary uses.
+- The operator decided the translation sites on 2026-11-08, after TigerBeetle: the leaf has the most context for the message. A CLI-path site prints a message that names the leaf cause and the translated meaning, and then it returns `fail`. A TUI-path site whose boundary branches on the name returns the plain error without a record. ADR-0014 holds the rule.
 - `src/highlight/tree_sitter_highlighter.zig:54` records twice in one handler. It records the Zig error and then the predicate diagnostic.
 - `enrichSide` in `src/tui/file_enrichment.zig` has the error set `error{OutOfMemory}`. Its handlers at 319 and 338 record the error and return it when it is `error.OutOfMemory`. `error.Reported` in that set changes each caller's switch.
 
@@ -60,7 +62,7 @@ When the store converts, consider a check for a `native` check before a plain `S
    - Each worker entry point that turns an error into completion evidence, such as the workers in `src/tui/app.zig` and `src/tui/presentation_runtime.zig`.
    - Each CLI subcommand boundary that prints an error, such as `writeError` in `src/api/cli.zig`.
 2. Before you convert a site, find the boundary above it.
-   If that boundary prints `@errorName(err)` or branches on the error name, show the message at the site first, or return the error without a record.
+   If that boundary prints `@errorName(err)` or branches on the error name, a CLI-path site prints its message first and returns `fail`, and a TUI-path site returns the error without a record.
    Otherwise return `diagnostic.fail(phase, cause, @src())`.
 3. Convert the `errdefer |err|` records to a `catch` with `fail` on the call that has the evidence, or remove them.
 4. Convert the SQLite sites outside the check.

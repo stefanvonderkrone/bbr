@@ -16,7 +16,12 @@
 
 `error.Reported` drops the name of the cause, and the diagnostic file is off by default.
 Before you call `fail`, find the boundary above the site.
-If that boundary prints `@errorName(err)` or branches on the error name, show the message at the site first, or return the error without a record.
+If that boundary prints `@errorName(err)` or branches on the error name:
+
+- On a CLI path, print the message at the site first, then return `fail`.
+  The leaf has the most context for the message (TigerBeetle, `vsr.fatal`).
+  At a translation site, the message names the leaf cause and the translated meaning.
+- On a TUI path, the site cannot print. Return the plain error without a record, and the boundary records it once.
 
 `tools/check_diagnostics.py` counts each `catch` or `errdefer` handler that records and then returns an error.
 A count in `tools/diagnostic_record_baseline.txt` can go down. It cannot go up.
