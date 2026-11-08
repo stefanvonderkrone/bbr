@@ -21,6 +21,37 @@ const diagnostics = @import("../diagnostics.zig");
 
 pub const base_url = "https://api.bitbucket.org/2.0";
 
+/// `std.json` reports allocation failure as `error.OutOfMemory` and every
+/// document problem as its own parse error. Callers see allocation failure
+/// unchanged. Every parse error is `error.MalformedResponse`.
+fn jsonFailure(err: std.json.ParseError(std.json.Scanner)) error{ OutOfMemory, MalformedResponse } {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BufferUnderrun,
+        error.DuplicateField,
+        error.InvalidCharacter,
+        error.InvalidEnumTag,
+        error.InvalidNumber,
+        error.LengthMismatch,
+        error.MissingField,
+        error.Overflow,
+        error.SyntaxError,
+        error.UnexpectedEndOfInput,
+        error.UnexpectedToken,
+        error.UnknownField,
+        error.ValueTooLong,
+        => error.MalformedResponse,
+    };
+}
+
+fn parseResponse(comptime T: type, allocator: Allocator, body: []const u8) error{ OutOfMemory, MalformedResponse }!std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| return jsonFailure(err);
+}
+
+fn parseResponseLeaky(comptime T: type, allocator: Allocator, body: []const u8) error{ OutOfMemory, MalformedResponse }!T {
+    return std.json.parseFromSliceLeaky(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| return jsonFailure(err);
+}
+
 pub const Client = struct {
     diagnostic: diagnostics.Handle = .{},
     http: HttpClient,
@@ -375,7 +406,7 @@ pub const Client = struct {
             size: usize,
             attributes: []const []const u8,
         };
-        const parsed = std.json.parseFromSlice(Wire, allocator, metadata_body, .{ .ignore_unknown_fields = true }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(Wire, allocator, metadata_body);
         defer parsed.deinit();
         const metadata = parsed.value;
         if (!std.mem.eql(u8, metadata.type, "commit_file")) return error.BlobTypeMismatch;
@@ -515,12 +546,7 @@ pub const Client = struct {
             .reason = reason,
             .retry_after_ms = res.retry_after_ms,
         } };
-        const parsed = std.json.parseFromSlice(
-            struct { id: u64 },
-            allocator,
-            res.body,
-            .{ .ignore_unknown_fields = true },
-        ) catch return error.MalformedResponse;
+        const parsed = try parseResponse(struct { id: u64 }, allocator, res.body);
         defer parsed.deinit();
         return .{ .posted = parsed.value.id };
     }
@@ -535,15 +561,12 @@ pub const Client = struct {
         try percentEncodeInto(allocator, &url, user_id);
         const body = try self.requestJson(allocator, .GET, url.items, null);
         defer allocator.free(body);
-        const parsed = std.json.parseFromSlice(struct {
+        const parsed = try parseResponse(struct {
             uuid: []const u8,
             account_id: ?[]const u8 = null,
             display_name: ?[]const u8 = null,
             nickname: ?[]const u8 = null,
-        }, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.MalformedResponse,
-        };
+        }, allocator, body);
         defer parsed.deinit();
         if (parsed.value.uuid.len == 0) return error.MalformedResponse;
         const uuid = try allocator.dupe(u8, parsed.value.uuid);
@@ -575,9 +598,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = std.json.parseFromSlice(struct { uuid: []const u8 }, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(struct { uuid: []const u8 }, allocator, res.body);
         defer parsed.deinit();
         return allocator.dupe(u8, parsed.value.uuid);
     }
@@ -1055,9 +1076,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = std.json.parseFromSlice(WorkspaceJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(WorkspaceJson, allocator, res.body);
         defer parsed.deinit();
         return dupeWorkspaceJson(allocator, parsed.value);
     }
@@ -1130,9 +1149,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = std.json.parseFromSlice(RepositoryJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(RepositoryJson, allocator, res.body);
         defer parsed.deinit();
         return dupeRepository(allocator, parsed.value);
     }
@@ -1234,9 +1251,7 @@ pub const Client = struct {
                 if (rejection) |failure| failure.* = .{ .reason = reason, .retry_after_ms = res.retry_after_ms };
                 return reason;
             };
-            const parsed = std.json.parseFromSlice(Page, allocator, res.body, .{
-                .ignore_unknown_fields = true,
-            }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+            const parsed = try parseResponse(Page, allocator, res.body);
             defer parsed.deinit();
             for (parsed.value.values) |wire| {
                 if (opts.limit) |limit| {
@@ -1339,9 +1354,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = std.json.parseFromSlice(CommentJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(CommentJson, allocator, res.body);
         defer parsed.deinit();
         return dupeComment(allocator, parsed.value, .{});
     }
@@ -1446,9 +1459,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = std.json.parseFromSlice(TaskJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(TaskJson, allocator, res.body);
         defer parsed.deinit();
         return dupeTask(allocator, parsed.value);
     }
@@ -1493,12 +1504,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = std.json.parseFromSlice(
-            struct { id: u64 },
-            allocator,
-            res.body,
-            .{ .ignore_unknown_fields = true },
-        ) catch return error.MalformedResponse;
+        const parsed = try parseResponse(struct { id: u64 }, allocator, res.body);
         defer parsed.deinit();
         return parsed.value.id;
     }
@@ -1545,9 +1551,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = std.json.parseFromSlice(TaskJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(TaskJson, allocator, res.body);
         defer parsed.deinit();
         return dupeTask(allocator, parsed.value);
     }
@@ -1625,7 +1629,7 @@ pub const Client = struct {
             size: usize,
             attributes: []const []const u8 = &.{},
         };
-        const parsed = std.json.parseFromSlice(Wire, allocator, metadata_body, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+        const parsed = try parseResponse(Wire, allocator, metadata_body);
         defer parsed.deinit();
         const m = parsed.value;
         if (!std.mem.eql(u8, m.type, "commit_file")) return error.BlobTypeMismatch;
@@ -1860,8 +1864,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                     },
                 });
                 try classify(response.status);
-                return std.json.parseFromSliceLeaky(Page, a, response.body, .{ .ignore_unknown_fields = true }) catch |err|
-                    return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+                return parseResponseLeaky(Page, a, response.body);
             }
         };
 
@@ -2221,8 +2224,7 @@ fn validateBranchName(name: []const u8) !void {
 }
 
 fn parseBranch(allocator: Allocator, body: []const u8) !types.Branch {
-    const parsed = std.json.parseFromSlice(BranchJson, allocator, body, .{ .ignore_unknown_fields = true }) catch |err|
-        return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+    const parsed = try parseResponse(BranchJson, allocator, body);
     defer parsed.deinit();
     return dupeBranch(allocator, parsed.value);
 }
@@ -2624,9 +2626,7 @@ const PrEndpointJson = struct {
 };
 
 fn parsePullRequest(allocator: Allocator, body: []const u8, comptime full_read: bool) !PullRequest {
-    const parsed = std.json.parseFromSlice(PrJson, allocator, body, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+    const parsed = try parseResponse(PrJson, allocator, body);
     defer parsed.deinit();
     const v = parsed.value;
     // Preserve the full-read contract used by SourceCommit and Reviewer Verdict
@@ -4056,6 +4056,24 @@ test "getUser resolves account IDs and UUIDs without Workspace membership" {
     try testing.expectEqualStrings("", user.account_id);
     try testing.expectEqualStrings("", user.display_name);
     try testing.expectEqualStrings("", user.nickname);
+}
+
+test "an account lookup that cannot allocate reports out of memory" {
+    const body = "{\"uuid\":\"{account}\"}";
+    var index: usize = 0;
+    var saw_failure = false;
+    while (index < 32) : (index += 1) {
+        var fake: FakeHttpClient = .{ .body = body };
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = index });
+        const bb = Client.init(fake.httpClient(), testCredential());
+        if (bb.getAuthenticatedAccountUuid(failing.allocator())) |uuid| {
+            failing.allocator().free(uuid);
+        } else |err| {
+            saw_failure = true;
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    try testing.expect(saw_failure);
 }
 
 test "getUser rejects empty IDs and malformed profiles and classifies API failures" {
