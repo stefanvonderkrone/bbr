@@ -3358,8 +3358,10 @@ pub const ThemePersisted = struct {
         no_config_location,
         /// config.toml does not parse with the new Theme.
         config_invalid,
-        /// Reading or writing failed, or the command could not start.
+        /// The write failed, or the command could not start.
         write_failed,
+        /// config.toml could not be read. The record names the read error.
+        read_failed,
     };
 };
 
@@ -3804,6 +3806,7 @@ pub const ActionError = enum {
     out_of_memory,
     theme_not_saved,
     theme_not_saved_invalid_config,
+    theme_not_saved_unreadable,
     persistence_failed,
     submission_already_active,
     submission_launch_failed,
@@ -12763,6 +12766,7 @@ pub const Presentation = struct {
         switch (persisted.outcome) {
             .saved => {},
             .config_invalid => self.action_error = .theme_not_saved_invalid_config,
+            .read_failed => self.action_error = .theme_not_saved_unreadable,
             .no_config_location, .write_failed => self.action_error = .theme_not_saved,
         }
     }
@@ -20998,6 +21002,12 @@ test "a failed Theme save keeps the Theme and reports it, and a stale completion
     try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
     try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id, .outcome = .write_failed } });
     try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_enter });
+    const reread = presentation.takeCommand().?.persist_theme;
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = reread.command_id, .outcome = .read_failed } });
+    try testing.expectEqual(ThemeId.solarized_light, presentation.projection().theme);
+    try testing.expectEqual(ActionError.theme_not_saved_unreadable, presentation.projection().action_error.?);
 }
 
 test "a Theme Overlay query edit previews the top match" {
