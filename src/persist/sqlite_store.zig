@@ -99,11 +99,13 @@ pub const SqliteStore = struct {
 
     /// The SQLite seam. It records a failed result once and returns error.Reported, so no
     /// caller records the same failure again. Any other result returns unchanged.
+    /// A failed finalize repeats the error of the statement's last step, which this
+    /// function recorded, so the finalize gets no second record.
     fn native(self: *SqliteStore, result: c_int, phase: bbr.diagnostic.Phase, comptime source: std.builtin.SourceLocation) error{Reported}!c_int {
         const primary = result & 0xff;
-        if (primary != c.SQLITE_OK and primary != c.SQLITE_ROW and primary != c.SQLITE_DONE)
-            return self.diagnostic.fail(phase, .{ .sqlite = .{ .result = primary, .extended = c.sqlite3_extended_errcode(self.db) } }, source);
-        return result;
+        if (primary == c.SQLITE_OK or primary == c.SQLITE_ROW or primary == c.SQLITE_DONE) return result;
+        if (phase == .finalize) return error.Reported;
+        return self.diagnostic.fail(phase, .{ .sqlite = .{ .result = primary, .extended = c.sqlite3_extended_errcode(self.db) } }, source);
     }
 
     /// Open (creating if needed) the database at `path`, a NUL-terminated path or
@@ -1638,7 +1640,7 @@ fn testReviewKey(pull_request_id: u64) RemoteReviewIdentity {
     return .{ .workspace = "workspace", .repository = "repo", .pull_request_id = pull_request_id };
 }
 
-test "diagnostics SQLite records real open exec prepare bind and step codes without SQL" {
+test "diagnostics SQLite records each real open exec prepare bind and step code once without SQL" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
@@ -1662,7 +1664,10 @@ test "diagnostics SQLite records real open exec prepare bind and step codes with
     bindInt(&db, stmt, 999, 1);
     bindInt(&db, stmt, 1, 1);
     try testing.expectError(error.Reported, db.native(c.sqlite3_step(stmt), .step, @src()));
+    try testing.expectEqual(@as(u64, 5), sink.sequence);
+    // The finalize repeats the step's error, which has its record.
     try testing.expectError(error.Reported, db.native(c.sqlite3_finalize(stmt), .finalize, @src()));
+    try testing.expectEqual(@as(u64, 5), sink.sequence);
     const locked_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/locked.db", .{home}, 0);
     defer testing.allocator.free(locked_path);
     var owner = try SqliteStore.openDiagnostic(locked_path, diagnostic);
@@ -1671,6 +1676,7 @@ test "diagnostics SQLite records real open exec prepare bind and step codes with
     defer contender.deinit();
     try owner.exec("BEGIN EXCLUSIVE;");
     try testing.expectError(error.Reported, contender.exec("CREATE TABLE private_blocked(value INTEGER);"));
+    try testing.expectEqual(@as(u64, 6), sink.sequence);
     try owner.exec("ROLLBACK;");
     _ = sink.setEnabled(false);
     var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
@@ -1679,7 +1685,7 @@ test "diagnostics SQLite records real open exec prepare bind and step codes with
     const entry = (try iterator.next(testing.io)).?;
     const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
     defer testing.allocator.free(bytes);
-    for ([_][]const u8{ "phase=open", "result=14 extended=14", "phase=exec", "phase=prepare", "result=1 extended=1", "phase=bind", "result=25 extended=25", "phase=step", "result=19 extended=1555", "result=5 extended=5", "phase=finalize", "command_id=81", "draft_id=82", "source=persist/sqlite_store.zig:" }) |needle|
+    for ([_][]const u8{ "phase=open", "result=14 extended=14", "phase=exec", "phase=prepare", "result=1 extended=1", "phase=bind", "result=25 extended=25", "phase=step", "result=19 extended=1555", "result=5 extended=5", "command_id=81", "draft_id=82", "source=persist/sqlite_store.zig:" }) |needle|
         try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
     for ([_][]const u8{ "private_", "SELECT", "INSERT", "workspace", home }) |secret|
         try testing.expect(std.mem.indexOf(u8, bytes, secret) == null);

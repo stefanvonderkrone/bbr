@@ -664,16 +664,19 @@ pub const Client = struct {
 
         var uncertain = false;
         var uncertain_reason: ?ApiError = null;
+        // An uncertain or unresolved outcome drops the cause, so a failure without the rejection record of send gets its record here.
         self.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
             if (asApiError(err)) |api_error| switch (api_error) {
                 error.RateLimited, error.ServerError => uncertain_reason = api_error,
                 else => return .{ .api_error = api_error },
-            };
+            } else _ = self.diagnostic.failure(.execute, .{ .zig = err }, @src());
             uncertain = true;
         };
 
         const after = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
-            return .{ .unresolved = asApiError(err) };
+            const api_error = asApiError(err);
+            if (api_error == null or err == error.MalformedResponse) _ = self.diagnostic.failure(.read, .{ .zig = err }, @src());
+            return .{ .unresolved = api_error };
         };
         defer deinitPullRequest(allocator, after);
         if (after.reviewerVerdict(authenticated_account_uuid) != target) return .{ .unresolved = uncertain_reason };
@@ -3288,6 +3291,36 @@ test "getPullRequest translates PullRequest Author and Reviewer Verdicts" {
     try testing.expectEqual(types.ReviewerVerdict.changes_requested, pr.reviewerVerdict("{changes}"));
     try testing.expectEqual(types.ReviewerVerdict.no_verdict, pr.reviewerVerdict("{none}"));
     try testing.expectEqual(types.ReviewerVerdict.no_verdict, pr.reviewerVerdict("{missing}"));
+}
+
+test "diagnostics an unresolved Reviewer Verdict change keeps each transport cause in one record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const before =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [] }
+    ;
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = before },
+        .{ .send_error = error.ConnectionResetByPeer },
+        .{ .send_error = error.ConnectionResetByPeer },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(sink.handle(.verdict, .{}));
+    const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+    try testing.expectEqual(@as(?ApiError, null), result.unresolved);
+    try testing.expectEqual(@as(u64, 2), sink.sequence);
 }
 
 test "changeReviewerVerdict POSTs Approved after a fresh SourceCommit check" {

@@ -111,7 +111,7 @@ The sink does not recursively log its own failure.
 Each failure has one record ([ADR-0014](adr/0014-a-failure-is-recorded-once-and-error-reported-marks-it.md)).
 A site that records a failure and still fails returns `error.Reported`, and the boundaries above write nothing more for it.
 The Bitbucket client, the HTTP transport, and the Git client record nothing, because their callers branch on the error name.
-The boundary that receives such an error records it, so its record names the typed error, not the transport phase, the JSON error, or the Git exit code.
+The boundary that receives such an error records it, so its record names the typed error, not the transport phase, the JSON error, the page number, or the Git exit code.
 An HTTP rejection is the exception: `Client.send` records the status, and the boundary records the typed rejection error again.
 
 Normal cancellation, no matches, optional missing files, Submission lock contention, unsupported Grammars, and configured size limits are not operational errors.

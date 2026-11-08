@@ -217,9 +217,12 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
         }
     }
 
-    if (pr_branch.err) |err| return err;
-    if (diff_branch.err) |err| return err;
-    if (comments_branch.err) |err| return err;
+    // The worker records the returned failure. A second failed branch has no other record.
+    var failed: ?anyerror = null;
+    for ([_]?anyerror{ pr_branch.err, diff_branch.err, comments_branch.err }) |branch_error| if (branch_error) |err| {
+        if (failed == null) failed = err else _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+    };
+    if (failed) |err| return err;
 
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
@@ -330,7 +333,6 @@ fn Branch(comptime T: type) type {
 
 fn acquirePullRequest(branch: *Branch(PullRequest), bb: Client, repo: []const u8, id: u64) void {
     branch.value = bb.getPullRequest(branch.arena.allocator(), repo, id) catch |err| {
-        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
         branch.err = err;
         return;
     };
@@ -346,7 +348,6 @@ fn acquireAccount(branch: *Branch([]u8), bb: Client) void {
 
 fn acquireRawDiff(branch: *Branch([]u8), bb: Client, repo: []const u8, id: u64) void {
     branch.value = bb.getDiff(branch.arena.allocator(), repo, id) catch |err| {
-        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
         branch.err = err;
         return;
     };
@@ -354,7 +355,6 @@ fn acquireRawDiff(branch: *Branch([]u8), bb: Client, repo: []const u8, id: u64) 
 
 fn acquireComments(branch: *Branch([]bbr.review.Comment), bb: Client, repo: []const u8, id: u64, source: []const u8, destination: []const u8) void {
     branch.value = bb.getComments(branch.arena.allocator(), repo, id, .{ .source = source, .destination = destination }) catch |err| {
-        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
         branch.err = err;
         return;
     };
@@ -558,6 +558,29 @@ test "loadWith surfaces an error and leaks nothing" {
     try testing.expectError(error.NotFound, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
     try testing.expect(fake.callCount() >= 2);
     try testing.expect(fake.callCount() <= 3);
+}
+
+test "diagnostics a returned acquisition failure is left to the worker boundary" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]Canned{
+        .{ .request_key = "/user", .status = 200, .body = "{ \"uuid\": \"{ada}\" }" },
+        .{ .request_key = "/pullrequests/7/diff", .body = "" },
+        .{ .request_key = "/pullrequests/7/comments", .body = "{ \"values\": [] }" },
+        .{ .request_key = "/pullrequests/7", .send_error = error.ConnectionReset },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(sink.handle(.session_load, .{}));
+    try testing.expectError(error.ConnectionReset, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
+    try testing.expectEqual(@as(u64, 0), sink.sequence);
 }
 
 test "Authenticated Account failure preserves a read-only Candidate Session" {

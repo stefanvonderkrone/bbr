@@ -94,6 +94,7 @@ Commits:
 - `71602ae` bitbucket: leave each decode failure to the boundary.
 - `a01a43a` http: record each transport failure once at the boundary.
 - `836a980` git: record each Git failure once at the boundary.
+- A review commit fixes the doubles and drops that the review found.
 - The commit that adds this section updates `docs/diagnostic-logging.md`, ADR-0014, `.agents/skills/zig/errors.md`, and the record-once row of `AGENTS.md`.
 
 The HTTP transport, the Bitbucket client, and the Git client return their typed errors without a record. The plan converted `StdHttpClient.send` to `fail`, but its callers branch on the error names, so the operator decision of 2026-11-08 applies. ADR-0014 now says so.
@@ -105,12 +106,16 @@ Acceptance:
 - Each CLI failure that printed a name still prints a message. `tests/config_load_cli_test.py` proves it for the config load failure of `runMain`. The SQLite open message in `openStore` lost the redundant "(Open)" suffix.
 - `zig build test` exits 0. `python3 tools/check_agent_docs.py` passes.
 
-Review: no independent code review ran in this session.
+Review: a read-only review of the last five commits found a second SQLite record on each failed finalize, a second record of a failed Session acquisition, two dropped causes in the Reviewer Verdict change, and a changed message for a failed Git launch. The review commit fixes all four. The remaining items are under Comments.
 
 ## Comments
 
 Remaining work, outside the checked sites:
 
 - `Client.send` records an HTTP rejection with its status, and the boundary records the typed rejection error again. The check does not count it, because the record is not in a handler.
-- The diagnostic file lost the JSON error behind `MalformedResponse`, the HTTP phase of a transport failure, and the Git exit code. A follow-up can carry them to the boundary, for example in `Client.ErrorDetail`.
+- The diagnostic file lost the JSON error behind `MalformedResponse`, the HTTP phase of a transport failure, the page number of a failed page, and the Git exit code and launch error. A follow-up can carry them to the boundary, for example in `Client.ErrorDetail`.
+- `GitAnchorResolver` in `src/review/anchor.zig` drops each `git.diff` error as an unavailable transition. A failed Git launch or a signal there now has no record. It has no diagnostics handle.
+- A `PagedLists` page that fails after the limit is met is discarded without a record.
+- `detectRun` in `src/main.zig` prints the Git error name without a record.
+- The ShellGitClient launch catch maps a launch error to `on_fail` without a record, so the user text stays the same. The catch baseline for `src/git/client.zig` is 4. Returning the launch cause instead would print, for example, `FileNotFound` for a missing git. That is a user text change, so it needs an operator decision.
 - The `git` cause variant in `src/diagnostic.zig` has no producer left.
