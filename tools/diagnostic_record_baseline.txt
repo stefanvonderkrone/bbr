@@ -1,4 +1,4 @@
 # Production `catch` and `errdefer` handlers that record a failure and then return an error, per file. tools/check_diagnostics.py fails when a count changes.
-14 src/bitbucket/client.zig
+1 src/bitbucket/client.zig
 1 src/git/client.zig
 1 src/http/std_client.zig

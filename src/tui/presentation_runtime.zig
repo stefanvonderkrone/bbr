@@ -203,6 +203,46 @@ test "diagnostics a worker completion that carries error.Reported keeps the leaf
     try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=LeafListingFailure"));
 }
 
+test "diagnostics a Bitbucket failure has one record from the worker boundary" {
+    const cases = [_]struct { fake: bbr.http.FakeHttpClient, cause: []const u8 }{
+        .{ .fake = .{ .body = "{" }, .cause = "cause=zig error=MalformedResponse" },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer diagnostic_sink.deinit();
+        try testing.expect(diagnostic_sink.setEnabled(true) == .on);
+        const handle = diagnostic_sink.handle(.picker_list, .{ .work_id = 41 });
+        var fake = case.fake;
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "user", .token = "token", .workspace = "workspace" }).withDiagnostics(handle);
+        var repository: [256]u8 = undefined;
+        @memcpy(repository[0..4], "repo");
+        var sink: CapturingSink = .{};
+        var completion = sink.sink();
+        completion.diagnostic = handle;
+        deliver(completion, adapter.listPullRequests(testing.allocator, client, .{ .command_id = 31, .work_id = 41, .repository = .{ .bytes = repository, .len = 4 } }));
+        _ = diagnostic_sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next().?;
+        try testing.expect(lines.next() == null);
+        try testing.expect(std.mem.indexOf(u8, only, "source=tui/presentation_adapter.zig:") != null);
+        try testing.expect(std.mem.endsWith(u8, only, case.cause));
+    }
+}
+
 test "diagnostics launch failure retains actual cause and command work identities" {
     var command: presentation.OwnedCommand = .{ .list_pull_requests = .{ .command_id = 19, .work_id = 29, .repository = .{ .bytes = undefined, .len = 0 } } };
     var input = try command.launchFailed(error.ConcurrencyUnavailable);
