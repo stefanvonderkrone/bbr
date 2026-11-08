@@ -95,10 +95,12 @@ pub const Session = struct {
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try a.dupe(u8, span.mention);
                 entry.value_ptr.* = "";
-                const user = bb.getUser(scratch.allocator(), span.mention) catch |err| {
-                    _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
-                    if (err == error.OutOfMemory) return err;
-                    continue;
+                const user = bb.getUser(scratch.allocator(), span.mention) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+                        continue;
+                    },
                 };
                 const name = if (validMentionName(user.display_name)) user.display_name else user.nickname;
                 if (validMentionName(name)) entry.value_ptr.* = try std.fmt.allocPrint(a, "@{s}", .{name});

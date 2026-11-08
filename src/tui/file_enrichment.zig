@@ -28,35 +28,42 @@ pub const RemoteBlobSource = struct {
     fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, request: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *RemoteBlobSource = @ptrCast(@alignCast(ptr));
         const diagnostic = if (request.sink != null) request else self.client.diagnostic;
-        if (self.retry_io) |io| {
-            for (0..2) |attempt| {
-                var context = diagnostic.context;
-                context.attempt = @intCast(attempt + 1);
-                const client = self.client.withDiagnostics(diagnostic.forContext(.file_enrichment, context));
-                const response = client.getFileBlobAttempt(allocator, self.repo, commit, path) catch |err| {
-                    if (err != error.InvalidPath) _ = client.diagnostic.failure(.read, .{ .zig = err }, @src());
-                    if (attempt == 0 and err != error.OutOfMemory and err != error.InvalidPath) {
-                        io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch {};
-                        continue;
-                    }
-                    return err;
+        const io = self.retry_io orelse return self.client.withDiagnostics(diagnostic).getFileBlob(allocator, self.repo, commit, path);
+        if (try self.firstAttempt(io, allocator, commit, path, diagnostic)) |bytes| return bytes;
+        return switch (try self.attemptClient(diagnostic, 2).getFileBlobAttempt(allocator, self.repo, commit, path)) {
+            .content => |bytes| bytes,
+            .rejected => |failure| failure.reason,
+        };
+    }
+
+    /// Returns null when the second attempt retries the read. The first failure is
+    /// recorded here, because no caller sees it.
+    fn firstAttempt(self: *RemoteBlobSource, io: std.Io, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) !?[]u8 {
+        const client = self.attemptClient(diagnostic, 1);
+        const response = client.getFileBlobAttempt(allocator, self.repo, commit, path) catch |err| switch (err) {
+            error.OutOfMemory, error.InvalidPath => return err,
+            else => {
+                _ = client.diagnostic.failure(.read, .{ .zig = err }, @src());
+                io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+                return null;
+            },
+        };
+        switch (response) {
+            .content => |bytes| return bytes,
+            .rejected => |failure| {
+                if (failure.reason != error.RateLimited and failure.reason != error.ServerError) return failure.reason;
+                io.sleep(std.Io.Duration.fromMilliseconds(if (failure.reason == error.RateLimited) rateLimitRetryMs(failure.retry_after_ms) else 100), .awake) catch |err| switch (err) {
+                    error.Canceled => {},
                 };
-                switch (response) {
-                    .content => |bytes| return bytes,
-                    .rejected => |failure| {
-                        if (attempt == 0 and (failure.reason == error.RateLimited or failure.reason == error.ServerError)) {
-                            io.sleep(std.Io.Duration.fromMilliseconds(if (failure.reason == error.RateLimited) rateLimitRetryMs(failure.retry_after_ms) else 100), .awake) catch |err| switch (err) {
-                                error.Canceled => {},
-                            };
-                            continue;
-                        }
-                        return failure.reason;
-                    },
-                }
-            }
-            unreachable;
+                return null;
+            },
         }
-        return self.client.withDiagnostics(diagnostic).getFileBlob(allocator, self.repo, commit, path);
+    }
+
+    fn attemptClient(self: *RemoteBlobSource, diagnostic: bbr.diagnostics.Handle, attempt: u32) bbr.bitbucket.Client {
+        var context = diagnostic.context;
+        context.attempt = attempt;
+        return self.client.withDiagnostics(diagnostic.forContext(.file_enrichment, context));
     }
 };
 
@@ -306,22 +313,24 @@ fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.h
 }
 
 fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
-    const side = backing.create(OwnedSide) catch |err| {
-        _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
-        return err;
-    };
+    const side = try backing.create(OwnedSide);
     errdefer backing.destroy(side);
     side.references = .init(1);
     side.arena = std.heap.ArenaAllocator.init(backing);
     errdefer side.arena.deinit();
     const allocator = side.arena.allocator();
 
-    side.blob = source.read(allocator, commit, path, diagnostic) catch |err| {
-        if (err != error.InvalidPath) _ = diagnostic.failure(.read, .{ .zig = err }, @src());
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        side.destroy();
-        if (err == error.InvalidPath) return .{ .unavailable = .{ .unavailable = .{ .reason = .invalid_path } } };
-        return .{ .fetch_failed = err };
+    side.blob = source.read(allocator, commit, path, diagnostic) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidPath => {
+            side.destroy();
+            return .{ .unavailable = .{ .unavailable = .{ .reason = .invalid_path } } };
+        },
+        else => {
+            _ = diagnostic.failure(.read, .{ .zig = err }, @src());
+            side.destroy();
+            return .{ .fetch_failed = err };
+        },
     };
     if (!std.unicode.utf8ValidateSlice(side.blob)) {
         const byte_size = side.blob.len;
@@ -335,12 +344,14 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
     }
     var scratch = std.heap.ArenaAllocator.init(backing);
     defer scratch.deinit();
-    const highlights = highlighter.withDiagnostics(diagnostic.forContext(.highlighting, diagnostic.context)).highlightWithScratch(allocator, scratch.allocator(), path, side.blob) catch |err| {
-        _ = diagnostic.forContext(.highlighting, diagnostic.context).failure(.execute, .{ .zig = err }, @src());
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        side.highlighting = .{ .failed = err };
-        side.retained_bytes = retainedBytes(side);
-        return .{ .owned = side };
+    const highlights = highlighter.withDiagnostics(diagnostic.forContext(.highlighting, diagnostic.context)).highlightWithScratch(allocator, scratch.allocator(), path, side.blob) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            _ = diagnostic.forContext(.highlighting, diagnostic.context).failure(.execute, .{ .zig = err }, @src());
+            side.highlighting = .{ .failed = err };
+            side.retained_bytes = retainedBytes(side);
+            return .{ .owned = side };
+        },
     };
     side.highlighting = .{ .ready = highlights };
     side.retained_bytes = retainedBytes(side);

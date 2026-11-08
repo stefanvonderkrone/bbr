@@ -2,6 +2,3 @@
 14 src/bitbucket/client.zig
 1 src/git/client.zig
 2 src/http/std_client.zig
-1 src/tui/app.zig
-4 src/tui/file_enrichment.zig
-1 src/tui/session.zig

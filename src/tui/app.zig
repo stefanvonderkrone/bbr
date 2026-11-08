@@ -933,29 +933,22 @@ fn presentationEnrichmentWorker(
     defer scratch.deinit();
     var request = command.request();
     request.diagnostic = diagnostic;
-    const outcome: presentation.FileEnrichmentOutcome = switch (command.source) {
-        .remote => blk: {
-            break :blk if (file_enrichment.enrichConcurrent(
-                io,
-                std.heap.page_allocator,
-                client.?,
-                highlighter,
-                request,
-            )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
-        },
+    const enriched = switch (command.source) {
+        .remote => file_enrichment.enrichConcurrent(io, std.heap.page_allocator, client.?, highlighter, request),
         .local => blk: {
             var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
             git.diagnostic = diagnostic;
             var source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
-            break :blk if (file_enrichment.enrichFrom(
-                std.heap.page_allocator,
-                source.source(),
-                highlighter,
-                request,
-            )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+            break :blk file_enrichment.enrichFrom(std.heap.page_allocator, source.source(), highlighter, request);
         },
     };
+    var evidence: ?bbr.diagnostic.Failure = null;
+    const outcome: presentation.FileEnrichmentOutcome = if (enriched) |result| .{ .completed = result } else |err| failed: {
+        evidence = bbr.diagnostic.Failure.capture(.file_enrichment, .execute, diagnostic.context, .{ .zig = err }, @src());
+        break :failed .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+    };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .file_enrichment_completed = .{
+        .evidence = evidence,
         .command_id = command.command_id,
         .work_id = command.work_id,
         .session_epoch = command.session_epoch,
@@ -1149,9 +1142,8 @@ fn drainPresentationCommands(
                 .write_buf = write_buf,
             };
             const completed = presentation_adapter.externalEdit(ctx.io, ctx.env_map, handoff_context.handoff(), command.external_edit) catch |err| {
-                _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
                 command = undefined;
-                return error.OutOfMemory;
+                return err;
             };
             command = undefined;
             presentation_runtime.recordFailures(diagnostic, .{ .external_edit_completed = completed });
