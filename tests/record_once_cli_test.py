@@ -85,6 +85,11 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
         subprocess.run([*git, *command], cwd=repository, env=env, check=True, capture_output=True)
     check(["local", "main", "record-once-missing-source"], {}, b"bbr local: cannot resolve SourceRef 'record-once-missing-source': UnknownRef\n", "session_load", "UnknownRef", cwd=repository, status=0)
     check([], credentials, b"bbr: could not resolve a PR to open: NoRemote\n", "startup", "NoRemote", cwd=repository, status=0)
+    # The detect probe lines show a Git error without a record. Startup resolution meets the
+    # same error again and fails the command, which records it once.
+    check(["detect"], credentials, b"branch: main\nremote: <NoRemote>\nerror: NoRemote\n", "startup", "NoRemote", cwd=repository)
+    check(["detect"], credentials, b"branch: <NotAGitRepo>\nremote: <NoRemote>\nerror: NoRemote\n", "startup", "NoRemote")
+    check(["detect", "record-once"], credentials, b"branch: <NotAGitRepo>\nremote: <NoRemote>\nerror: NotAGitRepo\n", "startup", "NotAGitRepo")
     auth_file = root / "data/bbr/auth.toml"
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     auth_file.write_text("record-once-invalid")
