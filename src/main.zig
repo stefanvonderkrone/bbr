@@ -204,7 +204,7 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
 /// The boundary of `bbr grammar`: it prints and records each failure of the command once.
 fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
     grammarCommand(init, gpa, it, diagnostic) catch |err| switch (err) {
-        error.StdoutClosed => return err,
+        error.StdoutClosed, error.Reported => return err,
         else => {
             std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
             return diagnostic.fail(.execute, .{ .zig = err }, @src());

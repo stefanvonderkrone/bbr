@@ -40,15 +40,17 @@ pub const Diagnostic = struct {
     }
 
     pub fn record(self: Diagnostic, handle: diagnostics.Handle, comptime source: std.builtin.SourceLocation) void {
-        const cause: diagnostics.Cause = if (self.query_error) |code|
-            .{ .grammar = .{ .rule = .query, .code = code, .offset = self.source_offset } }
-        else if (self.regex_failure) |failure|
-            .{ .grammar = .{ .rule = .regex, .code = @bitCast(failure.engine_code), .offset = self.source_offset } }
-        else switch (self.kind) {
-            .invalid_query, .invalid_regex => return,
+        if (self.cause()) |cause_value| _ = handle.failure(.query, cause_value, source);
+    }
+
+    /// The Grammar cause, or null when the failure has no code to record.
+    pub fn cause(self: Diagnostic) ?diagnostics.Cause {
+        if (self.query_error) |code| return .{ .grammar = .{ .rule = .query, .code = code, .offset = self.source_offset } };
+        if (self.regex_failure) |failure| return .{ .grammar = .{ .rule = .regex, .code = @bitCast(failure.engine_code), .offset = self.source_offset } };
+        return switch (self.kind) {
+            .invalid_query, .invalid_regex => null,
             inline .unknown_operator, .unsupported_directive, .malformed_arguments, .unsupported_property => |kind| .{ .grammar = .{ .rule = @field(diagnostics.GrammarRule, @tagName(kind)), .offset = self.source_offset } },
         };
-        _ = handle.failure(.query, cause, source);
     }
 };
 

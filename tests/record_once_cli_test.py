@@ -22,6 +22,7 @@ cases = (
     (["completion", "record-once-shell"], {}, b"bbr completion: unknown shell (bash|zsh|fish)\n", "completion", "UnknownFlag"),
     (["grammar", "record-once-command"], {}, b"bbr grammar: InvalidGrammarCommand\n", "grammar", "InvalidGrammarCommand"),
     (["grammar", "check", "/record-once-missing-bundle"], {}, b"bbr grammar: FileNotFound\n", "grammar", "FileNotFound"),
+    (["grammar", "check", "record-once-bad.tar.gz"], {}, b"bbr grammar: InvalidArchive (BadGzipHeader)\n", "grammar", "BadGzipHeader"),
     (["auth", "status"], {}, b"bbr: no credential for profile; run `bbr auth login` (MissingUsername)\n", "auth", "MissingUsername"),
 )
 # These run with an invalid auth file in the data home.
@@ -46,6 +47,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
     config = root / "config/bbr/config.toml"
     config.parent.mkdir(parents=True)
     config.write_text("[logging]\nenabled = true\n")
+    (root / "record-once-bad.tar.gz").write_bytes(b"\x1f\x8b\x09\x00\x00\x00\x00\x00\x00\x03not-gzip-content")
     def check(args, extra, message, operation, cause):
         before = logs(env)
         result = subprocess.run(
