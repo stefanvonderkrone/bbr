@@ -50,9 +50,12 @@ pub fn main(init: std.process.Init) !void {
     const diagnostic = sink.handle(.startup, .{});
     runMain(init, snapshot, diagnostic) catch |err| switch (err) {
         error.StdoutClosed => {},
+        error.Reported => exitFailure(diagnostic, err, @src()),
         else => {
-            _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
-            return err;
+            // The Zig start code printed this line and the trace when main returned the error.
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            exitFailure(diagnostic, err, @src());
         },
     };
 }
@@ -1299,7 +1302,10 @@ fn authRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag
 }
 
 fn exitFailure(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) noreturn {
-    if (cause != error.LoginAborted) _ = diagnostic.failure(.execute, .{ .zig = cause }, source);
+    switch (cause) {
+        error.Reported, error.LoginAborted => {},
+        else => _ = diagnostic.failure(.execute, .{ .zig = cause }, source),
+    }
     std.process.exit(1);
 }
 

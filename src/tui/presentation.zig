@@ -6561,7 +6561,7 @@ pub const Presentation = struct {
     }
 
     fn reportEvidence(self: *Presentation, failure: bbr.diagnostic.Failure) void {
-        if (self.diagnostic_state != .on) return;
+        if (self.diagnostic_state != .on or failure.reported()) return;
         self.commands.append(self.allocator, .{ .report_diagnostic = failure }) catch |err| switch (err) {
             error.OutOfMemory => {
                 if (self.emergency_diagnostic_count == self.emergency_diagnostics.len) return;
@@ -31913,6 +31913,77 @@ test "checkpoint failure pauses Submission and retry persists before next POST" 
     const after = try store.store().load(after_arena.allocator(), key.storeKey());
     try testing.expectEqual(@as(bbr.review.CommentId, 900), after[0].state.posted);
     try testing.expect(after[1].state == .submitting);
+}
+
+var test_store_diagnostic: bbr.diagnostics.Handle = .{};
+
+fn failTestCheckpointThroughFail(_: *anyopaque, _: bbr.review.OperationId, _: bbr.review.RemoteReviewIdentity, _: bbr.review.TempId, _: bbr.review.SubmissionOutcome, _: ?bbr.review.TempId) anyerror!void {
+    return test_store_diagnostic.fail(.step, .{ .sqlite = .{ .result = 10, .extended = 266 } }, @src());
+}
+
+test "diagnostics a store failure through fail keeps one record when Presentation shows it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    test_store_diagnostic = sink.handle(.persistence, .{});
+    defer test_store_diagnostic = .{};
+
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "first" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "second" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var first = presentation.takeCommand().?;
+    const operation_id = first.post_draft.operation_id;
+    first.deinit();
+    var vtable = store.store().vtable.*;
+    vtable.checkpoint_submission = failTestCheckpointThroughFail;
+    presentation.dependencies.reviews.vtable = &vtable;
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+
+    try testing.expect(presentation.projection().submission.?.persistence_paused);
+    while (presentation.takeCommand()) |command_value| {
+        var command = command_value;
+        defer command.deinit();
+        if (command == .report_diagnostic) sink.handle(.persistence, .{}).record(command.report_diagnostic);
+    }
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only, "operation=persistence phase=step source=tui/presentation.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=sqlite result=10 extended=266"));
 }
 
 test "terminal persistence retry does not repeat an already-durable checkpoint" {

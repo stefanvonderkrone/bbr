@@ -7,7 +7,7 @@
 1 src/highlight/tree_sitter_highlighter.zig
 10 src/highlight/user_grammar.zig
 2 src/http/std_client.zig
-10 src/main.zig
+9 src/main.zig
 1 src/tui/app.zig
 4 src/tui/file_enrichment.zig
 1 src/tui/session.zig

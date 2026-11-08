@@ -103,6 +103,18 @@ pub const Failure = struct {
             .source = .{ .file = source.file, .line = source.line, .column = source.column },
         };
     }
+
+    /// Whether the cause is `error.Reported`, the marker of a failure that a layer below
+    /// recorded. A boundary skips such a Failure, so the failure keeps exactly one record.
+    pub fn reported(self: Failure) bool {
+        return switch (self.cause) {
+            .zig => |err| switch (err) {
+                error.Reported => true,
+                else => false,
+            },
+            .http, .git, .sqlite, .grammar => false,
+        };
+    }
 };
 
 pub const State = union(enum) {

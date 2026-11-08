@@ -98,6 +98,7 @@ pub fn recordFailures(handle: bbr.diagnostics.Handle, input: presentation.OwnedI
 }
 
 fn record(handle: bbr.diagnostics.Handle, value: bbr.diagnostic.Failure) void {
+    if (value.reported()) return;
     var failure = value;
     inline for (@typeInfo(bbr.diagnostic.Context).@"struct".fields) |field| {
         if (@field(failure.context, field.name) == null) @field(failure.context, field.name) = @field(handle.context, field.name);
@@ -161,6 +162,45 @@ test "diagnostics records an actual Picker error before stale completion disposa
     for ([_][]const u8{ "ConnectionReset", "command_id=31", "work_id=41", "presentation_adapter.zig" }) |needle|
         try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
     try testing.expect(std.mem.indexOf(u8, bytes, "secret-token") == null);
+}
+
+fn failingListing(handle: bbr.diagnostics.Handle) error{Reported}!void {
+    return handle.fail(.read, .{ .zig = error.LeafListingFailure }, @src());
+}
+
+test "diagnostics a worker completion that carries error.Reported keeps the leaf's one record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer diagnostic_sink.deinit();
+    try testing.expect(diagnostic_sink.setEnabled(true) == .on);
+    const handle = diagnostic_sink.handle(.picker_list, .{ .work_id = 43 });
+    const err = if (failingListing(handle)) |_| unreachable else |err| err;
+    var sink: CapturingSink = .{};
+    var completion = sink.sink();
+    completion.diagnostic = handle;
+    deliver(completion, .{ .pull_requests_loaded = .{ .work_id = 43, .outcome = .{
+        .failed = bbr.diagnostic.Failure.capture(.picker_list, .execute, .{}, .{ .zig = err }, @src()),
+    } } });
+    try testing.expect(sink.input.?.pull_requests_loaded.outcome.failed.reported());
+    _ = diagnostic_sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only, "source=tui/presentation_runtime.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=LeafListingFailure"));
 }
 
 test "diagnostics launch failure retains actual cause and command work identities" {

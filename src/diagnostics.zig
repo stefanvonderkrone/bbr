@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("diagnostic.zig");
 const xdg = @import("xdg.zig");
 pub const Failure = value.Failure;
@@ -32,6 +33,8 @@ pub const Handle = struct {
     }
 
     pub fn record(self: Handle, failure_value: Failure) void {
+        // A boundary that records error.Reported writes a second record of one failure.
+        if (builtin.is_test) std.debug.assert(!failure_value.reported());
         if (self.sink) |sink| sink.record(failure_value);
     }
 };
