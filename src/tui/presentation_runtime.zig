@@ -263,6 +263,7 @@ test "diagnostics a refused Reviewer Verdict change has one record from the work
         .{ .responses = &.{.{ .status = 401, .body = "{}" }}, .cause = "cause=zig error=Unauthorized" },
         .{ .responses = &.{ .{ .body = before }, .{ .status = 403, .body = "{}" } }, .cause = "cause=zig error=Forbidden" },
         .{ .responses = &.{ .{ .body = before }, .{ .status = 503, .body = "{}" }, .{ .body = before } }, .cause = "cause=zig error=ServerError" },
+        .{ .responses = &.{ .{ .body = before }, .{ .send_error = error.ConnectionResetByPeer }, .{ .body = before } }, .cause = "cause=zig error=ConnectionResetByPeer" },
     };
     for (cases) |case| {
         var tmp = testing.tmpDir(.{});

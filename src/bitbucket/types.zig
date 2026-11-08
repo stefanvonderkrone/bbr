@@ -88,12 +88,14 @@ pub const ReviewerVerdictChangeResult = union(enum) {
     reconciled_success,
     api_error: ApiError,
     stale_source_commit,
-    unresolved: ?ApiError,
+    /// The error that left the outcome unknown: an `ApiError` or a transport error. Null when
+    /// the mutation succeeded and the fresh read shows another Reviewer Verdict.
+    unresolved: ?anyerror,
 
     pub fn invalidatesAuthenticatedAccount(self: ReviewerVerdictChangeResult) bool {
         return switch (self) {
             .api_error => |err| err == error.Unauthorized,
-            .unresolved => |err| if (err) |api_error| api_error == error.Unauthorized else false,
+            .unresolved => |err| if (err) |cause| cause == error.Unauthorized else false,
             else => false,
         };
     }

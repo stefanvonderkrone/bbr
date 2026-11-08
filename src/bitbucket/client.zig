@@ -613,7 +613,7 @@ pub const Client = struct {
         authenticated_account_uuid: []const u8,
         target: types.ReviewerVerdict,
     ) !types.ReviewerVerdictChangeResult {
-        // The caller records the error that this function returns and the reason that the
+        // The caller records the error that this function returns and the cause that the
         // result names. Each other cause drops out of the result, so it gets its record here.
         const before = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err|
             return .{ .api_error = asApiError(err) orelse return err };
@@ -643,26 +643,24 @@ pub const Client = struct {
         const mutation_auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(mutation_auth);
 
-        var uncertain = false;
-        var uncertain_reason: ?ApiError = null;
+        // A rate limit, a server error, or a transport failure leaves the mutation uncertain.
+        var uncertain: ?anyerror = null;
         self.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
             if (asApiError(err)) |api_error| switch (api_error) {
-                error.RateLimited, error.ServerError => uncertain_reason = api_error,
+                error.RateLimited, error.ServerError => {},
                 else => return .{ .api_error = api_error },
-            } else _ = self.diagnostic.failure(.execute, .{ .zig = err }, @src());
-            uncertain = true;
+            };
+            uncertain = err;
         };
 
         const after = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
-            if (uncertain_reason) |reason| _ = self.diagnostic.failure(.execute, .{ .zig = reason }, @src());
-            const read_reason = asApiError(err);
-            if (read_reason == null) _ = self.diagnostic.failure(.read, .{ .zig = err }, @src());
-            return .{ .unresolved = read_reason };
+            if (uncertain) |cause| _ = self.diagnostic.failure(.execute, .{ .zig = cause }, @src());
+            return .{ .unresolved = err };
         };
         defer deinitPullRequest(allocator, after);
-        if (after.reviewerVerdict(authenticated_account_uuid) != target) return .{ .unresolved = uncertain_reason };
-        if (uncertain_reason) |reason| _ = self.diagnostic.failure(.execute, .{ .zig = reason }, @src());
-        if (uncertain or !std.mem.eql(u8, after.source_commit, expected_source_commit)) return .reconciled_success;
+        if (after.reviewerVerdict(authenticated_account_uuid) != target) return .{ .unresolved = uncertain };
+        if (uncertain) |cause| _ = self.diagnostic.failure(.execute, .{ .zig = cause }, @src());
+        if (uncertain != null or !std.mem.eql(u8, after.source_commit, expected_source_commit)) return .reconciled_success;
         return .success;
     }
 
@@ -2371,7 +2369,7 @@ fn classify(status: u16) ApiError!void {
     };
 }
 
-fn asApiError(err: anyerror) ?ApiError {
+pub fn asApiError(err: anyerror) ?ApiError {
     return switch (err) {
         error.Unauthorized => error.Unauthorized,
         error.Forbidden => error.Forbidden,
@@ -3296,10 +3294,16 @@ test "diagnostics a Reviewer Verdict change records each cause that its result d
         result: types.ReviewerVerdictChangeResult,
         records: []const []const u8,
     }{
+        // The result names the read failure, so the mutation failure has its record here.
         .{
             .responses = &.{ .{ .status = 200, .body = before }, reset, reset },
-            .result = .{ .unresolved = null },
-            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer", "phase=read source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer" },
+            .result = .{ .unresolved = error.ConnectionResetByPeer },
+            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer" },
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, reset, .{ .status = 200, .body = before } },
+            .result = .{ .unresolved = error.ConnectionResetByPeer },
+            .records = &.{},
         },
         // The caller records a reason that the result names.
         .{ .responses = &.{.{ .status = 401, .body = "{}" }}, .result = .{ .api_error = error.Unauthorized }, .records = &.{} },
@@ -3513,7 +3517,7 @@ test "changeReviewerVerdict reports unresolved reconciliation and malformed resp
     var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), testCredential());
     const unresolved = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
-    try testing.expect(unresolved.unresolved == null);
+    try testing.expectEqual(error.ConnectionResetByPeer, unresolved.unresolved.?);
 
     var malformed: FakeHttpClient = .{ .status = 200, .body = "not-json" };
     const malformed_bb = Client.init(malformed.httpClient(), testCredential());
@@ -3561,7 +3565,7 @@ test "changeReviewerVerdict reconciles response allocation failure once" {
     var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), testCredential());
     const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
-    try testing.expect(result.unresolved == null);
+    try testing.expectEqual(error.OutOfMemory, result.unresolved.?);
     try testing.expectEqual(@as(usize, 3), fake.call_count);
 }
 

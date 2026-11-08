@@ -1,6 +1,7 @@
 # Close the remaining record gaps
 
-Status: needs-triage
+Status: claimed
+Claimed by: feat/record-gaps worktree /Volumes/Work/t3-code/error-handling-discipline
 Type: implementation
 Blocked by: 06
 Parent: ../PRD.md

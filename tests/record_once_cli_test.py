@@ -34,6 +34,10 @@ with socket.socket() as probe:
     refused_proxy = dict(credentials, https_proxy=f"http://127.0.0.1:{probe.getsockname()[1]}")
 cases += (
     (["api", "whoami"], refused_proxy, b"bbr api whoami: ConnectionRefused\n", "api", "ConnectionRefused"),
+    (
+        ["api", "set-verdict", "--repository=record-once", "--pull-request-id=1", "--verdict=approved", "--expected-source-commit=abc123"],
+        refused_proxy, b"bbr api set-verdict: ConnectionRefused\n", "api", "ConnectionRefused",
+    ),
     (["auth", "status"], refused_proxy, b"bbr: status failed: transport (ConnectionRefused)\n", "auth", "ConnectionRefused"),
 )
 # These run with an invalid auth file in the data home.

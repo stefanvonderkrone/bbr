@@ -692,7 +692,10 @@ fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bit
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred).withDiagnostics(diagnostic);
+    try checkVerdict(gpa, bbr.bitbucket.Client.init(transport.httpClient(), cred).withDiagnostics(diagnostic), repo, pull_request_id, diagnostic);
+}
+
+fn checkVerdict(gpa: std.mem.Allocator, bb: bbr.bitbucket.Client, repo: []const u8, pull_request_id: u64, diagnostic: bbr.diagnostics.Handle) !void {
     const account_uuid = try bb.getAuthenticatedAccountUuid(gpa);
     defer gpa.free(account_uuid);
     const initial_pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
@@ -711,9 +714,9 @@ fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bit
     };
 
     const changed = try bb.changeReviewerVerdict(gpa, repo, pull_request_id, initial_pull_request.source_commit, account_uuid, target);
-    if (!verdictChangeSucceeded(changed)) return error.ReviewerVerdictChangeFailed;
+    if (!verdictChangeSucceeded(changed)) return verdictChangeFailed(diagnostic, changed, error.ReviewerVerdictChangeFailed, @src());
     const restore_result = try restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial);
-    if (!verdictChangeSucceeded(restore_result)) return error.ReviewerVerdictRestoreFailed;
+    if (!verdictChangeSucceeded(restore_result)) return verdictChangeFailed(diagnostic, restore_result, error.ReviewerVerdictRestoreFailed, @src());
     restored = true;
     std.debug.print("ok: changed Reviewer Verdict from {s} to {s} and restored it\n", .{ @tagName(initial), @tagName(target) });
 }
@@ -729,6 +732,17 @@ fn restoreReviewerVerdict(
     const current = try bb.getPullRequest(gpa, repo, pull_request_id);
     defer bbr.bitbucket.deinitPullRequest(gpa, current);
     return bb.changeReviewerVerdict(gpa, repo, pull_request_id, current.source_commit, account_uuid, target);
+}
+
+/// Shows a failed change with the cause that its result names, and records that cause once.
+fn verdictChangeFailed(diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    const cause: anyerror = switch (result) {
+        .api_error => |err| err,
+        .unresolved => |err| err orelse failure,
+        .success, .reconciled_success, .stale_source_commit => failure,
+    };
+    std.debug.print("bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) });
+    return diagnostic.forContext(.verdict, .{}).fail(.execute, .{ .zig = cause }, source);
 }
 
 fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) bool {
@@ -1575,6 +1589,50 @@ test "diagnostics pending store fallback records preparation failure but not abs
     defer allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "operation=persistence phase=prepare") != null);
     try testing.expect(std.mem.indexOf(u8, text, @errorName(cause)) != null);
+}
+
+test "diagnostics an unresolved check-verdict change has one record and reaches exitFailure as Reported" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const pr =
+        "{\"id\":42,\"title\":\"Review\",\"state\":\"OPEN\",\"author\":{\"display_name\":\"Ada\",\"uuid\":\"{author}\"}," ++
+        "\"source\":{\"branch\":{\"name\":\"feature\"},\"commit\":{\"hash\":\"abc123\"}}," ++
+        "\"destination\":{\"branch\":{\"name\":\"main\"},\"commit\":{\"hash\":\"def456\"}},\"participants\":[]}";
+    const responses = [_]bbr.http.Canned{
+        .{ .body = "{\"uuid\":\"{account}\"}" },
+        .{ .body = pr },
+        .{ .body = pr },
+        .{ .send_error = error.ConnectionResetByPeer },
+        .{ .body = pr },
+        .{ .body = pr },
+        .{ .body = pr },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const handle = sink.handle(.verdict, .{});
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "w" }).withDiagnostics(handle);
+    try testing.expectError(error.Reported, checkVerdict(testing.allocator, bb, "repo", 42, handle));
+    try testing.expectEqual(responses.len, fake.call_count);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.endsWith(u8, only, "error=ConnectionResetByPeer"));
 }
 
 test "login reader trims lines and preserves empty input and EOF errors" {

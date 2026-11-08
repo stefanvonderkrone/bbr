@@ -554,7 +554,16 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
         .success, .reconciled_success => {},
         .api_error => |err| return err,
         .stale_source_commit => return error.ReviewerVerdictChangeFailed,
-        .unresolved => {
+        .unresolved => |cause| {
+            const transport = cause orelse return error.ReviewerVerdictChangeFailed;
+            if (bbr.bitbucket.asApiError(transport) == null) {
+                // The api boundary shows only a Bitbucket rejection with its cause, so this site shows the transport cause.
+                var buf: [256]u8 = undefined;
+                var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
+                try stderr.interface.print("bbr api set-verdict: ReviewerVerdictChangeFailed: {s}\n", .{@errorName(transport)});
+                try stderr.interface.flush();
+                return bb.diagnostic.fail(.execute, .{ .zig = transport }, @src());
+            }
             if (bb.error_detail) |detail| detail.reported_error = error.ReviewerVerdictChangeFailed;
             return error.ReviewerVerdictChangeFailed;
         },

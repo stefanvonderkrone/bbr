@@ -371,13 +371,19 @@ pub fn executeReviewerVerdict(
         .target = command.target,
         .outcome = .adapter_failed,
     } };
-    const reason: ?bbr.bitbucket.ApiError = switch (result) {
+    const cause: ?anyerror = switch (result) {
         .api_error => |err| err,
         .unresolved => |err| err,
         .success, .reconciled_success, .stale_source_commit => null,
     };
     return .{ .reviewer_verdict_changed = .{
-        .evidence = if (reason) |err| bbr.diagnostic.Failure.capture(.verdict, .rejection, .{ .command_id = command.command_id }, .{ .zig = err }, @src()) else null,
+        .evidence = if (cause) |err| bbr.diagnostic.Failure.capture(
+            .verdict,
+            if (bbr.bitbucket.asApiError(err) != null) .rejection else .execute,
+            .{ .command_id = command.command_id },
+            .{ .zig = err },
+            @src(),
+        ) else null,
         .command_id = command.command_id,
         .identity = command.identity,
         .target = command.target,

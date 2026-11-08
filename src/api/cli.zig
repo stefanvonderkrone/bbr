@@ -318,13 +318,19 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, profile:
     };
     var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = gpa, .io = init.io };
     defer detail.deinit();
-    runArgs(init, gpa, argv.items, profile, &detail, diagnostic) catch |err| switch (err) {
+    runArgs(init, gpa, argv.items, profile, &detail, diagnostic) catch |err|
+        return reportFailure(init, diagnosticVerb(argv.items), err, &detail, diagnostic);
+}
+
+/// The api boundary. It shows each failure that a verb returns and records it once.
+fn reportFailure(init: std.process.Init, verb: ?Verb, err: anyerror, detail: *const bbr.bitbucket.Client.ErrorDetail, diagnostic: bbr.diagnostics.Handle) anyerror {
+    switch (err) {
         error.StdoutClosed, error.Reported => return err,
         else => {
-            try printError(init, diagnosticVerb(argv.items), err, &detail);
+            printError(init, verb, err, detail) catch |write_err| return write_err;
             return diagnostic.fail(.execute, .{ .zig = err }, @src());
         },
-    };
+    }
 }
 
 fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const u8, profile: ?[]const u8, detail: *bbr.bitbucket.Client.ErrorDetail, diagnostic: bbr.diagnostics.Handle) !void {
@@ -816,6 +822,80 @@ test "unresolved verdict changes keep the domain error and the relevant API mess
             try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
             try std.testing.expectEqual(@as(usize, 4), fake.call_count);
         }
+    }
+}
+
+test "diagnostics a refused set-verdict shows its message and has one record" {
+    const a = std.testing.allocator;
+    const pr =
+        "{\"id\":42,\"title\":\"Review\",\"state\":\"OPEN\",\"author\":{\"display_name\":\"Ada\",\"uuid\":\"{author}\"}," ++
+        "\"source\":{\"branch\":{\"name\":\"feature\"},\"commit\":{\"hash\":\"abc123\"}}," ++
+        "\"destination\":{\"branch\":{\"name\":\"main\"},\"commit\":{\"hash\":\"def456\"}},\"participants\":[]}";
+    const account: bbr.http.Canned = .{ .body = "{\"uuid\":\"{account}\"}" };
+    const cases = [_]struct { responses: []const bbr.http.Canned, expected_commit: []const u8 = "abc123", message: []const u8, cause: []const u8 }{
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{ .send_error = error.ConnectionResetByPeer }, .{ .body = pr } },
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: ConnectionResetByPeer\n",
+            .cause = "error=ConnectionResetByPeer",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr } },
+            .expected_commit = "old",
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed\n",
+            .cause = "error=ReviewerVerdictChangeFailed",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{ .status = 403, .body = "{\"error\":{\"message\":\"Read denied\"}}" } },
+            .message = "bbr api set-verdict: Bitbucket rejected request (Forbidden): Read denied\n",
+            .cause = "error=Forbidden",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{ .status = 429, .body = "{\"error\":{\"message\":\"Slow down\"}}" }, .{ .body = pr } },
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (RateLimited): Slow down\n",
+            .cause = "error=ReviewerVerdictChangeFailed",
+        },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(home);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &env);
+        defer sink.deinit();
+        try std.testing.expect(sink.setEnabled(true) == .on);
+        const handle = sink.handle(.api, .{});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var output: TestOutput = .{};
+        const init = output.init(&env, &arena);
+        var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
+        var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+        defer detail.deinit();
+        var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" }).withDiagnostics(handle);
+        bb.error_detail = &detail;
+        const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
+        const failure = if (pullrequests.runSetVerdict(init, bb, args, false)) |_| error.TestUnexpectedResult else |err| reportFailure(init, findVerb("set-verdict"), err, &detail, handle);
+        try std.testing.expectEqual(error.Reported, failure);
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(std.testing.io)).?;
+        const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+        defer a.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        var records: usize = 0;
+        while (lines.next()) |line| : (records += 1) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "operation=api ") != null);
+            try std.testing.expect(std.mem.endsWith(u8, line, case.cause));
+        }
+        try std.testing.expectEqual(@as(usize, 1), records);
+        try std.testing.expectEqualStrings(case.message, output.stderrBytes());
+        try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
     }
 }
 
