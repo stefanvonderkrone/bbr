@@ -8487,9 +8487,19 @@ pub const Presentation = struct {
         if (!state.open or state.pending or state.query == null or state.source_scan_active or state.source_scanned == null) return;
         for (published.session.diff.files, 0..) |_, index| {
             if (state.source_scanned.?[index] or !published.session.enrichment.isTerminal(index)) continue;
-            var command: OwnedCommand = .{ .scan_review_source = ScanReviewSource.create(published, index) catch {
-                self.action_error = .out_of_memory;
-                return;
+            var command: OwnedCommand = .{ .scan_review_source = ScanReviewSource.create(published, index) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    self.action_error = .out_of_memory;
+                    return;
+                },
+                error.TooLong => {
+                    self.action_error = .buffer_search_query_too_long;
+                    return;
+                },
+                error.InvalidUtf8, error.LineEnding, error.Nul => {
+                    self.action_error = .buffer_search_invalid_query;
+                    return;
+                },
             } };
             self.commands.append(self.allocator, command) catch |err| {
                 self.reportFailure(.review_search, .admission, err, @src());
@@ -10216,10 +10226,22 @@ pub const Presentation = struct {
     fn retryStaleBufferDisclosure(self: *Presentation, published: *Published) void {
         const input = &(published.buffer_search.input orelse return);
         const query = input.query orelse return;
-        const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch {
-            input.pending = false;
-            self.action_error = .out_of_memory;
-            return;
+        const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch |err| switch (err) {
+            error.OutOfMemory => {
+                input.pending = false;
+                self.action_error = .out_of_memory;
+                return;
+            },
+            error.TooLong => {
+                input.pending = false;
+                self.action_error = .buffer_search_query_too_long;
+                return;
+            },
+            error.InvalidUtf8, error.LineEnding, error.Nul => {
+                input.pending = false;
+                self.action_error = .buffer_search_invalid_query;
+                return;
+            },
         };
         const corpus = published.search_corpus orelse input.corpus;
         corpus.retain();
@@ -18671,6 +18693,43 @@ test "M21 kernel Buffer Search releases stale work after Session replacement" {
     try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
     try completeBufferSearchScan(&presentation);
     try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+}
+
+test "a stale Buffer Search retry reports a text error" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+    const published = presentation.published.?;
+    published.buffer_search.input.?.query.?.text[0] = '\n';
+    presentation.retryStaleBufferDisclosure(published);
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+}
+
+test "a Review source scan reports a text error" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+    const published = presentation.published.?;
+    for (published.session.enrichment.statuses) |*status| {
+        status.old = .absent;
+        status.new = .absent;
+    }
+    published.review_search.query.?.text[0] = '\n';
+    published.review_search.pending = false;
+    published.review_search.source_scan_active = false;
+    if (published.review_search.source_scanned) |scanned| @memset(scanned, false);
+    presentation.maybeQueueReviewSourceScan(published);
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
 }
 
 test "M21 kernel Buffer Search keeps the previous preview after a refused edit" {
