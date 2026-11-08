@@ -633,7 +633,7 @@ fn themeSaveOutcome(err: anyerror) presentation.ThemePersisted.Outcome {
     return switch (err) {
         error.NoConfigLocation => .no_config_location,
         error.ConfigInvalid => .config_invalid,
-        error.OutOfMemory, error.WriteFailed => .write_failed,
+        error.OutOfMemory, error.WriteFailed, error.Canceled => .write_failed,
         else => .read_failed,
     };
 }
@@ -1146,6 +1146,10 @@ fn drainPresentationCommands(
             const persist = command.persist_theme;
             const outcome: presentation.ThemePersisted.Outcome = if (config.persistTheme(ctx.gpa, ctx.io, ctx.env_map, persist.theme)) |_| .saved else |err| blk: {
                 _ = diagnostic.failure(.write, .{ .zig = err }, @src());
+                switch (err) {
+                    error.Canceled => ctx.io.recancel(),
+                    else => {},
+                }
                 break :blk themeSaveOutcome(err);
             };
             try state.dispatch(.{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = outcome } });
@@ -1551,7 +1555,9 @@ test {
 test "a directory config.toml is a read failure on the Theme status" {
     try std.testing.expectEqual(presentation.ThemePersisted.Outcome.read_failed, themeSaveOutcome(error.IsDir));
     try std.testing.expectEqual(presentation.ThemePersisted.Outcome.write_failed, themeSaveOutcome(error.WriteFailed));
+    try std.testing.expectEqual(presentation.ThemePersisted.Outcome.write_failed, themeSaveOutcome(error.Canceled));
     try std.testing.expectEqualStrings("Theme applied, but config.toml could not be read", actionErrorText(.theme_not_saved_unreadable));
+    try std.testing.expectEqualStrings("Theme applied, but config.toml could not be written", actionErrorText(.theme_not_saved));
     try std.testing.expectEqualStrings("an Anchor range must run forward", actionErrorText(.anchor_range_descending));
 }
 
