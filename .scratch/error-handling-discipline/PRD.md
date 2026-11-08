@@ -25,7 +25,7 @@ Its section "Implications for bbr" lists 11 proposals. This PRD adopts five of t
 4. A line check bans `== error.` comparisons. A `catch` switch on an error set that contains `error.Canceled` names `error.Canceled` in its own prong. See research proposals 6 and 7.
 5. `Handle.fail` records a failure and returns `error.Reported`. A site that records a failure and must still fail upward returns it, and the callers above keep `try`. A boundary records every error except `error.Reported`. See research proposal 5 and [ADR-0014](../../docs/adr/0014-a-failure-is-recorded-once-and-error-reported-marks-it.md).
    This answers research open question 2. The boundary owns the user message. It tells a recorded error from an unrecorded one by the name. `error.Reported` means that a layer below recorded the failure through its Handle, and every other error has no record yet. When logging is off, that record writes nothing. `error.Reported` also drops the name of the cause. So, after TigerBeetle, a CLI-path site prints its own message before `fail` when its boundary prints or branches on the error name. At a translation site that message names the leaf cause and the translated meaning. A TUI-path site cannot print, so it returns the error without a record. The operator made this decision on 2026-11-08.
-   Issue 06 converts the sites that record and then return a plain error. Until then, the rule holds for new code only.
+   Issue 06 converted the sites that recorded and then returned a plain error. Issue 08 tracks the gaps that remain.
 
 ## Out of scope
 
