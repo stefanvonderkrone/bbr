@@ -97,6 +97,10 @@ Commits on `feat/leaf-evidence`:
 | `2c8dbf0` | JSON parse error | `jsonFailure` notes `phase=decode` with the parser error. | The CLI test (`UnexpectedEndOfInput`, `UnexpectedToken`) and the worker Picker test. |
 | `5fabe2b` | Page number, and one writer for each slot | `PagedLists` page slots, `listPages` page numbers, `session.loadWith` branch slots, File Enrichment side slots. | "diagnostics a failed PullRequest page fails the list and its one record names the page" (pages 2 and 3 with their own status), the worker Picker test (`page=2`), and the session branch test. |
 | `42c738c` | Git termination and launch phase | `ShellGitClient.diagnostic`. `runRaw` notes `phase=launch` or `cause=git` with the `on_fail` name. | `tests/record_once_cli_test.py` (`UnknownRef`, `NotAGitRepo`, code 128), `tests/git_launch_cli_test.py` (`phase=launch`), and "diagnostics a failed local git command keeps its termination in the worker record". |
+| `99261c0` | Review fix: the verdict mutation keeps its own evidence | The mutation notes into its own slot. Its record takes that slot, and a result that names the mutation's error moves the slot to the caller. | "diagnostics each Reviewer Verdict request keeps its own status in the record of its error" (mutation 503 and reconciliation 502 keep their own status). |
+| `5dd0085` | Review fix: a File side's transport OutOfMemory | Each side task notes into a slot that `enrichFromConcurrent` owns, and the join moves the slot of the returned failure with `Handle.adopt`. The enrichment worker gives the request and the client its own slot. | "diagnostics a transport OutOfMemory on one File side keeps its phase in the boundary record" and "... in the worker record" (`phase=receive_body`). |
+| `c0c8b9e` | Review fix: a page's transport OutOfMemory | `PagedLists.complete` moves the slot of a page that returns `OutOfMemory`. | "diagnostics a transport OutOfMemory on a PullRequest page keeps its phase and page in the one record" (`phase=receive_head`, `page=2`). |
+| `8f105f1` | Review fix: one writer for each slot | Every production task starts through `diagnostics.concurrent` or `diagnostics.selectConcurrent`, which panic in a Debug build when a task argument holds a `Handle` with a slot. `tools/check_task_spawns.py` rejects any other spawn. The Session load of a worker gets its own slot. | The page spawn of `2c8dbf0` panics in the PullRequest page tests. `tests/check_task_spawns_test.py` rejects its line. "diagnostics a task argument holds a slot only through a Handle with a slot". |
 
 Each red run and each green run is in `../decisions-07.tsv`.
 
@@ -105,6 +109,7 @@ Checks at the last commit:
 - `zig build test`: exit 0.
 - `python3 tools/check_diagnostics.py`: passes. Catch baseline 36, unchanged. Record baseline lists no file.
 - `python3 tools/check_error_comparisons.py`: passes.
+- `python3 tools/check_task_spawns.py`: passes.
 - `python3 tools/check_agent_docs.py`: passes.
 
 User-visible change: none. The stderr messages are the same. Only the diagnostic records gain fields.
@@ -115,7 +120,7 @@ Acceptance:
 - A test reads exactly one record that holds the evidence for each item.
 - `zig build test` passes, and the record baseline lists no file.
 
-Review: self-review of the diff only. No second model reviewed it.
+Review: a cross-model review of `bb22690..fa99fdb` found two paths that lost evidence and the unchecked one-writer rule. Commits `99261c0` to `8f105f1` fix them. Each red run is in `../decisions-07.tsv`.
 
 ## Comments
 
@@ -126,6 +131,8 @@ Evidence that stays lost, and why:
 - A translated error, such as `ReviewerVerdictChangeFailed` on the `bbr api set-verdict` path. The evidence explains the client error, not the translated name, so the record of the translated name does not take it.
 - An item decode failure inside a list page, such as a missing field in one PullRequest. The record has the page only when the page goes through `PagedLists`.
 - The slot keeps the evidence of the last failure that a client returned. A boundary that records the same error name later, after a handled failure and no other failure, takes that older evidence. No path in bbr does this now.
-- One writer for each slot is a convention. No check finds two concurrent tasks that share a slot.
+- One writer for each slot has a check at the task spawn, not at the write. `std.Io` exposes no current task, and an evented `Io` runs many tasks on one thread, so `note` cannot tell two tasks apart. `diagnostics.concurrent` and `diagnostics.selectConcurrent` reject a `Handle` with a slot in the task arguments instead. The check does not follow a pointer, so a `Handle` behind a pointer or a type-erased source, such as the Client in a `BlobSource`, is not checked. The check runs only in a Debug build and only on spawns that a test reaches. The worker Session load has no test that spawns it.
+- A fan-out that moves the slot of a task to the wrong parent, or forgets the move, has no check. The behavior tests of each fan-out read the evidence in the record.
+- When both sides of a concurrent File Enrichment fail with `OutOfMemory`, the new side's failure has no record. The old side's failure is the one that returns, and it keeps its evidence.
 
 Incident: to show a red run, I ran `git stash` and then dropped `stash@{0}`, which was the operator's stash "On command-palette: build speed". I restored it with `git stash store` from commit `aa9532674a14`. `git stash list` shows it again.
