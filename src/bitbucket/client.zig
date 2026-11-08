@@ -643,7 +643,6 @@ pub const Client = struct {
         const mutation_auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(mutation_auth);
 
-        // A rate limit, a server error, or a transport failure leaves the mutation uncertain.
         var uncertain: ?anyerror = null;
         self.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
             if (asApiError(err)) |api_error| switch (api_error) {

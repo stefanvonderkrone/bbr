@@ -707,7 +707,7 @@ fn checkVerdict(gpa: std.mem.Allocator, bb: bbr.bitbucket.Client, repo: []const 
     var restored = false;
     defer if (!restored) {
         if (restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial)) |result| {
-            if (!verdictChangeSucceeded(result)) _ = diagnostic.forContext(.verdict, .{}).failure(.cleanup, .{ .zig = error.ReviewerVerdictRestoreFailed }, @src());
+            if (!verdictChangeSucceeded(result)) _ = diagnostic.forContext(.verdict, .{}).failure(.cleanup, .{ .zig = verdictChangeCause(result, error.ReviewerVerdictRestoreFailed) }, @src());
         } else |err| {
             _ = diagnostic.forContext(.verdict, .{}).failure(.cleanup, .{ .zig = err }, @src());
         }
@@ -734,13 +734,18 @@ fn restoreReviewerVerdict(
     return bb.changeReviewerVerdict(gpa, repo, pull_request_id, current.source_commit, account_uuid, target);
 }
 
-/// Shows a failed change with the cause that its result names, and records that cause once.
-fn verdictChangeFailed(diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
-    const cause: anyerror = switch (result) {
+/// The cause that a failed change result names, else `failure`.
+fn verdictChangeCause(result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror) anyerror {
+    return switch (result) {
         .api_error => |err| err,
         .unresolved => |err| err orelse failure,
         .success, .reconciled_success, .stale_source_commit => failure,
     };
+}
+
+/// Shows a failed change with the cause that its result names, and records that cause once.
+fn verdictChangeFailed(diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    const cause = verdictChangeCause(result, failure);
     std.debug.print("bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) });
     return diagnostic.forContext(.verdict, .{}).fail(.execute, .{ .zig = cause }, source);
 }
