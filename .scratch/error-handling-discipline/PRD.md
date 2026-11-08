@@ -49,3 +49,4 @@ These come from research.md. Each issue names the questions that it must answer 
 - [04 Ban error comparisons and require a Canceled prong](issues/04-ban-error-comparisons-require-canceled-prong.md)
 - [05 Fix the out-of-memory mislabels](issues/05-fix-out-of-memory-mislabels.md)
 - [06 Record each failure once through fail](issues/06-record-once-through-fail.md)
+- [07 Keep the leaf evidence in the one record](issues/07-keep-leaf-evidence-in-the-one-record.md)

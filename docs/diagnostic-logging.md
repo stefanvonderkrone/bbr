@@ -52,12 +52,13 @@ The fields are space-separated `name=value` pairs.
 | `operation` | The code-defined operation category. |
 | `phase` | The phase where the failure occurred. |
 | `source` | The compiler-authored source file, line, and column. |
-| `cause` | A Zig error, HTTP rejection, SQLite result, or Grammar failure. |
+| `cause` | A Zig error, Git termination, SQLite result, or Grammar failure. |
 
 Available numeric context follows the source field.
 It can include the command ID, work ID, Session Epoch, OperationId, Draft ID, File index, File side, attempt, or page.
 Absent context fields do not appear.
-Native cause fields retain HTTP classification and status, or SQLite primary and extended codes.
+Native cause fields retain the Git termination kind and code, or SQLite primary and extended codes.
+No code records an HTTP cause now. An HTTP rejection has a Zig cause that names its classification, such as `RateLimited`.
 A Grammar cause names its `rule`: `query` with the Tree-sitter query error code, `regex` with the regex engine code, or a predicate rule such as `unknown_operator` with code 0. Each Grammar cause has the byte offset in the query, but never the query text.
 Zig causes use the original error name where capture precedes domain conversion.
 
@@ -79,7 +80,9 @@ A handle keeps the sink reference while logging is off, so later enablement affe
 | Boundary | Evidence owner |
 | --- | --- |
 | Startup and CLI failures | `src/main.zig`, `src/api/cli.zig`, and `src/completion.zig`. |
-| HTTP rejection | `src/bitbucket/client.zig`. |
+| Rejection or transport cause that a Reviewer Verdict result drops, failed list page that the caller does not receive | `src/bitbucket/client.zig`. |
+| Retried first blob attempt | `src/tui/file_enrichment.zig`. |
+| Unavailable Anchor transition | `src/review/anchor.zig`. |
 | Ambiguous POST transport failure | `src/bitbucket/poster.zig`. |
 | SQLite result conversion | `src/persist/sqlite_store.zig`. |
 | Worker launch, completion, and delivery | `src/tui/app.zig` and `src/tui/presentation_runtime.zig`. |
@@ -112,8 +115,8 @@ Each failure has one record ([ADR-0014](adr/0014-a-failure-is-recorded-once-and-
 A site that records a failure and still fails returns `error.Reported`, and the boundaries above write nothing more for it.
 `Handle.record` drops a Failure whose cause is `error.Reported`, so a boundary that records it by mistake writes no second record.
 The Bitbucket client, the HTTP transport, and the Git client record nothing, because their callers branch on the error name.
-The boundary that receives such an error records it, so its record names the typed error, not the transport phase, the JSON error, the page number, or the Git exit code.
-An HTTP rejection is the exception: `Client.send` records the status, and the boundary records the typed rejection error again.
+The boundary that receives such an error records it, so its record names the typed error, not the HTTP status, the transport phase, the JSON error, the page number, or the Git exit code.
+A site that turns a failure into an outcome without its cause records it, like a boundary. Examples are a retried first blob attempt, an unavailable Anchor transition, and a list page that the result does not need.
 
 Normal cancellation, no matches, optional missing files, Submission lock contention, unsupported Grammars, and configured size limits are not operational errors.
 SQLite busy and locked results remain diagnostic evidence when they prevent a store operation.

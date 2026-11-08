@@ -108,14 +108,31 @@ Acceptance:
 
 Review: a read-only review of the last five commits found a second SQLite record on each failed finalize, a second record of a failed Session acquisition, two dropped causes in the Reviewer Verdict change, and a changed message for a failed Git launch. The review commit fixes all four. The remaining items are under Comments.
 
+Second review: a review of the branch found ten more items. The fix run of 2026-11-08 committed these:
+
+- `cc72665` diagnostics: drop a Reported record in the Handle. `Handle.record` drops a Failure whose cause is `error.Reported` in every build.
+- `1be62ba` cli: open the in-memory store in one place.
+- `beada5e` tui: record each store failure once behind a Presentation error. The Published write sites return `error.Reported` after their capture instead of `PersistenceFailed`, and `Published.create` loads the pending review with `try`, so the replacement boundary records the real cause. The two requeue catches in `acceptPreparedSession` now record. The test "diagnostics a store failure behind a translated Presentation error keeps one record" found seven second records and one requeue with no record before the fix.
+- `941ef9e` bitbucket: record each HTTP rejection once at its boundary. `Client.send` and `checkFileBlob` record nothing. The retried first blob attempt records its rejection. The worker test gains 429 and 503 cases, which found a second record before the fix.
+- `79d147d` diagnostics: record Git transition and discarded page failures once. `GitAnchorResolver` takes a required Handle and records the first failure of each transition. `PagedLists.finish` records each failed page that the caller does not receive.
+- `98fb277` tests: pin the bbr local store failure messages in `tests/store_message_cli_test.py`.
+- `431943a` bitbucket: record a Reviewer Verdict reason once on both paths. `changeReviewerVerdict` records only the causes that its result drops, and the caller records the reason that the result names. The verdict test now checks the phase and cause of each record.
+- The commit that adds this paragraph files issue 07, adds the Git launch site to issue 05, and updates ADR-0014, `docs/diagnostic-logging.md`, and the record-once row of `AGENTS.md`.
+
+Each commit ran `zig build test` with exit 0. The record baseline lists no file. The catch baseline went from 58 to 55: the classification switch in `Client.send` and the two uncaptured `git.diff` catches in `src/review/anchor.zig` are gone.
+
 ## Comments
 
 Remaining work, outside the checked sites:
 
-- `Client.send` records an HTTP rejection with its status, and the boundary records the typed rejection error again. The check does not count it, because the record is not in a handler.
-- The diagnostic file lost the JSON error behind `MalformedResponse`, the HTTP phase of a transport failure, the page number of a failed page, and the Git exit code and launch error. A follow-up can carry them to the boundary, for example in `Client.ErrorDetail`.
-- `GitAnchorResolver` in `src/review/anchor.zig` drops each `git.diff` error as an unavailable transition. A failed Git launch or a signal there now has no record. It has no diagnostics handle.
-- A `PagedLists` page that fails after the limit is met is discarded without a record.
+- Issue 07 owns the leaf evidence that the one record lost: the JSON error behind `MalformedResponse`, the HTTP phase, the exact HTTP status, the page number of a failed page, and the Git exit code and stderr.
 - `detectRun` in `src/main.zig` prints the Git error name without a record.
-- The ShellGitClient launch catch maps a launch error to `on_fail` without a record, so the user text stays the same. The catch baseline for `src/git/client.zig` is 4. Returning the launch cause instead would print, for example, `FileNotFound` for a missing git. That is a user text change, so it needs an operator decision.
-- The `git` cause variant in `src/diagnostic.zig` has no producer left.
+- Issue 05 owns the Git launch catch in `runRaw`, which shows `NotAGitRepo` for a missing git binary.
+- An unresolved Reviewer Verdict change after a lost connection has two records on the `bbr api` path: the transport cause from `changeReviewerVerdict` and `ReviewerVerdictChangeFailed` from the api boundary. `checkMutationRun` in `src/main.zig` has the same pair. The TUI path has one record.
+- `runPresentation` in `src/tui/app.zig` prints "bbr: could not load the pending review drafts" when the initial load fails with `error.Reported`. Only the demo passes an initial Session, and its `:memory:` store fails only on `SQLITE_NOMEM`, so no test reaches the message.
+
+Corrections to the first Comments of this issue:
+
+- "The page number of a failed page" was lost was too broad at that time. The rejection record of `Client.send` kept the page. Commit `941ef9e` removed that record, so the page is now lost for a rejection too, except for a page that `PagedLists.finish` discards.
+- "The `git` cause variant in `src/diagnostic.zig` has no producer left" was wrong. The External Edit adapter in `src/tui/presentation_adapter.zig` produces it for a failed editor exit. The `http` cause variant has no producer since `941ef9e`.
+- The items for `Client.send`, `GitAnchorResolver`, and the `PagedLists` page after the limit are fixed by `941ef9e` and `79d147d`.
