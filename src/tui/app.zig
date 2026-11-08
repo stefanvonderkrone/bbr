@@ -895,7 +895,7 @@ fn presentationLoadWorker(
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     const bound = if (client) |value| sink_context.bitbucket(value) else null;
-    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, bound, command })) |loaded|
+    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, bound, sink_context.handle(), command })) |loaded|
         .{ .loaded = loaded }
     else |err|
         .{ .failed = err };
@@ -911,7 +911,7 @@ fn presentationLoadWorker(
 /// replacement suspends Session-specific Actions until it completes.
 const session_load_timeout = std.Io.Duration.fromSeconds(60);
 
-fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, command: presentation.LoadSession) anyerror!*Session {
+fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, diagnostic: bbr.diagnostics.Handle, command: presentation.LoadSession) anyerror!*Session {
     return switch (command.key.kind) {
         .remote => session.loadWith(
             io,
@@ -922,6 +922,7 @@ fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, command: presentation.
         ),
         .local => blk: {
             var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
+            git.diagnostic = diagnostic;
             break :blk session.loadLocalWith(
                 std.heap.page_allocator,
                 git.gitClient(),

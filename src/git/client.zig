@@ -12,6 +12,7 @@ const Io = std.Io;
 const remote_mod = @import("remote.zig");
 const Remote = remote_mod.Remote;
 const Rewrite = remote_mod.Rewrite;
+const diagnostics = @import("../diagnostics.zig");
 
 pub const GitError = error{
     /// The working directory is not inside a git worktree.
@@ -101,6 +102,8 @@ pub const ShellGitClient = struct {
     gpa: Allocator,
     io: Io,
     cwd: std.process.Child.Cwd = .inherit,
+    /// Receives the termination or launch error behind each failure. The client records nothing.
+    diagnostic: diagnostics.Handle = .{},
 
     pub fn init(gpa: Allocator, io: Io) ShellGitClient {
         return .{ .gpa = gpa, .io = io };
@@ -148,19 +151,26 @@ pub const ShellGitClient = struct {
     /// A launch failure, such as a missing git binary, keeps its own error.
     /// `on_fail` is only a finished Git process that exits non-zero.
     fn runRaw(self: *ShellGitClient, allocator: Allocator, args: []const []const u8, on_fail: anyerror) ![]u8 {
-        const res = try std.process.run(allocator, self.io, .{
+        const res = std.process.run(allocator, self.io, .{
             .argv = args,
             .cwd = self.cwd,
-        });
+        }) catch |err| {
+            self.diagnostic.note(.{ .err = err, .phase = .launch });
+            return err;
+        };
         defer allocator.free(res.stderr);
         errdefer allocator.free(res.stdout);
 
-        switch (res.term) {
-            .exited => |code| if (code != 0) return on_fail,
-            .signal, .stopped, .unknown => return on_fail,
-        }
-
-        return res.stdout;
+        const termination: @FieldType(diagnostics.Cause, "git") = switch (res.term) {
+            .exited => |code| if (code == 0) return res.stdout else .{ .kind = .exited, .code = code },
+            .signal => |signal| .{ .kind = .signal, .code = @intFromEnum(signal) },
+            .stopped => |signal| .{ .kind = .stopped, .code = @intFromEnum(signal) },
+            .unknown => |code| .{ .kind = .unknown, .code = code },
+        };
+        var cause = termination;
+        cause.err = on_fail;
+        self.diagnostic.note(.{ .err = on_fail, .phase = .execute, .cause = .{ .git = cause } });
+        return on_fail;
     }
 
     fn currentBranch(ptr: *anyopaque, allocator: Allocator) anyerror![]u8 {

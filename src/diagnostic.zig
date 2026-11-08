@@ -78,7 +78,8 @@ pub const HttpClass = enum { authentication, authorization, rate_limit, server, 
 pub const Cause = union(enum) {
     zig: anyerror,
     http: struct { status: u16, classification: HttpClass },
-    git: struct { kind: enum { exited, signal, stopped, unknown }, code: u32 },
+    /// `err` is the typed error that a git command failure returns, such as `UnknownRef`.
+    git: struct { kind: enum { exited, signal, stopped, unknown }, code: u32, err: ?anyerror = null },
     sqlite: struct { result: i32, extended: i32 },
     grammar: struct { rule: GrammarRule, code: u32 = 0, offset: u32 },
 };

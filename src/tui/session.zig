@@ -833,3 +833,27 @@ fn testRemoteResponses(account_status: u16) [4]Canned {
         .{ .request_key = "/pullrequests/7", .body = pr_json },
     };
 }
+
+test "diagnostics a failed local git command keeps its termination in the worker record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.session_load, .{}).withLeaf(&leaf);
+    // The file system root is not inside a Git worktree, so git rev-parse exits with 128.
+    var git = bbr.git.ShellGitClient.init(testing.allocator, testing.io);
+    git.cwd = .{ .path = "/" };
+    git.diagnostic = boundary;
+    try testing.expectError(error.NotAGitRepo, loadLocalWith(testing.allocator, git.gitClient(), null, null));
+    const recorded = boundary.failure(.execute, .{ .zig = error.NotAGitRepo }, @src());
+    try testing.expectEqual(bbr.diagnostic.Phase.execute, recorded.phase);
+    try testing.expectEqual(error.NotAGitRepo, recorded.cause.git.err.?);
+    try testing.expectEqual(@as(u32, 128), recorded.cause.git.code);
+}

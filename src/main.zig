@@ -269,6 +269,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     const a = arena.allocator();
 
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    git.diagnostic = diagnostic;
 
     var client = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
     defer client.deinit();
@@ -369,6 +370,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
     defer arena.deinit();
     const a = arena.allocator();
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    git.diagnostic = diagnostic;
     const client = git.gitClient();
     const source_name = if (source_input) |value| value else client.currentBranch(a) catch |err| {
         _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
@@ -875,6 +877,7 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
     if (it.next()) |repo| input = .{ .repo_slug = repo };
 
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    git.diagnostic = diagnostic;
 
     // Report what the GitClient sees, so a failed detect is diagnosable.
     if (git.gitClient().currentBranch(a)) |b| {

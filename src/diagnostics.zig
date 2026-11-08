@@ -185,7 +185,10 @@ pub const Sink = struct {
         switch (failure_value.cause) {
             .zig => |err| try writer.print(" cause=zig error={s}", .{@errorName(err)}),
             .http => |http| try writer.print(" cause=http status={d} classification={s}", .{ http.status, @tagName(http.classification) }),
-            .git => |git| try writer.print(" cause=git termination={s} code={d}", .{ @tagName(git.kind), git.code }),
+            .git => |git| {
+                try writer.print(" cause=git termination={s} code={d}", .{ @tagName(git.kind), git.code });
+                if (git.err) |err| try writer.print(" error={s}", .{@errorName(err)});
+            },
             .sqlite => |sqlite| try writer.print(" cause=sqlite result={d} extended={d}", .{ sqlite.result, sqlite.extended }),
             .grammar => |grammar| try writer.print(" cause=grammar rule={s} code={d} offset={d}", .{ @tagName(grammar.rule), grammar.code, grammar.offset }),
         }
