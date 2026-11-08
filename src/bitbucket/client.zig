@@ -1247,8 +1247,11 @@ pub const Client = struct {
         defer allocator.free(url);
         var followed: FollowedPages = .{};
         defer followed.deinit(allocator);
-        while (true) {
-            const res = try self.send(allocator, .{
+        // Bitbucket numbers the pages that `next` links to one by one.
+        var page = self;
+        page.diagnostic.context.page = opts.page orelse 1;
+        while (true) : (page.diagnostic.context.page.? += 1) {
+            const res = try page.send(allocator, .{
                 .method = .GET,
                 .url = url,
                 .headers = &.{
@@ -1262,7 +1265,7 @@ pub const Client = struct {
                 if (rejection) |failure| failure.* = .{ .reason = reason, .retry_after_ms = res.retry_after_ms };
                 return reason;
             };
-            const parsed = try parseResponse(Page, self.diagnostic, allocator, res.body);
+            const parsed = try parseResponse(Page, page.diagnostic, allocator, res.body);
             defer parsed.deinit();
             for (parsed.value.values) |wire| {
                 if (opts.limit) |limit| {
@@ -1814,7 +1817,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
         const PageState = union(enum) {
             pending,
             done: []Item,
-            failed: struct { reason: anyerror, detail: ?Client.ErrorDetail },
+            failed: struct { reason: anyerror, detail: ?Client.ErrorDetail, leaf: ?diagnostics.Leaf },
         };
 
         const List = struct {
@@ -1842,6 +1845,8 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             page: ?Page = null,
             err: ?anyerror = null,
             error_detail: ?Client.ErrorDetail = null,
+            /// The page's own evidence slot, because pages fetch concurrently.
+            leaf: ?diagnostics.Leaf = null,
 
             fn deinit(self: *Slot, a: Allocator) void {
                 self.arena.deinit();
@@ -1851,7 +1856,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             }
 
             fn fetch(bb: Client, slot: *Slot, index: usize) usize {
-                var scoped = bb;
+                var scoped = bb.withDiagnostics(bb.diagnostic.withLeaf(&slot.leaf));
                 scoped.diagnostic.context.page = slot.page_number;
                 if (bb.error_detail) |detail| {
                     slot.error_detail = .{ .allocator = std.heap.page_allocator, .io = detail.io };
@@ -1885,7 +1890,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             for (self.lists) |*list| {
                 for (list.pages.items, 1..) |*page, number| {
                     if (page.* == .failed) {
-                        var diagnostic = self.diagnostic;
+                        var diagnostic = self.diagnostic.withLeaf(&page.failed.leaf);
                         diagnostic.context.page = self.pageNumber(@intCast(number));
                         _ = diagnostic.failure(.read, .{ .zig = page.failed.reason }, @src());
                     }
@@ -1961,7 +1966,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             const items = self.accept(slot) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
-                    state.* = .{ .failed = .{ .reason = err, .detail = slot.error_detail } };
+                    state.* = .{ .failed = .{ .reason = err, .detail = slot.error_detail, .leaf = slot.leaf orelse .{ .err = err, .page = slot.page_number } } };
                     slot.error_detail = null;
                     return;
                 },
@@ -2046,6 +2051,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                 const page = &self.lists[position.list].pages.items[position.number - 1];
                 const reason = page.failed.reason;
                 if (error_detail) |destination| destination.copyFrom(if (page.failed.detail) |*source| source else null);
+                if (page.failed.leaf) |leaf| self.diagnostic.note(leaf);
                 self.release(page);
                 return reason;
             }
@@ -5123,18 +5129,23 @@ test "diagnostics a failed page that the result does not need has one record" {
             try testing.expect(sink.setEnabled(true) == .on);
             const responses = repositoryResponses(.{ .status = 429, .body = "{}" }, null);
             var fake: FakeHttpClient = .{ .responses = &responses };
-            const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(sink.handle(.picker_list, .{}));
+            var leaf: ?diagnostics.Leaf = null;
+            const boundary = sink.handle(.picker_list, .{}).withLeaf(&leaf);
+            const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
             var done: std.atomic.Value(bool) = .init(false);
             const result = listRepositoryPullRequestsForTest(bb, .{ .reviewer = "{reviewer}" }, limit, concurrency, &done);
+            var source: []const u8 = "operation=picker_list phase=rejection source=bitbucket/client.zig:";
             if (limit == null) {
                 // The caller receives the failure, so its boundary records it.
                 try testing.expectError(error.RateLimited, result);
                 try testing.expectEqual(@as(u64, 0), sink.sequence);
-                continue;
+                _ = boundary.failure(.execute, .{ .zig = error.RateLimited }, @src());
+                source = "operation=picker_list phase=rejection source=bitbucket/client.zig:";
+            } else {
+                const items = try result;
+                defer deinitSummaries(testing.allocator, items);
+                try testing.expectEqual(@as(usize, 3), items.len);
             }
-            const items = try result;
-            defer deinitSummaries(testing.allocator, items);
-            try testing.expectEqual(@as(usize, 3), items.len);
             _ = sink.setEnabled(false);
             var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
             defer dir.close(testing.io);
@@ -5146,9 +5157,8 @@ test "diagnostics a failed page that the result does not need has one record" {
             _ = lines.next();
             const only = lines.next().?;
             try testing.expect(lines.next() == null);
-            try testing.expect(std.mem.indexOf(u8, only, "operation=picker_list phase=read source=bitbucket/client.zig:") != null);
-            try testing.expect(std.mem.indexOf(u8, only, "page=1") != null);
-            try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=RateLimited"));
+            try testing.expect(std.mem.indexOf(u8, only, source) != null);
+            try testing.expect(std.mem.endsWith(u8, only, " page=1 cause=http status=429 classification=rate_limit"));
         }
     }
 }
@@ -5190,8 +5200,8 @@ test "diagnostics a failed page keeps its record when the coordinator fails befo
         _ = lines.next();
         var records: usize = 0;
         while (lines.next()) |line| : (records += 1) {
-            try testing.expect(std.mem.indexOf(u8, line, " page=1 ") != null);
-            try testing.expect(std.mem.endsWith(u8, line, "cause=zig error=RateLimited"));
+            try testing.expect(std.mem.indexOf(u8, line, " phase=rejection ") != null);
+            try testing.expect(std.mem.endsWith(u8, line, " page=1 cause=http status=429 classification=rate_limit"));
         }
         // The caller receives OutOfMemory, so its boundary records that. The failed page is not in the result.
         try testing.expectEqual(@as(usize, @intFromBool(beta_failed)), records);
@@ -5391,22 +5401,57 @@ test "a list that ends early ignores a failed page past its end in any completio
     for (items, 1..) |item, id| try testing.expectEqual(@as(u64, id), item.id);
 }
 
-test "a failed PullRequest page fails the list and reports its detail" {
+test "diagnostics a failed PullRequest page fails the list and its one record names the page" {
     for ([_]usize{ 1, 3 }) |concurrency| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const responses = try pullRequestPages(arena.allocator(), author_endpoint, 4, true);
-        responses[2].status = 500;
-        responses[2].body = "{\"error\":{\"message\":\"Page 3 failed\"}}";
+        // The fixture holds page 1, then the pages from the last down.
+        responses[3].status = 500;
+        responses[3].body = "{\"error\":{\"message\":\"Page 2 failed\"}}";
+        responses[2].status = 503;
+        responses[2].body = "{}";
         var fake: FakeHttpClient = .{ .responses = responses };
         var detail: Client.ErrorDetail = .{ .allocator = testing.allocator, .io = testing.io };
         defer detail.deinit();
-        var bb = Client.init(fake.httpClient(), testCredential());
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        var leaf: ?diagnostics.Leaf = null;
+        const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+        var bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
         bb.error_detail = &detail;
         var done: std.atomic.Value(bool) = .init(false);
         try testing.expectError(error.ServerError, listPagedPullRequestsForTest(bb, author_scope, null, concurrency, &done));
-        try testing.expectEqualStrings("Page 3 failed", detail.message.?);
+        try testing.expectEqualStrings("Page 2 failed", detail.message.?);
         try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+        _ = boundary.failure(.execute, .{ .zig = error.ServerError }, @src());
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        // With one active request, page 3 never starts. Otherwise its failure has its own record.
+        if (concurrency > 1) {
+            const unneeded = lines.next().?;
+            try testing.expect(std.mem.indexOf(u8, unneeded, "operation=api phase=rejection source=bitbucket/client.zig:") != null);
+            try testing.expect(std.mem.endsWith(u8, unneeded, " page=3 cause=http status=503 classification=server"));
+        }
+        const returned = lines.next().?;
+        try testing.expect(lines.next() == null);
+        try testing.expect(std.mem.indexOf(u8, returned, "operation=api phase=rejection source=bitbucket/client.zig:") != null);
+        try testing.expect(std.mem.endsWith(u8, returned, " page=2 cause=http status=500 classification=server"));
     }
 }
 

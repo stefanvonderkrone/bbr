@@ -209,6 +209,7 @@ test "diagnostics a Bitbucket failure has one record from the worker boundary" {
         .{ .fake = .{ .status = 429, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=429 classification=rate_limit" },
         .{ .fake = .{ .status = 503, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=503 classification=server" },
         .{ .fake = .{ .status = 418, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=418 classification=other" },
+        .{ .fake = .{ .responses = &.{ .{ .body = "{\"values\":[],\"next\":\"https://api.bitbucket.org/2.0/next-page\"}" }, .{ .status = 503, .body = "{}" } } }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = " page=2 cause=http status=503 classification=server" },
     };
     for (cases) |case| {
         var tmp = testing.tmpDir(.{});

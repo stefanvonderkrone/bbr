@@ -319,7 +319,10 @@ fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.h
     };
 }
 
-fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
+fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, side_diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
+    // The sides read concurrently, so each owns the evidence slot of its read.
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const diagnostic = side_diagnostic.withLeaf(&leaf);
     const side = try backing.create(OwnedSide);
     errdefer backing.destroy(side);
     side.references = .init(1);

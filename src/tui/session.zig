@@ -217,10 +217,19 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
         }
     }
 
-    // The worker records the returned failure. A second failed branch has no other record.
+    // The worker records the returned failure with its branch's evidence. A second failed
+    // branch has no other record.
     var failed: ?anyerror = null;
-    for ([_]?anyerror{ pr_branch.err, diff_branch.err, comments_branch.err }) |branch_error| if (branch_error) |err| {
-        if (failed == null) failed = err else _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+    const outcomes = [_]struct { err: ?anyerror, leaf: *?bbr.diagnostic.Leaf }{
+        .{ .err = pr_branch.err, .leaf = &pr_branch.leaf },
+        .{ .err = diff_branch.err, .leaf = &diff_branch.leaf },
+        .{ .err = comments_branch.err, .leaf = &comments_branch.leaf },
+    };
+    for (outcomes) |outcome| if (outcome.err) |err| {
+        if (failed == null) {
+            failed = err;
+            if (outcome.leaf.*) |leaf| bb.diagnostic.note(leaf);
+        } else _ = bb.diagnostic.withLeaf(outcome.leaf).failure(.read, .{ .zig = err }, @src());
     };
     if (failed) |err| return err;
 
@@ -330,6 +339,12 @@ fn Branch(comptime T: type) type {
         arena: std.heap.ArenaAllocator,
         value: ?T = null,
         err: ?anyerror = null,
+        /// The branch's own evidence slot, because branches fetch concurrently.
+        leaf: ?bbr.diagnostic.Leaf = null,
+
+        fn client(self: *@This(), bb: Client) Client {
+            return bb.withDiagnostics(bb.diagnostic.withLeaf(&self.leaf));
+        }
 
         fn init(backing: Allocator) @This() {
             return .{ .arena = std.heap.ArenaAllocator.init(backing) };
@@ -338,29 +353,30 @@ fn Branch(comptime T: type) type {
 }
 
 fn acquirePullRequest(branch: *Branch(PullRequest), bb: Client, repo: []const u8, id: u64) void {
-    branch.value = bb.getPullRequest(branch.arena.allocator(), repo, id) catch |err| {
+    branch.value = branch.client(bb).getPullRequest(branch.arena.allocator(), repo, id) catch |err| {
         branch.err = err;
         return;
     };
 }
 
 fn acquireAccount(branch: *Branch([]u8), bb: Client) void {
-    branch.value = bb.getAuthenticatedAccountUuid(branch.arena.allocator()) catch |err| {
-        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+    const client = branch.client(bb);
+    branch.value = client.getAuthenticatedAccountUuid(branch.arena.allocator()) catch |err| {
+        _ = client.diagnostic.failure(.read, .{ .zig = err }, @src());
         branch.err = err;
         return;
     };
 }
 
 fn acquireRawDiff(branch: *Branch([]u8), bb: Client, repo: []const u8, id: u64) void {
-    branch.value = bb.getDiff(branch.arena.allocator(), repo, id) catch |err| {
+    branch.value = branch.client(bb).getDiff(branch.arena.allocator(), repo, id) catch |err| {
         branch.err = err;
         return;
     };
 }
 
 fn acquireComments(branch: *Branch([]bbr.review.Comment), bb: Client, repo: []const u8, id: u64, source: []const u8, destination: []const u8) void {
-    branch.value = bb.getComments(branch.arena.allocator(), repo, id, .{ .source = source, .destination = destination }) catch |err| {
+    branch.value = branch.client(bb).getComments(branch.arena.allocator(), repo, id, .{ .source = source, .destination = destination }) catch |err| {
         branch.err = err;
         return;
     };
@@ -581,12 +597,18 @@ test "diagnostics a returned acquisition failure is left to the worker boundary"
         .{ .request_key = "/user", .status = 200, .body = "{ \"uuid\": \"{ada}\" }" },
         .{ .request_key = "/pullrequests/7/diff", .body = "" },
         .{ .request_key = "/pullrequests/7/comments", .body = "{ \"values\": [] }" },
-        .{ .request_key = "/pullrequests/7", .send_error = error.ConnectionReset },
+        .{ .request_key = "/pullrequests/7", .send_error = error.ConnectionReset, .send_phase = .receive_head },
     };
     var fake: FakeHttpClient = .{ .responses = &responses };
-    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(sink.handle(.session_load, .{}));
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.session_load, .{}).withLeaf(&leaf);
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(boundary);
     try testing.expectError(error.ConnectionReset, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
     try testing.expectEqual(@as(u64, 0), sink.sequence);
+    // The worker boundary's record carries the transport phase of the failed branch.
+    const recorded = boundary.failure(.execute, .{ .zig = error.ConnectionReset }, @src());
+    try testing.expectEqual(bbr.diagnostic.Phase.receive_head, recorded.phase);
+    try testing.expectEqual(@as(u64, 1), sink.sequence);
 }
 
 test "Authenticated Account failure preserves a read-only Candidate Session" {

@@ -894,7 +894,8 @@ fn presentationLoadWorker(
     command: presentation.LoadSession,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, client, command })) |loaded|
+    const bound = if (client) |value| sink_context.bitbucket(value) else null;
+    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, bound, command })) |loaded|
         .{ .loaded = loaded }
     else |err|
         .{ .failed = err };
