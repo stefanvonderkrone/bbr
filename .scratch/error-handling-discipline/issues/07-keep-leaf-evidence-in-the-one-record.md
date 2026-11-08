@@ -1,7 +1,6 @@
 # Keep the leaf evidence in the one record
 
-Status: claimed
-Claimed by: feat/leaf-evidence worktree /Volumes/Work/t3-code/error-handling-discipline
+Status: resolved
 Type: implementation
 Blocked by: 06
 Parent: ../PRD.md
@@ -86,3 +85,47 @@ The HTTP seam gets the phase out through `Request.phase`, an optional pointer th
 ### Items
 
 Each item has its own commit, a test that reads exactly one record with the evidence, and a red run before the change.
+
+## Completion
+
+Commits on `feat/leaf-evidence`:
+
+| Commit | Evidence | Where it lands | Test, red before the change |
+| --- | --- | --- | --- |
+| `bb22690` | Carrier, HTTP status and classification | `Client.send` notes `phase=rejection` and `cause=http`. | "diagnostics the api boundary record holds the leaf evidence of a Bitbucket failure" (CLI), the two worker tests in `src/tui/presentation_runtime.zig`, and "diagnostics a boundary record takes the leaf evidence of its own error once". |
+| `01a6e3a` | Transport phase | `Request.phase`, written by `StdHttpClient.send`. `Client.send` notes it. | `tests/record_once_cli_test.py` (`phase=connect` for `bbr api whoami` and `bbr auth status`), and the worker tests (`receive_head`, `send_body`). |
+| `2c8dbf0` | JSON parse error | `jsonFailure` notes `phase=decode` with the parser error. | The CLI test (`UnexpectedEndOfInput`, `UnexpectedToken`) and the worker Picker test. |
+| `5fabe2b` | Page number, and one writer for each slot | `PagedLists` page slots, `listPages` page numbers, `session.loadWith` branch slots, File Enrichment side slots. | "diagnostics a failed PullRequest page fails the list and its one record names the page" (pages 2 and 3 with their own status), the worker Picker test (`page=2`), and the session branch test. |
+| `42c738c` | Git termination and launch phase | `ShellGitClient.diagnostic`. `runRaw` notes `phase=launch` or `cause=git` with the `on_fail` name. | `tests/record_once_cli_test.py` (`UnknownRef`, `NotAGitRepo`, code 128), `tests/git_launch_cli_test.py` (`phase=launch`), and "diagnostics a failed local git command keeps its termination in the worker record". |
+
+Each red run and each green run is in `../decisions-07.tsv`.
+
+Checks at the last commit:
+
+- `zig build test`: exit 0.
+- `python3 tools/check_diagnostics.py`: passes. Catch baseline 36, unchanged. Record baseline lists no file.
+- `python3 tools/check_error_comparisons.py`: passes.
+- `python3 tools/check_agent_docs.py`: passes.
+
+User-visible change: none. The stderr messages are the same. Only the diagnostic records gain fields.
+
+Acceptance:
+
+- Each listed item reaches the one record of its failure on the CLI and on the TUI worker path. The exceptions are in Comments.
+- A test reads exactly one record that holds the evidence for each item.
+- `zig build test` passes, and the record baseline lists no file.
+
+Review: self-review of the diff only. No second model reviewed it.
+
+## Comments
+
+Evidence that stays lost, and why:
+
+- A local blob read in File Enrichment. `GitBlobSource` holds a `GitClient` vtable value, and the side's slot cannot reach the `ShellGitClient` of the worker without a handle argument on each vtable function. The record keeps the Git error name.
+- A Git Anchor transition. `GitAnchorResolver` records its own Git failures, and its `ShellGitClient` has no slot, because the resolver can run on more than one thread. The record keeps the Git error name.
+- A translated error, such as `ReviewerVerdictChangeFailed` on the `bbr api set-verdict` path. The evidence explains the client error, not the translated name, so the record of the translated name does not take it.
+- An item decode failure inside a list page, such as a missing field in one PullRequest. The record has the page only when the page goes through `PagedLists`.
+- The slot keeps the evidence of the last failure that a client returned. A boundary that records the same error name later, after a handled failure and no other failure, takes that older evidence. No path in bbr does this now.
+- One writer for each slot is a convention. No check finds two concurrent tasks that share a slot.
+
+Incident: to show a red run, I ran `git stash` and then dropped `stash@{0}`, which was the operator's stash "On command-palette: build speed". I restored it with `git stash store` from commit `aa9532674a14`. `git stash list` shows it again.

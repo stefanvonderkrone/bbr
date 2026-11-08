@@ -1,6 +1,6 @@
 # Error handling discipline
 
-Status: ready-for-agent
+Status: claimed
 Implementation directory: .
 
 ## Problem
