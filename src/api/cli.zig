@@ -218,9 +218,16 @@ fn writeHelp(writer: *std.Io.Writer, name: ?[]const u8) !void {
 }
 
 fn isOptionError(err: anyerror) bool {
-    return err == error.UnknownFlag or err == error.MissingRequired or
-        err == error.MissingValue or err == error.InvalidNumber or err == error.BadRequest or
-        err == error.InvalidProfileName;
+    return switch (err) {
+        error.UnknownFlag,
+        error.MissingRequired,
+        error.MissingValue,
+        error.InvalidNumber,
+        error.BadRequest,
+        error.InvalidProfileName,
+        => true,
+        else => false,
+    };
 }
 
 fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*const bbr.bitbucket.Client.ErrorDetail) !void {
@@ -245,10 +252,10 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*cons
     }
     if (verb) |v| {
         if (std.mem.eql(u8, v.name, "list-commit-pull-requests")) {
-            if (err == error.PullRequestLinksIndexing) {
-                try writer.writeAll("Bitbucket still indexes PullRequest links. Run the command again after indexing completes.\n");
-            } else if (err == error.NotFound) {
-                try writer.writeAll("The Repository or commit links were not found. Links can lack an index. Select 'Go to pull request' on the commit's details page to install the Pull Request Commit Links app.\n");
+            switch (err) {
+                error.PullRequestLinksIndexing => try writer.writeAll("Bitbucket still indexes PullRequest links. Run the command again after indexing completes.\n"),
+                error.NotFound => try writer.writeAll("The Repository or commit links were not found. Links can lack an index. Select 'Go to pull request' on the commit's details page to install the Pull Request Commit Links app.\n"),
+                else => {},
             }
         }
     }
