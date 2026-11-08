@@ -52,6 +52,7 @@ pub const RemoteBlobSource = struct {
             .content => |bytes| return bytes,
             .rejected => |failure| {
                 if (failure.reason != error.RateLimited and failure.reason != error.ServerError) return failure.reason;
+                _ = client.diagnostic.failure(.rejection, .{ .zig = failure.reason }, @src());
                 io.sleep(std.Io.Duration.fromMilliseconds(if (failure.reason == error.RateLimited) rateLimitRetryMs(failure.retry_after_ms) else 100), .awake) catch |err| switch (err) {
                     error.Canceled => {},
                 };
@@ -1046,8 +1047,18 @@ test "remote File Enrichment retries transient source failures once in the File 
             .{ .status = status, .retry_after_ms = 1, .body = "try later", .send_error = if (status == 0) error.ConnectionReset else null },
             .{ .status = 200, .body = "needle\n" },
         };
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
         var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(sink.handle(.file_enrichment, .{}));
         var plain: bbr.highlight.PlainHighlighter = .{};
         var result = try enrichConcurrent(testing.io, testing.allocator, client, plain.highlighter(), .{
             .repo = "repo",
@@ -1061,6 +1072,8 @@ test "remote File Enrichment retries transient source failures once in the File 
         defer result.deinit();
         try testing.expectEqualStrings("needle\n", result.new.owned.blob);
         try testing.expectEqual(@as(usize, 2), fake.callCount());
+        // The retry hides the first failure from every caller, so it has its own record.
+        try testing.expectEqual(@as(u64, 1), sink.sequence);
     }
     const refused = [_]bbr.http.Canned{.{ .status = 401, .body = "unauthorized" }};
     var fake: bbr.http.FakeHttpClient = .{ .responses = &refused };

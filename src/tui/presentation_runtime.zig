@@ -206,6 +206,8 @@ test "diagnostics a Bitbucket failure has one record from the worker boundary" {
     const cases = [_]struct { fake: bbr.http.FakeHttpClient, cause: []const u8 }{
         .{ .fake = .{ .body = "{" }, .cause = "cause=zig error=MalformedResponse" },
         .{ .fake = .{ .send_error = error.ConnectionReset }, .cause = "cause=zig error=ConnectionReset" },
+        .{ .fake = .{ .status = 429, .body = "token" }, .cause = "cause=zig error=RateLimited" },
+        .{ .fake = .{ .status = 503, .body = "token" }, .cause = "cause=zig error=ServerError" },
     };
     for (cases) |case| {
         var tmp = testing.tmpDir(.{});

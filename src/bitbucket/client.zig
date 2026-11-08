@@ -109,18 +109,6 @@ pub const Client = struct {
 
     fn send(self: Client, allocator: Allocator, request: httpc.Request) !httpc.Response {
         const response = try self.http.send(allocator, request);
-        classify(response.status) catch |reason| {
-            _ = self.diagnostic.failure(.rejection, .{ .http = .{ .status = response.status, .classification = switch (reason) {
-                error.Unauthorized => .authentication,
-                error.Forbidden => .authorization,
-                error.RateLimited => .rate_limit,
-                error.ServerError => .server,
-                error.NotFound => .not_found,
-                error.BadRequest => .validation,
-                error.Conflict => .conflict,
-                else => .other,
-            } } }, @src());
-        };
         if (self.error_detail) |detail| {
             classify(response.status) catch |reason| detail.record(reason, response.body, self.cred.token, request.headers);
         }
@@ -390,22 +378,15 @@ pub const Client = struct {
         const parsed = std.json.parseFromSlice(Wire, allocator, metadata_body, .{ .ignore_unknown_fields = true }) catch return error.MalformedResponse;
         defer parsed.deinit();
         const metadata = parsed.value;
-        if (!std.mem.eql(u8, metadata.type, "commit_file")) return self.invalidBlob(error.BlobTypeMismatch, @src());
-        if (!std.mem.eql(u8, metadata.path, path)) return self.invalidBlob(error.BlobPathMismatch, @src());
-        if (!hashMatches(metadata.commit.hash, commit)) return self.invalidBlob(error.BlobCommitMismatch, @src());
-        if (!stringSlicesEqual(metadata.attributes, expected_attributes)) return self.invalidBlob(error.BlobAttributesMismatch, @src());
+        if (!std.mem.eql(u8, metadata.type, "commit_file")) return error.BlobTypeMismatch;
+        if (!std.mem.eql(u8, metadata.path, path)) return error.BlobPathMismatch;
+        if (!hashMatches(metadata.commit.hash, commit)) return error.BlobCommitMismatch;
+        if (!stringSlicesEqual(metadata.attributes, expected_attributes)) return error.BlobAttributesMismatch;
 
         const raw = try self.getFileBlob(allocator, repo_slug, commit, path);
         defer allocator.free(raw);
-        if (metadata.size != raw.len) return self.invalidBlob(error.BlobSizeMismatch, @src());
+        if (metadata.size != raw.len) return error.BlobSizeMismatch;
         return raw.len;
-    }
-
-    const BlobShapeError = error{ BlobTypeMismatch, BlobPathMismatch, BlobCommitMismatch, BlobAttributesMismatch, BlobSizeMismatch };
-
-    fn invalidBlob(self: Client, err: BlobShapeError, comptime source: std.builtin.SourceLocation) BlobShapeError {
-        _ = self.diagnostic.failure(.validate, .{ .zig = err }, source);
-        return err;
     }
 
     fn getSource(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, path: []const u8, metadata: bool) ![]u8 {
@@ -632,10 +613,10 @@ pub const Client = struct {
         authenticated_account_uuid: []const u8,
         target: types.ReviewerVerdict,
     ) !types.ReviewerVerdictChangeResult {
-        const before = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
-            if (asApiError(err)) |api_error| return .{ .api_error = api_error };
-            return err;
-        };
+        // A boundary records the error that this function returns. An outcome carries no
+        // evidence, so each cause that becomes an outcome gets its record here.
+        const before = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err|
+            return self.verdictRefusal(asApiError(err) orelse return err, @src());
         defer deinitPullRequest(allocator, before);
         if (!std.mem.eql(u8, before.source_commit, expected_source_commit)) return .stale_source_commit;
         if (before.author_uuid.len != 0 and std.mem.eql(u8, before.author_uuid, authenticated_account_uuid)) return .{ .api_error = error.Forbidden };
@@ -664,24 +645,28 @@ pub const Client = struct {
 
         var uncertain = false;
         var uncertain_reason: ?ApiError = null;
-        // An uncertain or unresolved outcome drops the cause, so a failure without the rejection record of send gets its record here.
         self.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
+            _ = self.diagnostic.failure(.execute, .{ .zig = err }, @src());
             if (asApiError(err)) |api_error| switch (api_error) {
                 error.RateLimited, error.ServerError => uncertain_reason = api_error,
                 else => return .{ .api_error = api_error },
-            } else _ = self.diagnostic.failure(.execute, .{ .zig = err }, @src());
+            };
             uncertain = true;
         };
 
         const after = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
-            const api_error = asApiError(err);
-            if (api_error == null or err == error.MalformedResponse) _ = self.diagnostic.failure(.read, .{ .zig = err }, @src());
-            return .{ .unresolved = api_error };
+            _ = self.diagnostic.failure(.read, .{ .zig = err }, @src());
+            return .{ .unresolved = asApiError(err) };
         };
         defer deinitPullRequest(allocator, after);
         if (after.reviewerVerdict(authenticated_account_uuid) != target) return .{ .unresolved = uncertain_reason };
         if (uncertain or !std.mem.eql(u8, after.source_commit, expected_source_commit)) return .reconciled_success;
         return .success;
+    }
+
+    fn verdictRefusal(self: Client, api_error: ApiError, comptime source: std.builtin.SourceLocation) types.ReviewerVerdictChangeResult {
+        _ = self.diagnostic.failure(.read, .{ .zig = api_error }, source);
+        return .{ .api_error = api_error };
     }
 
     fn sendReviewerVerdictMutation(
@@ -2936,7 +2921,7 @@ fn testCredential() Credential {
     return .{ .username = "u", .token = "t", .workspace = "check24" };
 }
 
-test "diagnostics Bitbucket records a typed rejection and leaves a decode failure to the boundary" {
+test "diagnostics Bitbucket leaves a rejection and a decode failure to the boundary" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
@@ -2950,11 +2935,12 @@ test "diagnostics Bitbucket records a typed rejection and leaves a decode failur
     var fake: FakeHttpClient = .{ .status = 429, .body = "private-server-body", .retry_after_ms = 1234 };
     const bb = Client.init(fake.httpClient(), .{ .username = "private-user", .token = "private-token", .workspace = "private-workspace" })
         .withDiagnostics(sink.handle(.submission, .{ .command_id = 71, .work_id = 72, .session_epoch = 3, .attempt = 2 }));
+    // The rejection reaches the caller as a value, and the caller that drops or shows it records it.
     const result = try bb.createCommentAttempt(testing.allocator, "private-repository", 7, .{ .body = "private-authored-body" });
     try testing.expectEqual(error.RateLimited, result.rejected.reason);
     try testing.expectEqual(@as(?u64, 1234), result.rejected.retry_after_ms);
-    try testing.expectEqual(@as(u64, 1), sink.sequence);
-    // The boundary that receives a decode error records it once, so the client records nothing.
+    try testing.expectError(error.RateLimited, bb.getPullRequest(testing.allocator, "private-repository", 7));
+    try testing.expectError(error.RateLimited, bb.listBranches(testing.io, testing.allocator, "private-repository", .{ .page = 4 }, 1));
     fake.status = 200;
     fake.body = "{";
     try testing.expectError(error.MalformedResponse, bb.getPullRequest(testing.allocator, "private-repository", 7));
@@ -2962,19 +2948,8 @@ test "diagnostics Bitbucket records a typed rejection and leaves a decode failur
     try testing.expectError(error.MalformedResponse, bb.getPullRequest(testing.allocator, "private-repository", 7));
     fake.body = "{";
     try testing.expectError(error.MalformedResponse, bb.listBranches(testing.io, testing.allocator, "private-repository", .{ .page = 4 }, 1));
-    try testing.expectEqual(@as(usize, 4), fake.call_count);
-    try testing.expectEqual(@as(u64, 1), sink.sequence);
-    _ = sink.setEnabled(false);
-    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
-    defer dir.close(testing.io);
-    var iterator = dir.iterate();
-    const entry = (try iterator.next(testing.io)).?;
-    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
-    defer testing.allocator.free(bytes);
-    for ([_][]const u8{ "operation=submission", "phase=rejection", "status=429 classification=rate_limit", "command_id=71", "work_id=72", "session_epoch=3", "attempt=2", "source=bitbucket/client.zig:" }) |needle|
-        try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
-    try testing.expect(std.mem.indexOf(u8, bytes, "private-") == null);
-    try testing.expect(std.mem.indexOf(u8, bytes, "api.bitbucket.org") == null);
+    try testing.expectEqual(@as(usize, 6), fake.call_count);
+    try testing.expectEqual(@as(u64, 0), sink.sequence);
 }
 
 const lifecycle_branch =
@@ -3293,17 +3268,8 @@ test "getPullRequest translates PullRequest Author and Reviewer Verdicts" {
     try testing.expectEqual(types.ReviewerVerdict.no_verdict, pr.reviewerVerdict("{missing}"));
 }
 
-test "diagnostics an unresolved Reviewer Verdict change keeps each transport cause in one record" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
-    defer testing.allocator.free(home);
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("XDG_STATE_HOME", home);
-    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
-    defer sink.deinit();
-    try testing.expect(sink.setEnabled(true) == .on);
+test "diagnostics each Reviewer Verdict cause that becomes an outcome has one record" {
+    const Canned = @import("../http/fake_client.zig").Canned;
     const before =
         \\{ "id": 42, "title": "Review", "state": "OPEN",
         \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
@@ -3311,16 +3277,65 @@ test "diagnostics an unresolved Reviewer Verdict change keeps each transport cau
         \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
         \\  "participants": [] }
     ;
-    const responses = [_]@import("../http/fake_client.zig").Canned{
-        .{ .status = 200, .body = before },
-        .{ .send_error = error.ConnectionResetByPeer },
-        .{ .send_error = error.ConnectionResetByPeer },
+    const reset: Canned = .{ .send_error = error.ConnectionResetByPeer };
+    const cases = [_]struct {
+        responses: []const Canned,
+        result: types.ReviewerVerdictChangeResult,
+        records: []const []const u8,
+    }{
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, reset, reset },
+            .result = .{ .unresolved = null },
+            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer", "phase=read source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer" },
+        },
+        .{
+            .responses = &.{.{ .status = 401, .body = "{}" }},
+            .result = .{ .api_error = error.Unauthorized },
+            .records = &.{ "phase=read source=bitbucket/client.zig:", "cause=zig error=Unauthorized" },
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 403, .body = "{}" } },
+            .result = .{ .api_error = error.Forbidden },
+            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=Forbidden" },
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 200, .body = before } },
+            .result = .{ .unresolved = error.ServerError },
+            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=ServerError" },
+        },
     };
-    var fake: FakeHttpClient = .{ .responses = &responses };
-    const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(sink.handle(.verdict, .{}));
-    const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
-    try testing.expectEqual(@as(?ApiError, null), result.unresolved);
-    try testing.expectEqual(@as(u64, 2), sink.sequence);
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        var fake: FakeHttpClient = .{ .responses = case.responses };
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(sink.handle(.verdict, .{}));
+        const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+        try testing.expectEqualDeep(case.result, result);
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        var index: usize = 0;
+        while (lines.next()) |line| : (index += 2) {
+            try testing.expect(index + 1 < case.records.len);
+            try testing.expect(std.mem.indexOf(u8, line, case.records[index]) != null);
+            try testing.expect(std.mem.endsWith(u8, line, case.records[index + 1]));
+        }
+        try testing.expectEqual(case.records.len, index);
+    }
 }
 
 test "changeReviewerVerdict POSTs Approved after a fresh SourceCommit check" {
