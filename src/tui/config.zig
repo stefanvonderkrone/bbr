@@ -159,6 +159,7 @@ pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.pr
     if (parsed == .invalid) return error.ConfigInvalid;
     writeAtomically(allocator, io, config_path, next) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
         else => error.WriteFailed,
     };
 }
@@ -338,13 +339,17 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             const override: keymap.Override = .{ .action = key, .sequences = sequences };
             keymap.validateOverride(override) catch |err| {
                 allocator.free(sequences);
-                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = switch (err) {
-                    error.UnknownAction => "unknown Action name",
-                    error.UnknownKey => "unknown key name",
-                    error.SequenceTooLong => "key sequence exceeds eight chords",
-                    error.CountConflict => "key sequence cannot begin with a Count digit",
-                    else => "invalid key sequence",
-                }, .hint = if (err == error.UnknownAction) "use an Action name shown in the Keybindings Overlay" else null });
+                const diagnosed: struct { message: []const u8, hint: ?[]const u8 } = switch (err) {
+                    error.UnknownAction => .{
+                        .message = "unknown Action name",
+                        .hint = "use an Action name shown in the Keybindings Overlay",
+                    },
+                    error.UnknownKey => .{ .message = "unknown key name", .hint = null },
+                    error.SequenceTooLong => .{ .message = "key sequence exceeds eight chords", .hint = null },
+                    error.CountConflict => .{ .message = "key sequence cannot begin with a Count digit", .hint = null },
+                    error.EmptySequence, error.MissingKey => .{ .message = "invalid key sequence", .hint = null },
+                };
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = diagnosed.message, .hint = diagnosed.hint });
                 continue;
             };
             try overrides.append(allocator, override);

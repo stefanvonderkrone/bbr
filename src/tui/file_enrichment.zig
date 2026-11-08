@@ -44,17 +44,23 @@ pub const RemoteBlobSource = struct {
             error.OutOfMemory, error.InvalidPath => return err,
             else => {
                 _ = client.diagnostic.failure(.read, .{ .zig = err }, @src());
-                io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+                io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch |sleep_err| switch (sleep_err) {
+                    error.Canceled => return error.Canceled,
+                };
                 return null;
             },
         };
         switch (response) {
             .content => |bytes| return bytes,
             .rejected => |failure| {
-                if (failure.reason != error.RateLimited and failure.reason != error.ServerError) return failure.reason;
+                const delay_ms: i64 = switch (failure.reason) {
+                    error.RateLimited => rateLimitRetryMs(failure.retry_after_ms),
+                    error.ServerError => 100,
+                    else => return failure.reason,
+                };
                 _ = client.diagnostic.failure(.rejection, .{ .zig = failure.reason }, @src());
-                io.sleep(std.Io.Duration.fromMilliseconds(if (failure.reason == error.RateLimited) rateLimitRetryMs(failure.retry_after_ms) else 100), .awake) catch |err| switch (err) {
-                    error.Canceled => {},
+                io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
                 };
                 return null;
             },
@@ -1709,6 +1715,28 @@ test "a retried remote blob read records its first attempt with the File side" {
             try testing.expect(std.mem.indexOf(u8, line, needle) != null);
     }
     try testing.expect(records > 0);
+}
+
+fn readRemoteBlob(remote: *RemoteBlobSource) anyerror![]u8 {
+    return remote.source().read(testing.allocator, "source", "file.zig", .{});
+}
+
+test "a canceled remote blob retry returns error.Canceled and does not send the second request" {
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 503, .body = "failure" },
+        .{ .status = 200, .body = "should-not-be-read" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var remote: RemoteBlobSource = .{ .client = bb, .repo = "repo", .retry_io = testing.io };
+    var future = try testing.io.concurrent(readRemoteBlob, .{&remote});
+    var waits: usize = 0;
+    while (fake.callCount() == 0) : (waits += 1) {
+        if (waits == 2000) return error.TestUnexpectedResult;
+        try testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try testing.expectError(error.Canceled, future.cancel(testing.io));
+    try testing.expectEqual(@as(usize, 1), fake.callCount());
 }
 
 test "File Content Status is independent per expected side and from Highlighting" {

@@ -1322,7 +1322,10 @@ pub const PrepareSession = struct {
     pub fn build(self: *PrepareSession) void {
         self.candidate.?.finishCreate(self.preferences, self.location) catch |err| {
             self.evidence = bbr.diagnostic.Failure.capture(.buffer_build, .prepare, .{ .command_id = self.command_id }, .{ .zig = err }, @src());
-            self.failure = if (err == error.OutOfMemory) .out_of_memory else .buffer_build_failed;
+            self.failure = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .buffer_build_failed,
+            };
             return;
         };
         self.ready = true;
@@ -4401,9 +4404,9 @@ const Published = struct {
                     .emphasis_cache = &published.emphasis_cache,
                     .mention_names = &session.mention_names,
                 },
-            ) catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                return error.BufferBuildFailed;
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => return error.BufferBuildFailed,
             };
             published.visual_rows = try frame_mod.buildVisualRowsWithOptions(buffer_allocator, published.buffer.rows, cell_metrics, .{
                 .layout = preferences.layout,
@@ -4443,7 +4446,10 @@ const Published = struct {
             0,
             cell_metrics,
         );
-        published.search_corpus = published.bufferSearchCorpus(preferences, disclosures.items, published.isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BufferBuildFailed;
+        published.search_corpus = published.bufferSearchCorpus(preferences, disclosures.items, published.isolated_file, geometry) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => error.BufferBuildFailed,
+        };
         errdefer published.search_corpus.?.release();
         published.navigation = Nav.init(published.visual_rows.len, panes.diff_content.height);
         published.disclosure_inputs = try DisclosureInputs.create(published);
@@ -4798,9 +4804,9 @@ const Published = struct {
                 .emphasis_cache = &self.emphasis_cache,
                 .mention_names = &self.session.mention_names,
             },
-        ) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return error.BufferBuildFailed;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => return error.BufferBuildFailed,
         };
         const visual_rows = try frame_mod.buildVisualRowsWithOptions(allocator, candidate.rows, self.cell_metrics, .{
             .layout = preferences.layout,
@@ -4907,7 +4913,10 @@ const Published = struct {
         const search_corpus = if (reuse_search_corpus)
             null
         else
-            self.bufferSearchCorpus(preferences, expanded_disclosures, isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.SearchFailed;
+            self.bufferSearchCorpus(preferences, expanded_disclosures, isolated_file, geometry) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => error.SearchFailed,
+            };
         errdefer if (search_corpus) |corpus| corpus.release();
         const disclosure_inputs = if (reuse_search_corpus and self.disclosure_inputs_current) blk: {
             self.disclosure_inputs.retain();
@@ -8180,10 +8189,12 @@ pub const Presentation = struct {
         if (state.open) return;
         self.cancelQueuedViewBuild(published);
         if (state.corpus == null) {
-            const corpus = published.reviewSearchCorpus() catch |err| {
-                self.reportFailure(.review_search, .prepare, err, @src());
-                self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_scan_failed;
-                return;
+            const corpus = published.reviewSearchCorpus() catch |err| switch (err) {
+                error.OutOfMemory => {
+                    self.reportFailure(.review_search, .prepare, err, @src());
+                    self.action_error = .out_of_memory;
+                    return;
+                },
             };
             state.corpus = corpus;
             state.candidate_count = corpus.candidates.len;
@@ -8321,7 +8332,10 @@ pub const Presentation = struct {
         state.opening_source = false;
         state.opening_identity = null;
         var query = search.Query.init(self.allocator, text) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.review_search, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
+                else => {},
+            }
             self.action_error = switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
                 error.OutOfMemory => .out_of_memory,
@@ -8355,9 +8369,15 @@ pub const Presentation = struct {
             return;
         }
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.review_search, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
+                else => {},
+            }
             query.deinit(self.allocator);
-            self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_invalid_query;
+            self.action_error = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .buffer_search_invalid_query,
+            };
             return;
         };
         const corpus = state.corpus orelse {
@@ -9196,7 +9216,10 @@ pub const Presentation = struct {
             return;
         }
         var query = search.Query.init(self.allocator, text) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.buffer_search, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.buffer_search, .prepare, err, @src()),
+                else => {},
+            }
             self.action_error = switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
                 error.OutOfMemory => .out_of_memory,
@@ -9205,9 +9228,15 @@ pub const Presentation = struct {
             return;
         };
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.buffer_search, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.buffer_search, .prepare, err, @src()),
+                else => {},
+            }
             query.deinit(self.allocator);
-            self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_invalid_query;
+            self.action_error = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .buffer_search_invalid_query,
+            };
             return;
         };
         const request_id = if (published.search_generation == std.math.maxInt(u64)) 1 else published.search_generation + 1;
@@ -10748,8 +10777,13 @@ pub const Presentation = struct {
             lock,
             selected_root,
         ) catch |err| {
-            if (err != error.SubmissionAlreadyActive) self.reportFailure(.submission, .prepare, err, @src());
-            self.action_error = if (err == error.SubmissionAlreadyActive) .submission_already_active else .submission_start_failed;
+            switch (err) {
+                error.SubmissionAlreadyActive => self.action_error = .submission_already_active,
+                else => {
+                    self.reportFailure(.submission, .prepare, err, @src());
+                    self.action_error = .submission_start_failed;
+                },
+            }
             return;
         } orelse {
             self.action_error = .action_refused;
@@ -10829,7 +10863,10 @@ pub const Presentation = struct {
         const durable = self.durable_comment_edit orelse return;
         if (!durableIdentityMatches(durable.key, completed.identity) or durable.comment_id != completed.comment_id) return;
         if (completed.outcome == .definitive_failure) {
-            if (completed.outcome.definitive_failure == error.Unauthorized) self.authenticated_account_uuid = null;
+            switch (completed.outcome.definitive_failure) {
+                error.Unauthorized => self.authenticated_account_uuid = null,
+                else => {},
+            }
             self.restoreCommentEditComposer(durable);
             self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
             self.durable_comment_edit = null;
@@ -10869,7 +10906,10 @@ pub const Presentation = struct {
         const durable = self.durable_comment_delete orelse return;
         if (!durableIdentityMatches(durable.key, completed.identity) or durable.comment_id != completed.comment_id) return;
         if (completed.outcome == .definitive_failure) {
-            if (completed.outcome.definitive_failure == error.Unauthorized) self.authenticated_account_uuid = null;
+            switch (completed.outcome.definitive_failure) {
+                error.Unauthorized => self.authenticated_account_uuid = null,
+                else => {},
+            }
             self.restoreCommentDeleteConfirmation(durable);
             self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
             self.durable_comment_delete = null;
@@ -11445,7 +11485,10 @@ pub const Presentation = struct {
             self.reportFailure(.submission, .execute, err, @src());
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
-            self.action_error = if (err == error.OutOfMemory) .out_of_memory else .persistence_failed;
+            self.action_error = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .persistence_failed,
+            };
             return;
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
@@ -12304,7 +12347,10 @@ pub const Presentation = struct {
         };
         job.kind = .draft_save;
         job.new_draft = published.prepareDraft(self.dependencies.reviews, job.arena.allocator(), composer.toNewDraft()) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.composer, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.composer, .prepare, err, @src()),
+                else => {},
+            }
             job.destroy();
             self.action_error = switch (err) {
                 error.AnchorRangeTooLong => .anchor_range_too_long,
@@ -12836,9 +12882,12 @@ pub const Presentation = struct {
                 (overlay orelse return summaries.destroy()).populatePullRequests(loaded.work_id, summaries) catch |err| {
                     self.reportFailure(.picker_list, .admission, err, @src());
                     summaries.destroy();
-                    if (err == error.OutOfMemory) {
-                        self.closeListOverlay();
-                        self.action_error = .out_of_memory;
+                    switch (err) {
+                        error.OutOfMemory => {
+                            self.closeListOverlay();
+                            self.action_error = .out_of_memory;
+                        },
+                        else => {},
                     }
                     return;
                 };
@@ -13062,7 +13111,10 @@ pub const Presentation = struct {
             candidate.session.retain();
             self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
                 self.reportFailure(.session_load, .prepare, err, @src());
-                self.failReplacement(replacement, if (err == error.OutOfMemory) .out_of_memory else .pending_review_load_failed);
+                self.failReplacement(replacement, switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    else => .pending_review_load_failed,
+                });
             };
             return;
         }
@@ -13072,7 +13124,10 @@ pub const Presentation = struct {
                 candidate.session.retain();
                 self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
                     self.reportFailure(.session_load, .prepare, err, @src());
-                    self.failReplacement(replacement, if (err == error.OutOfMemory) .out_of_memory else .buffer_build_failed);
+                    self.failReplacement(replacement, switch (err) {
+                        error.OutOfMemory => .out_of_memory,
+                        else => .buffer_build_failed,
+                    });
                 };
                 return;
             };

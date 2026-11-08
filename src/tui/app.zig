@@ -254,10 +254,13 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
 
 fn pickerTickWorker(loop: *Loop, future_id: u64, scope: presentation.WorkId, io: std.Io) void {
     io.sleep(std.Io.Duration.fromMilliseconds(picker_tick_interval_ms), .awake) catch |err| switch (err) {
-        error.Canceled => return,
+        error.Canceled => {
+            io.recancel();
+            return;
+        },
     };
     loop.postEvent(.{ .picker_tick = .{ .future_id = future_id, .scope = scope } }) catch |err| switch (err) {
-        error.Canceled => {},
+        error.Canceled => io.recancel(),
     };
 }
 
@@ -964,7 +967,9 @@ fn presentationEnrichmentWorker(
     var evidence: ?bbr.diagnostic.Failure = null;
     const outcome: presentation.FileEnrichmentOutcome = if (enriched) |result| .{ .completed = result } else |err| failed: {
         evidence = bbr.diagnostic.Failure.capture(.file_enrichment, .execute, diagnostic.context, .{ .zig = err }, @src());
-        break :failed .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+        break :failed .{ .failed = switch (err) {
+            error.OutOfMemory => .out_of_memory,
+        } };
     };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .file_enrichment_completed = .{
         .evidence = evidence,

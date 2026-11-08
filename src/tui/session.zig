@@ -235,7 +235,10 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     const a = s.arena.allocator();
 
     s.authenticated_account_uuid = account_branch.value;
-    s.authenticated_account_unauthorized = if (account_branch.err) |err| err == error.Unauthorized else false;
+    s.authenticated_account_unauthorized = if (account_branch.err) |err| switch (err) {
+        error.Unauthorized => true,
+        else => false,
+    } else false;
 
     const pr = pr_branch.value.?;
     s.source = .{ .remote = pr };
@@ -287,7 +290,10 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     s.authenticated_account_unauthorized = false;
     s.authenticated_account_uuid = bb.getAuthenticatedAccountUuid(a) catch |err| blk: {
         _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
-        s.authenticated_account_unauthorized = err == error.Unauthorized;
+        s.authenticated_account_unauthorized = switch (err) {
+            error.Unauthorized => true,
+            else => false,
+        };
         break :blk null;
     };
     const pr = try bb.getPullRequest(a, repo, id);
