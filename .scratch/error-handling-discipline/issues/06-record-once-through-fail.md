@@ -130,6 +130,9 @@ Remaining work, outside the checked sites:
 - Issue 05 owns the Git launch catch in `runRaw`, which shows `NotAGitRepo` for a missing git binary.
 - An unresolved Reviewer Verdict change after a lost connection has two records on the `bbr api` path: the transport cause from `changeReviewerVerdict` and `ReviewerVerdictChangeFailed` from the api boundary. `checkMutationRun` in `src/main.zig` has the same pair. The TUI path has one record.
 - `runPresentation` in `src/tui/app.zig` prints "bbr: could not load the pending review drafts" when the initial load fails with `error.Reported`. Only the demo passes an initial Session, and its `:memory:` store fails only on `SQLITE_NOMEM`, so no test reaches the message.
+- `Published.createInputs` in `src/tui/presentation.zig` turns a resolver error, such as `OutOfMemory`, into an unavailable scope with an uncaptured `catch .unavailable`, so it has no record. `GitAnchorResolver` records only Git and parse failures.
+- `listPagesConcurrent` in `src/bitbucket/client.zig` can leave through `try` before `PagedLists.finish`, for example on `OutOfMemory`. Other failed pages then have no record.
+- No test reads the record count of a refused `bbr api set-reviewer-verdict`. The worker test covers the TUI path, and the client test shows that the client records no reason that the result names.
 
 Corrections to the first Comments of this issue:
 
