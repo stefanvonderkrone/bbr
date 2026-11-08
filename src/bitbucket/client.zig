@@ -139,7 +139,13 @@ pub const Client = struct {
     }
 
     fn send(self: Client, allocator: Allocator, request: httpc.Request) !httpc.Response {
-        const response = try self.http.send(allocator, request);
+        var phase: httpc.Phase = .prepare;
+        var traced = request;
+        traced.phase = &phase;
+        const response = self.http.send(allocator, traced) catch |err| {
+            self.diagnostic.note(.{ .err = err, .phase = phase });
+            return err;
+        };
         classify(response.status) catch |reason| {
             self.diagnostic.note(.{ .err = reason, .phase = .rejection, .cause = .{ .http = .{ .status = response.status, .classification = httpClass(reason) } } });
             if (self.error_detail) |detail| detail.record(reason, response.body, self.cred.token, request.headers);

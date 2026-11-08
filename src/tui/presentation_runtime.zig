@@ -205,7 +205,7 @@ test "diagnostics a worker completion that carries error.Reported keeps the leaf
 test "diagnostics a Bitbucket failure has one record from the worker boundary" {
     const cases = [_]struct { fake: bbr.http.FakeHttpClient, cause: []const u8 = "source=tui/presentation_adapter.zig:", cause_end: []const u8 }{
         .{ .fake = .{ .body = "{" }, .cause_end = "cause=zig error=MalformedResponse" },
-        .{ .fake = .{ .send_error = error.ConnectionReset }, .cause_end = "cause=zig error=ConnectionReset" },
+        .{ .fake = .{ .send_error = error.ConnectionReset, .send_phase = .receive_head }, .cause = "phase=receive_head source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=ConnectionReset" },
         .{ .fake = .{ .status = 429, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=429 classification=rate_limit" },
         .{ .fake = .{ .status = 503, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=503 classification=server" },
         .{ .fake = .{ .status = 418, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=418 classification=other" },
@@ -265,7 +265,7 @@ test "diagnostics a refused Reviewer Verdict change has one record from the work
         .{ .responses = &.{.{ .status = 401, .body = "{}" }}, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=401 classification=authentication" },
         .{ .responses = &.{ .{ .body = before }, .{ .status = 403, .body = "{}" } }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=403 classification=authorization" },
         .{ .responses = &.{ .{ .body = before }, .{ .status = 503, .body = "{}" }, .{ .body = before } }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=503 classification=server" },
-        .{ .responses = &.{ .{ .body = before }, .{ .send_error = error.ConnectionResetByPeer }, .{ .body = before } }, .cause_end = "cause=zig error=ConnectionResetByPeer" },
+        .{ .responses = &.{ .{ .body = before }, .{ .send_error = error.ConnectionResetByPeer, .send_phase = .send_body }, .{ .body = before } }, .cause = "phase=send_body source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=ConnectionResetByPeer" },
     };
     for (cases) |case| {
         var tmp = testing.tmpDir(.{});

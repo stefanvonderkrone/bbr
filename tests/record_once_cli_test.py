@@ -17,6 +17,7 @@ binary = str(Path(sys.argv[1]).resolve())
 credentials = {"BITBUCKET_USERNAME": "record-once-user", "BITBUCKET_TOKEN": "record-once-token", "BITBUCKET_WORKSPACE": "record-once-workspace"}
 
 # (arguments, extra environment, stderr text, operation, cause) of the one record.
+# A failure whose leaf has more evidence names it in `evidence`, a part of the record.
 cases = (
     (["api", "whoami", "--json"], {}, b"bbr api whoami: MissingCredential (MissingUsername)\nRun `bbr auth login`", "api", "MissingUsername"),
     (["api", "frobnicate"], {}, b"bbr api: bad options (UnknownFlag)\n", "api", "UnknownFlag"),
@@ -63,7 +64,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
     config.parent.mkdir(parents=True)
     config.write_text("[logging]\nenabled = true\n")
     (root / "record-once-bad.tar.gz").write_bytes(b"\x1f\x8b\x09\x00\x00\x00\x00\x00\x00\x03not-gzip-content")
-    def check(args, extra, message, operation, cause, cwd=root, status=1):
+    def check(args, extra, message, operation, cause, cwd=root, status=1, evidence=""):
         before = logs(env)
         result = subprocess.run(
             [binary, *args], capture_output=True, env=dict(env, **extra), cwd=cwd, timeout=10, stdin=subprocess.DEVNULL,
@@ -74,9 +75,13 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
         assert b"error: Reported" not in result.stderr, (args, result.stderr)
         assert len(records) == 1, (args, records)
         assert f" operation={operation} " in records[0] and records[0].endswith(f" error={cause}"), (args, records)
+        assert evidence in records[0], (args, evidence, records)
 
     for case in cases:
         check(*case)
+    # The transport phase reaches the one record of a refused connection.
+    for args in (["api", "whoami"], ["auth", "status"]):
+        check(args, refused_proxy, b"ConnectionRefused", "api" if args[0] == "api" else "auth", "ConnectionRefused", evidence=" phase=connect ")
     # These Git failures print their message and end with status 0, as before.
     repository = root / "repository"
     repository.mkdir()
