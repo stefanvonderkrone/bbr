@@ -471,11 +471,12 @@ fn openStore(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.M
     } else |err| {
         if (err != error.NoStateHome) _ = diagnostic.forContext(.persistence, .{}).failure(.prepare, .{ .zig = err }, @src());
     }
+    return memoryStore(diagnostic);
+}
+
+fn memoryStore(diagnostic: bbr.diagnostics.Handle) persist.SqliteStore {
     return persist.SqliteStore.openDiagnostic(":memory:", diagnostic.forContext(.persistence, .{})) catch |err| {
-        switch (err) {
-            error.Reported => {},
-            else => _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src()),
-        }
+        _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
         @panic("sqlite :memory: open failed");
     };
 }
@@ -1419,10 +1420,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
     };
 
     // Ephemeral in-memory store: the demo authors drafts but persists nothing.
-    var store = persist.SqliteStore.openDiagnostic(":memory:", diagnostic.forContext(.persistence, .{})) catch |err| {
-        _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
-        @panic("sqlite :memory: open failed");
-    };
+    var store = memoryStore(diagnostic);
     defer store.deinit();
     var plain_highlighter: bbr.highlight.PlainHighlighter = .{};
     try app.run(.{
