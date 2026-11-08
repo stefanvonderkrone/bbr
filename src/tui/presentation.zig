@@ -4295,9 +4295,9 @@ const Published = struct {
             const resolution: bbr.review.ScopeResolution = if (key.isRemote())
                 resolveRemoteScope(authored, session)
             else if (scope_resolver) |resolver|
-                resolver.resolve(published.review_arena.allocator(), authored, current_commit) catch .unavailable
+                try resolver.resolve(published.review_arena.allocator(), authored, current_commit)
             else if (authored == .@"inline" and anchor_resolver != null) blk: {
-                const legacy = anchor_resolver.?.resolve(published.review_arena.allocator(), authored.@"inline", current_commit) catch .unavailable;
+                const legacy = try anchor_resolver.?.resolve(published.review_arena.allocator(), authored.@"inline", current_commit);
                 break :blk switch (legacy) {
                     .unavailable => .unavailable,
                     .resolved => |value| .{ .resolved = .{ .state = value.state, .scope = .{ .@"inline" = value.anchor } } },
@@ -31983,6 +31983,69 @@ test "diagnostics a store failure through fail keeps one record when Presentatio
     try testing.expect(lines.next() == null);
     try testing.expect(std.mem.indexOf(u8, only, "operation=persistence phase=step source=tui/presentation.zig:") != null);
     try testing.expect(std.mem.endsWith(u8, only, "cause=sqlite result=10 extended=266"));
+}
+
+test "diagnostics a scope resolver failure fails the Session load with one record" {
+    const Resolver = struct {
+        var fails = false;
+        fn resolve(_: *anyopaque, _: Allocator, _: bbr.review.CommentScope, _: []const u8) anyerror!bbr.review.ScopeResolution {
+            if (fails) return error.OutOfMemory;
+            return .{ .resolved = .{ .state = .current, .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } } } };
+        }
+    };
+    defer Resolver.fails = false;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+
+    var resolver: u8 = 0;
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(1, "main", "feature");
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .target = .local, .kind = .comment, .body = "root", .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } } });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .scope_resolver = .{ .ptr = &resolver, .resolve_fn = Resolver.resolve } }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .refresh });
+    var load: ?LoadSession = null;
+    while (presentation.takeCommand()) |command_value| {
+        var command = command_value;
+        if (command == .load_session) load = command.load_session else command.deinit();
+    }
+    Resolver.fails = true;
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+        .command_id = load.?.command_id,
+        .intent = load.?.intent,
+        .outcome = .{ .loaded = try testLocalSession(testing.allocator) },
+    } });
+
+    try testing.expectEqual(ReplacementError.out_of_memory, presentation.projection().replacement_error orelse return error.TestExpectedReplacementError);
+    while (presentation.takeCommand()) |command_value| {
+        var command = command_value;
+        defer command.deinit();
+        if (command == .report_diagnostic) sink.handle(.session_load, .{}).record(command.report_diagnostic);
+    }
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next() orelse return error.TestExpectedRecord;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
 }
 
 const TestStoreFailure = enum { reported, plain };

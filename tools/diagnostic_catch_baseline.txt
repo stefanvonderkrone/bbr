@@ -13,6 +13,6 @@
 7 src/tui/config.zig
 2 src/tui/file_enrichment.zig
 1 src/tui/frame.zig
-11 src/tui/presentation.zig
+9 src/tui/presentation.zig
 1 src/tui/render.zig
 6 src/tui/search.zig

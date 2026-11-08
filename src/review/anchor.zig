@@ -42,6 +42,8 @@ pub fn findScope(entries: []const ScopeProjectionEntry, temp_id: @import("draft.
     return null;
 }
 
+/// A resolver turns an expected failure, such as an unavailable Git transition, into
+/// `.unavailable` and records it. An error that it returns fails the caller.
 pub const ScopeResolver = struct {
     ptr: *anyopaque,
     resolve_fn: *const fn (*anyopaque, Allocator, CommentScope, []const u8) anyerror!ScopeResolution,
