@@ -1866,9 +1866,18 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             }
         };
 
+        /// The caller sees one failure at most, so each other failed page has its record here.
+        /// This runs on every exit, also when the coordinator fails before `finish`.
         fn deinit(self: *Self) void {
             for (self.lists) |*list| {
-                for (list.pages.items) |*page| self.release(page);
+                for (list.pages.items, 1..) |*page, number| {
+                    if (page.* == .failed) {
+                        var diagnostic = self.diagnostic;
+                        diagnostic.context.page = self.pageNumber(@intCast(number));
+                        _ = diagnostic.failure(.read, .{ .zig = page.failed.reason }, @src());
+                    }
+                    self.release(page);
+                }
                 list.pages.deinit(self.allocator);
                 if (list.link) |link| self.allocator.free(link);
                 list.followed.deinit(self.allocator);
@@ -2014,23 +2023,16 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             return null;
         }
 
-        /// Moves the merged items to the caller, or returns the lowest needed failure.
-        /// The caller sees one failure at most, so each other failed page has its record here.
+        /// Moves the merged items to the caller, or moves the lowest needed failure to the caller.
         fn finish(self: *Self, error_detail: ?*Client.ErrorDetail) ![]Item {
             const merged = self.prefix();
-            const returned = if (merged.end != null) self.firstFailure() else null;
-            for (self.lists, 0..) |list, index| for (list.pages.items, 1..) |page, number| {
-                const position: PagePosition = .{ .list = index, .number = @intCast(number) };
-                if (page != .failed or (returned != null and std.meta.eql(position, returned.?))) continue;
-                var diagnostic = self.diagnostic;
-                diagnostic.context.page = self.pageNumber(position.number);
-                _ = diagnostic.failure(.read, .{ .zig = page.failed.reason }, @src());
-            };
             if (merged.end != null) {
-                const position = returned orelse return error.MalformedResponse;
-                const failed = &self.lists[position.list].pages.items[position.number - 1].failed;
-                if (error_detail) |destination| destination.copyFrom(if (failed.detail) |*source| source else null);
-                return failed.reason;
+                const position = self.firstFailure() orelse return error.MalformedResponse;
+                const page = &self.lists[position.list].pages.items[position.number - 1];
+                const reason = page.failed.reason;
+                if (error_detail) |destination| destination.copyFrom(if (page.failed.detail) |*source| source else null);
+                self.release(page);
+                return reason;
             }
             const count = @min(merged.items, self.options.limit orelse merged.items);
             const out = try self.allocator.alloc(Item, count);
@@ -5106,6 +5108,59 @@ test "diagnostics a failed page that the result does not need has one record" {
             try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=RateLimited"));
         }
     }
+}
+
+test "diagnostics a failed page keeps its record when the coordinator fails before the result" {
+    var exits_early = false;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        try testing.expect(fail_index < 1000);
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        const responses = repositoryResponses(.{ .status = 429, .body = "{}" }, null);
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(sink.handle(.picker_list, .{}));
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const result = bb.listWorkspacePullRequests(testing.io, failing.allocator(), .{
+            .scope = .{ .repositories = .{ .slugs = &.{ "gamma", "alpha", "beta" }, .party = .{ .reviewer = "{reviewer}" } } },
+            .states = .initMany(&.{.OPEN}),
+        }, .{ .limit = 3, .concurrency = 1 });
+        const beta_failed = for (0..fake.call_count) |index| {
+            if (std.mem.indexOf(u8, fake.urlAt(index).?, "/beta/") != null) break true;
+        } else false;
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        var records: usize = 0;
+        while (lines.next()) |line| : (records += 1) {
+            try testing.expect(std.mem.indexOf(u8, line, " page=1 ") != null);
+            try testing.expect(std.mem.endsWith(u8, line, "cause=zig error=RateLimited"));
+        }
+        // The caller receives OutOfMemory, so its boundary records that. The failed page is not in the result.
+        try testing.expectEqual(@as(usize, @intFromBool(beta_failed)), records);
+        const items = result catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            if (beta_failed) exits_early = true;
+            continue;
+        };
+        deinitSummaries(testing.allocator, items);
+        break;
+    }
+    try testing.expect(exits_early);
 }
 
 const author_endpoint = base_url ++ "/workspaces/check24/pullrequests/%7Bauthor%7D";
