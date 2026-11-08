@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-diagnostics-cli-") as directory:
 
     missing = check_failure(env, ["api", "whoami", "--json"], "MissingUsername", "api")
     assert missing.returncode != 0 and missing.stdout == b""
-    assert b"bbr api whoami: MissingCredential\n" in missing.stderr
+    assert b"bbr api whoami: MissingCredential (MissingUsername)\n" in missing.stderr
     missing = check_failure(env, ["auth", "status"], "MissingUsername", "auth")
     assert missing.returncode == 1 and missing.stdout == b""
 

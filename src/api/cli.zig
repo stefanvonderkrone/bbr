@@ -236,11 +236,12 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*cons
     } else if (isOptionError(err)) {
         try writer.print(": bad options ({s})\n", .{@errorName(err)});
         try writeHelp(writer, if (verb) |v| v.name else null);
-    } else {
-        try writer.print(": {s}\n", .{@errorName(err)});
-        if (err == error.MissingCredential) {
-            try writer.writeAll("Run `bbr auth login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n");
-        }
+    } else switch (err) {
+        error.MissingUsername, error.MissingToken, error.MissingWorkspace => try writer.print(
+            ": MissingCredential ({s})\nRun `bbr auth login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n",
+            .{@errorName(err)},
+        ),
+        else => try writer.print(": {s}\n", .{@errorName(err)}),
     }
     if (verb) |v| {
         if (std.mem.eql(u8, v.name, "list-commit-pull-requests")) {
@@ -312,17 +313,17 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, profile:
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     while (it.next()) |a| argv.append(gpa, a) catch |err| {
-        _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
         try printError(init, diagnosticVerb(argv.items), err, null);
-        return err;
+        return diagnostic.fail(.prepare, .{ .zig = err }, @src());
     };
     var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = gpa, .io = init.io };
     defer detail.deinit();
-    runArgs(init, gpa, argv.items, profile, &detail, diagnostic) catch |err| {
-        if (err == error.StdoutClosed) return err;
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
-        try printError(init, diagnosticVerb(argv.items), err, &detail);
-        return err;
+    runArgs(init, gpa, argv.items, profile, &detail, diagnostic) catch |err| switch (err) {
+        error.StdoutClosed, error.Reported => return err,
+        else => {
+            try printError(init, diagnosticVerb(argv.items), err, &detail);
+            return diagnostic.fail(.execute, .{ .zig = err }, @src());
+        },
     };
 }
 
@@ -336,13 +337,7 @@ fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const
 
     const entry = findVerb(verb) orelse return error.UnknownFlag;
 
-    var owned = cliCredential(gpa, init.io, init.environ_map, parsed.workspace, parsed.profile orelse profile) catch |err| {
-        _ = diagnostic.failure(.read, .{ .zig = err }, @src());
-        return switch (err) {
-            error.MissingUsername, error.MissingToken, error.MissingWorkspace => error.MissingCredential,
-            else => err,
-        };
-    };
+    var owned = try cliCredential(gpa, init.io, init.environ_map, parsed.workspace, parsed.profile orelse profile);
     defer owned.deinit(gpa);
 
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
@@ -622,8 +617,7 @@ test "global parse errors use stderr and name only a safely supplied verb" {
     for (cases) |case| {
         var output: TestOutput = .{};
         var args: arg.Cursor = .{ .args = case.args };
-        const expected: anyerror = if (case.args.len == 1) error.UnknownFlag else error.MissingValue;
-        try std.testing.expectError(expected, run(output.init(&env, &arena), a, &args, null, .{}));
+        try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &args, null, .{}));
         try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), case.prefix));
         try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), case.hidden) == null);
@@ -638,8 +632,8 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     defer arena.deinit();
     var output: TestOutput = .{};
     var missing: arg.Cursor = .{ .args = &.{ "whoami", "--json" } };
-    try std.testing.expectError(error.MissingCredential, run(output.init(&env, &arena), a, &missing, null, .{}));
-    try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: MissingCredential\n"));
+    try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &missing, null, .{}));
+    try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: MissingCredential (MissingUsername)\nRun `bbr auth login`"));
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
 
     try env.put("BITBUCKET_USERNAME", "private-username");
@@ -647,7 +641,7 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     try env.put("BITBUCKET_WORKSPACE", "private-workspace");
     output = .{};
     var invalid: arg.Cursor = .{ .args = &.{ "whoami", "--json", "--uuid=private-value" } };
-    try std.testing.expectError(error.UnknownFlag, run(output.init(&env, &arena), a, &invalid, null, .{}));
+    try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &invalid, null, .{}));
     try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: bad options (UnknownFlag)\n"));
     try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), "Example:\n  bbr api whoami --json\n") != null);
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
@@ -656,9 +650,50 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     try env.put("https_proxy", "socks5://private-proxy.invalid");
     output = .{};
     var proxy: arg.Cursor = .{ .args = &.{ "whoami", "--json" } };
-    try std.testing.expectError(error.InvalidProxyConfiguration, run(output.init(&env, &arena), a, &proxy, null, .{}));
+    try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &proxy, null, .{}));
     try std.testing.expectEqualStrings("bbr api whoami: InvalidProxyConfiguration\n", output.stderrBytes());
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+}
+
+test "diagnostics the api boundary shows each failure and records it once" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { args: []const []const u8, message: []const u8, cause: []const u8 }{
+        .{ .args = &.{ "whoami", "--json" }, .message = "bbr api whoami: MissingCredential (MissingUsername)\n", .cause = "error=MissingUsername" },
+        .{ .args = &.{"private-invalid-verb"}, .message = "bbr api: bad options (UnknownFlag)\n", .cause = "error=UnknownFlag" },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(home);
+        var sink_env = std.process.Environ.Map.init(a);
+        defer sink_env.deinit();
+        try sink_env.put("XDG_STATE_HOME", home);
+        var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &sink_env);
+        defer sink.deinit();
+        try std.testing.expect(sink.setEnabled(true) == .on);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var output: TestOutput = .{};
+        var args: arg.Cursor = .{ .args = case.args };
+        try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &args, null, sink.handle(.api, .{})));
+        try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), case.message));
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(std.testing.io)).?;
+        const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+        defer a.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next().?;
+        try std.testing.expect(lines.next() == null);
+        try std.testing.expect(std.mem.indexOf(u8, only, "operation=api ") != null);
+        try std.testing.expect(std.mem.endsWith(u8, only, case.cause));
+    }
 }
 
 test "error writer formats option help and runtime errors without user values" {
