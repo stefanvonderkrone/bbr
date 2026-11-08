@@ -401,10 +401,16 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
     }
     aliases[alias_count] = common_alias;
     alias_count += 1;
-    const repository_id = store.store().resolveRepository(aliases[0..alias_count]) catch |err| {
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
-        std.debug.print("bbr local: cannot resolve repository identity: {s}\n", .{@errorName(err)});
-        return;
+    const repository_id = store.store().resolveRepository(aliases[0..alias_count]) catch |err| switch (err) {
+        error.Reported => {
+            std.debug.print("bbr local: cannot resolve repository identity\n", .{});
+            return;
+        },
+        else => {
+            _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
+            std.debug.print("bbr local: cannot resolve repository identity: {s}\n", .{@errorName(err)});
+            return;
+        },
     };
     const key = presentation.OwnedReviewIdentity.initLocal(repository_id, base.canonical, source.canonical) catch |err| {
         _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
@@ -457,15 +463,22 @@ fn openStore(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.M
         defer gpa.free(path);
         if (persist.SqliteStore.openDiagnostic(path, diagnostic.forContext(.persistence, .{}))) |s| {
             return s;
-        } else |err| {
-            _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
-            std.debug.print("bbr: could not open {s} ({s}); drafts won't persist this session\n", .{ path, @errorName(err) });
+        } else |err| switch (err) {
+            // The SQLite seam recorded the result code. The error name says nothing more.
+            error.Reported => std.debug.print("bbr: could not open {s}; drafts won't persist this session\n", .{path}),
+            else => {
+                _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
+                std.debug.print("bbr: could not open {s} ({s}); drafts won't persist this session\n", .{ path, @errorName(err) });
+            },
         }
     } else |err| {
         if (err != error.NoStateHome) _ = diagnostic.forContext(.persistence, .{}).failure(.prepare, .{ .zig = err }, @src());
     }
     return persist.SqliteStore.openDiagnostic(":memory:", diagnostic.forContext(.persistence, .{})) catch |err| {
-        _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
+        switch (err) {
+            error.Reported => {},
+            else => _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src()),
+        }
         @panic("sqlite :memory: open failed");
     };
 }
