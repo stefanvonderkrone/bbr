@@ -145,12 +145,13 @@ pub const ShellGitClient = struct {
 
     /// Run Git while preserving stdout byte-for-byte. Diff and blob content use
     /// this path; metadata commands use `run`, which trims line endings.
+    /// A launch failure, such as a missing git binary, keeps its own error.
+    /// `on_fail` is only a finished Git process that exits non-zero.
     fn runRaw(self: *ShellGitClient, allocator: Allocator, args: []const []const u8, on_fail: anyerror) ![]u8 {
-        // A launch failure maps to `on_fail` too, because callers and users know Git failures by that name.
-        const res = std.process.run(allocator, self.io, .{
+        const res = try std.process.run(allocator, self.io, .{
             .argv = args,
             .cwd = self.cwd,
-        }) catch return on_fail;
+        });
         defer allocator.free(res.stderr);
         errdefer allocator.free(res.stdout);
 
@@ -463,7 +464,7 @@ test "Git failures return their typed error and leave the record to the boundary
     try testing.expectError(error.UnknownRef, shell.gitClient().resolveRef(testing.allocator, "missing-ref"));
     try testing.expectError(error.UnknownRef, shell.gitClient().diff(testing.allocator, "missing-base", "missing-source"));
     try testing.expectError(error.NoRemote, shell.run(testing.allocator, &.{ "git", "config", "--file", "/dev/null", "--get", "bbr.missing" }, error.NoRemote));
-    try testing.expectError(error.NotAGitRepo, shell.runRaw(testing.allocator, &.{"/bbr-no-such-executable"}, error.NotAGitRepo));
+    try testing.expectError(error.FileNotFound, shell.runRaw(testing.allocator, &.{"/bbr-no-such-executable"}, error.NotAGitRepo));
 }
 
 test "fake reports the current branch" {

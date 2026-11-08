@@ -5,7 +5,7 @@
 3 src/bitbucket/auth.zig
 10 src/bitbucket/client.zig
 1 src/bitbucket/url.zig
-4 src/git/client.zig
+3 src/git/client.zig
 2 src/highlight/tree_sitter_highlighter.zig
 2 src/http/std_client.zig
 1 src/logging_config.zig
