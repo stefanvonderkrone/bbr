@@ -27,3 +27,14 @@ If that boundary prints `@errorName(err)` or branches on the error name:
 
 `tools/check_diagnostics.py` counts each `catch` or `errdefer` handler that records and then returns an error.
 A count in `tools/diagnostic_record_baseline.txt` can go down. It cannot go up.
+
+## Compare errors with a switch
+
+Do not write `err == error.X` or `err != error.X`.
+That comparison compiles when `X` is not in the error set, because it widens the set to `anyerror`.
+Switch on the error and name each prong.
+`tools/check_error_comparisons.py` rejects the comparison in production Zig.
+
+When the error set contains `error.Canceled`, name that prong.
+Return `error.Canceled`, call `io.recancel()`, or use `unreachable` under `io.swapCancelProtection(.blocked)`.
+`std.Io.sleep` and `Group.await` return only `error.Canceled`, so an `else` prong does not compile on those calls.
