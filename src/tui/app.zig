@@ -583,6 +583,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .draft_descendant_locked => "a Reply below this Draft cannot be deleted yet",
         .anchor_candidate_ambiguous => "that source range is ambiguous; select one side of one File",
         .anchor_range_too_long => "an Anchor covers at most 30 lines",
+        .anchor_range_descending => "an Anchor range must run forward",
         .suggestion_anchor_not_new_side => "a Suggestion cannot anchor to removed lines",
         .replacement_pending => "the Review is reloading; try again when it finishes",
         .buffer_search_selection_active => "Clear Selection before Buffer Search",
@@ -1546,6 +1547,7 @@ test "a directory config.toml is a read failure on the Theme status" {
     try std.testing.expectEqual(presentation.ThemePersisted.Outcome.read_failed, themeSaveOutcome(error.IsDir));
     try std.testing.expectEqual(presentation.ThemePersisted.Outcome.write_failed, themeSaveOutcome(error.WriteFailed));
     try std.testing.expectEqualStrings("Theme applied, but config.toml could not be read", actionErrorText(.theme_not_saved_unreadable));
+    try std.testing.expectEqualStrings("an Anchor range must run forward", actionErrorText(.anchor_range_descending));
 }
 
 test "whole-text vaxis width matches grapheme measurement" {

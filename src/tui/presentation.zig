@@ -3862,6 +3862,7 @@ pub const ActionError = enum {
     draft_descendant_locked,
     anchor_candidate_ambiguous,
     anchor_range_too_long,
+    anchor_range_descending,
     suggestion_anchor_not_new_side,
     replacement_pending,
 };
@@ -13316,13 +13317,30 @@ fn reviewerVerdictRefusalError(refusal: ?ReviewerVerdictRefusal) ActionError {
 
 /// Why the source under the cursor cannot become an Anchor. Every reason is a
 /// refusal to guess, not a partially accepted range.
-fn candidateError(err: anyerror) ActionError {
+fn candidateError(err: error{
+    RangeTooLong,
+    AnchorRangeDescending,
+    SuggestionOnRemoved,
+    NotOnSource,
+    NotOnALine,
+    MixedSides,
+    AnchorSideAmbiguous,
+    NonContiguous,
+    CrossesFile,
+}) ActionError {
     return switch (err) {
         error.RangeTooLong => .anchor_range_too_long,
+        error.AnchorRangeDescending => .anchor_range_descending,
         error.SuggestionOnRemoved => .suggestion_anchor_not_new_side,
         error.NotOnSource, error.NotOnALine => .source_action_unavailable,
-        else => .anchor_candidate_ambiguous,
+        error.MixedSides, error.AnchorSideAmbiguous, error.NonContiguous, error.CrossesFile => .anchor_candidate_ambiguous,
     };
+}
+
+test "a descending Anchor is not a mixed-side range" {
+    try testing.expectEqual(ActionError.anchor_range_descending, candidateError(error.AnchorRangeDescending));
+    try testing.expectEqual(ActionError.anchor_candidate_ambiguous, candidateError(error.AnchorSideAmbiguous));
+    try testing.expectEqual(ActionError.anchor_candidate_ambiguous, candidateError(error.MixedSides));
 }
 
 /// The lines a replacement Anchor would cover. Bounded by `max_anchor_lines`,
@@ -13389,7 +13407,8 @@ fn reanchorCandidate(published: *const Published, kind: bbr.review.DraftKind, pr
     };
     anchor.validateShape() catch |err| return switch (err) {
         error.AnchorRangeTooLong => error.RangeTooLong,
-        else => error.MixedSides,
+        error.AnchorRangeDescending => error.AnchorRangeDescending,
+        error.AnchorSideAmbiguous => error.AnchorSideAmbiguous,
     };
     return .{ .file_index = file_index, .anchor = anchor, .lines = lines };
 }
