@@ -684,7 +684,7 @@ pub const Client = struct {
             if (asApiError(err)) |api_error| switch (api_error) {
                 error.RateLimited, error.ServerError => {},
                 else => {
-                    if (mutation_leaf) |leaf| self.diagnostic.note(leaf);
+                    self.diagnostic.adopt(&mutation_leaf);
                     return .{ .api_error = api_error };
                 },
             };
@@ -697,7 +697,7 @@ pub const Client = struct {
         };
         defer deinitPullRequest(allocator, after);
         if (after.reviewerVerdict(authenticated_account_uuid) != target) {
-            if (mutation_leaf) |leaf| self.diagnostic.note(leaf);
+            self.diagnostic.adopt(&mutation_leaf);
             return .{ .unresolved = uncertain };
         }
         if (uncertain) |cause| _ = mutation.diagnostic.failure(.execute, .{ .zig = cause }, @src());
@@ -2061,7 +2061,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                 const page = &self.lists[position.list].pages.items[position.number - 1];
                 const reason = page.failed.reason;
                 if (error_detail) |destination| destination.copyFrom(if (page.failed.detail) |*source| source else null);
-                if (page.failed.leaf) |leaf| self.diagnostic.note(leaf);
+                self.diagnostic.adopt(&page.failed.leaf);
                 self.release(page);
                 return reason;
             }

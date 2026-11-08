@@ -970,12 +970,22 @@ fn presentationEnrichmentWorker(
     command: presentation.EnrichFile,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer scratch.deinit();
+    presentation_runtime.deliver(presentationSink(&sink_context), enrichFileInput(&sink_context, io, client, highlighter, command));
+}
+
+/// The worker's File Enrichment. The request and the client note into the worker's slot, so
+/// the worker's one record of a failure holds the evidence.
+fn enrichFileInput(
+    sink_context: *PresentationSinkContext,
+    io: std.Io,
+    client: ?bbr.bitbucket.Client,
+    highlighter: bbr.highlight.Highlighter,
+    command: presentation.EnrichFile,
+) presentation.OwnedInput {
     var request = command.request();
-    request.diagnostic = diagnostic;
+    request.diagnostic = sink_context.handle();
     const enriched = switch (command.source) {
-        .remote => file_enrichment.enrichConcurrent(io, std.heap.page_allocator, client.?, highlighter, request),
+        .remote => file_enrichment.enrichConcurrent(io, std.heap.page_allocator, sink_context.bitbucket(client.?), highlighter, request),
         .local => blk: {
             var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
             var source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
@@ -984,19 +994,19 @@ fn presentationEnrichmentWorker(
     };
     var evidence: ?bbr.diagnostic.Failure = null;
     const outcome: presentation.FileEnrichmentOutcome = if (enriched) |result| .{ .completed = result } else |err| failed: {
-        evidence = bbr.diagnostic.Failure.capture(.file_enrichment, .execute, diagnostic.context, .{ .zig = err }, @src());
+        evidence = bbr.diagnostic.Failure.capture(.file_enrichment, .execute, sink_context.diagnostic.context, .{ .zig = err }, @src());
         break :failed .{ .failed = switch (err) {
             error.OutOfMemory => .out_of_memory,
         } };
     };
-    presentation_runtime.deliver(presentationSink(&sink_context), .{ .file_enrichment_completed = .{
+    return .{ .file_enrichment_completed = .{
         .evidence = evidence,
         .command_id = command.command_id,
         .work_id = command.work_id,
         .session_epoch = command.session_epoch,
         .file_index = command.file_index,
         .outcome = outcome,
-    } });
+    } };
 }
 
 fn presentationBufferSearchWorker(
@@ -1650,6 +1660,65 @@ const TestStderr = struct {
         return .{ .file_write_streaming = writer.buffered().len };
     }
 };
+
+fn testBoundedText(comptime T: type, value: []const u8) T {
+    var text: T = .{ .len = value.len };
+    @memcpy(text.bytes[0..value.len], value);
+    return text;
+}
+
+test "diagnostics a transport OutOfMemory on one File side keeps its phase in the worker record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(std.testing.allocator, std.testing.io, &env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/destination/", .send_error = error.OutOfMemory, .send_phase = .receive_body },
+        .{ .request_key = "/source/", .status = 200, .body = "new" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    // The worker gets the spawn handle and client, which have no slot, as `drainPresentationCommands` passes them.
+    const spawn_handle = sink.handle(.file_enrichment, .{ .work_id = 9 });
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(spawn_handle);
+    var sink_context: PresentationSinkContext = .{ .loop = undefined, .work_id = 9, .diagnostic = spawn_handle };
+    const Command = presentation.EnrichFile;
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var input = enrichFileInput(&sink_context, std.testing.io, client, plain.highlighter(), .{
+        .work_id = 9,
+        .session_epoch = 1,
+        .file_index = 0,
+        .source = .{ .remote = testBoundedText(@FieldType(@FieldType(Command, "source"), "remote"), "repo") },
+        .source_commit = testBoundedText(@FieldType(Command, "source_commit"), "source"),
+        .destination_commit = testBoundedText(@FieldType(Command, "destination_commit"), "destination"),
+        .old_path = testBoundedText(@FieldType(Command, "old_path"), "file.zig"),
+        .new_path = testBoundedText(@FieldType(Command, "new_path"), "file.zig"),
+        .status = .modified,
+        .max_file_bytes = 0,
+    });
+    defer input.deinit();
+    try std.testing.expect(input.file_enrichment_completed.outcome == .failed);
+    presentation_runtime.recordFailures(sink_context.handle(), input);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "operation=file_enrichment phase=receive_body source=tui/app.zig:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "work_id=9") != null);
+    try std.testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
+}
 
 test "diagnostics an initial load that the store reported shows its message and keeps one record" {
     var tmp = std.testing.tmpDir(.{});

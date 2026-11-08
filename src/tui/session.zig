@@ -228,7 +228,7 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     for (outcomes) |outcome| if (outcome.err) |err| {
         if (failed == null) {
             failed = err;
-            if (outcome.leaf.*) |leaf| bb.diagnostic.note(leaf);
+            bb.diagnostic.adopt(outcome.leaf);
         } else _ = bb.diagnostic.withLeaf(outcome.leaf).failure(.read, .{ .zig = err }, @src());
     };
     if (failed) |err| return err;

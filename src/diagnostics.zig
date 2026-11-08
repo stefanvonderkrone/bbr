@@ -37,6 +37,14 @@ pub const Handle = struct {
         slot.* = noted;
     }
 
+    /// Moves the evidence of a task's own slot into this handle's slot and empties the task's
+    /// slot. A fan-out calls it after the join for the failure that it returns.
+    pub fn adopt(self: Handle, task_slot: *?Leaf) void {
+        const leaf = task_slot.* orelse return;
+        task_slot.* = null;
+        self.note(leaf);
+    }
+
     pub fn failure(self: Handle, phase: Phase, cause: Cause, comptime source: std.builtin.SourceLocation) Failure {
         const result = self.explain(Failure.capture(self.operation, phase, self.context, cause, source));
         self.record(result);

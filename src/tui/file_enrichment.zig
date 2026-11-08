@@ -259,18 +259,27 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
     if (req.status == .added or req.status == .removed)
         return enrichFrom(backing, source, highlighter, req);
 
-    var old_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old, sideDiagnostic(req.diagnostic, .old) }) catch |err| {
+    // Each side task notes into its own slot, and the join moves the slot of the failure that
+    // it returns to the caller's slot.
+    var task_req = req;
+    task_req.diagnostic = req.diagnostic.withLeaf(null);
+    var old_slot: ?bbr.diagnostic.Leaf = null;
+    var new_slot: ?bbr.diagnostic.Leaf = null;
+    var old_future = io.concurrent(enrichSideTask, .{ backing, source, highlighter, task_req, .old, &old_slot }) catch |err| {
         _ = req.diagnostic.failure(.launch, .{ .zig = err }, @src());
         return enrichFrom(backing, source, highlighter, req);
     };
-    var new_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new) }) catch |launch_error| {
+    var new_future = io.concurrent(enrichSideTask, .{ backing, source, highlighter, task_req, .new, &new_slot }) catch |launch_error| {
         _ = req.diagnostic.failure(.launch, .{ .zig = launch_error }, @src());
         const old = old_future.await(io) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => {
+                req.diagnostic.adopt(&old_slot);
+                return error.OutOfMemory;
+            },
         };
         return .{
             .old = old,
-            .new = enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new)) catch |err| {
+            .new = enrichRequestSide(backing, source, highlighter, req, .new, req.diagnostic) catch |err| {
                 var cleanup = old;
                 cleanup.deinit();
                 return err;
@@ -278,6 +287,7 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
         };
     };
     const old = old_future.await(io) catch |err| {
+        req.diagnostic.adopt(&old_slot);
         var new = new_future.await(io) catch return error.OutOfMemory;
         new.deinit();
         return err;
@@ -287,7 +297,10 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
         cleanup.deinit();
     }
     const new = new_future.await(io) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => {
+            req.diagnostic.adopt(&new_slot);
+            return error.OutOfMemory;
+        },
     };
     return .{ .old = old, .new = new };
 }
@@ -295,16 +308,26 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
 pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
     var result: Result = .{ .old = .absent, .new = .absent };
     errdefer result.deinit();
-    if (req.status != .added) {
-        result.old = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old, sideDiagnostic(req.diagnostic, .old));
-    }
-    if (req.status != .removed) {
-        result.new = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new));
-    }
+    if (req.status != .added) result.old = try enrichRequestSide(backing, source, highlighter, req, .old, req.diagnostic);
+    if (req.status != .removed) result.new = try enrichRequestSide(backing, source, highlighter, req, .new, req.diagnostic);
     return result;
 }
 
-fn sideDiagnostic(handle: bbr.diagnostics.Handle, side: @FieldType(bbr.diagnostic.Context, "side")) bbr.diagnostics.Handle {
+const Side = @typeInfo(@FieldType(bbr.diagnostic.Context, "side")).optional.child;
+
+fn enrichSideTask(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request, side: Side, task_slot: *?bbr.diagnostic.Leaf) error{OutOfMemory}!SideResult {
+    return enrichRequestSide(backing, source, highlighter, req, side, req.diagnostic.withLeaf(task_slot));
+}
+
+fn enrichRequestSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request, side: Side, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
+    const commit, const path, const known = switch (side) {
+        .old => .{ req.destination_commit, req.old_path, req.content.old },
+        .new => .{ req.source_commit, req.new_path, req.content.new },
+    };
+    return enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, commit, path, known, sideDiagnostic(diagnostic, side));
+}
+
+fn sideDiagnostic(handle: bbr.diagnostics.Handle, side: Side) bbr.diagnostics.Handle {
     var context = handle.context;
     context.side = side;
     return handle.forContext(.file_enrichment, context);
@@ -319,10 +342,7 @@ fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.h
     };
 }
 
-fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, side_diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
-    // The sides read concurrently, so each owns the evidence slot of its read.
-    var leaf: ?bbr.diagnostic.Leaf = null;
-    const diagnostic = side_diagnostic.withLeaf(&leaf);
+fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
     const side = try backing.create(OwnedSide);
     errdefer backing.destroy(side);
     side.references = .init(1);
@@ -1718,6 +1738,52 @@ test "a retried remote blob read records its first attempt with the File side" {
             try testing.expect(std.mem.indexOf(u8, line, needle) != null);
     }
     try testing.expect(records > 0);
+}
+
+test "diagnostics a transport OutOfMemory on one File side keeps its phase in the boundary record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/destination/", .send_error = error.OutOfMemory, .send_phase = .receive_body },
+        .{ .request_key = "/source/", .status = 200, .body = "new" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.file_enrichment, .{ .command_id = 5 }).withLeaf(&leaf);
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(boundary);
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    try testing.expectError(error.OutOfMemory, enrichConcurrent(testing.io, testing.allocator, bb, plain.highlighter(), .{
+        .repo = "repo",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "file.zig",
+        .new_path = "file.zig",
+        .max_file_bytes = 0,
+        .diagnostic = boundary,
+    }));
+    _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only, "operation=file_enrichment phase=receive_body source=tui/file_enrichment.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
 }
 
 fn readRemoteBlob(remote: *RemoteBlobSource) anyerror![]u8 {
