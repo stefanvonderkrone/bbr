@@ -98,7 +98,6 @@ pub fn recordFailures(handle: bbr.diagnostics.Handle, input: presentation.OwnedI
 }
 
 fn record(handle: bbr.diagnostics.Handle, value: bbr.diagnostic.Failure) void {
-    if (value.reported()) return;
     var failure = value;
     inline for (@typeInfo(bbr.diagnostic.Context).@"struct".fields) |field| {
         if (@field(failure.context, field.name) == null) @field(failure.context, field.name) = @field(handle.context, field.name);

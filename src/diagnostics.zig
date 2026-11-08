@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const value = @import("diagnostic.zig");
 const xdg = @import("xdg.zig");
 pub const Failure = value.Failure;
@@ -32,9 +31,11 @@ pub const Handle = struct {
         return error.Reported;
     }
 
+    /// Drops a Failure whose cause is `error.Reported`, because the layer that returned it
+    /// already recorded the failure. A boundary that forgets its `error.Reported` prong
+    /// therefore writes no second record.
     pub fn record(self: Handle, failure_value: Failure) void {
-        // A boundary that records error.Reported writes a second record of one failure.
-        if (builtin.is_test) std.debug.assert(!failure_value.reported());
+        if (failure_value.reported()) return;
         if (self.sink) |sink| sink.record(failure_value);
     }
 };
@@ -126,7 +127,7 @@ pub const Sink = struct {
         self.actual = .{ .unavailable = failure_value };
     }
 
-    pub fn record(self: *Sink, failure_value: Failure) void {
+    fn record(self: *Sink, failure_value: Failure) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.actual != .on) return;
@@ -251,6 +252,27 @@ test "diagnostics fail records the leaf cause once and propagates error.Reported
     try testing.expect(lines.next() == null);
     try testing.expect(std.mem.indexOf(u8, only, "operation=grammar phase=read source=diagnostics.zig:") != null);
     try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=LeafFailure"));
+}
+
+fn boundaryWithoutReportedProng(handle: Handle) void {
+    propagatingCaller(handle) catch |err| {
+        _ = handle.failure(.execute, .{ .zig = err }, @src());
+    };
+}
+
+test "diagnostics a boundary that records error.Reported writes no second record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testHome(&env, tmp);
+    var sink = Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    boundaryWithoutReportedProng(sink.handle(.grammar, .{}));
+    try testing.expectEqual(@as(u64, 1), sink.sequence);
+    _ = sink.handle(.grammar, .{}).failure(.execute, .{ .zig = error.Unrecorded }, @src());
+    try testing.expectEqual(@as(u64, 2), sink.sequence);
 }
 
 fn writeMany(handle: Handle) void {

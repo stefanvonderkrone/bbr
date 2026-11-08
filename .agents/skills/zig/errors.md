@@ -11,6 +11,7 @@
 - When the function has no new evidence to add, return the error and record nothing. The boundary records it once.
 - Keep records out of `errdefer |err|`. An `errdefer` runs only when the function returns the error, so the layer above records the same failure again.
 - At a boundary, give `error.Reported` its own prong that records nothing. Record every other error once.
+  `Handle.record` drops `error.Reported`, so the prong keeps the name `Reported` out of the message, not out of the file.
   Then restore state or show the failure.
   The boundaries are worker task entry points, Presentation event and command handlers, CLI `main` through `exitFailure`, and the SQLite seam `SqliteStore.native`.
   The HTTP, Bitbucket, and Git clients are not boundaries. They return the typed error and record nothing.

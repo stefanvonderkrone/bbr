@@ -110,6 +110,7 @@ A file write can fail after a partial line. The sink closes that file and stops 
 The sink does not recursively log its own failure.
 Each failure has one record ([ADR-0014](adr/0014-a-failure-is-recorded-once-and-error-reported-marks-it.md)).
 A site that records a failure and still fails returns `error.Reported`, and the boundaries above write nothing more for it.
+`Handle.record` drops a Failure whose cause is `error.Reported`, so a boundary that records it by mistake writes no second record.
 The Bitbucket client, the HTTP transport, and the Git client record nothing, because their callers branch on the error name.
 The boundary that receives such an error records it, so its record names the typed error, not the transport phase, the JSON error, the page number, or the Git exit code.
 An HTTP rejection is the exception: `Client.send` records the status, and the boundary records the typed rejection error again.
