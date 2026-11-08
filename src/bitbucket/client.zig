@@ -2020,10 +2020,19 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
         }
 
         /// Moves the merged items to the caller, or returns the lowest needed failure.
+        /// The caller sees one failure at most, so each other failed page has its record here.
         fn finish(self: *Self, error_detail: ?*Client.ErrorDetail) ![]Item {
             const merged = self.prefix();
+            const returned = if (merged.end != null) self.firstFailure() else null;
+            for (self.lists, 0..) |list, index| for (list.pages.items, 1..) |page, number| {
+                const position: PagePosition = .{ .list = index, .number = @intCast(number) };
+                if (page != .failed or (returned != null and std.meta.eql(position, returned.?))) continue;
+                var diagnostic = self.diagnostic;
+                diagnostic.context.page = self.pageNumber(position.number);
+                _ = diagnostic.failure(.read, .{ .zig = page.failed.reason }, @src());
+            };
             if (merged.end != null) {
-                const position = self.firstFailure() orelse return error.MalformedResponse;
+                const position = returned orelse return error.MalformedResponse;
                 const failed = &self.lists[position.list].pages.items[position.number - 1].failed;
                 if (error_detail) |destination| destination.copyFrom(if (failed.detail) |*source| source else null);
                 return failed.reason;
@@ -5039,6 +5048,51 @@ test "Repository PullRequests fail on a failed Repository request unless the lim
                 try testing.expectEqual(@as(usize, 3), items.len);
             }
             try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+        }
+    }
+}
+
+test "diagnostics a failed page that the result does not need has one record" {
+    for ([_]usize{ 1, 3 }) |concurrency| {
+        for ([_]?usize{ null, 3 }) |limit| {
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+            defer testing.allocator.free(home);
+            var env = std.process.Environ.Map.init(testing.allocator);
+            defer env.deinit();
+            try env.put("XDG_STATE_HOME", home);
+            var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+            defer sink.deinit();
+            try testing.expect(sink.setEnabled(true) == .on);
+            const responses = repositoryResponses(.{ .status = 429, .body = "{}" }, null);
+            var fake: FakeHttpClient = .{ .responses = &responses };
+            const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(sink.handle(.picker_list, .{}));
+            var done: std.atomic.Value(bool) = .init(false);
+            const result = listRepositoryPullRequestsForTest(bb, .{ .reviewer = "{reviewer}" }, limit, concurrency, &done);
+            if (limit == null) {
+                // The caller receives the failure, so its boundary records it.
+                try testing.expectError(error.RateLimited, result);
+                try testing.expectEqual(@as(u64, 0), sink.sequence);
+                continue;
+            }
+            const items = try result;
+            defer deinitSummaries(testing.allocator, items);
+            try testing.expectEqual(@as(usize, 3), items.len);
+            _ = sink.setEnabled(false);
+            var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+            defer dir.close(testing.io);
+            var iterator = dir.iterate();
+            const entry = (try iterator.next(testing.io)).?;
+            const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+            defer testing.allocator.free(bytes);
+            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+            _ = lines.next();
+            const only = lines.next().?;
+            try testing.expect(lines.next() == null);
+            try testing.expect(std.mem.indexOf(u8, only, "operation=picker_list phase=read source=bitbucket/client.zig:") != null);
+            try testing.expect(std.mem.indexOf(u8, only, "page=1") != null);
+            try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=RateLimited"));
         }
     }
 }

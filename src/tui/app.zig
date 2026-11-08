@@ -99,7 +99,7 @@ const picker_tick_interval_ms = 250;
 
 fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
     var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
-    var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient());
+    var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient(), ctx.diagnostic.forContext(.git, .{}));
     defer git_anchor_resolver.deinit();
     var state = presentation.Presentation.init(ctx.gpa, .{
         .reviews = ctx.store,

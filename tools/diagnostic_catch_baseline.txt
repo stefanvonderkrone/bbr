@@ -9,7 +9,6 @@
 2 src/highlight/tree_sitter_highlighter.zig
 2 src/http/std_client.zig
 1 src/logging_config.zig
-2 src/review/anchor.zig
 1 src/review/draft.zig
 7 src/tui/config.zig
 2 src/tui/file_enrichment.zig

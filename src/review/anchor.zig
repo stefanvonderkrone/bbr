@@ -5,6 +5,7 @@ const std = @import("std");
 const diff_mod = @import("../diff/model.zig");
 const parser = @import("../diff/parser.zig");
 const git_mod = @import("../git/client.zig");
+const diagnostics = @import("../diagnostics.zig");
 const comment = @import("comment.zig");
 
 const Allocator = std.mem.Allocator;
@@ -71,12 +72,13 @@ pub const AnchorResolver = struct {
 
 pub const GitAnchorResolver = struct {
     git: git_mod.GitClient,
+    diagnostic: diagnostics.Handle,
     cache_arena: std.heap.ArenaAllocator,
     transitions: std.StringHashMapUnmanaged(diff_mod.Diff) = .empty,
     unavailable_transitions: std.StringHashMapUnmanaged(void) = .empty,
 
-    pub fn init(allocator: Allocator, git: git_mod.GitClient) GitAnchorResolver {
-        return .{ .git = git, .cache_arena = std.heap.ArenaAllocator.init(allocator) };
+    pub fn init(allocator: Allocator, git: git_mod.GitClient, diagnostic: diagnostics.Handle) GitAnchorResolver {
+        return .{ .git = git, .diagnostic = diagnostic, .cache_arena = std.heap.ArenaAllocator.init(allocator) };
     }
 
     pub fn deinit(self: *GitAnchorResolver) void {
@@ -108,45 +110,29 @@ pub const GitAnchorResolver = struct {
         }
     }
 
+    /// Null when the transition is unavailable. The resolution carries no cause, so the
+    /// first failure of each transition has its record here.
     fn loadTransition(self: *GitAnchorResolver, authored_commit: []const u8, current_commit: []const u8) !?diff_mod.Diff {
         const cache = self.cache_arena.allocator();
         const key = try std.fmt.allocPrint(cache, "{s}\x00{s}", .{ authored_commit, current_commit });
         if (self.unavailable_transitions.contains(key)) return null;
         if (self.transitions.get(key)) |cached| return cached;
-        const raw = self.git.diff(cache, authored_commit, current_commit) catch {
-            try self.unavailable_transitions.put(cache, key, {});
-            return null;
-        };
-        const parsed_transition = parser.parse(cache, raw) catch |err| switch (err) {
-            error.MalformedHunkHeader, error.OutOfMemory, error.UnexpectedLine => {
-                try self.unavailable_transitions.put(cache, key, {});
-                return null;
-            },
-        };
+        const raw = self.git.diff(cache, authored_commit, current_commit) catch |err| return self.unavailable(key, .execute, err, @src());
+        const parsed_transition = parser.parse(cache, raw) catch |err| return self.unavailable(key, .decode, err, @src());
         try self.transitions.put(cache, key, parsed_transition);
         return parsed_transition;
+    }
+
+    fn unavailable(self: *GitAnchorResolver, key: []const u8, phase: diagnostics.Phase, cause: anyerror, comptime source: std.builtin.SourceLocation) !?diff_mod.Diff {
+        _ = self.diagnostic.failure(phase, .{ .zig = cause }, source);
+        try self.unavailable_transitions.put(self.cache_arena.allocator(), key, {});
+        return null;
     }
 
     fn resolve(ptr: *anyopaque, allocator: Allocator, authored: Anchor, current_commit: []const u8) anyerror!AnchorResolution {
         const self: *GitAnchorResolver = @ptrCast(@alignCast(ptr));
         const authored_commit = authored.commit orelse return .unavailable;
-        const cache = self.cache_arena.allocator();
-        const key = try std.fmt.allocPrint(cache, "{s}\x00{s}", .{ authored_commit, current_commit });
-        if (self.unavailable_transitions.contains(key)) return .unavailable;
-        const transition = self.transitions.get(key) orelse blk: {
-            const raw = self.git.diff(cache, authored_commit, current_commit) catch {
-                try self.unavailable_transitions.put(cache, key, {});
-                return .unavailable;
-            };
-            const parsed_transition = parser.parse(cache, raw) catch |err| switch (err) {
-                error.MalformedHunkHeader, error.OutOfMemory, error.UnexpectedLine => {
-                    try self.unavailable_transitions.put(cache, key, {});
-                    return .unavailable;
-                },
-            };
-            try self.transitions.put(cache, key, parsed_transition);
-            break :blk parsed_transition;
-        };
+        const transition = (try self.loadTransition(authored_commit, current_commit)) orelse return .unavailable;
         return resolveAgainst(allocator, authored, transition);
     }
 };
@@ -330,7 +316,7 @@ test "removed File makes its Anchor outdated" {
 test "Git resolver groups anchors that share an authored and current commit" {
     var fake: git_mod.FakeGitClient = .{ .diff_result = "diff --git a/f.zig b/f.zig\n--- a/f.zig\n+++ b/f.zig\n" ++
         "@@ -1,2 +1,3 @@\n first\n+inserted\n target\n" };
-    var resolver = GitAnchorResolver.init(testing.allocator, fake.gitClient());
+    var resolver = GitAnchorResolver.init(testing.allocator, fake.gitClient(), .{});
     defer resolver.deinit();
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -343,7 +329,7 @@ test "Git resolver groups anchors that share an authored and current commit" {
 
 test "Git resolver also groups unavailable transition evidence" {
     var fake: git_mod.FakeGitClient = .{ .diff_result = error.UnknownRef };
-    var resolver = GitAnchorResolver.init(testing.allocator, fake.gitClient());
+    var resolver = GitAnchorResolver.init(testing.allocator, fake.gitClient(), .{});
     defer resolver.deinit();
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -351,6 +337,47 @@ test "Git resolver also groups unavailable transition evidence" {
     try testing.expect((try resolver.resolver().resolve(arena.allocator(), .{ .path = "f.zig", .to = 1, .commit = "missing" }, "new")) == .unavailable);
     try testing.expect((try resolver.resolver().resolve(arena.allocator(), .{ .path = "g.zig", .to = 2, .commit = "missing" }, "new")) == .unavailable);
     try testing.expectEqual(@as(usize, 1), fake.diff_calls);
+}
+
+test "diagnostics each unavailable Git transition has one record with its cause" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var failing: git_mod.FakeGitClient = .{ .diff_result = error.UnknownRef };
+    var resolver = GitAnchorResolver.init(testing.allocator, failing.gitClient(), sink.handle(.git, .{}));
+    defer resolver.deinit();
+    var malformed: git_mod.FakeGitClient = .{ .diff_result = "diff --git a/f.zig b/f.zig\n--- a/f.zig\n+++ b/f.zig\n@@ nonsense @@\n" };
+    var malformed_resolver = GitAnchorResolver.init(testing.allocator, malformed.gitClient(), sink.handle(.git, .{}));
+    defer malformed_resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try resolver.resolver().resolve(arena.allocator(), .{ .path = "f.zig", .to = 1, .commit = "missing" }, "new")) == .unavailable);
+    try testing.expect((try resolver.scopeResolver().resolve(arena.allocator(), .{ .file = .{ .path = "g.zig", .source_commit = "missing" } }, "new")) == .unavailable);
+    try testing.expect((try malformed_resolver.resolver().resolve(arena.allocator(), .{ .path = "f.zig", .to = 1, .commit = "old" }, "new")) == .unavailable);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const git_failure = lines.next().?;
+    try testing.expect(std.mem.indexOf(u8, git_failure, "operation=git phase=execute source=review/anchor.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, git_failure, "cause=zig error=UnknownRef"));
+    const parse_failure = lines.next().?;
+    try testing.expect(std.mem.indexOf(u8, parse_failure, "operation=git phase=decode source=review/anchor.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, parse_failure, "cause=zig error=MalformedHunkHeader"));
+    try testing.expect(lines.next() == null);
 }
 
 test "scope resolution exhausts Review and all File outcomes" {
