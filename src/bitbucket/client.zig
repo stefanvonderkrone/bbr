@@ -675,22 +675,32 @@ pub const Client = struct {
         const mutation_auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(mutation_auth);
 
+        // The reconciliation read can fail with the same error name, so the mutation keeps its
+        // evidence in its own slot, and only a result that names the mutation's error moves it.
+        var mutation_leaf: ?diagnostics.Leaf = null;
+        const mutation = self.withDiagnostics(self.diagnostic.withLeaf(&mutation_leaf));
         var uncertain: ?anyerror = null;
-        self.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
+        mutation.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
             if (asApiError(err)) |api_error| switch (api_error) {
                 error.RateLimited, error.ServerError => {},
-                else => return .{ .api_error = api_error },
+                else => {
+                    if (mutation_leaf) |leaf| self.diagnostic.note(leaf);
+                    return .{ .api_error = api_error };
+                },
             };
             uncertain = err;
         };
 
         const after = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
-            if (uncertain) |cause| _ = self.diagnostic.failure(.execute, .{ .zig = cause }, @src());
+            if (uncertain) |cause| _ = mutation.diagnostic.failure(.execute, .{ .zig = cause }, @src());
             return .{ .unresolved = err };
         };
         defer deinitPullRequest(allocator, after);
-        if (after.reviewerVerdict(authenticated_account_uuid) != target) return .{ .unresolved = uncertain };
-        if (uncertain) |cause| _ = self.diagnostic.failure(.execute, .{ .zig = cause }, @src());
+        if (after.reviewerVerdict(authenticated_account_uuid) != target) {
+            if (mutation_leaf) |leaf| self.diagnostic.note(leaf);
+            return .{ .unresolved = uncertain };
+        }
+        if (uncertain) |cause| _ = mutation.diagnostic.failure(.execute, .{ .zig = cause }, @src());
         if (uncertain != null or !std.mem.eql(u8, after.source_commit, expected_source_commit)) return .reconciled_success;
         return .success;
     }
@@ -3327,11 +3337,12 @@ test "diagnostics a Reviewer Verdict change records each cause that its result d
         result: types.ReviewerVerdictChangeResult,
         records: []const []const u8,
     }{
-        // The result names the read failure, so the mutation failure has its record here.
+        // The result names the read failure, so the mutation failure has its record here with
+        // the mutation's own evidence.
         .{
             .responses = &.{ .{ .status = 200, .body = before }, reset, reset },
             .result = .{ .unresolved = error.ConnectionResetByPeer },
-            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer" },
+            .records = &.{ "phase=prepare source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer" },
         },
         .{
             .responses = &.{ .{ .status = 200, .body = before }, reset, .{ .status = 200, .body = before } },
@@ -3349,12 +3360,12 @@ test "diagnostics a Reviewer Verdict change records each cause that its result d
         .{
             .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 200, .body = after } },
             .result = .reconciled_success,
-            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=ServerError" },
+            .records = &.{ "phase=rejection source=bitbucket/client.zig:", "cause=http status=503 classification=server" },
         },
         .{
             .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 429, .body = "{}" }, .{ .status = 401, .body = "{}" } },
             .result = .{ .unresolved = error.Unauthorized },
-            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=RateLimited" },
+            .records = &.{ "phase=rejection source=bitbucket/client.zig:", "cause=http status=429 classification=rate_limit" },
         },
     };
     for (cases) |case| {
@@ -3388,6 +3399,80 @@ test "diagnostics a Reviewer Verdict change records each cause that its result d
             try testing.expect(std.mem.endsWith(u8, line, case.records[index + 1]));
         }
         try testing.expectEqual(case.records.len, index);
+    }
+}
+
+test "diagnostics each Reviewer Verdict request keeps its own status in the record of its error" {
+    const Canned = @import("../http/fake_client.zig").Canned;
+    const before =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [] }
+    ;
+    const cases = [_]struct {
+        responses: []const Canned,
+        result: types.ReviewerVerdictChangeResult,
+        /// The end of each record, in record order.
+        records: []const []const u8,
+    }{
+        // The mutation and the reconciliation fail with the same error name and keep their own status.
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 502, .body = "{}" } },
+            .result = .{ .unresolved = error.ServerError },
+            .records = &.{ "cause=http status=503 classification=server", "cause=http status=502 classification=server" },
+        },
+        // The result names the mutation's error, so the boundary record holds the mutation's status.
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 200, .body = before } },
+            .result = .{ .unresolved = error.ServerError },
+            .records = &.{"cause=http status=503 classification=server"},
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 403, .body = "{}" } },
+            .result = .{ .api_error = error.Forbidden },
+            .records = &.{"cause=http status=403 classification=authorization"},
+        },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        var fake: FakeHttpClient = .{ .responses = case.responses };
+        var leaf: ?diagnostics.Leaf = null;
+        const boundary = sink.handle(.verdict, .{}).withLeaf(&leaf);
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+        const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+        try testing.expectEqualDeep(case.result, result);
+        const returned: anyerror = switch (result) {
+            .unresolved => |err| err.?,
+            .api_error => |err| err,
+            else => unreachable,
+        };
+        _ = boundary.failure(.execute, .{ .zig = returned }, @src());
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        for (case.records) |record| {
+            const line = lines.next().?;
+            try testing.expect(std.mem.indexOf(u8, line, "operation=verdict phase=rejection source=bitbucket/client.zig:") != null);
+            try testing.expect(std.mem.endsWith(u8, line, record));
+        }
+        try testing.expect(lines.next() == null);
     }
 }
 
