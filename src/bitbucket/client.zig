@@ -1974,7 +1974,10 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
         fn complete(self: *Self, slot: *Slot) !void {
             const state = &self.lists[slot.position.list].pages.items[slot.position.number - 1];
             const items = self.accept(slot) catch |err| switch (err) {
-                error.OutOfMemory => return err,
+                error.OutOfMemory => {
+                    self.diagnostic.adopt(&slot.leaf);
+                    return err;
+                },
                 else => {
                     state.* = .{ .failed = .{ .reason = err, .detail = slot.error_detail, .leaf = slot.leaf orelse .{ .err = err, .page = slot.page_number } } };
                     slot.error_detail = null;
@@ -5537,6 +5540,47 @@ test "diagnostics a failed PullRequest page fails the list and its one record na
         try testing.expect(lines.next() == null);
         try testing.expect(std.mem.indexOf(u8, returned, "operation=api phase=rejection source=bitbucket/client.zig:") != null);
         try testing.expect(std.mem.endsWith(u8, returned, " page=2 cause=http status=500 classification=server"));
+    }
+}
+
+test "diagnostics a transport OutOfMemory on a PullRequest page keeps its phase and page in the one record" {
+    for ([_]usize{ 1, 3 }) |concurrency| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const responses = try pullRequestPages(arena.allocator(), author_endpoint, 4, true);
+        // The fixture holds page 1, then the pages from the last down.
+        responses[3].send_error = error.OutOfMemory;
+        responses[3].send_phase = .receive_head;
+        var fake: FakeHttpClient = .{ .responses = responses };
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        var leaf: ?diagnostics.Leaf = null;
+        const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+        var done: std.atomic.Value(bool) = .init(false);
+        try testing.expectError(error.OutOfMemory, listPagedPullRequestsForTest(bb, author_scope, null, concurrency, &done));
+        _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next().?;
+        try testing.expect(lines.next() == null);
+        try testing.expect(std.mem.indexOf(u8, only, "operation=api phase=receive_head source=bitbucket/client.zig:") != null);
+        try testing.expect(std.mem.endsWith(u8, only, " page=2 cause=zig error=OutOfMemory"));
     }
 }
 
