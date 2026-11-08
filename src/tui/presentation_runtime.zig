@@ -206,6 +206,7 @@ test "diagnostics a worker completion that carries error.Reported keeps the leaf
 test "diagnostics a Bitbucket failure has one record from the worker boundary" {
     const cases = [_]struct { fake: bbr.http.FakeHttpClient, cause: []const u8 }{
         .{ .fake = .{ .body = "{" }, .cause = "cause=zig error=MalformedResponse" },
+        .{ .fake = .{ .send_error = error.ConnectionReset }, .cause = "cause=zig error=ConnectionReset" },
     };
     for (cases) |case| {
         var tmp = testing.tmpDir(.{});

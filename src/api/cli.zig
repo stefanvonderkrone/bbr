@@ -341,7 +341,6 @@ fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const
     defer owned.deinit(gpa);
 
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
-    transport.diagnostic = diagnostic;
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
     var bb = bbr.bitbucket.Client.init(transport.httpClient(), owned.credential());

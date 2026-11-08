@@ -5,6 +5,7 @@ holds exactly one record of it (docs/adr/0014).
 """
 
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,14 @@ cases = (
     (["auth", "status"], {}, b"bbr: no credential for profile; run `bbr auth login` (MissingUsername)\n", "auth", "MissingUsername"),
     (["api", "whoami"], dict(credentials, https_proxy="socks5://record-once.invalid"), b"bbr api whoami: InvalidProxyConfiguration\n", "api", "InvalidProxyConfiguration"),
     (["auth", "status"], dict(credentials, https_proxy="socks5://record-once.invalid"), b"bbr: status failed: transport (InvalidProxyConfiguration)\n", "auth", "InvalidProxyConfiguration"),
+)
+# A proxy on a closed local port refuses the connection, so the transport fails without network access.
+with socket.socket() as probe:
+    probe.bind(("127.0.0.1", 0))
+    refused_proxy = dict(credentials, https_proxy=f"http://127.0.0.1:{probe.getsockname()[1]}")
+cases += (
+    (["api", "whoami"], refused_proxy, b"bbr api whoami: ConnectionRefused\n", "api", "ConnectionRefused"),
+    (["auth", "status"], refused_proxy, b"bbr: status failed: transport (ConnectionRefused)\n", "auth", "ConnectionRefused"),
 )
 # These run with an invalid auth file in the data home.
 invalid_auth_cases = (

@@ -261,7 +261,6 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     git.diagnostic = diagnostic.forContext(.git, .{});
 
     var client = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(a, init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -513,7 +512,6 @@ fn rawComments(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbuck
     const pr_id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -529,7 +527,6 @@ fn rawComment(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucke
     const cid = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -544,7 +541,6 @@ fn checkRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.
     const id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -627,7 +623,6 @@ fn runAcquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bb
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
-    transport.diagnostic = diagnostic.forContext(.http, .{});
     defer transport.deinit();
     transport.enableConnectionCountTracking();
     try transport.initDefaultProxies(arena.allocator(), init.environ_map);
@@ -657,7 +652,6 @@ fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bi
     if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -697,7 +691,6 @@ fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bit
     if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
-    transport.diagnostic = diagnostic.forContext(.http, .{});
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred).withDiagnostics(diagnostic);
@@ -753,7 +746,6 @@ fn checkBlobsRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbu
     var checked: [fixture_classes.len]bool = @splat(false);
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -860,7 +852,6 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
     } else |err| std.debug.print("remote: <{s}>\n", .{@errorName(err)});
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(a, init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -1085,7 +1076,6 @@ fn loginValidateAndSave(init: std.process.Init, gpa: std.mem.Allocator, profile_
     const auth = bbr.bitbucket.auth;
     const candidate: bbr.bitbucket.Credential = .{ .username = email, .token = token, .workspace = workspace };
     var http_client = bbr.http.StdHttpClient.init(gpa, init.io);
-    http_client.diagnostic = diagnostic.forContext(.http, .{});
     defer http_client.deinit();
     http_client.initDefaultProxies(init.arena.allocator(), init.environ_map) catch |err| {
         std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
@@ -1249,7 +1239,6 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     defer owned.deinit(gpa);
 
     var http_client = bbr.http.StdHttpClient.init(gpa, init.io);
-    http_client.diagnostic = diagnostic.forContext(.http, .{});
     defer http_client.deinit();
     http_client.initDefaultProxies(init.arena.allocator(), init.environ_map) catch |err| {
         std.debug.print("bbr: status failed: transport ({s})\n", .{@errorName(err)});

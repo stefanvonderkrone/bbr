@@ -108,12 +108,7 @@ pub const Client = struct {
     }
 
     fn send(self: Client, allocator: Allocator, request: httpc.Request) !httpc.Response {
-        var bound = request;
-        bound.diagnostic = self.diagnostic;
-        const response = self.http.send(allocator, bound) catch |err| {
-            _ = self.diagnostic.failure(.execute, .{ .zig = err }, @src());
-            return err;
-        };
+        const response = try self.http.send(allocator, request);
         classify(response.status) catch |reason| {
             _ = self.diagnostic.failure(.rejection, .{ .http = .{ .status = response.status, .classification = switch (reason) {
                 error.Unauthorized => .authentication,
