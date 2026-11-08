@@ -140,9 +140,10 @@ pub const Client = struct {
 
     fn send(self: Client, allocator: Allocator, request: httpc.Request) !httpc.Response {
         const response = try self.http.send(allocator, request);
-        if (self.error_detail) |detail| {
-            classify(response.status) catch |reason| detail.record(reason, response.body, self.cred.token, request.headers);
-        }
+        classify(response.status) catch |reason| {
+            self.diagnostic.note(.{ .err = reason, .phase = .rejection, .cause = .{ .http = .{ .status = response.status, .classification = httpClass(reason) } } });
+            if (self.error_detail) |detail| detail.record(reason, response.body, self.cred.token, request.headers);
+        };
         return response;
     }
 
@@ -2371,6 +2372,19 @@ fn classify(status: u16) ApiError!void {
         429 => error.RateLimited,
         500...599 => error.ServerError,
         else => error.UnexpectedStatus,
+    };
+}
+
+fn httpClass(reason: ApiError) diagnostics.HttpClass {
+    return switch (reason) {
+        error.Unauthorized => .authentication,
+        error.Forbidden => .authorization,
+        error.RateLimited => .rate_limit,
+        error.ServerError => .server,
+        error.NotFound => .not_found,
+        error.BadRequest => .validation,
+        error.Conflict => .conflict,
+        error.UnexpectedStatus, error.MalformedResponse => .other,
     };
 }
 

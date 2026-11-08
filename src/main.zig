@@ -47,7 +47,10 @@ pub fn main(init: std.process.Init) !void {
         }}),
         .off, .on => {},
     }
-    const diagnostic = sink.handle(.startup, .{});
+    // The CLI runs one command at a time, so its boundaries share one evidence slot.
+    // The TUI gives each worker its own.
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const diagnostic = sink.handle(.startup, .{}).withLeaf(&leaf);
     runMain(init, snapshot, diagnostic) catch |err| switch (err) {
         error.StdoutClosed => {},
         error.Reported => exitFailure(diagnostic, err, @src()),

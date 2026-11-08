@@ -97,7 +97,12 @@ const PickerTickTransition = union(enum) {
 
 const picker_tick_interval_ms = 250;
 
-fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
+fn runPresentation(shared: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
+    // Workers note client evidence concurrently, so the CLI evidence slot stays out of the
+    // TUI, and each worker owns its own slot in its PresentationSinkContext.
+    var ctx = shared;
+    ctx.diagnostic = ctx.diagnostic.withLeaf(null);
+    if (ctx.bitbucket) |client| ctx.bitbucket = client.withDiagnostics(ctx.diagnostic);
     var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
     var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient(), ctx.diagnostic.forContext(.git, .{}));
     defer git_anchor_resolver.deinit();
@@ -797,10 +802,21 @@ const PresentationSinkContext = struct {
     loop: *Loop,
     work_id: u64,
     diagnostic: bbr.diagnostics.Handle = .{},
+    /// The worker's evidence slot. The worker's boundary record of a client error carries
+    /// the evidence that the client noted here.
+    leaf: ?bbr.diagnostic.Leaf = null,
+
+    fn handle(self: *PresentationSinkContext) bbr.diagnostics.Handle {
+        return self.diagnostic.withLeaf(&self.leaf);
+    }
+
+    fn bitbucket(self: *PresentationSinkContext, client: bbr.bitbucket.Client) bbr.bitbucket.Client {
+        return client.withDiagnostics(self.handle());
+    }
 };
 
 fn presentationSink(context: *PresentationSinkContext) presentation_runtime.CompletionSink {
-    return .{ .ptr = context, .post_fn = postPresentationInput, .diagnostic = context.diagnostic };
+    return .{ .ptr = context, .post_fn = postPresentationInput, .diagnostic = context.handle() };
 }
 
 fn postPresentationInput(ptr: *anyopaque, input: presentation.OwnedInput) anyerror!void {
@@ -822,7 +838,7 @@ fn presentationPostWorker(
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     var poster = bbr.bitbucket.Poster{
-        .client = client,
+        .client = sink_context.bitbucket(client),
         .allocator = scratch.allocator(),
         .repo_slug = command.identity.repository(),
         .pr_id = command.identity.pullRequestId(),
@@ -840,7 +856,7 @@ fn presentationCommentEditWorker(
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, client);
+    presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, sink_context.bitbucket(client));
 }
 
 fn presentationCommentDeleteWorker(
@@ -853,7 +869,7 @@ fn presentationCommentDeleteWorker(
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, client);
+    presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, sink_context.bitbucket(client));
 }
 
 fn presentationReviewerVerdictWorker(
@@ -866,7 +882,7 @@ fn presentationReviewerVerdictWorker(
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.executeReviewerVerdict(scratch.allocator(), command, client));
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.executeReviewerVerdict(scratch.allocator(), command, sink_context.bitbucket(client)));
 }
 
 fn presentationLoadWorker(
@@ -1036,7 +1052,7 @@ fn presentationRecoveryCheckWorker(
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    const input = presentation_adapter.checkRecovery(scratch.allocator(), client, check);
+    const input = presentation_adapter.checkRecovery(scratch.allocator(), sink_context.bitbucket(client), check);
     presentation_runtime.deliver(presentationSink(&sink_context), input);
 }
 
@@ -1044,11 +1060,12 @@ fn presentationDuplicateCheckWorker(
     loop: *Loop,
     work_id: u64,
     diagnostic: bbr.diagnostics.Handle,
-    client: bbr.bitbucket.Client,
+    unbound: bbr.bitbucket.Client,
     command: *presentation.PostDraft,
 ) void {
     defer command.destroy();
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
+    const client = sink_context.bitbucket(unbound);
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch |err| {
@@ -1071,14 +1088,14 @@ fn presentationDuplicateCheckWorker(
         .require_author_match = true,
     };
     const checked = poster.poster().findExisting(command.draft, command.parent) catch |err| blk: {
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
+        _ = client.diagnostic.failure(.execute, .{ .zig = err }, @src());
         break :blk bbr.review.CheckResult{ .outcome = .ambiguous };
     };
     const outcome: presentation.DuplicateCheckOutcome = switch (checked.outcome) {
         .found => |id| .{ .found = id },
         .missing => .missing,
         .rejected => |err| rejected: {
-            _ = diagnostic.failure(.rejection, .{ .zig = err }, @src());
+            _ = client.diagnostic.failure(.rejection, .{ .zig = err }, @src());
             break :rejected .{ .rejected = err };
         },
         .ambiguous => .failed,
@@ -1101,7 +1118,7 @@ fn presentationListPullRequestsWorker(
     command: presentation.ListPullRequests,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.listPullRequests(std.heap.page_allocator, client, command));
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.listPullRequests(std.heap.page_allocator, sink_context.bitbucket(client), command));
 }
 
 fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {

@@ -6,6 +6,8 @@ pub const State = value.State;
 pub const Context = value.Context;
 pub const Cause = value.Cause;
 pub const GrammarRule = value.GrammarRule;
+pub const Leaf = value.Leaf;
+pub const HttpClass = value.HttpClass;
 pub const Operation = value.Operation;
 pub const Phase = value.Phase;
 
@@ -13,13 +15,30 @@ pub const Handle = struct {
     sink: ?*Sink = null,
     operation: Operation = .startup,
     context: Context = .{},
+    /// The boundary's slot for the evidence of the last failure that a client returned.
+    /// One task at a time writes it, so a concurrent fan-out gives each task its own slot.
+    leaf: ?*?Leaf = null,
 
     pub fn forContext(self: Handle, operation: Operation, context: Context) Handle {
-        return .{ .sink = self.sink, .operation = operation, .context = context };
+        return .{ .sink = self.sink, .operation = operation, .context = context, .leaf = self.leaf };
+    }
+
+    pub fn withLeaf(self: Handle, slot: ?*?Leaf) Handle {
+        var result = self;
+        result.leaf = slot;
+        return result;
+    }
+
+    /// Keeps the evidence for the boundary's one record of `leaf.err` and records nothing.
+    pub fn note(self: Handle, leaf: Leaf) void {
+        const slot = self.leaf orelse return;
+        var noted = leaf;
+        noted.page = noted.page orelse self.context.page;
+        slot.* = noted;
     }
 
     pub fn failure(self: Handle, phase: Phase, cause: Cause, comptime source: std.builtin.SourceLocation) Failure {
-        const result = Failure.capture(self.operation, phase, self.context, cause, source);
+        const result = self.explain(Failure.capture(self.operation, phase, self.context, cause, source));
         self.record(result);
         return result;
     }
@@ -34,9 +53,20 @@ pub const Handle = struct {
     /// Drops a Failure whose cause is `error.Reported`, because the layer that returned it
     /// already recorded the failure. A boundary that forgets its `error.Reported` prong
     /// therefore writes no second record.
+    /// A Failure whose cause is the error in the slot takes the slot's evidence, so the
+    /// failure keeps one record that holds it.
     pub fn record(self: Handle, failure_value: Failure) void {
         if (failure_value.reported()) return;
-        if (self.sink) |sink| sink.record(failure_value);
+        const explained = self.explain(failure_value);
+        if (self.sink) |sink| sink.record(explained);
+    }
+
+    fn explain(self: Handle, failure_value: Failure) Failure {
+        const slot = self.leaf orelse return failure_value;
+        const leaf = slot.* orelse return failure_value;
+        const explained = failure_value.explainedBy(leaf) orelse return failure_value;
+        slot.* = null;
+        return explained;
     }
 };
 
@@ -273,6 +303,43 @@ test "diagnostics a boundary that records error.Reported writes no second record
     try testing.expectEqual(@as(u64, 1), sink.sequence);
     _ = sink.handle(.grammar, .{}).failure(.execute, .{ .zig = error.Unrecorded }, @src());
     try testing.expectEqual(@as(u64, 2), sink.sequence);
+}
+
+test "diagnostics a boundary record takes the leaf evidence of its own error once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testHome(&env, tmp);
+    var sink = Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var slot: ?Leaf = null;
+    const boundary = sink.handle(.api, .{}).withLeaf(&slot);
+    const client = boundary.forContext(.bitbucket, .{ .page = 3 });
+    client.note(.{ .err = error.ServerError, .phase = .rejection, .cause = .{ .http = .{ .status = 502, .classification = .server } } });
+    _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+    _ = boundary.failure(.execute, .{ .zig = error.ServerError }, @src());
+    _ = boundary.failure(.execute, .{ .zig = error.ServerError }, @src());
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const other = lines.next().?;
+    const explained = lines.next().?;
+    const later = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, other, "phase=execute ") != null);
+    try testing.expect(std.mem.endsWith(u8, other, "cause=zig error=OutOfMemory"));
+    try testing.expect(std.mem.indexOf(u8, explained, "operation=api phase=rejection ") != null);
+    try testing.expect(std.mem.endsWith(u8, explained, " page=3 cause=http status=502 classification=server"));
+    try testing.expect(std.mem.indexOf(u8, later, "phase=execute ") != null);
+    try testing.expect(std.mem.endsWith(u8, later, "cause=zig error=ServerError"));
 }
 
 fn writeMany(handle: Handle) void {

@@ -116,6 +116,34 @@ pub const Failure = struct {
             .http, .git, .sqlite, .grammar => false,
         };
     }
+
+    /// The Failure with the evidence of `leaf`, or null when `leaf` explains another error.
+    /// The leaf Phase and Cause name more than the boundary does, so they replace the
+    /// boundary's. A page that the boundary names stays.
+    pub fn explainedBy(self: Failure, leaf: Leaf) ?Failure {
+        const err = switch (self.cause) {
+            .zig => |err| err,
+            .http, .git, .sqlite, .grammar => return null,
+        };
+        if (err != leaf.err) return null;
+        var result = self;
+        result.phase = leaf.phase orelse self.phase;
+        result.context.page = self.context.page orelse leaf.page;
+        result.cause = leaf.cause orelse self.cause;
+        return result;
+    }
+};
+
+/// Evidence that only the leaf of a failure has, such as the HTTP status behind
+/// `error.ServerError`. A client that returns the typed error without a record notes the
+/// evidence through `diagnostics.Handle.note`, and the boundary's one record of that error
+/// carries it.
+pub const Leaf = struct {
+    /// The typed error that the client returns with this evidence.
+    err: anyerror,
+    phase: ?Phase = null,
+    page: ?u32 = null,
+    cause: ?Cause = null,
 };
 
 pub const State = union(enum) {
@@ -137,4 +165,5 @@ fn assertSafe(comptime T: type) void {
 comptime {
     assertSafe(Context);
     assertSafe(Cause);
+    assertSafe(Leaf);
 }

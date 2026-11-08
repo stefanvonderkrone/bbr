@@ -708,6 +708,66 @@ test "diagnostics the api boundary shows each failure and records it once" {
     }
 }
 
+/// Runs `whoami` against `fake` and returns the one record that the api boundary writes.
+fn leafEvidenceRecord(a: std.mem.Allocator, fake: *bbr.http.FakeHttpClient, message: []const u8) ![]u8 {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(home);
+    var sink_env = std.process.Environ.Map.init(a);
+    defer sink_env.deinit();
+    try sink_env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &sink_env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const diagnostic = sink.handle(.api, .{}).withLeaf(&leaf);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var output: TestOutput = .{};
+    const init = output.init(&env, &arena);
+    var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+    defer detail.deinit();
+    var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "user", .token = "token", .workspace = "workspace" });
+    bb.diagnostic = diagnostic;
+    bb.error_detail = &detail;
+    const verb = findVerb("whoami").?;
+    const err = if (verb.handler(init, bb, &.{}, true)) |_| return error.TestUnexpectedResult else |err| err;
+    try std.testing.expectEqual(error.Reported, reportFailure(init, verb, err, &detail, diagnostic));
+    try std.testing.expectEqualStrings(message, output.stderrBytes());
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+    defer a.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    return a.dupe(u8, only);
+}
+
+test "diagnostics the api boundary record holds the leaf evidence of a Bitbucket failure" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { fake: bbr.http.FakeHttpClient, message: []const u8, phase: []const u8, cause: []const u8 }{
+        .{ .fake = .{ .status = 503, .body = "{}" }, .message = "bbr api whoami: Bitbucket rejected request (ServerError)\n", .phase = "rejection", .cause = "cause=http status=503 classification=server" },
+        .{ .fake = .{ .status = 418, .body = "{}" }, .message = "bbr api whoami: Bitbucket rejected request (UnexpectedStatus)\n", .phase = "rejection", .cause = "cause=http status=418 classification=other" },
+    };
+    for (cases) |case| {
+        var fake = case.fake;
+        const record = try leafEvidenceRecord(a, &fake, case.message);
+        defer a.free(record);
+        const prefix = try std.fmt.allocPrint(a, "operation=api phase={s} source=api/cli.zig:", .{case.phase});
+        defer a.free(prefix);
+        try std.testing.expect(std.mem.indexOf(u8, record, prefix) != null);
+        try std.testing.expect(std.mem.endsWith(u8, record, case.cause));
+    }
+}
+
 test "error writer formats option help and runtime errors without user values" {
     var buffer: [8192]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
