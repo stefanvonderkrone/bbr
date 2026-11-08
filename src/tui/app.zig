@@ -129,7 +129,10 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     }) catch |err| switch (err) {
         // The store recorded the failure. The terminal is not in raw mode yet.
         error.Reported => {
-            std.debug.print("bbr: could not load the pending review drafts\n", .{});
+            var buf: [128]u8 = undefined;
+            var stderr = std.Io.File.stderr().writerStreaming(ctx.io, &buf);
+            try stderr.interface.writeAll("bbr: could not load the pending review drafts\n");
+            try stderr.interface.flush();
             return error.Reported;
         },
         else => return err,
@@ -1561,6 +1564,101 @@ test "pinned vaxis fixtures preserve Shift Arrow selection input" {
         try std.testing.expectEqual(fixture.codepoint, portable.codepoint);
         try std.testing.expect(portable.mods.shift);
     }
+}
+
+var test_store_diagnostic: bbr.diagnostics.Handle = .{};
+
+fn failTestLoad(_: *anyopaque, _: std.mem.Allocator, _: bbr.review.RemoteReviewIdentity) anyerror![]bbr.review.Draft {
+    return test_store_diagnostic.fail(.step, .{ .sqlite = .{ .result = 7, .extended = 7 } }, @src());
+}
+
+/// An Io that captures stderr writes and fails every other operation.
+const TestStderr = struct {
+    buffer: [512]u8 = undefined,
+    len: usize = 0,
+
+    const vtable: std.Io.VTable = blk: {
+        var table = std.Io.failing.vtable.*;
+        table.operate = operate;
+        break :blk table;
+    };
+
+    fn io(self: *TestStderr) std.Io {
+        return .{ .userdata = self, .vtable = &vtable };
+    }
+
+    fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        const self: *TestStderr = @ptrCast(@alignCast(userdata.?));
+        const write = switch (operation) {
+            .file_write_streaming => |write| write,
+            else => unreachable,
+        };
+        std.debug.assert(write.file.handle == std.Io.File.stderr().handle);
+        var writer = std.Io.Writer.fixed(self.buffer[self.len..]);
+        writer.writeAll(write.header) catch |err| switch (err) {
+            error.WriteFailed => return .{ .file_write_streaming = error.NoSpaceLeft },
+        };
+        for (write.data, 0..) |part, index| for (0..if (index + 1 == write.data.len) write.splat else 1) |_| writer.writeAll(part) catch |err| switch (err) {
+            error.WriteFailed => return .{ .file_write_streaming = error.NoSpaceLeft },
+        };
+        self.len += writer.buffered().len;
+        return .{ .file_write_streaming = writer.buffered().len };
+    }
+};
+
+test "diagnostics an initial load that the store reported shows its message and keeps one record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(std.testing.allocator, std.testing.io, &env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    test_store_diagnostic = sink.handle(.persistence, .{});
+    defer test_store_diagnostic = .{};
+
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    var vtable = store.store().vtable.*;
+    vtable.load = failTestLoad;
+    var reviews = store.store();
+    reviews.vtable = &vtable;
+    const initial = try session.create(std.testing.allocator);
+    initial.diff = .{ .files = &.{} };
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var output: TestStderr = .{};
+    try std.testing.expectError(error.Reported, run(.{
+        .diagnostic = sink.handle(.session_load, .{}),
+        .io = output.io(),
+        .gpa = std.testing.allocator,
+        .env_map = &env,
+        .repo = "",
+        .store = reviews,
+        .theme = .dark,
+        .keymap = keymap.Keymap.default,
+        .highlighter = plain.highlighter(),
+        .highlight_max_file_bytes = 0,
+        .file_cache_enabled = false,
+        .inactive_file_cache_max_bytes = 0,
+        .comments_collapsed_rows = 0,
+        .online = false,
+    }, initial, try presentation.OwnedReviewIdentity.init("workspace", "repo", 1)));
+    try std.testing.expectEqualStrings("bbr: could not load the pending review drafts\n", output.buffer[0..output.len]);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.endsWith(u8, only, "cause=sqlite result=7 extended=7"));
 }
 
 test "status labels project every Reviewer Verdict" {
