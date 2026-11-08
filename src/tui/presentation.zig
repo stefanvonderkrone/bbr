@@ -2708,7 +2708,7 @@ const DraftMutation = struct {
     }
 };
 
-const DraftMutationError = error{ OutOfMemory, DraftLocked, DraftEditConflict, DraftNotAnchorable, InvalidAnchor, PersistenceFailed };
+const DraftMutationError = error{ OutOfMemory, DraftLocked, DraftEditConflict, DraftNotAnchorable, InvalidAnchor, Reported };
 
 pub const DisclosureBuild = struct {
     const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, cache_update, draft_save, draft_mutation, review_destination, card_destination };
@@ -4063,7 +4063,7 @@ fn activeNumber(index: ?usize) ?usize {
 }
 
 const BufferTransactionError = error{ BufferBuildFailed, SearchFailed, OutOfMemory };
-const SaveDraftError = BufferTransactionError || error{ PersistenceFailed, AnchorRangeTooLong, InvalidDraftScope };
+const SaveDraftError = BufferTransactionError || error{ Reported, AnchorRangeTooLong, InvalidDraftScope };
 
 pub const ReplacementError = enum {
     session_load_failed,
@@ -4186,6 +4186,7 @@ const Published = struct {
     epoch: SessionEpoch,
     session: *Session,
     backing_allocator: Allocator,
+    /// The store failure behind a Published method's error.Reported. dispatch records it.
     diagnostic_failure: ?bbr.diagnostic.Failure,
     review_arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
@@ -4278,10 +4279,7 @@ const Published = struct {
         published.session = session;
         published.review_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer published.review_arena.deinit();
-        published.review = store.loadReview(published.review_arena.allocator(), key.storeKey()) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return error.PendingReviewLoadFailed;
-        };
+        published.review = try store.loadReview(published.review_arena.allocator(), key.storeKey());
         const expected_target: bbr.review.CommentTarget = if (key.isRemote()) .bitbucket else .local;
         for (published.review.drafts.items) |draft| {
             if (draft.target != expected_target) return error.PendingReviewLoadFailed;
@@ -4594,7 +4592,7 @@ const Published = struct {
         new_draft.validate() catch |err| return err;
         const reserved_id = store.reserveTempId(self.key.storeKey()) catch |err| {
             self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch }, .{ .zig = err }, @src());
-            return error.PersistenceFailed;
+            return error.Reported;
         };
 
         var draft: bbr.review.Draft = .{
@@ -4636,7 +4634,7 @@ const Published = struct {
     // Frame and closes the Composer through an infallible final step. Returns
     // true when the store resolved the parent to a Comment that another
     // process posted, so the worker Frame shows a stale parent.
-    fn persistPreparedDraft(self: *Published, store: bbr.review.PendingReviewStore, candidate: bbr.review.Draft) SaveDraftError!bool {
+    fn persistPreparedDraft(self: *Published, store: bbr.review.PendingReviewStore, candidate: bbr.review.Draft) error{ OutOfMemory, Reported }!bool {
         const a = self.review_arena.allocator();
         var draft = try cloneDisclosureDraft(a, candidate);
         // A completion can post the parent Draft after the Composer opens. The
@@ -4649,7 +4647,7 @@ const Published = struct {
         const requested = draft.parent;
         draft.parent = store.putResolvingParent(self.key.storeKey(), draft) catch |err| {
             self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = draft.local_id }, .{ .zig = err }, @src());
-            return error.PersistenceFailed;
+            return error.Reported;
         };
         // Another process posted the parent and removed it from the store. The
         // parent card then shows as posted, so the Reply stays under it.
@@ -4680,10 +4678,7 @@ const Published = struct {
                     .expected_kind = draft.kind,
                     .expected_parent = draft.parent,
                     .body = body,
-                }) catch |err| {
-                    self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = mutation.temp_id }, .{ .zig = err }, @src());
-                    return draftMutationStoreError(err);
-                };
+                }) catch |err| return self.draftMutationStoreError(err, mutation.temp_id, @src());
                 draft.body = body;
                 draft.state = job.mutation_state.?;
             },
@@ -4693,10 +4688,7 @@ const Published = struct {
                     .expected_kind = draft.kind,
                     .anchor = replacement.anchor,
                     .snapshot = replacement.snapshot,
-                }) catch |err| {
-                    self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = mutation.temp_id }, .{ .zig = err }, @src());
-                    return draftMutationStoreError(err);
-                };
+                }) catch |err| return self.draftMutationStoreError(err, mutation.temp_id, @src());
                 draft.scope = .{ .@"inline" = replacement.anchor };
                 draft.anchor = replacement.anchor;
                 draft.snapshot = replacement.snapshot;
@@ -4710,10 +4702,7 @@ const Published = struct {
                     .root_temp_id = mutation.temp_id,
                     .expected_parent = draft.parent,
                     .cascade = job.deleted_ids,
-                }) catch |err| {
-                    self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = mutation.temp_id }, .{ .zig = err }, @src());
-                    return draftMutationStoreError(err);
-                };
+                }) catch |err| return self.draftMutationStoreError(err, mutation.temp_id, @src());
                 var kept: usize = 0;
                 for (self.review.drafts.items) |candidate| {
                     if (bbr.review.containsTempId(job.deleted_ids, candidate.local_id)) continue;
@@ -4730,13 +4719,26 @@ const Published = struct {
                 self.scope_projection.shrinkRetainingCapacity(kept);
             },
             .unpublished => {
-                store.resolveUnknown(self.key.storeKey(), mutation.temp_id, .unpublished) catch |err| {
-                    self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = mutation.temp_id }, .{ .zig = err }, @src());
-                    return draftMutationStoreError(err);
-                };
+                store.resolveUnknown(self.key.storeKey(), mutation.temp_id, .unpublished) catch |err|
+                    return self.draftMutationStoreError(err, mutation.temp_id, @src());
                 draft.state = .draft;
             },
         }
+    }
+
+    /// A refusal keeps its name for the Action error. Any other store failure is
+    /// captured for dispatch to record once.
+    fn draftMutationStoreError(self: *Published, err: anyerror, temp_id: bbr.review.TempId, comptime source: std.builtin.SourceLocation) DraftMutationError {
+        return switch (err) {
+            error.DraftLocked, error.DraftNotEditable => error.DraftLocked,
+            error.DraftEditConflict, error.DraftNotFound, error.DraftCascadeConflict => error.DraftEditConflict,
+            error.DraftNotAnchorable => error.DraftNotAnchorable,
+            error.InvalidAnchor => error.InvalidAnchor,
+            else => {
+                self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .draft_id = temp_id }, .{ .zig = err }, source);
+                return error.Reported;
+            },
+        };
     }
 
     // Synchronous benchmark controls and test references. Production dispatch
@@ -9608,7 +9610,10 @@ pub const Presentation = struct {
         const parent_reposted = if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
             self.reportFailure(.composer, .write, err, @src());
             published.pending_draft_save = null;
-            self.action_error = if (err == error.PersistenceFailed) .persistence_failed else .out_of_memory;
+            self.action_error = switch (err) {
+                error.Reported => .persistence_failed,
+                error.OutOfMemory => .out_of_memory,
+            };
             return;
         } else false;
         if (job.mutation) |mutation| {
@@ -12254,12 +12259,12 @@ pub const Presentation = struct {
         };
         job.kind = .draft_save;
         job.new_draft = published.prepareDraft(self.dependencies.reviews, job.arena.allocator(), composer.toNewDraft()) catch |err| {
-            if (err == error.OutOfMemory or err == error.PersistenceFailed) self.reportFailure(.composer, .prepare, err, @src());
+            if (err == error.OutOfMemory) self.reportFailure(.composer, .prepare, err, @src());
             job.destroy();
             self.action_error = switch (err) {
                 error.AnchorRangeTooLong => .anchor_range_too_long,
                 error.InvalidDraftScope => .invalid_selection,
-                error.PersistenceFailed => .persistence_failed,
+                error.Reported => .persistence_failed,
                 error.BufferBuildFailed => .buffer_build_failed,
                 error.SearchFailed => .buffer_search_scan_failed,
                 error.OutOfMemory => .out_of_memory,
@@ -13009,16 +13014,20 @@ pub const Presentation = struct {
             job.review_revision != self.candidate_review_revision)
         {
             candidate.session.retain();
-            self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err|
+            self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
+                self.reportFailure(.session_load, .prepare, err, @src());
                 self.failReplacement(replacement, if (err == error.OutOfMemory) .out_of_memory else .pending_review_load_failed);
+            };
             return;
         }
         if (location) |target| {
             const required = reviewLocationDisclosures(candidate, target);
             for (required.items[0..required.len]) |key| if (!candidate.disclosure_keys.contains(key)) {
                 candidate.session.retain();
-                self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err|
+                self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
+                    self.reportFailure(.session_load, .prepare, err, @src());
                     self.failReplacement(replacement, if (err == error.OutOfMemory) .out_of_memory else .buffer_build_failed);
+                };
                 return;
             };
         }
@@ -13216,16 +13225,6 @@ fn normalizeActionError(err: BufferTransactionError) ActionError {
     };
 }
 
-fn draftMutationStoreError(err: anyerror) DraftMutationError {
-    return switch (err) {
-        error.DraftLocked, error.DraftNotEditable => error.DraftLocked,
-        error.DraftEditConflict, error.DraftNotFound, error.DraftCascadeConflict => error.DraftEditConflict,
-        error.DraftNotAnchorable => error.DraftNotAnchorable,
-        error.InvalidAnchor => error.InvalidAnchor,
-        else => error.PersistenceFailed,
-    };
-}
-
 fn draftMutationActionError(err: DraftMutationError) ActionError {
     return switch (err) {
         error.DraftLocked => .draft_owned_by_submission,
@@ -13233,7 +13232,7 @@ fn draftMutationActionError(err: DraftMutationError) ActionError {
         error.DraftNotAnchorable => .draft_scope_not_inline,
         error.InvalidAnchor => .anchor_candidate_ambiguous,
         error.OutOfMemory => .out_of_memory,
-        error.PersistenceFailed => .persistence_failed,
+        error.Reported => .persistence_failed,
     };
 }
 
@@ -31984,6 +31983,176 @@ test "diagnostics a store failure through fail keeps one record when Presentatio
     try testing.expect(lines.next() == null);
     try testing.expect(std.mem.indexOf(u8, only, "operation=persistence phase=step source=tui/presentation.zig:") != null);
     try testing.expect(std.mem.endsWith(u8, only, "cause=sqlite result=10 extended=266"));
+}
+
+const TestStoreFailure = enum { reported, plain };
+var test_store_failure: TestStoreFailure = .reported;
+
+fn failTestStoreWrite() anyerror {
+    return switch (test_store_failure) {
+        .reported => test_store_diagnostic.fail(.step, .{ .sqlite = .{ .result = 10, .extended = 266 } }, @src()),
+        .plain => error.StoreUnavailable,
+    };
+}
+
+fn failTestReserve(_: *anyopaque, _: bbr.review.RemoteReviewIdentity) anyerror!bbr.review.TempId {
+    return failTestStoreWrite();
+}
+
+fn failTestPut(_: *anyopaque, _: bbr.review.RemoteReviewIdentity, _: bbr.review.Draft) anyerror!@FieldType(bbr.review.Draft, "parent") {
+    return failTestStoreWrite();
+}
+
+fn failTestEdit(_: *anyopaque, _: bbr.review.RemoteReviewIdentity, _: bbr.review.DraftBodyEdit) anyerror!void {
+    return failTestStoreWrite();
+}
+
+fn failTestReanchor(_: *anyopaque, _: bbr.review.RemoteReviewIdentity, _: bbr.review.DraftReanchor) anyerror!void {
+    return failTestStoreWrite();
+}
+
+fn failTestDelete(_: *anyopaque, _: bbr.review.RemoteReviewIdentity, _: bbr.review.DraftSubtreeDelete) anyerror!void {
+    return failTestStoreWrite();
+}
+
+fn failTestResolveUnknown(_: *anyopaque, _: bbr.review.RemoteReviewIdentity, _: bbr.review.TempId, _: bbr.review.UnknownResolution) anyerror!void {
+    return failTestStoreWrite();
+}
+
+fn failTestLoad(_: *anyopaque, _: Allocator, _: bbr.review.RemoteReviewIdentity) anyerror![]bbr.review.Draft {
+    return failTestStoreWrite();
+}
+
+const TestTranslatedStoreFailure = enum { reserve, put, body, reanchor, delete, unpublished, load, requeue };
+
+test "diagnostics a store failure behind a translated Presentation error keeps one record" {
+    var miscounted: usize = 0;
+    defer test_store_failure = .reported;
+    for (std.meta.tags(TestStoreFailure)) |failure| for (std.meta.tags(TestTranslatedStoreFailure)) |path| {
+        test_store_failure = failure;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        test_store_diagnostic = sink.handle(.persistence, .{});
+        defer test_store_diagnostic = .{};
+
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        var vtable = store.store().vtable.*;
+        var presentation = switch (path) {
+            .reserve, .put, .load, .requeue => try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+                .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+            }),
+            .body => try testDraftMutationPresentation(testing.allocator, store.store(), key, .body),
+            .reanchor => try testDraftMutationPresentation(testing.allocator, store.store(), key, .reanchor),
+            .delete => try testDraftMutationPresentation(testing.allocator, store.store(), key, .delete),
+            .unpublished => try testDraftMutationPresentation(testing.allocator, store.store(), key, .unpublished),
+        };
+        defer presentation.deinit();
+        presentation.diagnostic_state = .on;
+        switch (path) {
+            .reserve => {
+                try presentation.dispatch(.{ .action = .review_comment });
+                try presentation.published.?.composer.?.seed("x");
+                vtable.reserve_temp_id = failTestReserve;
+                presentation.dependencies.reviews.vtable = &vtable;
+                try presentation.dispatch(.{ .composer = .save });
+            },
+            .put => {
+                try presentation.dispatch(.{ .action = .review_comment });
+                try presentation.published.?.composer.?.seed("x");
+                try presentation.dispatch(.{ .composer = .save });
+                vtable.put = failTestPut;
+                presentation.dependencies.reviews.vtable = &vtable;
+                try completeDisclosureBuild(&presentation);
+            },
+            .body, .reanchor, .delete, .unpublished => {
+                const mutation: TestDraftMutation = switch (path) {
+                    .body => .body,
+                    .reanchor => .reanchor,
+                    .delete => .delete,
+                    .unpublished => .unpublished,
+                    .reserve, .put, .load, .requeue => unreachable,
+                };
+                try startTestDraftMutation(&presentation, mutation);
+                switch (mutation) {
+                    .body => vtable.edit_draft_body = failTestEdit,
+                    .reanchor => vtable.reanchor_draft = failTestReanchor,
+                    .delete => vtable.delete_draft_subtree = failTestDelete,
+                    .unpublished => vtable.resolve_unknown = failTestResolveUnknown,
+                }
+                presentation.dependencies.reviews.vtable = &vtable;
+                try completeDisclosureBuild(&presentation);
+            },
+            .load => {
+                try presentation.dispatch(.{ .action = .refresh });
+                const load = presentation.takeCommand().?.load_session;
+                vtable.load = failTestLoad;
+                presentation.dependencies.reviews.vtable = &vtable;
+                try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+                    .command_id = load.command_id,
+                    .intent = load.intent,
+                    .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'a') },
+                } });
+            },
+            .requeue => {
+                try presentation.dispatch(.{ .action = .refresh });
+                const load = presentation.takeCommand().?.load_session;
+                try presentation.dispatch(.{ .session_loaded = .{
+                    .command_id = load.command_id,
+                    .intent = load.intent,
+                    .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'a') },
+                } });
+                const job = presentation.takeCommand().?.prepare_session;
+                job.build();
+                try presentation.dispatch(.{ .resize = .{ .cols = presentation.geometry.cols, .rows = presentation.geometry.rows + 5 } });
+                vtable.load = failTestLoad;
+                presentation.dependencies.reviews.vtable = &vtable;
+                try presentation.dispatch(.{ .session_prepared = job });
+            },
+        }
+
+        if (path == .load or path == .requeue)
+            try testing.expectEqual(ReplacementError.pending_review_load_failed, presentation.projection().replacement_error.?)
+        else
+            try testing.expectEqual(ActionError.persistence_failed, presentation.projection().action_error.?);
+        while (presentation.takeCommand()) |command_value| {
+            var command = command_value;
+            defer command.deinit();
+            if (command == .report_diagnostic) sink.handle(.persistence, .{}).record(command.report_diagnostic);
+        }
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next() orelse {
+            std.debug.print("{s} {s}: no record\n", .{ @tagName(failure), @tagName(path) });
+            miscounted += 1;
+            continue;
+        };
+        try testing.expect(std.mem.endsWith(u8, only, switch (failure) {
+            .reported => "cause=sqlite result=10 extended=266",
+            .plain => "cause=zig error=StoreUnavailable",
+        }));
+        while (lines.next()) |extra| {
+            std.debug.print("{s} {s}: second record {s}\n", .{ @tagName(failure), @tagName(path), extra });
+            miscounted += 1;
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), miscounted);
 }
 
 test "terminal persistence retry does not repeat an already-durable checkpoint" {

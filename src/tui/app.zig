@@ -101,7 +101,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
     var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient());
     defer git_anchor_resolver.deinit();
-    var state = try presentation.Presentation.init(ctx.gpa, .{
+    var state = presentation.Presentation.init(ctx.gpa, .{
         .reviews = ctx.store,
         .anchor_resolver = git_anchor_resolver.resolver(),
         .scope_resolver = git_anchor_resolver.scopeResolver(),
@@ -126,7 +126,14 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             .session = loaded,
         } else null,
         .viewport_rows = 1,
-    });
+    }) catch |err| switch (err) {
+        // The store recorded the failure. The terminal is not in raw mode yet.
+        error.Reported => {
+            std.debug.print("bbr: could not load the pending review drafts\n", .{});
+            return error.Reported;
+        },
+        else => return err,
+    };
     defer state.deinit();
     if (initial == null) try state.dispatch(.{ .choose_pull_request = initial_key });
 
