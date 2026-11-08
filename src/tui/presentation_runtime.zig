@@ -245,6 +245,69 @@ test "diagnostics a Bitbucket failure has one record from the worker boundary" {
     }
 }
 
+fn testBoundedText(comptime T: type, value: []const u8) T {
+    var text: T = .{ .len = value.len };
+    @memcpy(text.bytes[0..value.len], value);
+    return text;
+}
+
+test "diagnostics a refused Reviewer Verdict change has one record from the worker boundary" {
+    const before =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [] }
+    ;
+    const cases = [_]struct { responses: []const bbr.http.Canned, cause: []const u8 }{
+        .{ .responses = &.{.{ .status = 401, .body = "{}" }}, .cause = "cause=zig error=Unauthorized" },
+        .{ .responses = &.{ .{ .body = before }, .{ .status = 403, .body = "{}" } }, .cause = "cause=zig error=Forbidden" },
+        .{ .responses = &.{ .{ .body = before }, .{ .status = 503, .body = "{}" }, .{ .body = before } }, .cause = "cause=zig error=ServerError" },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer diagnostic_sink.deinit();
+        try testing.expect(diagnostic_sink.setEnabled(true) == .on);
+        const handle = diagnostic_sink.handle(.verdict, .{});
+        var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "user", .token = "token", .workspace = "workspace" }).withDiagnostics(handle);
+        const Verdict = presentation.ChangeReviewerVerdict;
+        const command: Verdict = .{
+            .command_id = 5,
+            .identity = .{ .value = try presentation.OwnedReviewIdentity.init("workspace", "repo", 42) },
+            .expected_source_commit = testBoundedText(@FieldType(Verdict, "expected_source_commit"), "abc123"),
+            .authenticated_account_uuid = testBoundedText(@FieldType(Verdict, "authenticated_account_uuid"), "{me}"),
+            .target = .approved,
+        };
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var sink: CapturingSink = .{};
+        var completion = sink.sink();
+        completion.diagnostic = handle;
+        deliver(completion, adapter.executeReviewerVerdict(arena.allocator(), command, client));
+        _ = diagnostic_sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next().?;
+        try testing.expect(lines.next() == null);
+        try testing.expect(std.mem.indexOf(u8, only, "command_id=5") != null);
+        try testing.expect(std.mem.endsWith(u8, only, case.cause));
+    }
+}
+
 test "diagnostics launch failure retains actual cause and command work identities" {
     var command: presentation.OwnedCommand = .{ .list_pull_requests = .{ .command_id = 19, .work_id = 29, .repository = .{ .bytes = undefined, .len = 0 } } };
     var input = try command.launchFailed(error.ConcurrencyUnavailable);

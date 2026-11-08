@@ -613,10 +613,10 @@ pub const Client = struct {
         authenticated_account_uuid: []const u8,
         target: types.ReviewerVerdict,
     ) !types.ReviewerVerdictChangeResult {
-        // A boundary records the error that this function returns. An outcome carries no
-        // evidence, so each cause that becomes an outcome gets its record here.
+        // The caller records the error that this function returns and the reason that the
+        // result names. Each other cause drops out of the result, so it gets its record here.
         const before = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err|
-            return self.verdictRefusal(asApiError(err) orelse return err, @src());
+            return .{ .api_error = asApiError(err) orelse return err };
         defer deinitPullRequest(allocator, before);
         if (!std.mem.eql(u8, before.source_commit, expected_source_commit)) return .stale_source_commit;
         if (before.author_uuid.len != 0 and std.mem.eql(u8, before.author_uuid, authenticated_account_uuid)) return .{ .api_error = error.Forbidden };
@@ -646,27 +646,24 @@ pub const Client = struct {
         var uncertain = false;
         var uncertain_reason: ?ApiError = null;
         self.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
-            _ = self.diagnostic.failure(.execute, .{ .zig = err }, @src());
             if (asApiError(err)) |api_error| switch (api_error) {
                 error.RateLimited, error.ServerError => uncertain_reason = api_error,
                 else => return .{ .api_error = api_error },
-            };
+            } else _ = self.diagnostic.failure(.execute, .{ .zig = err }, @src());
             uncertain = true;
         };
 
         const after = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
-            _ = self.diagnostic.failure(.read, .{ .zig = err }, @src());
-            return .{ .unresolved = asApiError(err) };
+            if (uncertain_reason) |reason| _ = self.diagnostic.failure(.execute, .{ .zig = reason }, @src());
+            const read_reason = asApiError(err);
+            if (read_reason == null) _ = self.diagnostic.failure(.read, .{ .zig = err }, @src());
+            return .{ .unresolved = read_reason };
         };
         defer deinitPullRequest(allocator, after);
         if (after.reviewerVerdict(authenticated_account_uuid) != target) return .{ .unresolved = uncertain_reason };
+        if (uncertain_reason) |reason| _ = self.diagnostic.failure(.execute, .{ .zig = reason }, @src());
         if (uncertain or !std.mem.eql(u8, after.source_commit, expected_source_commit)) return .reconciled_success;
         return .success;
-    }
-
-    fn verdictRefusal(self: Client, api_error: ApiError, comptime source: std.builtin.SourceLocation) types.ReviewerVerdictChangeResult {
-        _ = self.diagnostic.failure(.read, .{ .zig = api_error }, source);
-        return .{ .api_error = api_error };
     }
 
     fn sendReviewerVerdictMutation(
@@ -3277,7 +3274,7 @@ test "getPullRequest translates PullRequest Author and Reviewer Verdicts" {
     try testing.expectEqual(types.ReviewerVerdict.no_verdict, pr.reviewerVerdict("{missing}"));
 }
 
-test "diagnostics each Reviewer Verdict cause that becomes an outcome has one record" {
+test "diagnostics a Reviewer Verdict change records each cause that its result drops" {
     const Canned = @import("../http/fake_client.zig").Canned;
     const before =
         \\{ "id": 42, "title": "Review", "state": "OPEN",
@@ -3285,6 +3282,13 @@ test "diagnostics each Reviewer Verdict cause that becomes an outcome has one re
         \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
         \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
         \\  "participants": [] }
+    ;
+    const after =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [ { "user": { "uuid": "{me}" }, "approved": true, "state": "approved" } ] }
     ;
     const reset: Canned = .{ .send_error = error.ConnectionResetByPeer };
     const cases = [_]struct {
@@ -3297,20 +3301,23 @@ test "diagnostics each Reviewer Verdict cause that becomes an outcome has one re
             .result = .{ .unresolved = null },
             .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer", "phase=read source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer" },
         },
-        .{
-            .responses = &.{.{ .status = 401, .body = "{}" }},
-            .result = .{ .api_error = error.Unauthorized },
-            .records = &.{ "phase=read source=bitbucket/client.zig:", "cause=zig error=Unauthorized" },
-        },
-        .{
-            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 403, .body = "{}" } },
-            .result = .{ .api_error = error.Forbidden },
-            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=Forbidden" },
-        },
+        // The caller records a reason that the result names.
+        .{ .responses = &.{.{ .status = 401, .body = "{}" }}, .result = .{ .api_error = error.Unauthorized }, .records = &.{} },
+        .{ .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 403, .body = "{}" } }, .result = .{ .api_error = error.Forbidden }, .records = &.{} },
         .{
             .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 200, .body = before } },
             .result = .{ .unresolved = error.ServerError },
+            .records = &.{},
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 200, .body = after } },
+            .result = .reconciled_success,
             .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=ServerError" },
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 429, .body = "{}" }, .{ .status = 401, .body = "{}" } },
+            .result = .{ .unresolved = error.Unauthorized },
+            .records = &.{ "phase=execute source=bitbucket/client.zig:", "cause=zig error=RateLimited" },
         },
     };
     for (cases) |case| {
