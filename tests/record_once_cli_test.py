@@ -19,6 +19,15 @@ credentials = {"BITBUCKET_USERNAME": "record-once-user", "BITBUCKET_TOKEN": "rec
 cases = (
     (["api", "whoami", "--json"], {}, b"bbr api whoami: MissingCredential (MissingUsername)\nRun `bbr auth login`", "api", "MissingUsername"),
     (["api", "frobnicate"], {}, b"bbr api: bad options (UnknownFlag)\n", "api", "UnknownFlag"),
+    (["completion", "record-once-shell"], {}, b"bbr completion: unknown shell (bash|zsh|fish)\n", "completion", "UnknownFlag"),
+    (["grammar", "record-once-command"], {}, b"bbr grammar: InvalidGrammarCommand\n", "grammar", "InvalidGrammarCommand"),
+    (["grammar", "check", "/record-once-missing-bundle"], {}, b"bbr grammar: FileNotFound\n", "grammar", "FileNotFound"),
+    (["auth", "status"], {}, b"bbr: no credential for profile; run `bbr auth login` (MissingUsername)\n", "auth", "MissingUsername"),
+)
+# These run with an invalid auth file in the data home.
+invalid_auth_cases = (
+    (["completion", "--list-profiles"], {}, b"bbr completion: InvalidAuthFile\n", "completion", "InvalidAuthFile"),
+    (["api", "whoami"], {}, b"bbr api whoami: InvalidAuthFile\n", "api", "InvalidAuthFile"),
 )
 
 
@@ -37,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
     config = root / "config/bbr/config.toml"
     config.parent.mkdir(parents=True)
     config.write_text("[logging]\nenabled = true\n")
-    for args, extra, message, operation, cause in cases:
+    def check(args, extra, message, operation, cause):
         before = logs(env)
         result = subprocess.run(
             [binary, *args], capture_output=True, env=dict(env, **extra), cwd=root, timeout=10, stdin=subprocess.DEVNULL,
@@ -48,5 +57,14 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
         assert b"error: Reported" not in result.stderr, (args, result.stderr)
         assert len(records) == 1, (args, records)
         assert f" operation={operation} " in records[0] and records[0].endswith(f" error={cause}"), (args, records)
+
+    for case in cases:
+        check(*case)
+    auth_file = root / "data/bbr/auth.toml"
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text("record-once-invalid")
+    auth_file.chmod(0o600)
+    for case in invalid_auth_cases:
+        check(*case)
 
 print("Record-once CLI checks passed. Each failure prints its message and has one diagnostic record.")

@@ -117,10 +117,7 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
     if (first) |f| {
         if (std.mem.eql(u8, f, "grammar")) return grammarRun(init, gpa, &rest, diagnostic.forContext(.grammar, .{}));
         if (std.mem.eql(u8, f, "demo")) {
-            var loaded = config.loadSnapshot(gpa, snapshot) catch |err| {
-                _ = diagnostic.forContext(.configuration, .{}).failure(.read, .{ .zig = err }, @src());
-                return err;
-            };
+            var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(diagnostic, err, @src());
             defer loaded.deinit(gpa);
             return switch (loaded) {
                 .ok => |*configuration| demoRun(init.io, gpa, init.environ_map, configuration, diagnostic),
@@ -196,10 +193,7 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
         }
     }
 
-    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| {
-        _ = diagnostic.forContext(.configuration, .{}).failure(.read, .{ .zig = err }, @src());
-        return err;
-    };
+    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(diagnostic, err, @src());
     defer loaded.deinit(gpa);
     switch (loaded) {
         .ok => |*configuration| try openTui(init, gpa, cred, input, configuration, diagnostic),
@@ -207,8 +201,18 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
     }
 }
 
+/// The boundary of `bbr grammar`: it prints and records each failure of the command once.
 fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
-    errdefer |err| _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
+    grammarCommand(init, gpa, it, diagnostic) catch |err| switch (err) {
+        error.StdoutClosed => return err,
+        else => {
+            std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
+            return diagnostic.fail(.execute, .{ .zig = err }, @src());
+        },
+    };
+}
+
+fn grammarCommand(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(gpa);
     while (it.next()) |arg| try args.append(gpa, arg);
@@ -229,10 +233,7 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagn
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer, " \t\r"), "yes");
         if (approved) interactive_digest = previewed_digest;
     }
-    bbr.stdout.write(init.io, runGrammar, .{ gpa, init.io, init.environ_map, args.items, interactive_digest, diagnostic }) catch |err| {
-        if (err != error.StdoutClosed) std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
-        return @as(anyerror!void, err);
-    };
+    try bbr.stdout.write(init.io, runGrammar, .{ gpa, init.io, init.environ_map, args.items, interactive_digest, diagnostic });
 }
 
 fn writeTrustQuestion(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, path: []const u8, digest: *[32]u8, diagnostic: bbr.diagnostics.Handle) !void {
@@ -321,7 +322,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null, diagnostic.forContext(.highlighting, .{}));
     defer tree_sitter_highlighter.deinit();
 
-    app.run(.{
+    try app.run(.{
         .diagnostic = diagnostic,
         .io = init.io,
         .gpa = gpa,
@@ -340,26 +341,15 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .submission_locks = os_locks.locks(),
-    }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id)) catch |err| {
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
-        if (tuiFatalMessage(err)) |message| {
-            std.debug.print("{s}\n", .{message});
-            return;
-        }
-        return err;
-    };
+    }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id));
 }
 
 fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapshot: bbr.config_source.Snapshot, diagnostic: bbr.diagnostics.Handle) anyerror!void {
-    errdefer |err| _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
     const base_input = it.next();
     const source_input = it.next();
     if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
-    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| {
-        _ = diagnostic.forContext(.configuration, .{}).failure(.read, .{ .zig = err }, @src());
-        return @as(anyerror!void, err);
-    };
+    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(diagnostic, err, @src());
     defer loaded.deinit(gpa);
     const configuration = switch (loaded) {
         .ok => |*value| value,
@@ -457,13 +447,6 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
         .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .online = false,
     }, null, key);
-}
-
-fn tuiFatalMessage(err: anyerror) ?[]const u8 {
-    return switch (err) {
-        error.FileEnrichmentOutOfMemory => "bbr: file enrichment ran out of memory; the review was not modified",
-        else => null,
-    };
 }
 
 /// Open the pending-review store at `<state home>/bbr/pending.db`, creating the
@@ -605,8 +588,8 @@ fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr
         var rate_limited: usize = 0;
         var max_connections: usize = 0;
         for (0..10) |sample_index| {
-            sequential[sample_index] = runAcquisitionSample(init, gpa, cred, id, false, &failures, &rate_limited, &max_connections, diagnostic) catch 0;
-            bounded[sample_index] = runAcquisitionSample(init, gpa, cred, id, true, &failures, &rate_limited, &max_connections, diagnostic) catch 0;
+            sequential[sample_index] = acquisitionSample(init, gpa, cred, id, false, &failures, &rate_limited, &max_connections, diagnostic);
+            bounded[sample_index] = acquisitionSample(init, gpa, cred, id, true, &failures, &rate_limited, &max_connections, diagnostic);
         }
         std.mem.sort(u64, &sequential, {}, std.sort.asc(u64));
         std.mem.sort(u64, &bounded, {}, std.sort.asc(u64));
@@ -620,8 +603,14 @@ fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr
     }
 }
 
+fn acquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, id: u64, bounded: bool, failures: *usize, rate_limited: *usize, max_connections: *usize, diagnostic: bbr.diagnostics.Handle) u64 {
+    return runAcquisitionSample(init, gpa, cred, id, bounded, failures, rate_limited, max_connections, diagnostic) catch |err| {
+        _ = diagnostic.forContext(.session_load, .{}).failure(.execute, .{ .zig = err }, @src());
+        return 0;
+    };
+}
+
 fn runAcquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, id: u64, bounded: bool, failures: *usize, rate_limited: *usize, max_connections: *usize, diagnostic: bbr.diagnostics.Handle) !u64 {
-    errdefer |err| _ = diagnostic.forContext(.session_load, .{}).failure(.execute, .{ .zig = err }, @src());
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
@@ -636,7 +625,6 @@ fn runAcquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bb
     else
         session.loadSequentialWith(std.heap.page_allocator, bb, "pr-webapp", id);
     const candidate = loaded catch |err| {
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
         failures.* += 1;
         if (err == error.RateLimited) rate_limited.* += 1;
         return @as(anyerror!u64, err);
@@ -1285,7 +1273,6 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
 /// `bbr auth login|status|logout` dispatcher. Credential management lives
 /// outside the TUI under this one group; there are no top-level aliases.
 fn authRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8, diagnostic: bbr.diagnostics.Handle) !void {
-    errdefer |err| _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
     const sub = rest.next() orelse {
         std.debug.print("usage: bbr auth (login|status|logout) [...]\n", .{});
         exitFailure(diagnostic, error.MissingRequired, @src());
@@ -1312,6 +1299,11 @@ fn exitFailure(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime sou
 fn invalidUsage(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) void {
     _ = diagnostic.forContext(.arguments, .{}).failure(.decode, .{ .zig = cause }, source);
     usage();
+}
+
+fn configLoadFailed(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    std.debug.print("bbr: could not load configuration: {s}\n", .{@errorName(cause)});
+    return diagnostic.forContext(.configuration, .{}).fail(.read, .{ .zig = cause }, source);
 }
 
 fn reportConfigFailure(diagnostic: bbr.diagnostics.Handle, failure: config.Failure) void {
@@ -1544,14 +1536,6 @@ test "pending.db and submission locks live under an absolute XDG_STATE_HOME, els
         opened.close(testing.io);
     }
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, "relative/state", .{}));
-}
-
-test "File Enrichment OOM has a distinct fatal message" {
-    try std.testing.expectEqualStrings(
-        "bbr: file enrichment ran out of memory; the review was not modified",
-        tuiFatalMessage(error.FileEnrichmentOutOfMemory).?,
-    );
-    try std.testing.expect(tuiFatalMessage(error.NotFound) == null);
 }
 
 test "diagnostics pending store fallback records preparation failure but not absent state home" {
