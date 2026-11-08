@@ -969,7 +969,7 @@ pub const Client = struct {
             _ = io.swapCancelProtection(previous);
         };
         defer select.group.await(io) catch |err| switch (err) {
-            error.Canceled => {},
+            error.Canceled => io.recancel(),
         };
         var concurrent = opts.concurrency > 1;
         var active: usize = 0;
@@ -1947,11 +1947,13 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
 
         fn complete(self: *Self, slot: *Slot) !void {
             const state = &self.lists[slot.position.list].pages.items[slot.position.number - 1];
-            const items = self.accept(slot) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                state.* = .{ .failed = .{ .reason = err, .detail = slot.error_detail } };
-                slot.error_detail = null;
-                return;
+            const items = self.accept(slot) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    state.* = .{ .failed = .{ .reason = err, .detail = slot.error_detail } };
+                    slot.error_detail = null;
+                    return;
+                },
             };
             state.* = .{ .done = items };
         }

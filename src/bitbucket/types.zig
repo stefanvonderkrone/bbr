@@ -94,8 +94,14 @@ pub const ReviewerVerdictChangeResult = union(enum) {
 
     pub fn invalidatesAuthenticatedAccount(self: ReviewerVerdictChangeResult) bool {
         return switch (self) {
-            .api_error => |err| err == error.Unauthorized,
-            .unresolved => |err| if (err) |cause| cause == error.Unauthorized else false,
+            .api_error => |err| switch (err) {
+                error.Unauthorized => true,
+                else => false,
+            },
+            .unresolved => |err| if (err) |cause| switch (cause) {
+                error.Unauthorized => true,
+                else => false,
+            } else false,
             else => false,
         };
     }

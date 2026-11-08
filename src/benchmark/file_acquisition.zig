@@ -132,7 +132,7 @@ fn runFixture(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture) !void 
             run_count += 1;
             if (fixture.remote and run_count < samples_per_limit * limits.len)
                 io.sleep(std.Io.Duration.fromSeconds(10), .awake) catch |err| switch (err) {
-                    error.Canceled => return error.SleepFailed,
+                    error.Canceled => return error.Canceled,
                 };
         }
     }
@@ -166,7 +166,7 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
     var completion_buffer: [limits[limits.len - 1]]Selected = undefined;
     var select = std.Io.Select(Selected).init(io, &completion_buffer);
     defer select.group.await(io) catch |err| switch (err) {
-        error.Canceled => {},
+        error.Canceled => io.recancel(),
     };
     const start = std.Io.Clock.awake.now(io);
     var first_file_ms: u64 = 0;
@@ -197,7 +197,10 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
             },
             .failed => |err| {
                 failures += 1;
-                if (err == error.RateLimited) rate_limited += 1;
+                switch (err) {
+                    error.RateLimited => rate_limited += 1,
+                    else => {},
+                }
             },
         }
         if (next < order.len) {
@@ -247,7 +250,10 @@ fn lessThanFilePath(files: []const bbr.diff.File, lhs: usize, rhs: usize) bool {
 fn countFailure(side: file_enrichment.SideView, failures: *usize, rate_limited: *usize) void {
     if (side == .fetch_failed) {
         failures.* += 1;
-        if (side.fetch_failed == error.RateLimited) rate_limited.* += 1;
+        switch (side.fetch_failed) {
+            error.RateLimited => rate_limited.* += 1,
+            else => {},
+        }
     }
 }
 
