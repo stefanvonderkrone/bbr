@@ -120,6 +120,7 @@ A site that records a failure and still fails returns `error.Reported`, and the 
 `Handle.record` drops a Failure whose cause is `error.Reported`, so a boundary that records it by mistake writes no second record.
 The Bitbucket client, the HTTP transport, and the Git client record nothing, because their callers branch on the error name.
 They note their evidence in a slot that the boundary owns, and the boundary's one record of that error holds it.
+Each concurrent task notes into its own slot, and the join moves the slot of the returned failure to the boundary's slot.
 The evidence does not reach a record of another error. A translated error, such as `ReviewerVerdictChangeFailed`, keeps only its own name.
 A local blob read and a Git Anchor transition keep their Git error name without the termination, because their Git clients have no slot.
 A site that turns a failure into an outcome without its cause records it, like a boundary. Examples are a retried first blob attempt, an unavailable Anchor transition, and a list page that the result does not need.

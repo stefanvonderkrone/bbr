@@ -178,7 +178,7 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
 
     while (active < limit and next < order.len) : (next += 1) {
         const file_index = order[next];
-        try select.concurrent(.file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
+        try bbr.diagnostics.selectConcurrent(&select, .file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
         active += 1;
     }
     while (active > 0) {
@@ -206,7 +206,7 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
         if (next < order.len) {
             const file_index = order[next];
             next += 1;
-            try select.concurrent(.file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
+            try bbr.diagnostics.selectConcurrent(&select, .file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
             active += 1;
         }
     }

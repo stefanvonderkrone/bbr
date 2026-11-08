@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const http = std.http;
 const client = @import("client.zig");
+const diagnostics = @import("../diagnostics.zig");
 const HttpClient = client.HttpClient;
 const Request = client.Request;
 const Response = client.Response;
@@ -446,8 +447,8 @@ fn spinUntilAtLeast(value: *std.atomic.Value(usize), minimum: usize) !void {
 }
 
 fn serveTwo(server: *std.Io.net.Server, release: *std.atomic.Value(bool), accepted: *std.atomic.Value(usize), io: Io) !void {
-    var first = try io.concurrent(serveOne, .{ try server.accept(io), release, accepted, io });
-    var second = try io.concurrent(serveOne, .{ try server.accept(io), release, accepted, io });
+    var first = try diagnostics.concurrent(io, serveOne, .{ try server.accept(io), release, accepted, io });
+    var second = try diagnostics.concurrent(io, serveOne, .{ try server.accept(io), release, accepted, io });
     try first.await(io);
     try second.await(io);
 }

@@ -27,7 +27,8 @@ pub const RemoteBlobSource = struct {
 
     fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, request: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *RemoteBlobSource = @ptrCast(@alignCast(ptr));
-        const diagnostic = if (request.sink != null) request else self.client.diagnostic;
+        // The request names the slot, because the sides of one File read concurrently through one source.
+        const diagnostic = (if (request.sink != null) request else self.client.diagnostic).withLeaf(request.leaf);
         const io = self.retry_io orelse return self.client.withDiagnostics(diagnostic).getFileBlob(allocator, self.repo, commit, path);
         if (try self.firstAttempt(io, allocator, commit, path, diagnostic)) |bytes| return bytes;
         return switch (try self.attemptClient(diagnostic, 2).getFileBlobAttempt(allocator, self.repo, commit, path)) {
@@ -265,11 +266,11 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
     task_req.diagnostic = req.diagnostic.withLeaf(null);
     var old_slot: ?bbr.diagnostic.Leaf = null;
     var new_slot: ?bbr.diagnostic.Leaf = null;
-    var old_future = io.concurrent(enrichSideTask, .{ backing, source, highlighter, task_req, .old, &old_slot }) catch |err| {
+    var old_future = bbr.diagnostics.concurrent(io, enrichSideTask, .{ backing, source, highlighter, task_req, .old, &old_slot }) catch |err| {
         _ = req.diagnostic.failure(.launch, .{ .zig = err }, @src());
         return enrichFrom(backing, source, highlighter, req);
     };
-    var new_future = io.concurrent(enrichSideTask, .{ backing, source, highlighter, task_req, .new, &new_slot }) catch |launch_error| {
+    var new_future = bbr.diagnostics.concurrent(io, enrichSideTask, .{ backing, source, highlighter, task_req, .new, &new_slot }) catch |launch_error| {
         _ = req.diagnostic.failure(.launch, .{ .zig = launch_error }, @src());
         const old = old_future.await(io) catch |err| switch (err) {
             error.OutOfMemory => {

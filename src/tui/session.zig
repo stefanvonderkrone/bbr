@@ -178,9 +178,11 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     var comments_started = false;
     var required_failed = false;
 
-    try select.concurrent(.pull_request, acquirePullRequest, .{ &pr_branch, bb, repo, id });
+    // Each branch task binds its branch's slot, and the join below adopts the slot of the returned failure.
+    const task_bb = bb.withDiagnostics(bb.diagnostic.withLeaf(null));
+    try bbr.diagnostics.selectConcurrent(&select, .pull_request, acquirePullRequest, .{ &pr_branch, task_bb, repo, id });
     active += 1;
-    try select.concurrent(.account, acquireAccount, .{ &account_branch, bb });
+    try bbr.diagnostics.selectConcurrent(&select, .account, acquireAccount, .{ &account_branch, task_bb });
     active += 1;
 
     while (active > 0) {
@@ -206,11 +208,11 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
         while (!required_failed and active < 2) {
             if (comments_ready and !comments_started) {
                 const pr = pr_branch.value.?;
-                try select.concurrent(.comments, acquireComments, .{ &comments_branch, bb, repo, id, pr.source_commit, pr.destination_commit });
+                try bbr.diagnostics.selectConcurrent(&select, .comments, acquireComments, .{ &comments_branch, task_bb, repo, id, pr.source_commit, pr.destination_commit });
                 comments_started = true;
                 active += 1;
             } else if (!raw_diff_started) {
-                try select.concurrent(.raw_diff, acquireRawDiff, .{ &diff_branch, bb, repo, id });
+                try bbr.diagnostics.selectConcurrent(&select, .raw_diff, acquireRawDiff, .{ &diff_branch, task_bb, repo, id });
                 raw_diff_started = true;
                 active += 1;
             } else break;

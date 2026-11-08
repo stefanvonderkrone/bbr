@@ -303,7 +303,7 @@ fn syncPickerTick(
     try futures.ensureUnusedCapacity(ctx.gpa, 1);
     const id = next_work_id.*;
     next_work_id.* +%= 1;
-    const future = try ctx.io.concurrent(pickerTickWorker, .{ loop, id, start_scope.?, ctx.io });
+    const future = try bbr.diagnostics.concurrent(ctx.io, pickerTickWorker, .{ loop, id, start_scope.?, ctx.io });
     futures.appendAssumeCapacity(.{ .id = id, .future = future });
     active.* = .{ .id = id, .scope = start_scope.? };
 }
@@ -894,11 +894,14 @@ fn presentationLoadWorker(
     command: presentation.LoadSession,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    const bound = if (client) |value| sink_context.bitbucket(value) else null;
-    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, bound, sink_context.handle(), command })) |loaded|
+    // The load runs on its own task, so it notes into its own slot, and a failure moves it here.
+    var load_slot: ?bbr.diagnostic.Leaf = null;
+    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, client, diagnostic, &load_slot, command })) |loaded|
         .{ .loaded = loaded }
-    else |err|
-        .{ .failed = err };
+    else |err| failed: {
+        sink_context.handle().adopt(&load_slot);
+        break :failed .{ .failed = err };
+    };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_loaded = .{
         .evidence = if (outcome == .failed) bbr.diagnostic.Failure.capture(.session_load, .execute, diagnostic.context, .{ .zig = outcome.failed }, @src()) else null,
         .command_id = command.command_id,
@@ -911,12 +914,13 @@ fn presentationLoadWorker(
 /// replacement suspends Session-specific Actions until it completes.
 const session_load_timeout = std.Io.Duration.fromSeconds(60);
 
-fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, diagnostic: bbr.diagnostics.Handle, command: presentation.LoadSession) anyerror!*Session {
+fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, spawn_diagnostic: bbr.diagnostics.Handle, task_slot: *?bbr.diagnostic.Leaf, command: presentation.LoadSession) anyerror!*Session {
+    const diagnostic = spawn_diagnostic.withLeaf(task_slot);
     return switch (command.key.kind) {
         .remote => session.loadWith(
             io,
             std.heap.page_allocator,
-            client.?,
+            client.?.withDiagnostics(diagnostic),
             command.key.repository(),
             command.key.pull_request_id,
         ),
@@ -945,8 +949,8 @@ fn loadSessionWithin(io: std.Io, timeout: std.Io.Duration, load: anytype, args: 
     var buffer: [2]LoadRace = undefined;
     var race = std.Io.Select(LoadRace).init(io, &buffer);
     defer discardLoadRace(&race);
-    try race.concurrent(.loaded, load, args);
-    try race.concurrent(.expired, std.Io.sleep, .{ io, timeout, .awake });
+    try bbr.diagnostics.selectConcurrent(&race, .loaded, load, args);
+    try bbr.diagnostics.selectConcurrent(&race, .expired, std.Io.sleep, .{ io, timeout, .awake });
     return switch (try race.await()) {
         .loaded => |result| result,
         .expired => error.Timeout,
@@ -1221,23 +1225,23 @@ fn drainPresentationCommands(
         const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, work_id);
         const client = if (ctx.bitbucket) |value| value.withDiagnostics(diagnostic) else null;
         const future = switch (command) {
-            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, diagnostic, ctx.io, workerBitbucketForReviewKind(client, load.key.kind), load }),
-            .prepare_session => |job| ctx.io.concurrent(presentationPrepareSessionWorker, .{ loop, work_id, diagnostic, job }),
-            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, diagnostic, ctx.io, workerBitbucketForEnrichment(client, enrich.source), ctx.highlighter, enrich }),
-            .highlight_code => |job| ctx.io.concurrent(presentationCodeHighlightWorker, .{ loop, work_id, diagnostic, ctx.highlighter, job }),
-            .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, diagnostic, client.?, post }),
-            .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, diagnostic, client.?, update }),
-            .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, diagnostic, client.?, delete }),
-            .change_reviewer_verdict => |verdict| ctx.io.concurrent(presentationReviewerVerdictWorker, .{ loop, work_id, diagnostic, client.?, verdict }),
-            .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, diagnostic, ctx.io, wait }),
-            .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, diagnostic, client.?, check }),
-            .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, diagnostic, client.?, check }),
-            .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, diagnostic, client.?, list }),
+            .load_session => |load| bbr.diagnostics.concurrent(ctx.io, presentationLoadWorker, .{ loop, work_id, diagnostic, ctx.io, workerBitbucketForReviewKind(client, load.key.kind), load }),
+            .prepare_session => |job| bbr.diagnostics.concurrent(ctx.io, presentationPrepareSessionWorker, .{ loop, work_id, diagnostic, job }),
+            .enrich_file => |enrich| bbr.diagnostics.concurrent(ctx.io, presentationEnrichmentWorker, .{ loop, work_id, diagnostic, ctx.io, workerBitbucketForEnrichment(client, enrich.source), ctx.highlighter, enrich }),
+            .highlight_code => |job| bbr.diagnostics.concurrent(ctx.io, presentationCodeHighlightWorker, .{ loop, work_id, diagnostic, ctx.highlighter, job }),
+            .post_draft => |post| bbr.diagnostics.concurrent(ctx.io, presentationPostWorker, .{ loop, work_id, diagnostic, client.?, post }),
+            .update_comment => |update| bbr.diagnostics.concurrent(ctx.io, presentationCommentEditWorker, .{ loop, work_id, diagnostic, client.?, update }),
+            .delete_comment => |delete| bbr.diagnostics.concurrent(ctx.io, presentationCommentDeleteWorker, .{ loop, work_id, diagnostic, client.?, delete }),
+            .change_reviewer_verdict => |verdict| bbr.diagnostics.concurrent(ctx.io, presentationReviewerVerdictWorker, .{ loop, work_id, diagnostic, client.?, verdict }),
+            .wait_submission => |wait| bbr.diagnostics.concurrent(ctx.io, presentationWaitWorker, .{ loop, work_id, diagnostic, ctx.io, wait }),
+            .check_recovery => |check| bbr.diagnostics.concurrent(ctx.io, presentationRecoveryCheckWorker, .{ loop, work_id, diagnostic, client.?, check }),
+            .find_duplicate => |check| bbr.diagnostics.concurrent(ctx.io, presentationDuplicateCheckWorker, .{ loop, work_id, diagnostic, client.?, check }),
+            .list_pull_requests => |list| bbr.diagnostics.concurrent(ctx.io, presentationListPullRequestsWorker, .{ loop, work_id, diagnostic, client.?, list }),
             .copy_clipboard, .persist_theme, .set_diagnostics, .report_diagnostic => unreachable,
             .external_edit => unreachable,
-            .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, diagnostic, scan }),
-            .build_buffer_disclosure => |job| ctx.io.concurrent(presentationDisclosureWorker, .{ loop, work_id, diagnostic, job }),
-            .scan_review_source => |scan| ctx.io.concurrent(presentationReviewSourceWorker, .{ loop, work_id, diagnostic, scan }),
+            .scan_buffer_search => |scan| bbr.diagnostics.concurrent(ctx.io, presentationBufferSearchWorker, .{ loop, work_id, diagnostic, scan }),
+            .build_buffer_disclosure => |job| bbr.diagnostics.concurrent(ctx.io, presentationDisclosureWorker, .{ loop, work_id, diagnostic, job }),
+            .scan_review_source => |scan| bbr.diagnostics.concurrent(ctx.io, presentationReviewSourceWorker, .{ loop, work_id, diagnostic, scan }),
         } catch |err| {
             const input = try command.launchFailed(err);
             presentation_runtime.recordFailures(diagnostic, input);

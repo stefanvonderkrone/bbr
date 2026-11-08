@@ -992,6 +992,8 @@ pub const Client = struct {
         defer select.group.await(io) catch |err| switch (err) {
             error.Canceled => io.recancel(),
         };
+        // Each page task binds its page's slot, and `finish` adopts the slot of the returned failure.
+        const task_client = self.withDiagnostics(self.diagnostic.withLeaf(null));
         var concurrent = opts.concurrency > 1;
         var active: usize = 0;
         while (true) {
@@ -1005,7 +1007,7 @@ pub const Client = struct {
                 slot.* = .{ .position = position, .page_number = lists.pageNumber(position.number), .url = try lists.pageUrl(position) };
                 try lists.lists[position.list].pages.append(allocator, .pending);
                 if (concurrent) {
-                    if (select.concurrent(.page, Lists.Slot.fetch, .{ self, slot, index })) |_| {
+                    if (diagnostics.selectConcurrent(&select, .page, Lists.Slot.fetch, .{ task_client, slot, index })) |_| {
                         if (protection == null) protection = io.swapCancelProtection(.blocked);
                         slot.busy = true;
                         active += 1;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("diagnostic.zig");
 const xdg = @import("xdg.zig");
 pub const Failure = value.Failure;
@@ -77,6 +78,74 @@ pub const Handle = struct {
         return explained;
     }
 };
+
+/// `std.Io.concurrent` for production code. A task never shares a slot: two tasks that note
+/// into one slot overwrite each other's evidence. So no `Handle` in `args` carries a slot.
+/// The spawner passes the task its own slot by pointer, the task binds it with `withLeaf`,
+/// and the spawner calls `Handle.adopt` after the join. A Debug build panics on a Handle
+/// with a slot in `args`.
+pub fn concurrent(
+    io: std.Io,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) std.Io.ConcurrentError!std.Io.Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
+    rejectSharedSlot(args);
+    return io.concurrent(function, args);
+}
+
+/// `std.Io.Select.concurrent` with the check of `concurrent`.
+pub fn selectConcurrent(
+    select: anytype,
+    comptime field: @TypeOf(select.*).Field,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) std.Io.ConcurrentError!void {
+    rejectSharedSlot(args);
+    return select.concurrent(field, function, args);
+}
+
+fn rejectSharedSlot(args: anytype) void {
+    if (builtin.mode != .Debug) return;
+    if (holdsSlot(args)) @panic("a concurrent task got a diagnostics.Handle with an evidence slot. " ++
+        "Pass it withLeaf(null), give the task its own slot by pointer, and adopt that slot after the join.");
+}
+
+/// Whether `subject` holds a `Handle` with a slot, in itself, a field, an optional, an array
+/// element, or the active field of a tagged union. A pointer is not followed.
+pub fn holdsSlot(subject: anytype) bool {
+    const T = @TypeOf(subject);
+    if (T == Handle) return subject.leaf != null;
+    if (comptime !mayHoldHandle(T)) return false;
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.fields) |field| {
+            if (!field.is_comptime and holdsSlot(@field(subject, field.name))) return true;
+        },
+        .optional => if (subject) |child| return holdsSlot(child),
+        .array => for (subject) |item| {
+            if (holdsSlot(item)) return true;
+        },
+        .@"union" => switch (subject) {
+            inline else => |payload| return holdsSlot(payload),
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn mayHoldHandle(comptime T: type) bool {
+    if (T == Handle) return true;
+    return switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.fields) |field| {
+            if (!field.is_comptime and mayHoldHandle(field.type)) break true;
+        } else false,
+        .optional => |info| mayHoldHandle(info.child),
+        .array => |info| mayHoldHandle(info.child),
+        .@"union" => |info| info.tag_type != null and inline for (info.fields) |field| {
+            if (mayHoldHandle(field.type)) break true;
+        } else false,
+        else => false,
+    };
+}
 
 pub const Sink = struct {
     allocator: std.mem.Allocator,
@@ -314,6 +383,21 @@ test "diagnostics a boundary that records error.Reported writes no second record
     try testing.expectEqual(@as(u64, 1), sink.sequence);
     _ = sink.handle(.grammar, .{}).failure(.execute, .{ .zig = error.Unrecorded }, @src());
     try testing.expectEqual(@as(u64, 2), sink.sequence);
+}
+
+test "diagnostics a task argument holds a slot only through a Handle with a slot" {
+    var slot: ?Leaf = null;
+    const Client = struct { diagnostic: Handle, retries: [2]u8 = .{ 0, 0 } };
+    const Work = union(enum) { idle, fetch: Client };
+    const with_slot: Handle = (Handle{}).withLeaf(&slot);
+    const without_slot: Handle = .{};
+    try std.testing.expect(holdsSlot(.{ with_slot, 1 }));
+    try std.testing.expect(holdsSlot(.{ @as(u8, 1), Client{ .diagnostic = with_slot } }));
+    try std.testing.expect(holdsSlot(.{@as(?Client, .{ .diagnostic = with_slot })}));
+    try std.testing.expect(holdsSlot(.{[_]Handle{ without_slot, with_slot }}));
+    try std.testing.expect(holdsSlot(.{Work{ .fetch = .{ .diagnostic = with_slot } }}));
+    try std.testing.expect(!holdsSlot(.{ without_slot, Client{ .diagnostic = without_slot }, Work.idle, &slot }));
+    try std.testing.expect(!holdsSlot(.{ with_slot.withLeaf(null), @as(?Client, null) }));
 }
 
 test "diagnostics a boundary record takes the leaf evidence of its own error once" {
