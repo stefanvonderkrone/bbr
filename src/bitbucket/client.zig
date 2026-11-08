@@ -23,10 +23,11 @@ pub const base_url = "https://api.bitbucket.org/2.0";
 
 /// `std.json` reports allocation failure as `error.OutOfMemory` and every
 /// document problem as its own parse error. Callers see allocation failure
-/// unchanged. Every parse error is `error.MalformedResponse`.
-fn jsonFailure(err: std.json.ParseError(std.json.Scanner)) error{ OutOfMemory, MalformedResponse } {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
+/// unchanged. Every parse error is `error.MalformedResponse`, and the parse
+/// error goes to the boundary's record of it.
+fn jsonFailure(diagnostic: diagnostics.Handle, err: std.json.ParseError(std.json.Scanner)) error{ OutOfMemory, MalformedResponse } {
+    switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
         error.BufferUnderrun,
         error.DuplicateField,
         error.InvalidCharacter,
@@ -40,16 +41,19 @@ fn jsonFailure(err: std.json.ParseError(std.json.Scanner)) error{ OutOfMemory, M
         error.UnexpectedToken,
         error.UnknownField,
         error.ValueTooLong,
-        => error.MalformedResponse,
-    };
+        => {
+            diagnostic.note(.{ .err = error.MalformedResponse, .phase = .decode, .cause = .{ .zig = err } });
+            return error.MalformedResponse;
+        },
+    }
 }
 
-fn parseResponse(comptime T: type, allocator: Allocator, body: []const u8) error{ OutOfMemory, MalformedResponse }!std.json.Parsed(T) {
-    return std.json.parseFromSlice(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| return jsonFailure(err);
+fn parseResponse(comptime T: type, diagnostic: diagnostics.Handle, allocator: Allocator, body: []const u8) error{ OutOfMemory, MalformedResponse }!std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| return jsonFailure(diagnostic, err);
 }
 
-fn parseResponseLeaky(comptime T: type, allocator: Allocator, body: []const u8) error{ OutOfMemory, MalformedResponse }!T {
-    return std.json.parseFromSliceLeaky(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| return jsonFailure(err);
+fn parseResponseLeaky(comptime T: type, diagnostic: diagnostics.Handle, allocator: Allocator, body: []const u8) error{ OutOfMemory, MalformedResponse }!T {
+    return std.json.parseFromSliceLeaky(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| return jsonFailure(diagnostic, err);
 }
 
 pub const Client = struct {
@@ -182,7 +186,7 @@ pub const Client = struct {
         defer allocator.free(res.body);
 
         try classify(res.status);
-        return parsePullRequest(allocator, res.body, true);
+        return parsePullRequest(self.diagnostic, allocator, res.body, true);
     }
 
     pub fn createPullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, opts: types.PullRequestOptions) !PullRequest {
@@ -193,7 +197,7 @@ pub const Client = struct {
         defer allocator.free(body);
         const response = try self.requestJson(allocator, .POST, url, body);
         defer allocator.free(response);
-        return parsePullRequest(allocator, response, false);
+        return parsePullRequest(self.diagnostic, allocator, response, false);
     }
 
     pub fn updatePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64, opts: types.PullRequestOptions) !PullRequest {
@@ -206,7 +210,7 @@ pub const Client = struct {
         defer allocator.free(body);
         const response = try self.requestJson(allocator, .PUT, url, body);
         defer allocator.free(response);
-        return parsePullRequest(allocator, response, false);
+        return parsePullRequest(self.diagnostic, allocator, response, false);
     }
 
     pub fn declinePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64) !PullRequest {
@@ -216,7 +220,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const response = try self.requestJson(allocator, .POST, url, null);
         defer allocator.free(response);
-        return parsePullRequest(allocator, response, false);
+        return parsePullRequest(self.diagnostic, allocator, response, false);
     }
 
     /// Includes every returned lifecycle state. A pending index is not an empty result.
@@ -250,7 +254,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const response = try self.requestJson(allocator, .GET, url, null);
         defer allocator.free(response);
-        return parseBranch(allocator, response);
+        return parseBranch(self.diagnostic, allocator, response);
     }
 
     pub fn createBranch(self: Client, allocator: Allocator, repo_slug: []const u8, name: []const u8, target: []const u8) !types.Branch {
@@ -262,7 +266,7 @@ pub const Client = struct {
         defer allocator.free(body);
         const response = try self.requestJson(allocator, .POST, url, body);
         defer allocator.free(response);
-        return parseBranch(allocator, response);
+        return parseBranch(self.diagnostic, allocator, response);
     }
 
     fn repositoryEndpoint(self: Client, allocator: Allocator, repo_slug: []const u8, suffix: []const u8) ![]u8 {
@@ -413,7 +417,7 @@ pub const Client = struct {
             size: usize,
             attributes: []const []const u8,
         };
-        const parsed = try parseResponse(Wire, allocator, metadata_body);
+        const parsed = try parseResponse(Wire, self.diagnostic, allocator, metadata_body);
         defer parsed.deinit();
         const metadata = parsed.value;
         if (!std.mem.eql(u8, metadata.type, "commit_file")) return error.BlobTypeMismatch;
@@ -553,7 +557,7 @@ pub const Client = struct {
             .reason = reason,
             .retry_after_ms = res.retry_after_ms,
         } };
-        const parsed = try parseResponse(struct { id: u64 }, allocator, res.body);
+        const parsed = try parseResponse(struct { id: u64 }, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return .{ .posted = parsed.value.id };
     }
@@ -573,7 +577,7 @@ pub const Client = struct {
             account_id: ?[]const u8 = null,
             display_name: ?[]const u8 = null,
             nickname: ?[]const u8 = null,
-        }, allocator, body);
+        }, self.diagnostic, allocator, body);
         defer parsed.deinit();
         if (parsed.value.uuid.len == 0) return error.MalformedResponse;
         const uuid = try allocator.dupe(u8, parsed.value.uuid);
@@ -605,7 +609,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = try parseResponse(struct { uuid: []const u8 }, allocator, res.body);
+        const parsed = try parseResponse(struct { uuid: []const u8 }, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return allocator.dupe(u8, parsed.value.uuid);
     }
@@ -1083,7 +1087,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = try parseResponse(WorkspaceJson, allocator, res.body);
+        const parsed = try parseResponse(WorkspaceJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return dupeWorkspaceJson(allocator, parsed.value);
     }
@@ -1156,7 +1160,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = try parseResponse(RepositoryJson, allocator, res.body);
+        const parsed = try parseResponse(RepositoryJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return dupeRepository(allocator, parsed.value);
     }
@@ -1258,7 +1262,7 @@ pub const Client = struct {
                 if (rejection) |failure| failure.* = .{ .reason = reason, .retry_after_ms = res.retry_after_ms };
                 return reason;
             };
-            const parsed = try parseResponse(Page, allocator, res.body);
+            const parsed = try parseResponse(Page, self.diagnostic, allocator, res.body);
             defer parsed.deinit();
             for (parsed.value.values) |wire| {
                 if (opts.limit) |limit| {
@@ -1361,7 +1365,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = try parseResponse(CommentJson, allocator, res.body);
+        const parsed = try parseResponse(CommentJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return dupeComment(allocator, parsed.value, .{});
     }
@@ -1466,7 +1470,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = try parseResponse(TaskJson, allocator, res.body);
+        const parsed = try parseResponse(TaskJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return dupeTask(allocator, parsed.value);
     }
@@ -1511,7 +1515,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = try parseResponse(struct { id: u64 }, allocator, res.body);
+        const parsed = try parseResponse(struct { id: u64 }, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return parsed.value.id;
     }
@@ -1558,7 +1562,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = try parseResponse(TaskJson, allocator, res.body);
+        const parsed = try parseResponse(TaskJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return dupeTask(allocator, parsed.value);
     }
@@ -1636,7 +1640,7 @@ pub const Client = struct {
             size: usize,
             attributes: []const []const u8 = &.{},
         };
-        const parsed = try parseResponse(Wire, allocator, metadata_body);
+        const parsed = try parseResponse(Wire, self.diagnostic, allocator, metadata_body);
         defer parsed.deinit();
         const m = parsed.value;
         if (!std.mem.eql(u8, m.type, "commit_file")) return error.BlobTypeMismatch;
@@ -1871,7 +1875,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                     },
                 });
                 try classify(response.status);
-                return parseResponseLeaky(Page, a, response.body);
+                return parseResponseLeaky(Page, bb.diagnostic, a, response.body);
             }
         };
 
@@ -2232,8 +2236,8 @@ fn validateBranchName(name: []const u8) !void {
     if (name.len == 0 or std.mem.startsWith(u8, name, "refs/heads/")) return error.BadRequest;
 }
 
-fn parseBranch(allocator: Allocator, body: []const u8) !types.Branch {
-    const parsed = try parseResponse(BranchJson, allocator, body);
+fn parseBranch(diagnostic: diagnostics.Handle, allocator: Allocator, body: []const u8) !types.Branch {
+    const parsed = try parseResponse(BranchJson, diagnostic, allocator, body);
     defer parsed.deinit();
     return dupeBranch(allocator, parsed.value);
 }
@@ -2647,8 +2651,8 @@ const PrEndpointJson = struct {
     repository: ?struct { full_name: []const u8 = "" } = null,
 };
 
-fn parsePullRequest(allocator: Allocator, body: []const u8, comptime full_read: bool) !PullRequest {
-    const parsed = try parseResponse(PrJson, allocator, body);
+fn parsePullRequest(diagnostic: diagnostics.Handle, allocator: Allocator, body: []const u8, comptime full_read: bool) !PullRequest {
+    const parsed = try parseResponse(PrJson, diagnostic, allocator, body);
     defer parsed.deinit();
     const v = parsed.value;
     // Preserve the full-read contract used by SourceCommit and Reviewer Verdict

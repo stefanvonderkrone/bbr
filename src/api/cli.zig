@@ -756,6 +756,8 @@ test "diagnostics the api boundary record holds the leaf evidence of a Bitbucket
     const cases = [_]struct { fake: bbr.http.FakeHttpClient, message: []const u8, phase: []const u8, cause: []const u8 }{
         .{ .fake = .{ .status = 503, .body = "{}" }, .message = "bbr api whoami: Bitbucket rejected request (ServerError)\n", .phase = "rejection", .cause = "cause=http status=503 classification=server" },
         .{ .fake = .{ .status = 418, .body = "{}" }, .message = "bbr api whoami: Bitbucket rejected request (UnexpectedStatus)\n", .phase = "rejection", .cause = "cause=http status=418 classification=other" },
+        .{ .fake = .{ .body = "{" }, .message = "bbr api whoami: MalformedResponse\n", .phase = "decode", .cause = "cause=zig error=UnexpectedEndOfInput" },
+        .{ .fake = .{ .body = "{\"uuid\":7}" }, .message = "bbr api whoami: MalformedResponse\n", .phase = "decode", .cause = "cause=zig error=UnexpectedToken" },
     };
     for (cases) |case| {
         var fake = case.fake;

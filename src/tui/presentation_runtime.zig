@@ -204,7 +204,7 @@ test "diagnostics a worker completion that carries error.Reported keeps the leaf
 
 test "diagnostics a Bitbucket failure has one record from the worker boundary" {
     const cases = [_]struct { fake: bbr.http.FakeHttpClient, cause: []const u8 = "source=tui/presentation_adapter.zig:", cause_end: []const u8 }{
-        .{ .fake = .{ .body = "{" }, .cause_end = "cause=zig error=MalformedResponse" },
+        .{ .fake = .{ .body = "{" }, .cause = "phase=decode source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=UnexpectedEndOfInput" },
         .{ .fake = .{ .send_error = error.ConnectionReset, .send_phase = .receive_head }, .cause = "phase=receive_head source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=ConnectionReset" },
         .{ .fake = .{ .status = 429, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=429 classification=rate_limit" },
         .{ .fake = .{ .status = 503, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=503 classification=server" },
