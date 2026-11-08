@@ -52,12 +52,12 @@ The fields are space-separated `name=value` pairs.
 | `operation` | The code-defined operation category. |
 | `phase` | The phase where the failure occurred. |
 | `source` | The compiler-authored source file, line, and column. |
-| `cause` | A Zig error, HTTP rejection, Git termination, SQLite result, or Grammar failure. |
+| `cause` | A Zig error, HTTP rejection, SQLite result, or Grammar failure. |
 
 Available numeric context follows the source field.
 It can include the command ID, work ID, Session Epoch, OperationId, Draft ID, File index, File side, attempt, or page.
 Absent context fields do not appear.
-Native cause fields retain HTTP classification and status, Git termination and code, or SQLite primary and extended codes.
+Native cause fields retain HTTP classification and status, or SQLite primary and extended codes.
 A Grammar cause names its `rule`: `query` with the Tree-sitter query error code, `regex` with the regex engine code, or a predicate rule such as `unknown_operator` with code 0. Each Grammar cause has the byte offset in the query, but never the query text.
 Zig causes use the original error name where capture precedes domain conversion.
 
@@ -79,9 +79,8 @@ A handle keeps the sink reference while logging is off, so later enablement affe
 | Boundary | Evidence owner |
 | --- | --- |
 | Startup and CLI failures | `src/main.zig`, `src/api/cli.zig`, and `src/completion.zig`. |
-| Transport exchange | `src/http/std_client.zig`. |
-| HTTP rejection and Bitbucket decoding | `src/bitbucket/client.zig`. |
-| Git launch and termination | `src/git/client.zig`. |
+| HTTP rejection | `src/bitbucket/client.zig`. |
+| Ambiguous POST transport failure | `src/bitbucket/poster.zig`. |
 | SQLite result conversion | `src/persist/sqlite_store.zig`. |
 | Worker launch, completion, and delivery | `src/tui/app.zig` and `src/tui/presentation_runtime.zig`. |
 | Pure Action failures | `src/tui/presentation.zig`. |
@@ -109,8 +108,11 @@ Logging starts when the sink is enabled. It does not replay earlier failures.
 Crashes, signals, and process termination can occur before application code captures an error.
 A file write can fail after a partial line. The sink closes that file and stops further writes.
 The sink does not recursively log its own failure.
-The same error can appear at multiple boundaries with different context.
-The run identity, sequence, source, and numeric context distinguish those records.
+Each failure has one record ([ADR-0014](adr/0014-a-failure-is-recorded-once-and-error-reported-marks-it.md)).
+A site that records a failure and still fails returns `error.Reported`, and the boundaries above write nothing more for it.
+The Bitbucket client, the HTTP transport, and the Git client record nothing, because their callers branch on the error name.
+The boundary that receives such an error records it, so its record names the typed error, not the transport phase, the JSON error, or the Git exit code.
+An HTTP rejection is the exception: `Client.send` records the status, and the boundary records the typed rejection error again.
 
 Normal cancellation, no matches, optional missing files, Submission lock contention, unsupported Grammars, and configured size limits are not operational errors.
 SQLite busy and locked results remain diagnostic evidence when they prevent a store operation.

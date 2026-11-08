@@ -39,7 +39,9 @@ Most boundaries cannot return an error, or they own a decision that the user see
 - Presentation event and command handlers (ADR-0012). They record through `Presentation.reportFailure`. Then they keep the Published review intact and show the failure in the Projection.
 - CLI `main` in `src/main.zig`, through `exitFailure`.
 
-The SQLite and HTTP seams are the other kind of boundary. They are `SqliteStore.native` in `src/persist/sqlite_store.zig` and `StdHttpClient.send` in `src/http/std_client.zig`. A seam converts a foreign result, such as a SQLite result code or an HTTP status, into a typed cause. No layer above the seam sees the foreign result, so the seam is the one place that can record it. The seam records it once and restores its own state, for example with a `ROLLBACK`. Then the seam fails upward through `fail`, like any leaf, and the boundaries above skip `error.Reported`. Today `StdHttpClient.send` records in an `errdefer`, which this decision forbids, so issue 06 converts it.
+The SQLite seam is the other kind of boundary. It is `SqliteStore.native` in `src/persist/sqlite_store.zig`. It converts a SQLite result code into a typed cause. No layer above the seam sees the result code, so the seam is the one place that can record it. The seam records it once and restores its own state, for example with a `ROLLBACK`. Then the seam fails upward through `fail`, like any leaf, and the boundaries above skip `error.Reported`. No caller names a `SqliteError` member, so no caller loses a branch.
+
+The HTTP transport in `src/http/std_client.zig`, the Bitbucket client in `src/bitbucket/client.zig`, and the Git client in `src/git/client.zig` are not boundaries. Their callers branch on the error name or print it, and they serve the CLI and the TUI, so they cannot print a message first. They return the typed error without a record, and the boundary that receives it records it once. Issue 06 first planned to convert `StdHttpClient.send` to `fail`. The operator decision of 2026-11-08 replaced that plan.
 
 ## Why
 
@@ -78,4 +80,6 @@ Code records at the deepest point that has context, and each boundary leaves out
 - At a translation site, the message names what the user needs: the leaf cause and the translated meaning. So no site has to choose between losing the name and losing the leaf cause. The operator made this decision on 2026-11-08.
 - A site on a TUI path cannot print, because the terminal is in raw mode. When its boundary branches on the error name, as Presentation and the File acquisition status in `src/tui/render.zig` do, the site returns the plain error without a record, and the boundary records it once.
 - bbr does not adopt `vsr.fatal` or an exit status for each reason. A CLI failure still exits with status 1.
-- `docs/diagnostic-logging.md` says that "The same error can appear at multiple boundaries with different context." That stays true until issue 06 converts the counted sites.
+- A record names the typed error that reached the boundary. The JSON error behind `MalformedResponse`, the HTTP phase of a transport failure, and the Git exit code behind `UnknownRef` no longer reach the diagnostic file.
+- `Poster.post` turns a transport failure into the ambiguous outcome, which carries no cause. So it records the cause itself, like a boundary.
+- `Client.send` still records an HTTP rejection with its status, and the boundary records the typed rejection error again. The check does not count this site, because the record is not in a `catch` or `errdefer` handler.

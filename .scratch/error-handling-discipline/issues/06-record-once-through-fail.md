@@ -1,7 +1,6 @@
 # Record each failure once through fail
 
-Status: claimed
-Claimed by: /Volumes/Work/t3-code/error-handling-discipline (branch feat/record-once)
+Status: resolved
 Type: implementation
 Blocked by: 03
 Parent: ../PRD.md
@@ -76,3 +75,42 @@ When the store converts, consider a check for a `native` check before a plain `S
 - Each CLI failure that printed a name before this issue still prints a message for that failure. A `*_cli_test.py` check proves it for the config load failure of `runMain`.
 - `zig build test` passes.
 - `python3 tools/check_agent_docs.py` passes.
+
+## Completion
+
+Branch `feat/record-once`, on `feat/try-boundary-rule`.
+
+Commits:
+
+- `c86f685` docs: print the message at the leaf, after TigerBeetle.
+- `2677ccd` tests: pin the runMain configuration failure message.
+- `0a7185c` diagnostics: teach the boundaries to skip error.Reported.
+- `df3c7b2` api: show and record each api failure once.
+- `ccc8733` cli: record each CLI entry failure once in main and completion.
+- `c2cf0f9` grammar: record each Grammar failure once and name its leaf cause.
+- `796ba86` tui: record TUI failures once at the worker and adapter boundaries.
+- `fc9c39a` http: record an invalid proxy setting once.
+- `b1fc56e` persist: record each SQLite failure once at the seam.
+- `71602ae` bitbucket: leave each decode failure to the boundary.
+- `a01a43a` http: record each transport failure once at the boundary.
+- `836a980` git: record each Git failure once at the boundary.
+- The commit that adds this section updates `docs/diagnostic-logging.md`, ADR-0014, `.agents/skills/zig/errors.md`, and the record-once row of `AGENTS.md`.
+
+The HTTP transport, the Bitbucket client, and the Git client return their typed errors without a record. The plan converted `StdHttpClient.send` to `fail`, but its callers branch on the error names, so the operator decision of 2026-11-08 applies. ADR-0014 now says so.
+
+Acceptance:
+
+- `tools/diagnostic_record_baseline.txt` lists no file.
+- Boundary tests read exactly one record: `tests/record_once_cli_test.py` and `tests/config_load_cli_test.py` for `main` and `exitFailure`, "diagnostics the api boundary shows each failure and records it once" for the CLI subcommand boundary, "diagnostics a store failure through fail keeps one record when Presentation shows it" for Presentation, and "diagnostics a worker completion that carries error.Reported keeps the leaf's one record" and "diagnostics a Bitbucket failure has one record from the worker boundary" for the workers.
+- Each CLI failure that printed a name still prints a message. `tests/config_load_cli_test.py` proves it for the config load failure of `runMain`. The SQLite open message in `openStore` lost the redundant "(Open)" suffix.
+- `zig build test` exits 0. `python3 tools/check_agent_docs.py` passes.
+
+Review: no independent code review ran in this session.
+
+## Comments
+
+Remaining work, outside the checked sites:
+
+- `Client.send` records an HTTP rejection with its status, and the boundary records the typed rejection error again. The check does not count it, because the record is not in a handler.
+- The diagnostic file lost the JSON error behind `MalformedResponse`, the HTTP phase of a transport failure, and the Git exit code. A follow-up can carry them to the boundary, for example in `Client.ErrorDetail`.
+- The `git` cause variant in `src/diagnostic.zig` has no producer left.
