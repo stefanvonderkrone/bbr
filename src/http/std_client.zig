@@ -35,7 +35,6 @@ pub const StdHttpClient = struct {
         arena: Allocator,
         environ_map: *const std.process.Environ.Map,
     ) !void {
-        errdefer |err| _ = self.diagnostic.failure(.proxy, .{ .zig = err }, @src());
         try validateProxyEnvironment(environ_map);
         try self.inner.initDefaultProxies(arena, environ_map);
     }

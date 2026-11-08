@@ -24,6 +24,8 @@ cases = (
     (["grammar", "check", "/record-once-missing-bundle"], {}, b"bbr grammar: FileNotFound\n", "grammar", "FileNotFound"),
     (["grammar", "check", "record-once-bad.tar.gz"], {}, b"bbr grammar: InvalidArchive (BadGzipHeader)\n", "grammar", "BadGzipHeader"),
     (["auth", "status"], {}, b"bbr: no credential for profile; run `bbr auth login` (MissingUsername)\n", "auth", "MissingUsername"),
+    (["api", "whoami"], dict(credentials, https_proxy="socks5://record-once.invalid"), b"bbr api whoami: InvalidProxyConfiguration\n", "api", "InvalidProxyConfiguration"),
+    (["auth", "status"], dict(credentials, https_proxy="socks5://record-once.invalid"), b"bbr: status failed: transport (InvalidProxyConfiguration)\n", "auth", "InvalidProxyConfiguration"),
 )
 # These run with an invalid auth file in the data home.
 invalid_auth_cases = (
