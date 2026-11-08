@@ -99,7 +99,6 @@ const picker_tick_interval_ms = 250;
 
 fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
     var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
-    anchor_git.diagnostic = ctx.diagnostic.forContext(.git, .{});
     var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient());
     defer git_anchor_resolver.deinit();
     var state = try presentation.Presentation.init(ctx.gpa, .{
@@ -854,7 +853,7 @@ fn presentationLoadWorker(
     command: presentation.LoadSession,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, diagnostic, client, command })) |loaded|
+    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, client, command })) |loaded|
         .{ .loaded = loaded }
     else |err|
         .{ .failed = err };
@@ -870,7 +869,7 @@ fn presentationLoadWorker(
 /// replacement suspends Session-specific Actions until it completes.
 const session_load_timeout = std.Io.Duration.fromSeconds(60);
 
-fn loadSession(io: std.Io, diagnostic: bbr.diagnostics.Handle, client: ?bbr.bitbucket.Client, command: presentation.LoadSession) anyerror!*Session {
+fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, command: presentation.LoadSession) anyerror!*Session {
     return switch (command.key.kind) {
         .remote => session.loadWith(
             io,
@@ -881,7 +880,6 @@ fn loadSession(io: std.Io, diagnostic: bbr.diagnostics.Handle, client: ?bbr.bitb
         ),
         .local => blk: {
             var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
-            git.diagnostic = diagnostic;
             break :blk session.loadLocalWith(
                 std.heap.page_allocator,
                 git.gitClient(),
@@ -937,7 +935,6 @@ fn presentationEnrichmentWorker(
         .remote => file_enrichment.enrichConcurrent(io, std.heap.page_allocator, client.?, highlighter, request),
         .local => blk: {
             var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
-            git.diagnostic = diagnostic;
             var source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
             break :blk file_enrichment.enrichFrom(std.heap.page_allocator, source.source(), highlighter, request);
         },
