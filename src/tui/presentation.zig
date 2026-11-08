@@ -7066,9 +7066,16 @@ pub const Presentation = struct {
             }
         }
         result.completion = if (clean) .clean else .partial;
-        const tree = SubmissionTree.createPersisted(self.allocator, notice.key, notice.operation_id, &review, run.items, result.completion) catch {
-            self.action_error = .out_of_memory;
-            return;
+        const tree = SubmissionTree.createPersisted(self.allocator, notice.key, notice.operation_id, &review, run.items, result.completion) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.action_error = .out_of_memory;
+                return;
+            },
+            error.DraftNotFound => {
+                self.reportFailure(.recovery_check, .prepare, err, @src());
+                self.action_error = .recovery_claim_failed;
+                return;
+            },
         };
         self.dependencies.reviews.completeSubmission(notice.operation_id, notice.key.storeKey(), result.completion) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
@@ -11022,9 +11029,21 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
-        const command = durable.retryPost(self.allocator) catch {
-            self.action_error = .out_of_memory;
-            return;
+        const command = durable.retryPost(self.allocator) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.action_error = .out_of_memory;
+                return;
+            },
+            error.DraftNotFound => {
+                self.reportFailure(.submission, .prepare, err, @src());
+                self.action_error = .persistence_failed;
+                return;
+            },
+            error.InvalidSubmissionState => {
+                self.reportFailure(.submission, .prepare, err, @src());
+                self.action_error = .submission_launch_failed;
+                return;
+            },
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
         self.action_error = null;
@@ -32370,6 +32389,34 @@ test "queue allocation failure retains a POST completion for admission retry" {
     failing.fail_index = std.math.maxInt(usize);
     try presentation.dispatch(.{ .action = .submit });
     try testing.expect(presentation.projection().submission == null);
+}
+
+test "a paused POST retry with a missing Draft reports an invalid Submission" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retry launch" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .submission_locks = locks.locks() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var first = presentation.takeCommand().?;
+    const operation_id = first.post_draft.operation_id;
+    first.deinit();
+    try presentation.dispatch(.{ .post_draft_launch_failed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+    } });
+    presentation.durable_submission.?.review.drafts.clearRetainingCapacity();
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expectEqual(ActionError.submission_launch_failed, presentation.projection().action_error.?);
+    const failure = presentation.takeCommand().?.report_diagnostic;
+    try testing.expectEqual(error.InvalidSubmissionState, failure.cause.zig);
 }
 
 test "POST launch failure pauses without reporting a remote outcome and submit retries" {
