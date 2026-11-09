@@ -93,6 +93,7 @@ pub const Failure = struct {
     phase: Phase,
     context: Context,
     cause: Cause,
+    boundary_error: ?anyerror = null,
     source: struct { file: []const u8, line: u32, column: u32 },
 
     pub fn capture(operation: Operation, phase: Phase, context: Context, cause: Cause, comptime source: std.builtin.SourceLocation) Failure {
@@ -128,6 +129,7 @@ pub const Failure = struct {
         };
         if (err != leaf.err) return null;
         var result = self;
+        result.boundary_error = err;
         result.phase = leaf.phase orelse self.phase;
         result.context.page = self.context.page orelse leaf.page;
         result.cause = leaf.cause orelse self.cause;

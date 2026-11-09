@@ -53,6 +53,7 @@ The fields are space-separated `name=value` pairs.
 | `phase` | The phase where the failure occurred. |
 | `source` | The compiler-authored source file, line, and column. |
 | `cause` | A Zig error, HTTP rejection, Git termination, SQLite result, or Grammar failure. |
+| `boundary_error` | The typed error that reached the boundary when the record merges leaf evidence. |
 
 Available numeric context follows the source field.
 It can include the command ID, work ID, Session Epoch, OperationId, Draft ID, File index, File side, attempt, or page.
@@ -61,7 +62,8 @@ Native cause fields retain the Git termination kind and code, or SQLite primary 
 A Git cause of a failed git command also names the typed error, such as `error=UnknownRef`. A git launch failure has `phase=launch` and the launch error.
 An HTTP rejection has `phase=rejection` and an HTTP cause with the status and its classification, such as `status=503 classification=server`.
 A transport failure has the phase of the step that failed, such as `connect` or `receive_head`, and the transport error.
-A response that is not valid JSON has `phase=decode` and the JSON parse error, such as `UnexpectedEndOfInput`. The caller sees `MalformedResponse`.
+A response that is not valid JSON has `phase=decode` and the JSON parse error, such as `UnexpectedEndOfInput`.
+Its `boundary_error=MalformedResponse` keeps the error name that the caller sees.
 A failed list page has its page number, also when one of its items fails to decode.
 A Grammar cause names its `rule`: `query` with the Tree-sitter query error code, `regex` with the regex engine code, or a predicate rule such as `unknown_operator` with code 0. Each Grammar cause has the byte offset in the query, but never the query text.
 Zig causes use the original error name where capture precedes domain conversion.

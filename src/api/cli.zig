@@ -778,6 +778,9 @@ test "diagnostics the api boundary record holds the leaf evidence of a Bitbucket
         defer a.free(prefix);
         try std.testing.expect(std.mem.indexOf(u8, record, prefix) != null);
         try std.testing.expect(std.mem.endsWith(u8, record, case.cause));
+        if (std.mem.eql(u8, case.phase, "decode")) {
+            try std.testing.expect(std.mem.indexOf(u8, record, " boundary_error=MalformedResponse ") != null);
+        }
     }
 }
 

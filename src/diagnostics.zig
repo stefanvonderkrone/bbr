@@ -252,6 +252,9 @@ pub const Sink = struct {
             @tagName(failure_value.operation),              @tagName(failure_value.phase), failure_value.source.file,
             failure_value.source.line,                      failure_value.source.column,
         });
+        if (failure_value.boundary_error) |err| {
+            try writer.print(" boundary_error={s}", .{@errorName(err)});
+        }
         inline for (@typeInfo(Context).@"struct".fields) |field| {
             if (@field(failure_value.context, field.name)) |number| {
                 if (@typeInfo(@TypeOf(number)) == .@"enum") {
