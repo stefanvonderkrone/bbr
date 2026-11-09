@@ -97,6 +97,11 @@ class TaskSpawnCheckTest(unittest.TestCase):
             text = declaration + "\nfn start(diagnostics: std.Io) void {\n    _ = diagnostics.concurrent(work, .{});\n    _ = bbr.diagnostics.concurrent(io, work, .{});\n}\n"
             self.assertEqual(len(self.check(text)), 2, declaration)
 
+    def test_a_bbr_diagnostics_alias_needs_the_bbr_module(self):
+        for declaration in ("", 'const bbr = @import("other");\n', "const bbr = std;\n"):
+            text = declaration + "const diagnostics = bbr.diagnostics;\nfn start(io: std.Io) void {\n    _ = diagnostics.concurrent(io, work, .{});\n}\n"
+            self.assertEqual(len(self.check(text)), 1, declaration)
+
     def test_a_local_named_diagnostics_beside_no_wrapper_import_is_rejected(self):
         text = "fn start(io: std.Io) void {\n    const diagnostics = io;\n    _ = diagnostics.concurrent(work, .{});\n}\n"
         self.assertEqual(len(self.check(text)), 1)

@@ -23,9 +23,11 @@ OWNER = Path("src/diagnostics.zig")
 # Zig rejects a local that shadows a top-level name, so a top-level declaration names the
 # receiver in the whole file.
 WRAPPER = re.compile(
-    r'^const\s+diagnostics\s*=\s*(?:@import\("bbr"\)\s*\.\s*diagnostics|bbr\s*\.\s*diagnostics|@import\("(?:\.\./)*diagnostics\.zig"\))\s*;',
+    r'^const\s+diagnostics\s*=\s*(?:@import\("bbr"\)\s*\.\s*diagnostics|@import\("(?:\.\./)*diagnostics\.zig"\))\s*;',
     re.MULTILINE,
 )
+# This alias names the module only when `bbr` is the bbr module.
+BBR_ALIAS = re.compile(r"^const\s+diagnostics\s*=\s*bbr\s*\.\s*diagnostics\s*;", re.MULTILINE)
 BBR = re.compile(r'^const\s+bbr\s*=\s*@import\("bbr"\)\s*;', re.MULTILINE)
 FIX = (
     "Start the task with diagnostics.concurrent or diagnostics.selectConcurrent, which reject "
@@ -38,9 +40,10 @@ def wrappers(lines):
     """The receivers that name the `diagnostics` module in a file with these code lines."""
     text = "\n".join(lines)
     names = set()
-    if WRAPPER.search(text):
+    bbr = BBR.search(text) is not None
+    if WRAPPER.search(text) or (bbr and BBR_ALIAS.search(text)):
         names.add("diagnostics")
-    if BBR.search(text):
+    if bbr:
         names.add("bbr.diagnostics")
     return names
 
