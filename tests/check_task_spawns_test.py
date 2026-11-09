@@ -61,6 +61,14 @@ class TaskSpawnCheckTest(unittest.TestCase):
     def test_the_checkout_passes(self):
         self.assertEqual(list(checker.violations(ROOT)), [])
 
+    def test_a_receiver_with_a_diagnostics_suffix_is_rejected(self):
+        found = self.check("fn f() void { task_diagnostics.concurrent(work, .{}); }")
+        self.assertEqual(len(found), 1)
+
+    def test_an_allowed_wrapper_does_not_hide_another_spawn_on_its_line(self):
+        text = "fn f() void { bbr.diagnostics.concurrent(io, work, .{}); task_diagnostics.concurrent(work, .{}); }"
+        self.assertEqual(len(self.check(text)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

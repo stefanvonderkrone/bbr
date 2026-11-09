@@ -22,7 +22,7 @@ NESTED_CATCH = re.compile(r"\bcatch\b(?:\s*\|\s*[A-Za-z_]\w*\s*\|)?")
 RECORD = re.compile(r"(?:\.\s*(?:failure|record)|\breportFailure)\s*\(")
 RECORD_BASELINE = "tools/diagnostic_record_baseline.txt"
 RETURN = re.compile(r"\breturn\b")
-NO_NEW_ERROR = re.compile(r"(?:\.|\d|(?:null|true|false|undefined|try)\b|error\.Reported\b|(?!(?:if|switch)\b)[A-Za-z_][\w.]*\s*\()")
+NO_NEW_ERROR = re.compile(r"(?:\.|-?\d|(?:null|true|false|undefined|try)\b|error\.Reported\b|(?!(?:if|switch)\b)[A-Za-z_][\w.]*\s*\()")
 # A SQLite result call must be the first argument of a `native` call on any receiver.
 NATIVE_WRAPPER = re.compile(r"\b\w+(?:\s*\.\s*\w+)*\s*\.\s*native\s*\(\s*$")
 # The client returns each error of this set only through `noted`, so its record never takes stale evidence.
@@ -175,6 +175,8 @@ def cause_drops(lines):
             if payload:
                 names.add(payload[1])
                 used = rest[payload.end() :]
+            for item in names:
+                used = re.sub(r"\b_\s*=\s*" + re.escape(item) + r"\s*;", "", used)
             if not any(re.search(r"\b" + re.escape(item) + r"\b", used) for item in names):
                 return True
         return False
@@ -187,11 +189,15 @@ def cause_drops(lines):
         handler = text[match.end() : handler_end(text, match.end())]
         if re.search(r"\b_\s*=\s*" + re.escape(name) + r"\s*;", handler):
             yield line_of(match.start()), "discarded"
-        elif any(else_drops(handler[start:end], name) for start, end in switch_spans(handler, name)):
-            # The switch subject is not a use. Any other reference means the cause flows.
-            without_subjects = re.sub(r"\bswitch\s*\(\s*" + re.escape(name) + r"\s*\)", "", handler)
-            if re.search(r"\b" + re.escape(name) + r"\b", without_subjects) is None:
-                yield line_of(match.start()), "unchecked_else"
+        else:
+            for start, end in switch_spans(handler, name):
+                if not else_drops(handler[start:end], name):
+                    continue
+                outside = handler[:start] + handler[end:]
+                outside = re.sub(r"\bswitch\s*\(\s*" + re.escape(name) + r"\s*\)", "", outside)
+                if re.search(r"\b" + re.escape(name) + r"\b", outside) is None:
+                    yield line_of(match.start()), "unchecked_else"
+                    break
 
 
 def returns_error(code):
@@ -243,9 +249,9 @@ def recorded_returns(lines):
                 spans.append((start, end))
         shared = own
         for start, end in reversed(spans):
-            shared = shared[:start] + shared[end:]
-        units = [shared + prong for start, end in spans for prong in prongs(own[start:end])] or [shared]
-        if any(record.search(unit) and returns_error(unit) for unit in units):
+            shared = shared[:start] + " " * (end - start) + shared[end:]
+        units = [shared[:start] + prong + shared[end:] for start, end in spans for prong in prongs(own[start:end])] or [shared]
+        if any(returns_error(unit[found.end():]) for unit in units for found in record.finditer(unit)):
             yield line_of(match.start())
 
 

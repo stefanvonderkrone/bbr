@@ -8334,7 +8334,7 @@ pub const Presentation = struct {
         var query = search.Query.init(self.allocator, text) catch |err| {
             switch (err) {
                 error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
-                else => {},
+                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
             self.action_error = switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
@@ -8371,7 +8371,7 @@ pub const Presentation = struct {
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
             switch (err) {
                 error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
-                else => {},
+                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
             query.deinit(self.allocator);
             self.action_error = switch (err) {
@@ -9218,7 +9218,7 @@ pub const Presentation = struct {
         var query = search.Query.init(self.allocator, text) catch |err| {
             switch (err) {
                 error.OutOfMemory => self.reportFailure(.buffer_search, .prepare, err, @src()),
-                else => {},
+                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
             self.action_error = switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
@@ -9230,7 +9230,7 @@ pub const Presentation = struct {
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
             switch (err) {
                 error.OutOfMemory => self.reportFailure(.buffer_search, .prepare, err, @src()),
-                else => {},
+                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
             query.deinit(self.allocator);
             self.action_error = switch (err) {
@@ -12349,7 +12349,7 @@ pub const Presentation = struct {
         job.new_draft = published.prepareDraft(self.dependencies.reviews, job.arena.allocator(), composer.toNewDraft()) catch |err| {
             switch (err) {
                 error.OutOfMemory => self.reportFailure(.composer, .prepare, err, @src()),
-                else => {},
+                error.AnchorRangeTooLong, error.InvalidDraftScope, error.Reported, error.BufferBuildFailed, error.SearchFailed => {},
             }
             job.destroy();
             self.action_error = switch (err) {
