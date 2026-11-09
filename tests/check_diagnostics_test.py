@@ -139,6 +139,44 @@ class DiagnosticsCheckTest(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn("diagnostic.fail", found[0])
 
+    def test_old_highlight_built_in_helper_record_before_plain_return_is_rejected(self):
+        text = "\n".join((
+            "fn highlightBuiltIn(self: *H, diagnostic: Handle) !Result {",
+            "    return highlightWithPackage() catch |err| {",
+            "        recordHighlightFailure(diagnostic, err);",
+            "        return err;",
+            "    };",
+            "}",
+            "fn recordHighlightFailure(diagnostic: Handle, err: anyerror) void {",
+            "    switch (err) {",
+            "        error.FileTooLarge, error.InvalidUtf8 => {},",
+            "        else => _ = diagnostic.failure(.execute, .{ .zig = err }, @src()),",
+            "    }",
+            "}",
+        ))
+        found = self.check("src/highlight/tree_sitter_highlighter.zig", text)
+        self.assertEqual(len(found), 1)
+        self.assertIn("diagnostic.fail", found[0])
+        self.assertIn("boundary records it once", found[0])
+        for returned in ("error.Reported", ".{ .spans = &.{} }"):
+            with self.subTest(returned=returned):
+                self.assertEqual(self.check("src/highlight/tree_sitter_highlighter.zig", text.replace("return err;", f"return {returned};")), [])
+        self.assertEqual(self.check("src/highlight/tree_sitter_highlighter.zig", text.replace("        recordHighlightFailure(diagnostic, err);\n", "")), [])
+
+    def test_same_file_recording_helpers_are_transitive_and_errdefer_is_rejected(self):
+        helpers = "\n".join((
+            "fn outer(diagnostic: Handle, err: anyerror) void { inner(diagnostic, err); }",
+            "fn inner(diagnostic: Handle, err: anyerror) void { _ = diagnostic.failure(.execute, .{ .zig = err }, @src()); }",
+        ))
+        for handler in (
+            "x() catch |err| { outer(diagnostic, err); return err; };",
+            "errdefer |err| outer(diagnostic, err);",
+        ):
+            with self.subTest(handler=handler):
+                self.assertEqual(len(self.check("src/example.zig", handler + "\n" + helpers)), 1)
+        self.assertEqual(self.check("src/example.zig", "x() catch |err| { cleanup(err); return err; };\n" + helpers), [])
+        self.assertEqual(self.check("src/example.zig", "x() catch |err| { outer(diagnostic, other); return err; };\n" + helpers), [])
+
     def test_a_return_through_fail_is_allowed(self):
         for text in (
             "var loaded = config.loadSnapshot(gpa, snapshot) catch |err|\n    return diagnostic.forContext(.configuration, .{}).fail(.read, .{ .zig = err }, @src());",

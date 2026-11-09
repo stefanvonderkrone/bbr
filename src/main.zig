@@ -1532,6 +1532,7 @@ test {
     _ = @import("api/branches.zig");
     _ = @import("api/users.zig");
     _ = @import("highlight/tree_sitter_highlighter.zig");
+    _ = @import("highlight_record_once_test.zig");
     _ = @import("highlight/query_regex.zig");
     _ = @import("highlight/user_grammar.zig");
     _ = @import("highlight/grammar_cli.zig");

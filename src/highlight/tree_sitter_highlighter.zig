@@ -84,25 +84,28 @@ pub const TreeSitterHighlighter = struct {
                         error.Reported => {},
                         else => _ = diagnostic.failure(.prepare, .{ .zig = err }, @src()),
                     }
-                    return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content, diagnostic) catch .{ .spans = &.{} };
+                    return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch |fallback_err| {
+                        recordHighlightFailure(diagnostic, fallback_err);
+                        return .{ .spans = &.{} };
+                    };
                 };
                 if (grammar) |selected| {
                     return highlightWithPackage(result_allocator, scratch_allocator, selected.package, content, null) catch |err| {
                         recordHighlightFailure(diagnostic, err);
-                        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content, diagnostic) catch .{ .spans = &.{} };
+                        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch |fallback_err| {
+                            recordHighlightFailure(diagnostic, fallback_err);
+                            return .{ .spans = &.{} };
+                        };
                     };
                 }
             }
         }
-        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content, diagnostic);
+        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content);
     }
 
-    fn highlightBuiltIn(self: *TreeSitterHighlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8, diagnostic: diagnostics.Handle) !bbr.highlight.HighlightResult {
+    fn highlightBuiltIn(self: *TreeSitterHighlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
         const selected = grammar_match.selectBuiltIn(path, content) orelse return .{ .spans = &.{} };
-        return highlightWithPackage(result_allocator, scratch_allocator, &self.packages[@intFromEnum(selected)], content, null) catch |err| {
-            recordHighlightFailure(diagnostic, err);
-            return err;
-        };
+        return highlightWithPackage(result_allocator, scratch_allocator, &self.packages[@intFromEnum(selected)], content, null);
     }
 
     fn recordHighlightFailure(diagnostic: diagnostics.Handle, err: anyerror) void {
@@ -382,11 +385,21 @@ test "diagnostics retain UserGrammar load and fallback allocation failures witho
         try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
     // The native library failure has one record: the leaf cause at the open, and no translated or repeated record.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "phase=open"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "error=OutOfMemory"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\n") - 1);
     try testing.expect(std.mem.indexOf(u8, bytes, "error=NativeLibraryLoadFailed") == null);
     for ([_][]const u8{ "private_path", "private_source", "not a library", path }) |secret|
         try testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
 
     const before_disable = sink.sequence;
+    const invalid = try highlighter.highlighter().highlight(testing.allocator, "private_path.js", "\xff");
+    try testing.expectEqual(@as(usize, 0), invalid.spans.len);
+    if (@sizeOf(usize) > @sizeOf(u32)) {
+        const oversized = @as([*]const u8, @ptrFromInt(1))[0 .. @as(usize, std.math.maxInt(u32)) + 1];
+        const too_large = try highlighter.highlighter().highlight(testing.allocator, "private_path.js", oversized);
+        try testing.expectEqual(@as(usize, 0), too_large.spans.len);
+    }
+    try testing.expectEqual(before_disable, sink.sequence);
     try testing.expect(sink.setEnabled(false) == .off);
     _ = try highlighter.highlighter().highlightWithScratch(testing.allocator, failing.allocator(), "private_path.js", "const private_source = 1;\n");
     try testing.expectEqual(before_disable, sink.sequence);
@@ -394,6 +407,25 @@ test "diagnostics retain UserGrammar load and fallback allocation failures witho
     try testing.expectEqual(before_disable, sink.sequence);
     _ = try highlighter.highlighter().highlightWithScratch(testing.allocator, failing.allocator(), "private_path.js", "const private_source = 1;\n");
     try testing.expect(sink.sequence > before_disable);
+}
+
+test "diagnostics expected BuiltInGrammar content limits return their errors without a record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    var sink = try privateSink(tmp, &env);
+    defer sink.deinit();
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, sink.handle(.highlighting, .{}));
+    defer highlighter.deinit();
+    try testing.expectError(error.InvalidUtf8, highlighter.highlighter().highlight(testing.allocator, "private.js", "\xff"));
+    if (@sizeOf(usize) > @sizeOf(u32)) {
+        const oversized = @as([*]const u8, @ptrFromInt(1))[0 .. @as(usize, std.math.maxInt(u32)) + 1];
+        try testing.expectError(error.FileTooLarge, highlighter.highlighter().highlight(testing.allocator, "private.js", oversized));
+    }
+    const bytes = try diagnosticBytes(tmp);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n"));
 }
 
 test "diagnostics retain native query and regex codes without source or engine fragments" {

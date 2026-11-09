@@ -217,7 +217,14 @@ def recorded_returns(lines):
     record before a return. A record in an `errdefer` always comes before the return.
     """
     text, line_of = joined(lines)
+    helpers = recording_helpers(text)
     for match in RECORDING_HANDLER.finditer(text):
+        record = RECORD
+        if helpers:
+            record = re.compile(
+                RECORD.pattern + r"|\b(?:" + "|".join(map(re.escape, helpers))
+                + r")\s*\([^;{}]*\b" + re.escape(match[1]) + r"\b[^;{}]*\)"
+            )
         handler = text[match.end() : handler_end(text, match.end())]
         own = ""
         index = 0
@@ -227,7 +234,7 @@ def recorded_returns(lines):
                 index = handler_end(handler, nested.end())
         own += handler[index:]
         if match[0].startswith("errdefer"):
-            if RECORD.search(own):
+            if record.search(own):
                 yield line_of(match.start())
             continue
         spans = []
@@ -238,8 +245,33 @@ def recorded_returns(lines):
         for start, end in reversed(spans):
             shared = shared[:start] + shared[end:]
         units = [shared + prong for start, end in spans for prong in prongs(own[start:end])] or [shared]
-        if any(RECORD.search(unit) and returns_error(unit) for unit in units):
+        if any(record.search(unit) and returns_error(unit) for unit in units):
             yield line_of(match.start())
+
+
+def recording_helpers(text):
+    helpers = {}
+    for declaration in re.finditer(r"\bfn\s+(\w+)\s*\(", text):
+        end = declaration.end()
+        depth = 1
+        while end < len(text) and depth:
+            depth += text[end] in OPENS
+            depth -= text[end] in CLOSES
+            end += 1
+        signature = re.match(r"\s*void\s*\{", text[end:])
+        if signature:
+            start = end + signature.end() - 1
+            helpers[declaration[1]] = text[start:handler_end(text, start)]
+    record = RECORD
+    pending = dict(helpers)
+    while pending:
+        found = [name for name, body in pending.items() if record.search(body)]
+        if not found:
+            break
+        record = re.compile(record.pattern + r"|\b(?:" + "|".join(map(re.escape, found)) + r")\s*\(")
+        for name in found:
+            del pending[name]
+    return set(helpers) - set(pending)
 
 
 class Ratchet(NamedTuple):
