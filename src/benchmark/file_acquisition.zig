@@ -169,8 +169,14 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
     const Selected = union(enum) { file: Completion };
     var completion_buffer: [limits[limits.len - 1]]Selected = undefined;
     var select = std.Io.Select(Selected).init(io, &completion_buffer);
-    defer select.group.await(io) catch |err| switch (err) {
-        error.Canceled => io.recancel(),
+    defer while (select.cancel()) |completion| {
+        switch (completion.file.outcome) {
+            .completed => |value| {
+                var result = value;
+                result.deinit();
+            },
+            .failed => {},
+        }
     };
     const start = std.Io.Clock.awake.now(io);
     var first_file_ms: u64 = 0;
@@ -200,6 +206,10 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
                 countFailure(view.new, &failures, &rate_limited);
             },
             .failed => |err| {
+                switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => {},
+                }
                 failures += 1;
                 switch (err) {
                     error.RateLimited => rate_limited += 1,

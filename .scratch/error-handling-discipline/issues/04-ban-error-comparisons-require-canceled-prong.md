@@ -80,3 +80,15 @@ Commit `c52f4ea` protects that completion when cancellation meets a full event q
 The new test fails on detached `50a69d1` and passes with the fix. It checks one completion and zero remaining tracked work.
 The logs are `wait-retirement-red-50a69d1.log`, `wait-retirement-green.log`, and `wait-retirement-full.log` in the parent evidence directory.
 The full native suite passes all 1,596 tests.
+
+### 2026-11-09 benchmark cancellation follow-up
+
+F18 is valid. `runSample` counted a canceled enrichment as a failure and scheduled another File.
+It now returns `error.Canceled` before it changes the failure count or schedules another File.
+Cleanup cancels the remaining tasks and releases every completed result in the Select queue.
+The Select buffer holds at least as many results as the active task limit.
+
+The benchmark has no test module in `build.zig`, so this path has compile coverage only.
+`zig build bench-file-acquisition -- invalid` compiles the executable, then returns the expected `InvalidArguments` error.
+The log is `f18-benchmark-compile.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/pr22-d-evidence/`.
+No runtime test reaches a canceled benchmark sample.
