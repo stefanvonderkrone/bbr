@@ -2335,16 +2335,16 @@ const EffectiveDefaultReviewerJson = struct {
     user: DefaultReviewerJson,
 };
 
-fn dupeDefaultReviewer(allocator: Allocator, wire: DefaultReviewerJson) !types.DefaultReviewer {
-    return dupeReviewerAccount(allocator, wire, .repository);
+fn dupeDefaultReviewer(diagnostic: diagnostics.Handle, allocator: Allocator, wire: DefaultReviewerJson) !types.DefaultReviewer {
+    return dupeReviewerAccount(diagnostic, allocator, wire, .repository);
 }
 
-fn dupeEffectiveDefaultReviewer(allocator: Allocator, wire: EffectiveDefaultReviewerJson) !types.DefaultReviewer {
-    return dupeReviewerAccount(allocator, wire.user, wire.reviewer_type);
+fn dupeEffectiveDefaultReviewer(diagnostic: diagnostics.Handle, allocator: Allocator, wire: EffectiveDefaultReviewerJson) !types.DefaultReviewer {
+    return dupeReviewerAccount(diagnostic, allocator, wire.user, wire.reviewer_type);
 }
 
-fn dupeReviewerAccount(allocator: Allocator, account: DefaultReviewerJson, reviewer_type: types.DefaultReviewerType) !types.DefaultReviewer {
-    if (account.uuid.len == 0) return error.MalformedResponse;
+fn dupeReviewerAccount(diagnostic: diagnostics.Handle, allocator: Allocator, account: DefaultReviewerJson, reviewer_type: types.DefaultReviewerType) !types.DefaultReviewer {
+    if (account.uuid.len == 0) return noted(diagnostic, error.MalformedResponse, .validate, null);
     const uuid = try allocator.dupe(u8, account.uuid);
     errdefer allocator.free(uuid);
     return .{ .uuid = uuid, .display_name = try allocator.dupe(u8, account.display_name), .reviewer_type = reviewer_type };
@@ -5928,6 +5928,38 @@ test "Default Reviewer lists reject an empty UUID and an unknown reviewer type" 
             var fake: FakeHttpClient = .{ .body = case.body };
             const bb = Client.init(fake.httpClient(), testCredential());
             try testing.expectError(error.MalformedResponse, bb.listDefaultReviewers(testing.io, testing.allocator, "repo", case.effective, .{ .follow = follow }, 2));
+        }
+    }
+}
+
+test "diagnostics a Default Reviewer with an empty UUID notes its validate phase and page in the one record" {
+    for ([_]struct { effective: bool, body: []const u8 }{
+        .{ .effective = false, .body = "{\"values\":[{\"uuid\":\"\",\"display_name\":\"Ada\"}]}" },
+        .{ .effective = true, .body = "{\"values\":[{\"reviewer_type\":\"repository\",\"user\":{\"uuid\":\"\",\"display_name\":\"Ada\"}}]}" },
+    }) |case| {
+        for ([_]bool{ true, false }) |follow| {
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+            defer testing.allocator.free(home);
+            var env = std.process.Environ.Map.init(testing.allocator);
+            defer env.deinit();
+            try env.put("XDG_STATE_HOME", home);
+            var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+            defer sink.deinit();
+            try testing.expect(sink.setEnabled(true) == .on);
+            var fake: FakeHttpClient = .{ .body = case.body };
+            var leaf: ?diagnostics.Leaf = null;
+            const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+            const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+            try testing.expectError(error.MalformedResponse, bb.listDefaultReviewers(testing.io, testing.allocator, "repo", case.effective, .{ .follow = follow }, 2));
+            _ = boundary.failure(.execute, .{ .zig = error.MalformedResponse }, @src());
+            const bytes = try sinkRecords(tmp, &sink);
+            defer testing.allocator.free(bytes);
+            const only = std.mem.trimEnd(u8, bytes, "\n");
+            try testing.expect(std.mem.indexOfScalar(u8, only, '\n') == null);
+            try testing.expect(std.mem.indexOf(u8, only, "operation=api phase=validate ") != null);
+            try testing.expect(std.mem.endsWith(u8, only, " page=1 cause=zig error=MalformedResponse"));
         }
     }
 }
