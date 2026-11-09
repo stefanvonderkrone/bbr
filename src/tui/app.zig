@@ -1725,6 +1725,52 @@ test "diagnostics a transport OutOfMemory on one File side keeps its phase in th
     try std.testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
 }
 
+test "diagnostics the worker Session load spawns with its own slot and its one record keeps the status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(std.testing.allocator, std.testing.io, &env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/2.0/user", .body = "{\"uuid\":\"{account}\"}" },
+        .{ .request_key = "/pullrequests/7", .status = 404, .body = "{}" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    // The worker gets the spawn handle and client, which have no slot, as `drainPresentationCommands` passes them.
+    // A Debug build panics when the worker spawns its load with a handle that has a slot.
+    const spawn_handle = sink.handle(.session_load, .{ .work_id = 4 });
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(spawn_handle);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    presentationLoadWorker(&loop, 4, spawn_handle, std.testing.io, client, .{
+        .command_id = 8,
+        .intent = 3,
+        .key = try presentation.OwnedReviewIdentity.init("ws", "repo", 7),
+    });
+    var event = (try loop.tryEvent()) orelse return error.TestUnexpectedResult;
+    defer event.presentation_done.input.deinit();
+    const loaded = event.presentation_done.input.session_loaded;
+    try std.testing.expectEqual(error.NotFound, loaded.outcome.failed);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "operation=session_load phase=rejection source=tui/app.zig:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "work_id=4") != null);
+    try std.testing.expect(std.mem.endsWith(u8, only, "cause=http status=404 classification=not_found"));
+}
+
 test "diagnostics an initial load that the store reported shows its message and keeps one record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
