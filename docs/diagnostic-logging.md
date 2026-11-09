@@ -52,7 +52,7 @@ The fields are space-separated `name=value` pairs.
 | `operation` | The code-defined operation category. |
 | `phase` | The phase where the failure occurred. |
 | `source` | The compiler-authored source file, line, and column. |
-| `cause` | A Zig error, Git termination, SQLite result, or Grammar failure. |
+| `cause` | A Zig error, HTTP rejection, Git termination, SQLite result, or Grammar failure. |
 
 Available numeric context follows the source field.
 It can include the command ID, work ID, Session Epoch, OperationId, Draft ID, File index, File side, attempt, or page.
