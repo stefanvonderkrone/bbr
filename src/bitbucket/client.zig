@@ -27,7 +27,7 @@ pub const base_url = "https://api.bitbucket.org/2.0";
 /// error goes to the boundary's record of it.
 fn jsonFailure(diagnostic: diagnostics.Handle, err: std.json.ParseError(std.json.Scanner)) error{ OutOfMemory, MalformedResponse } {
     switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => return noted(diagnostic, error.OutOfMemory, .decode, null),
         error.BufferUnderrun,
         error.DuplicateField,
         error.InvalidCharacter,
@@ -1303,7 +1303,7 @@ pub const Client = struct {
                 },
             });
             defer allocator.free(res.body);
-            if (commit_links and res.status == 202) return error.PullRequestLinksIndexing;
+            if (commit_links and res.status == 202) return noted(page.diagnostic, error.PullRequestLinksIndexing, .rejection, .{ .http = .{ .status = res.status, .classification = .other } });
             classify(res.status) catch |reason| {
                 if (rejection) |failure| failure.* = .{ .reason = reason, .retry_after_ms = res.retry_after_ms };
                 return reason;
@@ -3091,6 +3091,39 @@ fn sinkRecords(tmp: anytype, sink: *diagnostics.Sink) ![]u8 {
     const start = (std.mem.indexOfScalar(u8, bytes, '\n') orelse return error.TestUnexpectedResult) + 1;
     std.mem.copyForwards(u8, bytes, bytes[start..]);
     return testing.allocator.realloc(bytes, bytes.len - start);
+}
+
+test "diagnostics PullRequest link indexing and a JSON allocation failure replace stale evidence" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var fake: FakeHttpClient = .{ .status = 202, .body = "{\"values\":[]}" };
+    var leaf: ?diagnostics.Leaf = null;
+    const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+    const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+    boundary.note(.{ .err = error.PullRequestLinksIndexing, .phase = .connect });
+    try testing.expectError(error.PullRequestLinksIndexing, bb.listCommitPullRequests(testing.allocator, "myrepo", "abc123", .{ .follow = false }));
+    _ = boundary.failure(.execute, .{ .zig = error.PullRequestLinksIndexing }, @src());
+    boundary.note(.{ .err = error.OutOfMemory, .phase = .connect });
+    try testing.expectEqual(@as(error{ OutOfMemory, MalformedResponse }, error.OutOfMemory), jsonFailure(boundary, error.OutOfMemory));
+    _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+    const bytes = try sinkRecords(tmp, &sink);
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    const indexing = lines.next().?;
+    const allocation = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, indexing, "operation=api phase=rejection ") != null);
+    try testing.expect(std.mem.indexOf(u8, indexing, "cause=http status=202 ") != null);
+    try testing.expect(std.mem.indexOf(u8, allocation, "operation=api phase=decode ") != null);
+    try testing.expect(std.mem.endsWith(u8, allocation, "error=OutOfMemory"));
 }
 
 test "diagnostics a client failure without a request replaces the evidence of an earlier failure" {

@@ -330,7 +330,6 @@ class DiagnosticsCheckTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "src/bitbucket").mkdir(parents=True)
-            (root / "src/bitbucket/types.zig").write_text("pub const ApiError = error{\n    /// 403\n    Forbidden,\n    MalformedResponse,\n};\n")
             (root / checker.CLIENT).write_text(text)
             return list(checker.violations(root))
 
@@ -344,6 +343,16 @@ class DiagnosticsCheckTest(unittest.TestCase):
             found = self.client(line)
             self.assertEqual(len(found), 1, line)
             self.assertIn("noted(diagnostic, error.X, phase, cause)", found[0])
+
+    def test_every_client_error_return_without_a_note_is_rejected(self):
+        # Returns of client.zig before the gap fix. None of these errors is an `ApiError` member.
+        for line in (
+            "        if (metadata.size != raw.len) return error.BlobSizeMismatch;",
+            "            if (commit_links and res.status == 202) return error.PullRequestLinksIndexing;",
+            "        error.OutOfMemory => return error.OutOfMemory,",
+        ):
+            found = self.client(line)
+            self.assertEqual(len(found), 1, line)
 
     def test_a_multiline_client_error_result_without_a_note_is_rejected(self):
         found = self.client("return .{\n    .api_error = error.Forbidden,\n};")
@@ -378,7 +387,8 @@ class DiagnosticsCheckTest(unittest.TestCase):
         text = "\n".join((
             "        if (parsed.value.uuid.len == 0) return noted(self.diagnostic, error.MalformedResponse, .validate, null);",
             "        return .{ .api_error = noted(self.diagnostic, error.Forbidden, .validate, null) };",
-            "    return error.OutOfMemory;",
+            "    return noted(diagnostic, error.OutOfMemory, .decode, null);",
+            "    return error.TestUnexpectedResult;",
             "    // return error.Forbidden;",
             'test "a rejection" {',
             "    return error.Forbidden;",
