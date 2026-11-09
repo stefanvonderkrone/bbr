@@ -6,7 +6,8 @@ const grammar_match = @import("grammar_match.zig");
 const predicate_mod = @import("query_predicates.zig");
 const RuntimePackage = @import("runtime_package.zig").RuntimePackage;
 const c = predicate_mod.c;
-const diagnostics = @import("bbr").diagnostics;
+const bbr = @import("bbr");
+const diagnostics = bbr.diagnostics;
 
 const max_file_bytes = 64 * 1024 * 1024;
 const manifest_name = "grammar.toml";
@@ -280,7 +281,7 @@ pub const Registry = struct {
                 _ = diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
             };
             var library = std.DynLib.open(temporary.path) catch |err|
-                return failTranslated(diagnostic_handle, .open, "NativeLibraryLoadFailed", err, @src());
+                return failTranslated(inspection.io, diagnostic_handle, .open, "NativeLibraryLoadFailed", err, @src());
             errdefer library.close();
             const symbol = try allocator.dupeZ(u8, inspection.manifest.symbol);
             defer allocator.free(symbol);
@@ -376,13 +377,13 @@ pub const Inspection = struct {
         };
         const library_path = temporary.path;
         var library = std.DynLib.open(library_path) catch |err|
-            return failTranslated(diagnostic_handle, .open, "NativeLibraryLoadFailed", err, @src());
+            return failTranslated(self.io, diagnostic_handle, .open, "NativeLibraryLoadFailed", err, @src());
         defer library.close();
         const symbol = try self.arena.allocator().dupeZ(u8, self.manifest.symbol);
         const language_fn = library.lookup(*const fn () callconv(.c) ?*const c.TSLanguage, symbol) orelse return error.MissingLanguageSymbol;
         const language = language_fn() orelse return error.InvalidLanguageSymbol;
         self.diagnostic = null;
-        try validateLanguage(self.arena.allocator(), language, self.manifest, self.files, &self.diagnostic, diagnostic_handle);
+        try validateLanguage(self.io, self.arena.allocator(), language, self.manifest, self.files, &self.diagnostic, diagnostic_handle);
     }
 
     pub fn writeBundle(self: *const Inspection, dir: std.Io.Dir) !void {
@@ -497,13 +498,13 @@ fn readArchive(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagn
     var decompressor = std.compress.flate.Decompress.init(&input, .gzip, &window);
     const tar_bytes = decompressor.reader.allocRemaining(allocator, .limited(max_file_bytes + 1)) catch |err| switch (err) {
         error.StreamTooLong => return error.InvalidArchive,
-        else => return failTranslated(diagnostic_handle, .decode, "InvalidArchive", decompressor.err orelse err, @src()),
+        else => return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", decompressor.err orelse err, @src()),
     };
     if (tar_bytes.len > max_file_bytes) return error.ArchiveTooLarge;
-    return parseTar(allocator, tar_bytes, diagnostic_handle);
+    return parseTar(io, allocator, tar_bytes, diagnostic_handle);
 }
 
-fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, diagnostic_handle: diagnostics.Handle) ![]File {
+fn parseTar(io: std.Io, allocator: std.mem.Allocator, bytes: []const u8, diagnostic_handle: diagnostics.Handle) ![]File {
     var files: std.ArrayList(File) = .empty;
     var seen: std.ArrayList([]const u8) = .empty;
     var at: usize = 0;
@@ -516,20 +517,20 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, diagnostic_handle: 
             break;
         }
         const valid_checksum = validTarChecksum(header) catch |err|
-            return failTranslated(diagnostic_handle, .decode, "InvalidArchive", err, @src());
+            return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", err, @src());
         if (!valid_checksum) return error.InvalidArchive;
         var name = tarPath(header, allocator) catch |err|
-            return failTranslated(diagnostic_handle, .decode, "InvalidArchive", err, @src());
+            return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", err, @src());
         const kind = header[156];
         if (kind == '5' and std.mem.endsWith(u8, name, "/")) name = name[0 .. name.len - 1];
         if (!safePath(name)) return error.UnsafePath;
         for (seen.items) |previous| if (std.mem.eql(u8, previous, name)) return error.DuplicateArchiveEntry;
         try seen.append(allocator, name);
         const size = parseTarOctal(header[124..136]) catch |err|
-            return failTranslated(diagnostic_handle, .decode, "InvalidArchive", err, @src());
+            return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", err, @src());
         const data_start = at + 512;
         const data_end = std.math.add(usize, data_start, size) catch |err|
-            return failTranslated(diagnostic_handle, .decode, "InvalidArchive", err, @src());
+            return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", err, @src());
         if (data_end > bytes.len) return error.InvalidArchive;
         if (kind == '5') {
             if (size != 0) return error.InvalidArchive;
@@ -724,23 +725,22 @@ fn canonicalDigest(files: []const File) [32]u8 {
     return hasher.finalResult();
 }
 
-fn validateLanguage(allocator: std.mem.Allocator, language: *const c.TSLanguage, manifest: Manifest, files: []const File, diagnostic: ?*?predicate_mod.Diagnostic, diagnostic_handle: diagnostics.Handle) !void {
+fn validateLanguage(io: std.Io, allocator: std.mem.Allocator, language: *const c.TSLanguage, manifest: Manifest, files: []const File, diagnostic: ?*?predicate_mod.Diagnostic, diagnostic_handle: diagnostics.Handle) !void {
     if (c.ts_language_abi_version(language) != manifest.tree_sitter_abi.?) return error.TreeSitterAbiMismatch;
     const highlight = findFile(files, manifest.highlight_query).?.bytes;
-    const requires_locals = try validateQuery(allocator, language, highlight, .highlight, diagnostic, diagnostic_handle);
+    const requires_locals = try validateQuery(io, allocator, language, highlight, .highlight, diagnostic, diagnostic_handle);
     if (manifest.locals_query) |path| {
-        if (try validateQuery(allocator, language, findFile(files, path).?.bytes, .locals, diagnostic, diagnostic_handle)) return error.InvalidLocalsQuery;
+        if (try validateQuery(io, allocator, language, findFile(files, path).?.bytes, .locals, diagnostic, diagnostic_handle)) return error.InvalidLocalsQuery;
     } else if (requires_locals) return error.MissingLocalsQuery;
 }
 
-fn validateQuery(allocator: std.mem.Allocator, language: *const c.TSLanguage, source: []const u8, kind: predicate_mod.Diagnostic.QueryKind, diagnostic: ?*?predicate_mod.Diagnostic, diagnostic_handle: diagnostics.Handle) !bool {
+fn validateQuery(io: std.Io, allocator: std.mem.Allocator, language: *const c.TSLanguage, source: []const u8, kind: predicate_mod.Diagnostic.QueryKind, diagnostic: ?*?predicate_mod.Diagnostic, diagnostic_handle: diagnostics.Handle) !bool {
     var offset: u32 = 0;
     var query_error: c.TSQueryError = undefined;
     const query = c.ts_query_new(language, source.ptr, @intCast(source.len), &offset, &query_error) orelse {
         const failure = queryDiagnostic(source, offset, kind, query_error);
         if (diagnostic) |output| output.* = failure;
-        failure.report();
-        return diagnostic_handle.fail(.query, failure.cause().?, @src());
+        return bbr.cli_failure.fail(io, diagnostic_handle, .query, failure.cause().?, @src(), predicate_mod.Diagnostic.write, .{failure});
     };
     defer c.ts_query_delete(query);
     var predicate_diagnostic: predicate_mod.Diagnostic = undefined;
@@ -748,10 +748,9 @@ fn validateQuery(allocator: std.mem.Allocator, language: *const c.TSLanguage, so
         error.InvalidPredicate => {
             predicate_diagnostic.query_kind = kind;
             if (diagnostic) |output| output.* = predicate_diagnostic;
-            predicate_diagnostic.report();
-            return diagnostic_handle.fail(.query, predicate_diagnostic.cause() orelse .{ .zig = err }, @src());
+            return bbr.cli_failure.fail(io, diagnostic_handle, .query, predicate_diagnostic.cause() orelse .{ .zig = err }, @src(), predicate_mod.Diagnostic.write, .{predicate_diagnostic});
         },
-        else => return failTranslated(diagnostic_handle, .query, "InvalidPredicate", err, @src()),
+        else => return failTranslated(io, diagnostic_handle, .query, "InvalidPredicate", err, @src()),
     };
     defer predicates.deinit(allocator);
     if (kind == .locals and (!queryHasCapture(query, "local.definition") or !queryHasCapture(query, "local.reference"))) return error.InvalidLocalsQuery;
@@ -864,10 +863,8 @@ fn hasTerminalControl(value: []const u8) bool {
     return false;
 }
 
-/// Prints the translated meaning and the leaf cause for the CLI, then records the leaf cause once.
-fn failTranslated(handle: diagnostics.Handle, phase: diagnostics.Phase, comptime meaning: []const u8, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
-    std.debug.print("bbr grammar: " ++ meaning ++ " ({s})\n", .{@errorName(cause)});
-    return handle.fail(phase, .{ .zig = cause }, source);
+fn failTranslated(io: std.Io, handle: diagnostics.Handle, phase: diagnostics.Phase, comptime meaning: []const u8, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    return bbr.cli_failure.fail(io, handle, phase, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr grammar: " ++ meaning ++ " ({s})\n", .{@errorName(cause)} });
 }
 
 fn parseDigest(hex: []const u8) ![32]u8 {
@@ -927,6 +924,7 @@ test "diagnostics preserve predicate allocation cause before InvalidPredicate co
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var diagnostic: ?predicate_mod.Diagnostic = null;
     try testing.expectError(error.Reported, validateQuery(
+        testing.io,
         failing.allocator(),
         tree_sitter_javascript().?,
         "(identifier) @private_capture_48c",
@@ -1022,17 +1020,17 @@ test "tar parser rejects duplicate unsafe and linked entries" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const regular = try testTar(allocator, &.{ .{ "grammar.toml", '0', "x" }, .{ "payload", '0', "y" } });
-    const files = try parseTar(allocator, regular, .{});
+    const files = try parseTar(testing.io, allocator, regular, .{});
     try testing.expectEqual(@as(usize, 2), files.len);
 
     const duplicate = try testTar(allocator, &.{ .{ "x", '0', "a" }, .{ "x", '0', "b" } });
-    try testing.expectError(error.DuplicateArchiveEntry, parseTar(allocator, duplicate, .{}));
+    try testing.expectError(error.DuplicateArchiveEntry, parseTar(testing.io, allocator, duplicate, .{}));
     const unsafe = try testTar(allocator, &.{.{ "../x", '0', "a" }});
-    try testing.expectError(error.UnsafePath, parseTar(allocator, unsafe, .{}));
+    try testing.expectError(error.UnsafePath, parseTar(testing.io, allocator, unsafe, .{}));
     const link = try testTar(allocator, &.{.{ "x", '2', "" }});
-    try testing.expectError(error.NonRegularFile, parseTar(allocator, link, .{}));
+    try testing.expectError(error.NonRegularFile, parseTar(testing.io, allocator, link, .{}));
     const duplicate_dir = try testTar(allocator, &.{ .{ "queries/", '5', "" }, .{ "queries/", '5', "" } });
-    try testing.expectError(error.DuplicateArchiveEntry, parseTar(allocator, duplicate_dir, .{}));
+    try testing.expectError(error.DuplicateArchiveEntry, parseTar(testing.io, allocator, duplicate_dir, .{}));
 }
 
 test "tar.gz inspection uses the same logical bundle" {
@@ -1069,20 +1067,20 @@ test "trusted native validation checks ABI queries predicates and regexes" {
         .highlight_query = "highlights.scm",
         .locals_query = "locals.scm",
     };
-    try validateLanguage(testing.allocator, language, manifest, &valid_files, null, .{});
+    try validateLanguage(testing.io, testing.allocator, language, manifest, &valid_files, null, .{});
 
     manifest.tree_sitter_abi.? -= 1;
-    try testing.expectError(error.TreeSitterAbiMismatch, validateLanguage(testing.allocator, language, manifest, &valid_files, null, .{}));
+    try testing.expectError(error.TreeSitterAbiMismatch, validateLanguage(testing.io, testing.allocator, language, manifest, &valid_files, null, .{}));
     manifest.tree_sitter_abi = c.ts_language_abi_version(language);
     const invalid_query = [_]File{
         .{ .path = "highlights.scm", .bytes = "((identifier) @x (#match? @x \"(?=x)\"))" },
         .{ .path = "locals.scm", .bytes = "(identifier) @local.definition\n(identifier) @local.reference" },
     };
-    try testing.expectError(error.Reported, validateLanguage(testing.allocator, language, manifest, &invalid_query, null, .{}));
+    try testing.expectError(error.Reported, validateLanguage(testing.io, testing.allocator, language, manifest, &invalid_query, null, .{}));
 
     manifest.locals_query = null;
     const local_predicate = [_]File{.{ .path = "highlights.scm", .bytes = "((identifier) @variable.builtin (#is-not? local))" }};
-    try testing.expectError(error.MissingLocalsQuery, validateLanguage(testing.allocator, language, manifest, &local_predicate, null, .{}));
+    try testing.expectError(error.MissingLocalsQuery, validateLanguage(testing.io, testing.allocator, language, manifest, &local_predicate, null, .{}));
 }
 
 test "canonical digest changes with any declared byte" {

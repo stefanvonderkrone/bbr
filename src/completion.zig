@@ -46,11 +46,7 @@ fn isHelp(a: []const u8) bool {
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
     runArgs(init, gpa, it, diagnostic) catch |err| switch (err) {
         error.StdoutClosed, error.Reported => return err,
-        else => {
-            const reported = diagnostic.fail(.execute, .{ .zig = err }, @src());
-            std.debug.print("bbr completion: {s}\n", .{@errorName(err)});
-            return reported;
-        },
+        else => return bbr.cli_failure.fail(init.io, diagnostic, .execute, .{ .zig = err }, @src(), std.Io.Writer.print, .{ "bbr completion: {s}\n", .{@errorName(err)} }),
     };
 }
 
@@ -92,16 +88,7 @@ fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnost
 }
 
 fn usageFailure(init: std.process.Init, diagnostic: bbr.diagnostics.Handle, comptime message: []const u8) error{Reported} {
-    const reported = diagnostic.fail(.execute, .{ .zig = error.UnknownFlag }, @src());
-    var buf: [512]u8 = undefined;
-    var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
-    stderr.interface.writeAll(message) catch |err| {
-        _ = diagnostic.failure(.write, .{ .zig = err }, @src());
-    };
-    stderr.interface.flush() catch |err| {
-        _ = diagnostic.failure(.write, .{ .zig = err }, @src());
-    };
-    return reported;
+    return bbr.cli_failure.fail(init.io, diagnostic, .execute, .{ .zig = error.UnknownFlag }, @src(), std.Io.Writer.writeAll, .{message});
 }
 
 /// Print one saved Profile name per line. Missing file prints nothing;

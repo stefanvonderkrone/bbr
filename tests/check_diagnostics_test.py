@@ -9,6 +9,34 @@ import check_diagnostics as checker
 
 
 class DiagnosticsCheckTest(unittest.TestCase):
+    def test_cli_fail_then_try_stderr_is_rejected(self):
+        text = "\n".join((
+            "pub fn runSetVerdict(init: Init, bb: Client) !void {",
+            "    const reported = bb.diagnostic.fail(.execute, .{ .zig = cause }, @src());",
+            "    var buf: [512]u8 = undefined;",
+            "    var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);",
+            "    const writer = &stderr.interface;",
+            '    try writer.writeAll("bbr api set-verdict: ReviewerVerdictChangeFailed");',
+            "    try writer.flush();",
+            "    return reported;",
+            "}",
+        ))
+        for path in ("src/api/pullrequests.zig", "src/api/cli.zig", "src/main.zig", "src/completion.zig"):
+            with self.subTest(path=path):
+                found = self.check(path, text)
+                self.assertEqual(len(found), 1)
+                self.assertIn(f"{path}:2:", found[0])
+                self.assertIn("bbr.cli_failure.fail", found[0])
+        for owner in ("validateQuery", "failTranslated"):
+            found = self.check("src/highlight/user_grammar.zig", text.replace("runSetVerdict", owner))
+            self.assertEqual(len(found), 1)
+            self.assertIn("bbr.cli_failure.fail", found[0])
+
+    def test_cli_failure_helper_and_non_cli_fail_are_allowed(self):
+        self.assertEqual(self.check("src/api/cli.zig", "return bbr.cli_failure.fail(io, diagnostic, .execute, cause, @src(), writeError, .{});"), [])
+        self.assertEqual(self.check("src/persist/sqlite_store.zig", "return diagnostic.fail(.read, cause, @src());"), [])
+        self.assertEqual(self.check("src/main.zig", 'test "failure" { _ = diagnostic.fail(.read, cause, @src()); }'), [])
+
     def check(self, path, text, baseline=None, record_baseline=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -179,7 +207,7 @@ class DiagnosticsCheckTest(unittest.TestCase):
 
     def test_a_return_through_fail_is_allowed(self):
         for text in (
-            "var loaded = config.loadSnapshot(gpa, snapshot) catch |err|\n    return diagnostic.forContext(.configuration, .{}).fail(.read, .{ .zig = err }, @src());",
+            "var loaded = config.loadSnapshot(gpa, snapshot) catch |err|\n    return bbr.cli_failure.fail(io, diagnostic.forContext(.configuration, .{}), .read, .{ .zig = err }, @src(), writeError, .{});",
             "x() catch |err| {\n    _ = diagnostic.failure(.read, .{ .zig = err }, @src());\n    return error.Reported;\n};",
         ):
             with self.subTest(text=text):

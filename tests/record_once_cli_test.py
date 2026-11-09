@@ -90,6 +90,11 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
         original = [line for line in records if line.endswith(f" error={cause}")]
         assert result.returncode == 1, (args, result)
         assert len(original) == 1, (args, cause, records)
+        if args[0] != "auth":
+            assert len(records) == 2, (args, records)
+            write_failures = [line for line in records if " phase=write " in line]
+            assert len(write_failures) == 1, (args, records)
+            assert write_failures[0].endswith(" error=NotOpenForWriting"), (args, records)
         assert f" operation={operation} " in original[0], (args, original)
         if cause == "ConnectionRefused":
             assert " phase=connect " in original[0], (args, original)

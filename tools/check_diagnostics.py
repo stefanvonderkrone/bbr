@@ -338,6 +338,18 @@ def violations(root):
                 owner = declaration[1]
             if STANDARD_LOG.search(line):
                 yield f"{path}:{number}: use a diagnostic Handle or a pure diagnostic Failure, not std.log."
+            cli_site = (
+                str(path) in ("src/main.zig", "src/completion.zig")
+                or str(path).startswith("src/api/")
+                or (str(path) == "src/highlight/user_grammar.zig" and owner in ("validateQuery", "failTranslated"))
+            )
+            if cli_site:
+                for call in re.finditer(r"\.\s*fail\s*\(", line):
+                    if not line[:call.start()].endswith("bbr.cli_failure"):
+                        yield (
+                            f"{path}:{number}: use bbr.cli_failure.fail to record the cause, print its message, "
+                            "record a failed stderr write once, and return error.Reported."
+                        )
             if declaration and declaration[1].endswith("WithDiagnostics") and declaration[1] != "WithDiagnostics":
                 base = declaration[1][: -len("WithDiagnostics")]
                 yield (

@@ -260,13 +260,6 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*cons
     }
 }
 
-fn printError(init: std.process.Init, verb: ?Verb, err: anyerror, detail: ?*const bbr.bitbucket.Client.ErrorDetail) !void {
-    var buf: [8192]u8 = undefined;
-    var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
-    try writeError(&stderr.interface, verb, err, detail);
-    try stderr.interface.flush();
-}
-
 /// Only report a registered verb in a positional slot. Never report a flag value.
 fn diagnosticVerb(argv: []const []const u8) ?Verb {
     var i: usize = 0;
@@ -319,9 +312,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, profile:
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     while (it.next()) |a| argv.append(gpa, a) catch |err| {
-        const reported = diagnostic.fail(.prepare, .{ .zig = err }, @src());
-        try printError(init, diagnosticVerb(argv.items), err, null);
-        return reported;
+        return bbr.cli_failure.fail(init.io, diagnostic, .prepare, .{ .zig = err }, @src(), writeError, .{ diagnosticVerb(argv.items), err, null });
     };
     var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = gpa, .io = init.io };
     defer detail.deinit();
@@ -333,11 +324,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, profile:
 fn reportFailure(init: std.process.Init, verb: ?Verb, err: anyerror, detail: *const bbr.bitbucket.Client.ErrorDetail, diagnostic: bbr.diagnostics.Handle) anyerror {
     switch (err) {
         error.StdoutClosed, error.Reported => return err,
-        else => {
-            const reported = diagnostic.fail(.execute, .{ .zig = err }, @src());
-            printError(init, verb, err, detail) catch |write_err| return write_err;
-            return reported;
-        },
+        else => return bbr.cli_failure.fail(init.io, diagnostic, .execute, .{ .zig = err }, @src(), writeError, .{ verb, err, detail }),
     }
 }
 
@@ -678,6 +665,48 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
 }
 
+test "diagnostics failed api stderr keeps the cause and write failure once across boundaries" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |argv_oom| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(home);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &env);
+        defer sink.deinit();
+        try std.testing.expect(sink.setEnabled(true) == .on);
+        const handle = sink.handle(.api, .{});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var output: TestOutput = .{ .stderr_fails = true };
+        var args: arg.Cursor = .{ .args = &.{"private-invalid-verb"} };
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const allocator = if (argv_oom) failing.allocator() else a;
+        const failure = if (run(output.init(&env, &arena), allocator, &args, null, handle)) |_| error.TestUnexpectedResult else |err| err;
+        try std.testing.expectEqual(error.Reported, failure);
+        _ = handle.failure(.execute, .{ .zig = failure }, @src());
+        try std.testing.expectEqual(@as(usize, 1), output.stderr_writes);
+        try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(std.testing.io)).?;
+        const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+        defer a.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        try std.testing.expect(std.mem.endsWith(u8, lines.next().?, if (argv_oom) "error=OutOfMemory" else "error=UnknownFlag"));
+        const write_failure = lines.next().?;
+        try std.testing.expect(std.mem.indexOf(u8, write_failure, "phase=write ") != null);
+        try std.testing.expect(std.mem.endsWith(u8, write_failure, "error=NoSpaceLeft"));
+        try std.testing.expect(lines.next() == null);
+    }
+}
+
 test "diagnostics the api boundary shows each failure and records it once" {
     const a = std.testing.allocator;
     const cases = [_]struct { args: []const []const u8, message: []const u8, cause: []const u8 }{
@@ -834,7 +863,7 @@ test "Bitbucket rejection messages survive response cleanup and stay on stderr" 
         bb.error_detail = &detail;
         const init = output.init(&env, &arena);
         try std.testing.expectError(case.err, comments.runList(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--query=resolution=null", "--no-head" }, true));
-        try printError(init, findVerb("list-comments"), case.err, &detail);
+        try std.testing.expectEqual(error.Reported, reportFailure(init, findVerb("list-comments"), case.err, &detail, .{}));
         try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
         try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         try std.testing.expectEqual(@as(usize, 1), fake.call_count);
@@ -936,6 +965,12 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
             .cause = "cause=http status=429 classification=rate_limit",
         },
         .{
+            .responses = &.{ account, .{ .body = pr }, .{ .status = 429, .body = "{\"error\":{\"message\":\"" ++ "x" ** 9000 ++ "\"}}" }, .{ .body = pr } },
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (RateLimited): " ++ "x" ** 9000 ++ "\n",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=429 classification=rate_limit",
+        },
+        .{
             .responses = &.{ account, .{ .body = pr }, .{}, .{ .status = 403, .body = "{\"error\":{\"message\":\"Read denied\"}}" } },
             .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (Forbidden): Read denied\n",
             .phase = "phase=rejection",
@@ -966,8 +1001,9 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
             var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" }).withDiagnostics(handle);
             bb.error_detail = &detail;
             const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
-            const failure = if (pullrequests.runSetVerdict(init, bb, args, false)) |_| error.TestUnexpectedResult else |err| if (stderr_fails and err == error.WriteFailed) err else reportFailure(init, findVerb("set-verdict"), err, &detail, handle);
-            try std.testing.expectEqual(if (stderr_fails) error.WriteFailed else error.Reported, failure);
+            const failure = if (pullrequests.runSetVerdict(init, bb, args, false)) |_| error.TestUnexpectedResult else |err| reportFailure(init, findVerb("set-verdict"), err, &detail, handle);
+            try std.testing.expectEqual(error.Reported, failure);
+            _ = handle.failure(.execute, .{ .zig = failure }, @src());
             try std.testing.expect(leaf == null);
             _ = sink.setEnabled(false);
             var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
@@ -981,11 +1017,16 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
             var records: usize = 0;
             while (lines.next()) |line| : (records += 1) {
                 try std.testing.expect(std.mem.indexOf(u8, line, "operation=api ") != null);
-                try std.testing.expect(std.mem.indexOf(u8, line, case.phase) != null);
-                try std.testing.expect(std.mem.endsWith(u8, line, case.cause));
+                if (records == 0) {
+                    try std.testing.expect(std.mem.indexOf(u8, line, case.phase) != null);
+                    try std.testing.expect(std.mem.endsWith(u8, line, case.cause));
+                } else {
+                    try std.testing.expect(std.mem.indexOf(u8, line, "phase=write ") != null);
+                    try std.testing.expect(std.mem.endsWith(u8, line, "error=NoSpaceLeft"));
+                }
             }
-            try std.testing.expectEqual(@as(usize, 1), records);
-            try std.testing.expect(output.stderr_writes > 0);
+            try std.testing.expectEqual(@as(usize, if (stderr_fails) 2 else 1), records);
+            if (stderr_fails) try std.testing.expectEqual(@as(usize, 1), output.stderr_writes);
             try std.testing.expectEqualStrings(if (stderr_fails) "" else case.message, output.stderrBytes());
             try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         }
@@ -1609,7 +1650,7 @@ test "list-workspace-pull-requests prints the named Repositories once in the giv
 
 const TestOutput = struct {
     stdout_buffer: [8192]u8 = undefined,
-    stderr_buffer: [8192]u8 = undefined,
+    stderr_buffer: [16384]u8 = undefined,
     stdout_len: usize = 0,
     stderr_len: usize = 0,
     stderr_fails: bool = false,

@@ -649,23 +649,7 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
         .stale_source_commit => return error.ReviewerVerdictChangeFailed,
         .unresolved => |unresolved| {
             const cause = unresolved orelse return error.ReviewerVerdictChangeFailed;
-            const reported = bb.diagnostic.fail(.execute, .{ .zig = cause }, @src());
-            // The message names the translated meaning and the client cause, and the record
-            // takes the client cause, so the record keeps the evidence that the client noted.
-            var buf: [512]u8 = undefined;
-            var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
-            const writer = &stderr.interface;
-            try writer.writeAll("bbr api set-verdict: ReviewerVerdictChangeFailed");
-            const rejection = if (bb.error_detail) |detail| detail.reason else null;
-            if (bbr.bitbucket.asApiError(cause) == null) {
-                try writer.print(": {s}", .{@errorName(cause)});
-            } else if (rejection) |reason| {
-                try writer.print(": Bitbucket rejected request ({s})", .{@errorName(reason)});
-                if (bb.error_detail.?.message) |message| try writer.print(": {s}", .{message});
-            }
-            try writer.writeByte('\n');
-            try writer.flush();
-            return reported;
+            return bbr.cli_failure.fail(init.io, bb.diagnostic, .execute, .{ .zig = cause }, @src(), writeVerdictFailure, .{ bb.error_detail, cause });
         },
     }
     const name: []const u8 = switch (result) {
@@ -680,6 +664,18 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
     } else {
         try out.printLine(init, "ok: {s} (verdict {s})", .{ name, vs });
     }
+}
+
+fn writeVerdictFailure(writer: *std.Io.Writer, detail: ?*const bbr.bitbucket.Client.ErrorDetail, cause: anyerror) !void {
+    try writer.writeAll("bbr api set-verdict: ReviewerVerdictChangeFailed");
+    const rejection = if (detail) |value| value.reason else null;
+    if (bbr.bitbucket.asApiError(cause) == null) {
+        try writer.print(": {s}", .{@errorName(cause)});
+    } else if (rejection) |reason| {
+        try writer.print(": Bitbucket rejected request ({s})", .{@errorName(reason)});
+        if (detail.?.message) |message| try writer.print(": {s}", .{message});
+    }
+    try writer.writeByte('\n');
 }
 
 test "list-pull-requests parses interleaved filters and page controls in both value forms" {
