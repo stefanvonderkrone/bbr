@@ -1,6 +1,6 @@
 # Error handling discipline
 
-Status: claimed
+Status: resolved
 Implementation directory: .
 
 ## Problem
@@ -52,3 +52,21 @@ These come from research.md. Each issue names the questions that it must answer 
 - [07 Keep the leaf evidence in the one record](issues/07-keep-leaf-evidence-in-the-one-record.md)
 - [08 Close the remaining record gaps](issues/08-close-the-remaining-record-gaps.md)
 - [09 Close the remaining evidence and test gaps](issues/09-close-the-remaining-evidence-and-test-gaps.md)
+
+## Completion
+
+All nine implementation tickets are resolved.
+Issue 01 answers open question 3. Issue 02 answers open questions 1 and 2.
+
+Integrated checks on 2026-11-09, on PR #22 at `1ccef4b`:
+
+- `zig build test --summary all` passed 50 of 50 steps and 1602 of 1602 tests.
+- All seven `tools/check_*.py` checks passed. The catch baseline is 33, and the record baseline lists no file.
+- CI on PR #22 passed on linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, and agent documents.
+
+Final review:
+
+- A read-only re-verification checked each requirement of tickets 01 to 09 on the merged tree. Tickets 04, 06, and 08 had regressions. Commits `aab419e`, `defe67a`, `50a69d1`, and `c52f4ea` fixed them, and the notes in those issues record the fixes.
+- The CodeRabbit review of PR #22 had 20 findings. 19 were valid, and commits `c8eab63`, `1e809a1`, `1236cb7`, `e33fe67`, `ea7a6db`, and `db51640` fixed them. Finding 6 did not apply, because two runtime error values add no error name. AGENTS.md states that exception.
+- Commit `1ccef4b` widened the `noted` lint to every error that `src/bitbucket/client.zig` returns.
+- These limits remain, and each one has its reason in its issue or in AGENTS.md: compile-only coverage of the benchmark paths, the conventions without a check, and the two missing `Group.await` cleanup cancel tests.
