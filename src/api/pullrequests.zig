@@ -554,19 +554,24 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
         .success, .reconciled_success => {},
         .api_error => |err| return err,
         .stale_source_commit => return error.ReviewerVerdictChangeFailed,
-        .unresolved => |cause| {
-            const transport = cause orelse return error.ReviewerVerdictChangeFailed;
-            if (bbr.bitbucket.asApiError(transport) == null) {
-                // The api boundary shows only a Bitbucket rejection with its cause, so this site shows the transport cause.
-                const reported = bb.diagnostic.fail(.execute, .{ .zig = transport }, @src());
-                var buf: [256]u8 = undefined;
-                var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
-                try stderr.interface.print("bbr api set-verdict: ReviewerVerdictChangeFailed: {s}\n", .{@errorName(transport)});
-                try stderr.interface.flush();
-                return reported;
+        .unresolved => |unresolved| {
+            const cause = unresolved orelse return error.ReviewerVerdictChangeFailed;
+            // The message names the translated meaning and the client cause, and the record
+            // takes the client cause, so the record keeps the evidence that the client noted.
+            var buf: [512]u8 = undefined;
+            var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
+            const writer = &stderr.interface;
+            try writer.writeAll("bbr api set-verdict: ReviewerVerdictChangeFailed");
+            const rejection = if (bb.error_detail) |detail| detail.reason else null;
+            if (bbr.bitbucket.asApiError(cause) == null) {
+                try writer.print(": {s}", .{@errorName(cause)});
+            } else if (rejection) |reason| {
+                try writer.print(": Bitbucket rejected request ({s})", .{@errorName(reason)});
+                if (bb.error_detail.?.message) |message| try writer.print(": {s}", .{message});
             }
-            if (bb.error_detail) |detail| detail.reported_error = error.ReviewerVerdictChangeFailed;
-            return error.ReviewerVerdictChangeFailed;
+            try writer.writeByte('\n');
+            try writer.flush();
+            return bb.diagnostic.fail(.execute, .{ .zig = cause }, @src());
         },
     }
     const name: []const u8 = switch (result) {

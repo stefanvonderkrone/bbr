@@ -234,9 +234,7 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*cons
     try writer.writeAll("bbr api");
     if (verb) |v| try writer.print(" {s}", .{v.name});
     const api_error = if (detail) |d| d.reason else null;
-    const reported_error = if (detail) |d| d.reported_error else null;
-    if (api_error != null and (api_error.? == err or (reported_error != null and reported_error.? == err))) {
-        if (api_error.? != err) try writer.print(": {s}", .{@errorName(err)});
+    if (api_error != null and api_error.? == err) {
         try writer.print(": Bitbucket rejected request ({s})", .{@errorName(api_error.?)});
         if (detail.?.message) |message| try writer.print(": {s}", .{message});
         try writer.writeAll("\n");
@@ -885,8 +883,7 @@ test "unresolved verdict changes keep the domain error and the relevant API mess
             var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" });
             bb.error_detail = &detail;
             const init = output.init(&env, &arena);
-            try std.testing.expectError(error.ReviewerVerdictChangeFailed, pullrequests.runSetVerdict(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit=abc123" }, json));
-            try printError(init, findVerb("set-verdict"), error.ReviewerVerdictChangeFailed, &detail);
+            try std.testing.expectError(error.Reported, pullrequests.runSetVerdict(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit=abc123" }, json));
             try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
             try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
             try std.testing.expectEqual(@as(usize, 4), fake.call_count);
@@ -901,7 +898,7 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         "\"source\":{\"branch\":{\"name\":\"feature\"},\"commit\":{\"hash\":\"abc123\"}}," ++
         "\"destination\":{\"branch\":{\"name\":\"main\"},\"commit\":{\"hash\":\"def456\"}},\"participants\":[]}";
     const account: bbr.http.Canned = .{ .body = "{\"uuid\":\"{account}\"}" };
-    const cases = [_]struct { responses: []const bbr.http.Canned, expected_commit: []const u8 = "abc123", message: []const u8, cause: []const u8 }{
+    const cases = [_]struct { responses: []const bbr.http.Canned, expected_commit: []const u8 = "abc123", message: []const u8, phase: []const u8 = "", cause: []const u8 }{
         .{
             .responses = &.{ account, .{ .body = pr }, .{ .send_error = error.ConnectionResetByPeer }, .{ .body = pr } },
             .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: ConnectionResetByPeer\n",
@@ -916,12 +913,20 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         .{
             .responses = &.{ account, .{ .body = pr }, .{ .status = 403, .body = "{\"error\":{\"message\":\"Read denied\"}}" } },
             .message = "bbr api set-verdict: Bitbucket rejected request (Forbidden): Read denied\n",
-            .cause = "error=Forbidden",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=403 classification=authorization",
         },
         .{
             .responses = &.{ account, .{ .body = pr }, .{ .status = 429, .body = "{\"error\":{\"message\":\"Slow down\"}}" }, .{ .body = pr } },
             .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (RateLimited): Slow down\n",
-            .cause = "error=ReviewerVerdictChangeFailed",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=429 classification=rate_limit",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{}, .{ .status = 403, .body = "{\"error\":{\"message\":\"Read denied\"}}" } },
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (Forbidden): Read denied\n",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=403 classification=authorization",
         },
     };
     for (cases) |case| {
@@ -935,7 +940,8 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &env);
         defer sink.deinit();
         try std.testing.expect(sink.setEnabled(true) == .on);
-        const handle = sink.handle(.api, .{});
+        var leaf: ?bbr.diagnostic.Leaf = null;
+        const handle = sink.handle(.api, .{}).withLeaf(&leaf);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var output: TestOutput = .{};
@@ -948,6 +954,7 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
         const failure = if (pullrequests.runSetVerdict(init, bb, args, false)) |_| error.TestUnexpectedResult else |err| reportFailure(init, findVerb("set-verdict"), err, &detail, handle);
         try std.testing.expectEqual(error.Reported, failure);
+        try std.testing.expect(leaf == null);
         _ = sink.setEnabled(false);
         var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
         defer dir.close(std.testing.io);
@@ -960,6 +967,7 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         var records: usize = 0;
         while (lines.next()) |line| : (records += 1) {
             try std.testing.expect(std.mem.indexOf(u8, line, "operation=api ") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, case.phase) != null);
             try std.testing.expect(std.mem.endsWith(u8, line, case.cause));
         }
         try std.testing.expectEqual(@as(usize, 1), records);

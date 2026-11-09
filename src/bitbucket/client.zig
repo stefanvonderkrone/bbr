@@ -68,14 +68,12 @@ pub const Client = struct {
         io: std.Io,
         mutex: std.Io.Mutex = .init,
         reason: ?ApiError = null,
-        reported_error: ?anyerror = null,
         message: ?[]u8 = null,
 
         pub fn deinit(self: *ErrorDetail) void {
             if (self.message) |message| self.allocator.free(message);
             self.message = null;
             self.reason = null;
-            self.reported_error = null;
         }
 
         fn copyFrom(self: *ErrorDetail, source: ?*const ErrorDetail) void {
@@ -84,7 +82,6 @@ pub const Client = struct {
             self.deinit();
             const detail = source orelse return;
             self.reason = detail.reason;
-            self.reported_error = detail.reported_error;
             if (detail.message) |message| self.message = self.allocator.dupe(u8, message) catch |err| switch (err) {
                 error.OutOfMemory => null,
             };
