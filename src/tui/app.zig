@@ -932,6 +932,7 @@ fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, spawn_diagnostic: bbr.
                 git.gitClient(),
                 command.key.baseRef(),
                 command.key.sourceRef(),
+                diagnostic,
             );
         },
     };

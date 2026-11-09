@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
         var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, init.io);
         const base = try git.gitClient().resolveRef(allocator, base_ref);
         const source = try git.gitClient().resolveRef(allocator, source_ref);
-        const raw_diff = try git.gitClient().diff(allocator, base.commit, source.commit);
+        const raw_diff = try git.gitClient().diff(allocator, base.commit, source.commit, .{});
         const diff = try bbr.diff.parse(allocator, raw_diff);
         var git_source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
         const name = try std.fmt.allocPrint(allocator, "LocalReview {s}..{s}", .{ base_ref, source_ref });

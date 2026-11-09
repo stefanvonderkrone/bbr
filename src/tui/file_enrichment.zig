@@ -86,9 +86,9 @@ pub const GitBlobSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, _: bbr.diagnostics.Handle) anyerror![]u8 {
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *GitBlobSource = @ptrCast(@alignCast(ptr));
-        return self.client.blob(allocator, commit, path);
+        return self.client.blob(allocator, commit, path, diagnostic);
     }
 };
 
@@ -1785,6 +1785,54 @@ test "diagnostics a transport OutOfMemory on one File side keeps its phase in th
     try testing.expect(lines.next() == null);
     try testing.expect(std.mem.indexOf(u8, only, "operation=file_enrichment phase=receive_body source=tui/file_enrichment.zig:") != null);
     try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
+}
+
+test "diagnostics a failed local blob read keeps the git termination in the record of its File side" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    // The file system root is not inside a Git worktree, so git show exits with 128.
+    var git = bbr.git.ShellGitClient.init(testing.allocator, testing.io);
+    git.cwd = .{ .path = "/" };
+    var source: GitBlobSource = .{ .client = git.gitClient() };
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var result = try enrichFrom(testing.allocator, source.source(), plain.highlighter(), .{
+        .repo = "repo",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "file.zig",
+        .new_path = "file.zig",
+        .max_file_bytes = 0,
+        .diagnostic = sink.handle(.file_enrichment, .{ .command_id = 9 }).withLeaf(&leaf),
+    });
+    defer result.deinit();
+    try testing.expectEqual(error.BlobNotFound, result.old.fetch_failed);
+    try testing.expectEqual(error.BlobNotFound, result.new.fetch_failed);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    for ([_][]const u8{ "side=old", "side=new" }) |side| {
+        const line = lines.next().?;
+        try testing.expect(std.mem.indexOf(u8, line, "operation=file_enrichment phase=execute ") != null);
+        try testing.expect(std.mem.indexOf(u8, line, side) != null);
+        try testing.expect(std.mem.endsWith(u8, line, "cause=git termination=exited code=128 error=BlobNotFound"));
+    }
+    try testing.expect(lines.next() == null);
 }
 
 fn readRemoteBlob(remote: *RemoteBlobSource) anyerror![]u8 {
