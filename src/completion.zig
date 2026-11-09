@@ -47,8 +47,9 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnost
     runArgs(init, gpa, it, diagnostic) catch |err| switch (err) {
         error.StdoutClosed, error.Reported => return err,
         else => {
+            const reported = diagnostic.fail(.execute, .{ .zig = err }, @src());
             std.debug.print("bbr completion: {s}\n", .{@errorName(err)});
-            return diagnostic.fail(.execute, .{ .zig = err }, @src());
+            return reported;
         },
     };
 }
@@ -91,6 +92,7 @@ fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnost
 }
 
 fn usageFailure(init: std.process.Init, diagnostic: bbr.diagnostics.Handle, comptime message: []const u8) error{Reported} {
+    const reported = diagnostic.fail(.execute, .{ .zig = error.UnknownFlag }, @src());
     var buf: [512]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
     stderr.interface.writeAll(message) catch |err| {
@@ -99,7 +101,7 @@ fn usageFailure(init: std.process.Init, diagnostic: bbr.diagnostics.Handle, comp
     stderr.interface.flush() catch |err| {
         _ = diagnostic.failure(.write, .{ .zig = err }, @src());
     };
-    return diagnostic.fail(.execute, .{ .zig = error.UnknownFlag }, @src());
+    return reported;
 }
 
 /// Print one saved Profile name per line. Missing file prints nothing;

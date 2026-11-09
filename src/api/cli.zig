@@ -319,8 +319,9 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, profile:
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     while (it.next()) |a| argv.append(gpa, a) catch |err| {
+        const reported = diagnostic.fail(.prepare, .{ .zig = err }, @src());
         try printError(init, diagnosticVerb(argv.items), err, null);
-        return diagnostic.fail(.prepare, .{ .zig = err }, @src());
+        return reported;
     };
     var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = gpa, .io = init.io };
     defer detail.deinit();
@@ -333,8 +334,9 @@ fn reportFailure(init: std.process.Init, verb: ?Verb, err: anyerror, detail: *co
     switch (err) {
         error.StdoutClosed, error.Reported => return err,
         else => {
+            const reported = diagnostic.fail(.execute, .{ .zig = err }, @src());
             printError(init, verb, err, detail) catch |write_err| return write_err;
-            return diagnostic.fail(.execute, .{ .zig = err }, @src());
+            return reported;
         },
     }
 }
@@ -941,49 +943,52 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         },
     };
     for (cases) |case| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-        defer a.free(home);
-        var env = std.process.Environ.Map.init(a);
-        defer env.deinit();
-        try env.put("XDG_STATE_HOME", home);
-        var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &env);
-        defer sink.deinit();
-        try std.testing.expect(sink.setEnabled(true) == .on);
-        var leaf: ?bbr.diagnostic.Leaf = null;
-        const handle = sink.handle(.api, .{}).withLeaf(&leaf);
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        var output: TestOutput = .{};
-        const init = output.init(&env, &arena);
-        var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
-        var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
-        defer detail.deinit();
-        var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" }).withDiagnostics(handle);
-        bb.error_detail = &detail;
-        const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
-        const failure = if (pullrequests.runSetVerdict(init, bb, args, false)) |_| error.TestUnexpectedResult else |err| reportFailure(init, findVerb("set-verdict"), err, &detail, handle);
-        try std.testing.expectEqual(error.Reported, failure);
-        try std.testing.expect(leaf == null);
-        _ = sink.setEnabled(false);
-        var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
-        defer dir.close(std.testing.io);
-        var iterator = dir.iterate();
-        const entry = (try iterator.next(std.testing.io)).?;
-        const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
-        defer a.free(bytes);
-        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
-        _ = lines.next();
-        var records: usize = 0;
-        while (lines.next()) |line| : (records += 1) {
-            try std.testing.expect(std.mem.indexOf(u8, line, "operation=api ") != null);
-            try std.testing.expect(std.mem.indexOf(u8, line, case.phase) != null);
-            try std.testing.expect(std.mem.endsWith(u8, line, case.cause));
+        for ([_]bool{ false, true }) |stderr_fails| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+            defer a.free(home);
+            var env = std.process.Environ.Map.init(a);
+            defer env.deinit();
+            try env.put("XDG_STATE_HOME", home);
+            var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &env);
+            defer sink.deinit();
+            try std.testing.expect(sink.setEnabled(true) == .on);
+            var leaf: ?bbr.diagnostic.Leaf = null;
+            const handle = sink.handle(.api, .{}).withLeaf(&leaf);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var output: TestOutput = .{ .stderr_fails = stderr_fails };
+            const init = output.init(&env, &arena);
+            var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
+            var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+            defer detail.deinit();
+            var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" }).withDiagnostics(handle);
+            bb.error_detail = &detail;
+            const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
+            const failure = if (pullrequests.runSetVerdict(init, bb, args, false)) |_| error.TestUnexpectedResult else |err| if (stderr_fails and err == error.WriteFailed) err else reportFailure(init, findVerb("set-verdict"), err, &detail, handle);
+            try std.testing.expectEqual(if (stderr_fails) error.WriteFailed else error.Reported, failure);
+            try std.testing.expect(leaf == null);
+            _ = sink.setEnabled(false);
+            var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+            defer dir.close(std.testing.io);
+            var iterator = dir.iterate();
+            const entry = (try iterator.next(std.testing.io)).?;
+            const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+            defer a.free(bytes);
+            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+            _ = lines.next();
+            var records: usize = 0;
+            while (lines.next()) |line| : (records += 1) {
+                try std.testing.expect(std.mem.indexOf(u8, line, "operation=api ") != null);
+                try std.testing.expect(std.mem.indexOf(u8, line, case.phase) != null);
+                try std.testing.expect(std.mem.endsWith(u8, line, case.cause));
+            }
+            try std.testing.expectEqual(@as(usize, 1), records);
+            try std.testing.expect(output.stderr_writes > 0);
+            try std.testing.expectEqualStrings(if (stderr_fails) "" else case.message, output.stderrBytes());
+            try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         }
-        try std.testing.expectEqual(@as(usize, 1), records);
-        try std.testing.expectEqualStrings(case.message, output.stderrBytes());
-        try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
     }
 }
 
@@ -1607,6 +1612,8 @@ const TestOutput = struct {
     stderr_buffer: [8192]u8 = undefined,
     stdout_len: usize = 0,
     stderr_len: usize = 0,
+    stderr_fails: bool = false,
+    stderr_writes: usize = 0,
 
     const vtable: std.Io.VTable = blk: {
         var table = std.Io.failing.vtable.*;
@@ -1635,6 +1642,10 @@ const TestOutput = struct {
 
     fn capture(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize) error{NoSpaceLeft}!usize {
         const self: *TestOutput = @ptrCast(@alignCast(userdata.?));
+        if (file.handle == std.Io.File.stderr().handle) {
+            self.stderr_writes += 1;
+            if (self.stderr_fails) return error.NoSpaceLeft;
+        }
         const buffer: []u8 = if (file.handle == std.Io.File.stdout().handle) &self.stdout_buffer else &self.stderr_buffer;
         const len: *usize = if (file.handle == std.Io.File.stdout().handle) &self.stdout_len else &self.stderr_len;
         var writer = std.Io.Writer.fixed(buffer[len.*..]);

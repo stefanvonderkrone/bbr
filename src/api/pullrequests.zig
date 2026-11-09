@@ -649,6 +649,7 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
         .stale_source_commit => return error.ReviewerVerdictChangeFailed,
         .unresolved => |unresolved| {
             const cause = unresolved orelse return error.ReviewerVerdictChangeFailed;
+            const reported = bb.diagnostic.fail(.execute, .{ .zig = cause }, @src());
             // The message names the translated meaning and the client cause, and the record
             // takes the client cause, so the record keeps the evidence that the client noted.
             var buf: [512]u8 = undefined;
@@ -664,7 +665,7 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
             }
             try writer.writeByte('\n');
             try writer.flush();
-            return bb.diagnostic.fail(.execute, .{ .zig = cause }, @src());
+            return reported;
         },
     }
     const name: []const u8 = switch (result) {

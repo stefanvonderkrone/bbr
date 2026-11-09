@@ -23,7 +23,8 @@
 Before you call `fail`, find the boundary above the site.
 If that boundary prints `@errorName(err)` or branches on the error name:
 
-- On a CLI path, print the message at the site first, then return `fail`.
+- On a CLI path, record through `fail` first and keep its `error.Reported` result.
+  Then print the message and return that result, so a failed write cannot drop the record.
   The leaf has the most context for the message (TigerBeetle, `vsr.fatal`).
   At a translation site, the message names the leaf cause and the translated meaning.
 - On a TUI path, the site cannot print. Return the plain error without a record, and the boundary records it once.

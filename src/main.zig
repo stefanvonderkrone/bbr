@@ -217,8 +217,9 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagn
     grammarCommand(init, gpa, it, diagnostic) catch |err| switch (err) {
         error.StdoutClosed, error.Reported => return err,
         else => {
+            const reported = diagnostic.fail(.execute, .{ .zig = err }, @src());
             std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
-            return diagnostic.fail(.execute, .{ .zig = err }, @src());
+            return reported;
         },
     };
 }
@@ -764,8 +765,9 @@ fn verdictChangeCause(result: bbr.bitbucket.ReviewerVerdictChangeResult, failure
 /// Shows a failed change with the cause that its result names, and records that cause once.
 fn verdictChangeFailed(diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
     const cause = verdictChangeCause(result, failure);
+    const reported = diagnostic.forContext(.verdict, .{}).fail(.execute, .{ .zig = cause }, source);
     std.debug.print("bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) });
-    return diagnostic.forContext(.verdict, .{}).fail(.execute, .{ .zig = cause }, source);
+    return reported;
 }
 
 fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) bool {
@@ -1342,8 +1344,9 @@ fn invalidUsage(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime so
 }
 
 fn configLoadFailed(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    const reported = diagnostic.forContext(.configuration, .{}).fail(.read, .{ .zig = cause }, source);
     std.debug.print("bbr: could not load configuration: {s}\n", .{@errorName(cause)});
-    return diagnostic.forContext(.configuration, .{}).fail(.read, .{ .zig = cause }, source);
+    return reported;
 }
 
 fn reportConfigFailure(diagnostic: bbr.diagnostics.Handle, failure: config.Failure) void {

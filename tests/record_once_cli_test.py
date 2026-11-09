@@ -79,6 +79,20 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
 
     for case in cases:
         check(*case)
+    for args, extra, _, operation, cause in cases:
+        before = logs(env)
+        with config.open("rb") as refused_stderr:
+            result = subprocess.run(
+                [binary, *args], stdout=subprocess.PIPE, stderr=refused_stderr,
+                env=dict(env, **extra), cwd=root, timeout=10, stdin=subprocess.DEVNULL,
+            )
+        records = [line for path in logs(env) - before for line in path.read_text().splitlines()[1:]]
+        original = [line for line in records if line.endswith(f" error={cause}")]
+        assert result.returncode == 1, (args, result)
+        assert len(original) == 1, (args, cause, records)
+        assert f" operation={operation} " in original[0], (args, original)
+        if cause == "ConnectionRefused":
+            assert " phase=connect " in original[0], (args, original)
     # The transport phase reaches the one record of a refused connection.
     for args in (["api", "whoami"], ["auth", "status"]):
         check(args, refused_proxy, b"ConnectionRefused", "api" if args[0] == "api" else "auth", "ConnectionRefused", evidence=" phase=connect ")
