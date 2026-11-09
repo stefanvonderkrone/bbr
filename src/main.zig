@@ -120,7 +120,7 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
     if (first) |f| {
         if (std.mem.eql(u8, f, "grammar")) return grammarRun(init, gpa, &rest, diagnostic.forContext(.grammar, .{}));
         if (std.mem.eql(u8, f, "demo")) {
-            var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(diagnostic, err, @src());
+            var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(init.io, diagnostic, err, @src());
             defer loaded.deinit(gpa);
             return switch (loaded) {
                 .ok => |*configuration| demoRun(init.io, gpa, init.environ_map, configuration, diagnostic),
@@ -204,7 +204,7 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
         }
     }
 
-    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(diagnostic, err, @src());
+    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(init.io, diagnostic, err, @src());
     defer loaded.deinit(gpa);
     switch (loaded) {
         .ok => |*configuration| try openTui(init, gpa, cred, input, configuration, diagnostic),
@@ -216,11 +216,7 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
 fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
     grammarCommand(init, gpa, it, diagnostic) catch |err| switch (err) {
         error.StdoutClosed, error.Reported => return err,
-        else => {
-            const reported = diagnostic.fail(.execute, .{ .zig = err }, @src());
-            std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
-            return reported;
-        },
+        else => return bbr.cli_failure.fail(init.io, diagnostic, .execute, .{ .zig = err }, @src(), std.Io.Writer.print, .{ "bbr grammar: {s}\n", .{@errorName(err)} }),
     };
 }
 
@@ -360,7 +356,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
     const source_input = it.next();
     if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
-    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(diagnostic, err, @src());
+    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(init.io, diagnostic, err, @src());
     defer loaded.deinit(gpa);
     const configuration = switch (loaded) {
         .ok => |*value| value,
@@ -711,10 +707,10 @@ fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bit
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    try checkVerdict(gpa, bbr.bitbucket.Client.init(transport.httpClient(), cred).withDiagnostics(diagnostic), repo, pull_request_id, diagnostic);
+    try checkVerdict(init.io, gpa, bbr.bitbucket.Client.init(transport.httpClient(), cred).withDiagnostics(diagnostic), repo, pull_request_id, diagnostic);
 }
 
-fn checkVerdict(gpa: std.mem.Allocator, bb: bbr.bitbucket.Client, repo: []const u8, pull_request_id: u64, diagnostic: bbr.diagnostics.Handle) !void {
+fn checkVerdict(io: std.Io, gpa: std.mem.Allocator, bb: bbr.bitbucket.Client, repo: []const u8, pull_request_id: u64, diagnostic: bbr.diagnostics.Handle) !void {
     const account_uuid = try bb.getAuthenticatedAccountUuid(gpa);
     defer gpa.free(account_uuid);
     const initial_pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
@@ -733,9 +729,9 @@ fn checkVerdict(gpa: std.mem.Allocator, bb: bbr.bitbucket.Client, repo: []const 
     };
 
     const changed = try bb.changeReviewerVerdict(gpa, repo, pull_request_id, initial_pull_request.source_commit, account_uuid, target);
-    if (!verdictChangeSucceeded(changed)) return verdictChangeFailed(diagnostic, changed, error.ReviewerVerdictChangeFailed, @src());
+    if (!verdictChangeSucceeded(changed)) return verdictChangeFailed(io, diagnostic, changed, error.ReviewerVerdictChangeFailed, @src());
     const restore_result = try restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial);
-    if (!verdictChangeSucceeded(restore_result)) return verdictChangeFailed(diagnostic, restore_result, error.ReviewerVerdictRestoreFailed, @src());
+    if (!verdictChangeSucceeded(restore_result)) return verdictChangeFailed(io, diagnostic, restore_result, error.ReviewerVerdictRestoreFailed, @src());
     restored = true;
     std.debug.print("ok: changed Reviewer Verdict from {s} to {s} and restored it\n", .{ @tagName(initial), @tagName(target) });
 }
@@ -763,11 +759,9 @@ fn verdictChangeCause(result: bbr.bitbucket.ReviewerVerdictChangeResult, failure
 }
 
 /// Shows a failed change with the cause that its result names, and records that cause once.
-fn verdictChangeFailed(diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+fn verdictChangeFailed(io: std.Io, diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
     const cause = verdictChangeCause(result, failure);
-    const reported = diagnostic.forContext(.verdict, .{}).fail(.execute, .{ .zig = cause }, source);
-    std.debug.print("bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) });
-    return reported;
+    return bbr.cli_failure.fail(io, diagnostic.forContext(.verdict, .{}), .execute, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) } });
 }
 
 fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) bool {
@@ -1343,10 +1337,8 @@ fn invalidUsage(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime so
     usage();
 }
 
-fn configLoadFailed(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
-    const reported = diagnostic.forContext(.configuration, .{}).fail(.read, .{ .zig = cause }, source);
-    std.debug.print("bbr: could not load configuration: {s}\n", .{@errorName(cause)});
-    return reported;
+fn configLoadFailed(io: std.Io, diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    return bbr.cli_failure.fail(io, diagnostic.forContext(.configuration, .{}), .read, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr: could not load configuration: {s}\n", .{@errorName(cause)} });
 }
 
 fn reportConfigFailure(diagnostic: bbr.diagnostics.Handle, failure: config.Failure) void {
@@ -1649,7 +1641,7 @@ test "diagnostics an unresolved check-verdict change has one record and reaches 
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
     const handle = sink.handle(.verdict, .{});
     const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "w" }).withDiagnostics(handle);
-    try testing.expectError(error.Reported, checkVerdict(testing.allocator, bb, "repo", 42, handle));
+    try testing.expectError(error.Reported, checkVerdict(testing.io, testing.allocator, bb, "repo", 42, handle));
     try testing.expectEqual(responses.len, fake.call_count);
     _ = sink.setEnabled(false);
     var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });

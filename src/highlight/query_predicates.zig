@@ -28,14 +28,23 @@ pub const Diagnostic = struct {
     };
 
     pub fn report(self: Diagnostic) void {
+        var buffer: [512]u8 = undefined;
+        const stderr = std.debug.lockStderr(&buffer);
+        defer std.debug.unlockStderr();
+        write(&stderr.file_writer.interface, self) catch |err| switch (err) {
+            error.WriteFailed => return,
+        };
+    }
+
+    pub fn write(writer: *std.Io.Writer, self: Diagnostic) std.Io.Writer.Error!void {
         const query_kind = @tagName(self.query_kind);
         if (self.regex_failure) |failure| {
-            std.debug.print("error: {s}-query:{d}:{d}: invalid #match? expression for {s}: {s}\n", .{ query_kind, self.line, self.column, regex_mod.engine, @tagName(failure.reason) });
-            std.debug.print("error: engine-code: {d}; engine-fragment: {s}; dialect: {s}\n", .{ failure.engine_code, failure.fragment(), regex_mod.dialect });
+            try writer.print("error: {s}-query:{d}:{d}: invalid #match? expression for {s}: {s}\n", .{ query_kind, self.line, self.column, regex_mod.engine, @tagName(failure.reason) });
+            try writer.print("error: engine-code: {d}; engine-fragment: {s}; dialect: {s}\n", .{ failure.engine_code, failure.fragment(), regex_mod.dialect });
         } else if (self.kind == .invalid_query) {
-            std.debug.print("error: {s}-query:{d}:{d}: invalid query\n", .{ query_kind, self.line, self.column });
+            try writer.print("error: {s}-query:{d}:{d}: invalid query\n", .{ query_kind, self.line, self.column });
         } else {
-            std.debug.print("error: {s}-query:{d}:{d}: invalid predicate: {s}\n", .{ query_kind, self.line, self.column, @tagName(self.kind) });
+            try writer.print("error: {s}-query:{d}:{d}: invalid predicate: {s}\n", .{ query_kind, self.line, self.column, @tagName(self.kind) });
         }
     }
 
