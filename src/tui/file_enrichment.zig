@@ -289,8 +289,7 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
     };
     const old = old_future.await(io) catch |err| {
         req.diagnostic.adopt(&old_slot);
-        var new = new_future.await(io) catch return error.OutOfMemory;
-        new.deinit();
+        dropSide(task_req, .new, new_future.await(io), &new_slot);
         return err;
     };
     errdefer {
@@ -304,6 +303,16 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
         },
     };
     return .{ .old = old, .new = new };
+}
+
+/// Releases a side that the result drops. The caller receives the failure of the other side,
+/// so a failure of this side has its record here, with the evidence of its own slot.
+fn dropSide(req: Request, side: Side, outcome: error{OutOfMemory}!SideResult, task_slot: *?bbr.diagnostic.Leaf) void {
+    var result = outcome catch |err| {
+        _ = sideDiagnostic(req.diagnostic.withLeaf(task_slot), side).failure(.execute, .{ .zig = err }, @src());
+        return;
+    };
+    result.deinit();
 }
 
 pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
@@ -1785,6 +1794,56 @@ test "diagnostics a transport OutOfMemory on one File side keeps its phase in th
     try testing.expect(lines.next() == null);
     try testing.expect(std.mem.indexOf(u8, only, "operation=file_enrichment phase=receive_body source=tui/file_enrichment.zig:") != null);
     try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
+}
+
+test "diagnostics a second File side that fails with OutOfMemory has its own record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/destination/", .send_error = error.OutOfMemory, .send_phase = .receive_body },
+        .{ .request_key = "/source/", .send_error = error.OutOfMemory, .send_phase = .send_body },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.file_enrichment, .{ .command_id = 6 }).withLeaf(&leaf);
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(boundary);
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    try testing.expectError(error.OutOfMemory, enrichConcurrent(testing.io, testing.allocator, bb, plain.highlighter(), .{
+        .repo = "repo",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "file.zig",
+        .new_path = "file.zig",
+        .max_file_bytes = 0,
+        .diagnostic = boundary,
+    }));
+    _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const dropped = lines.next() orelse return error.TestUnexpectedResult;
+    const returned = lines.next() orelse return error.TestUnexpectedResult;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, dropped, "operation=file_enrichment phase=send_body ") != null);
+    try testing.expect(std.mem.indexOf(u8, dropped, "side=new") != null);
+    try testing.expect(std.mem.endsWith(u8, dropped, "cause=zig error=OutOfMemory"));
+    try testing.expect(std.mem.indexOf(u8, returned, "operation=file_enrichment phase=receive_body ") != null);
+    try testing.expect(std.mem.endsWith(u8, returned, "cause=zig error=OutOfMemory"));
 }
 
 test "diagnostics a failed local blob read keeps the git termination in the record of its File side" {
