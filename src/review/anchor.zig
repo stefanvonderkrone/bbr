@@ -42,6 +42,8 @@ pub fn findScope(entries: []const ScopeProjectionEntry, temp_id: @import("draft.
     return null;
 }
 
+/// A resolver turns an expected failure, such as an unavailable Git transition, into
+/// `.unavailable` and records it. An error that it returns fails the caller.
 pub const ScopeResolver = struct {
     ptr: *anyopaque,
     resolve_fn: *const fn (*anyopaque, Allocator, CommentScope, []const u8) anyerror!ScopeResolution,
@@ -117,14 +119,17 @@ pub const GitAnchorResolver = struct {
         const key = try std.fmt.allocPrint(cache, "{s}\x00{s}", .{ authored_commit, current_commit });
         if (self.unavailable_transitions.contains(key)) return null;
         if (self.transitions.get(key)) |cached| return cached;
-        const raw = self.git.diff(cache, authored_commit, current_commit) catch |err| return self.unavailable(key, .execute, err, @src());
-        const parsed_transition = parser.parse(cache, raw) catch |err| return self.unavailable(key, .decode, err, @src());
+        // Each call owns its slot, so a transition read on any thread keeps its own evidence.
+        var leaf: ?diagnostics.Leaf = null;
+        const diagnostic = self.diagnostic.withLeaf(&leaf);
+        const raw = self.git.diff(cache, authored_commit, current_commit, diagnostic) catch |err| return self.unavailable(diagnostic, key, .execute, err, @src());
+        const parsed_transition = parser.parse(cache, raw) catch |err| return self.unavailable(diagnostic, key, .decode, err, @src());
         try self.transitions.put(cache, key, parsed_transition);
         return parsed_transition;
     }
 
-    fn unavailable(self: *GitAnchorResolver, key: []const u8, phase: diagnostics.Phase, cause: anyerror, comptime source: std.builtin.SourceLocation) !?diff_mod.Diff {
-        _ = self.diagnostic.failure(phase, .{ .zig = cause }, source);
+    fn unavailable(self: *GitAnchorResolver, diagnostic: diagnostics.Handle, key: []const u8, phase: diagnostics.Phase, cause: anyerror, comptime source: std.builtin.SourceLocation) !?diff_mod.Diff {
+        _ = diagnostic.failure(phase, .{ .zig = cause }, source);
         try self.unavailable_transitions.put(self.cache_arena.allocator(), key, {});
         return null;
     }
@@ -378,6 +383,47 @@ test "diagnostics each unavailable Git transition has one record with its cause"
     try testing.expect(std.mem.indexOf(u8, parse_failure, "operation=git phase=decode source=review/anchor.zig:") != null);
     try testing.expect(std.mem.endsWith(u8, parse_failure, "cause=zig error=MalformedHunkHeader"));
     try testing.expect(lines.next() == null);
+}
+
+test "diagnostics an unavailable Git transition keeps the git termination in its record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    // Outside a worktree, git diff compares files instead. In an empty repository the commits
+    // are unknown, so git diff exits with 128.
+    const repo_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(repo_path);
+    const init_result = try std.process.run(testing.allocator, testing.io, .{ .argv = &.{ "git", "init", "-q", repo_path } });
+    testing.allocator.free(init_result.stdout);
+    testing.allocator.free(init_result.stderr);
+    var git = git_mod.ShellGitClient.init(testing.allocator, testing.io);
+    git.cwd = .{ .path = repo_path };
+    // As in the TUI, the resolver handle has no slot of its own.
+    var resolver = GitAnchorResolver.init(testing.allocator, git.gitClient(), sink.handle(.git, .{}));
+    defer resolver.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try resolver.resolver().resolve(arena.allocator(), .{ .path = "f.zig", .to = 1, .commit = "missing" }, "new")) == .unavailable);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only, "operation=git phase=execute source=review/anchor.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=git termination=exited code=128 error=UnknownRef"));
 }
 
 test "scope resolution exhausts Review and all File outcomes" {

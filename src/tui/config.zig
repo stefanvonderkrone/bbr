@@ -131,22 +131,14 @@ pub fn loadSnapshot(allocator: std.mem.Allocator, snapshot: config_source.Snapsh
     };
 }
 
-pub const PersistThemeError = error{
-    /// `xdg.configFile` resolves no path: no absolute XDG_CONFIG_HOME and no HOME.
-    NoConfigLocation,
-    /// The file is over 64 KiB, or the rewritten file does not parse.
-    /// Nothing is written.
-    ConfigInvalid,
-    WriteFailed,
-    OutOfMemory,
-};
-
 /// Write `id` as the root `theme` of config.toml and keep every other byte.
 /// The rewritten file must parse before it replaces the old one. An existing
 /// file that already names `id` is not written. The write is atomic and
 /// durable, keeps the file's permissions, follows a symlinked config.toml to
 /// its target, and creates the `bbr` directory when it is absent.
-pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, id: ThemeId) PersistThemeError!void {
+/// A missing file is an empty source. A file over 64 KiB is `error.ConfigInvalid`.
+/// Every other read error, including `error.OutOfMemory`, keeps its name.
+pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, id: ThemeId) !void {
     const config_path = (try xdg.configFile(allocator, env)) orelse return error.NoConfigLocation;
     defer allocator.free(config_path);
     var exists = true;
@@ -156,8 +148,7 @@ pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.pr
             break :blk try allocator.dupe(u8, "");
         },
         error.StreamTooLong => return error.ConfigInvalid,
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.WriteFailed,
+        else => return err,
     };
     defer allocator.free(source);
     const next = try rewriteTheme(allocator, source, id.name());
@@ -168,6 +159,7 @@ pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.pr
     if (parsed == .invalid) return error.ConfigInvalid;
     writeAtomically(allocator, io, config_path, next) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
         else => error.WriteFailed,
     };
 }
@@ -347,13 +339,17 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             const override: keymap.Override = .{ .action = key, .sequences = sequences };
             keymap.validateOverride(override) catch |err| {
                 allocator.free(sequences);
-                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = switch (err) {
-                    error.UnknownAction => "unknown Action name",
-                    error.UnknownKey => "unknown key name",
-                    error.SequenceTooLong => "key sequence exceeds eight chords",
-                    error.CountConflict => "key sequence cannot begin with a Count digit",
-                    else => "invalid key sequence",
-                }, .hint = if (err == error.UnknownAction) "use an Action name shown in the Keybindings Overlay" else null });
+                const diagnosed: struct { message: []const u8, hint: ?[]const u8 } = switch (err) {
+                    error.UnknownAction => .{
+                        .message = "unknown Action name",
+                        .hint = "use an Action name shown in the Keybindings Overlay",
+                    },
+                    error.UnknownKey => .{ .message = "unknown key name", .hint = null },
+                    error.SequenceTooLong => .{ .message = "key sequence exceeds eight chords", .hint = null },
+                    error.CountConflict => .{ .message = "key sequence cannot begin with a Count digit", .hint = null },
+                    error.EmptySequence, error.MissingKey => .{ .message = "invalid key sequence", .hint = null },
+                };
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = diagnosed.message, .hint = diagnosed.hint });
                 continue;
             };
             try overrides.append(allocator, override);
@@ -833,6 +829,19 @@ test "rewriteTheme replaces or adds only the root theme value" {
     try expectRewrite("# only a comment", "# only a comment\ntheme = \"solarized-dark\"\n");
     try expectRewrite("# only a comment\n", "# only a comment\ntheme = \"solarized-dark\"\n");
     try expectRewrite("", "theme = \"solarized-dark\"\n");
+}
+
+test "persistTheme reports a directory config.toml as a read failure" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+    try tmp.dir.createDirPath(io, "bbr/config.toml");
+    try testing.expectError(error.IsDir, persistTheme(testing.allocator, io, &env, .light));
 }
 
 test "persistTheme writes config.toml atomically through a symlink and refuses an invalid file" {
