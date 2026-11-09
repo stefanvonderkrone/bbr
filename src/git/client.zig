@@ -232,9 +232,18 @@ pub const ShellGitClient = struct {
         if (std.mem.startsWith(u8, source_ref, heads)) {
             const branch = source_ref[heads.len..];
             const key = try std.fmt.allocPrint(sa, "branch.{s}.remote", .{branch});
-            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                error.OutOfMemory => return error.OutOfMemory,
+            var leaf: ?diagnostics.Leaf = null;
+            var lookup = self.*;
+            lookup.diagnostic = self.diagnostic.withLeaf(&leaf);
+            remote_name = lookup.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch |err| switch (err) {
+                error.Canceled => {
+                    self.diagnostic.adopt(&leaf);
+                    return error.Canceled;
+                },
+                error.OutOfMemory => {
+                    self.diagnostic.adopt(&leaf);
+                    return error.OutOfMemory;
+                },
                 else => "origin",
             };
             if (std.mem.eql(u8, remote_name, ".")) return error.NoDefaultBaseRef;
@@ -322,9 +331,18 @@ pub const ShellGitClient = struct {
         if (std.mem.startsWith(u8, source_ref, heads)) {
             const branch = source_ref[heads.len..];
             const key = try std.fmt.allocPrint(sa, "branch.{s}.remote", .{branch});
-            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                error.OutOfMemory => return error.OutOfMemory,
+            var leaf: ?diagnostics.Leaf = null;
+            var lookup = self.*;
+            lookup.diagnostic = self.diagnostic.withLeaf(&leaf);
+            remote_name = lookup.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch |err| switch (err) {
+                error.Canceled => {
+                    self.diagnostic.adopt(&leaf);
+                    return error.Canceled;
+                },
+                error.OutOfMemory => {
+                    self.diagnostic.adopt(&leaf);
+                    return error.OutOfMemory;
+                },
                 else => "origin",
             };
             if (std.mem.eql(u8, remote_name, ".")) return error.NoRemote;
@@ -338,9 +356,18 @@ pub const ShellGitClient = struct {
     /// Returns an empty slice when none are configured. All memory is `sa`-owned.
     fn readInsteadOf(self: *ShellGitClient, sa: Allocator) ![]Rewrite {
         // A missing key makes git exit 1; treat that as "no rewrites".
-        const out = self.run(sa, &.{ "git", "config", "--get-regexp", "url\\..*\\.insteadof" }, error.NoRemote) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            error.OutOfMemory => return error.OutOfMemory,
+        var leaf: ?diagnostics.Leaf = null;
+        var lookup = self.*;
+        lookup.diagnostic = self.diagnostic.withLeaf(&leaf);
+        const out = lookup.run(sa, &.{ "git", "config", "--get-regexp", "url\\..*\\.insteadof" }, error.NoRemote) catch |err| switch (err) {
+            error.Canceled => {
+                self.diagnostic.adopt(&leaf);
+                return error.Canceled;
+            },
+            error.OutOfMemory => {
+                self.diagnostic.adopt(&leaf);
+                return error.OutOfMemory;
+            },
             else => return &.{},
         };
 
@@ -362,6 +389,54 @@ pub const ShellGitClient = struct {
         return list.toOwnedSlice(sa);
     }
 };
+
+test "diagnostics Git metadata fallbacks leave no evidence for a later failure" {
+    const Isolated = struct {
+        var env: *std.process.Environ.Map = undefined;
+
+        fn spawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+            var isolated = options;
+            isolated.environ_map = env;
+            return testing.io.vtable.processSpawn(userdata, isolated);
+        }
+    };
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("GIT_CONFIG_NOSYSTEM", "1");
+    try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    Isolated.env = &env;
+    var vtable = testing.io.vtable.*;
+    vtable.processSpawn = Isolated.spawn;
+    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    try runTestProcess(path, &.{ "git", "init", "-b", "main" });
+    try runTestProcess(path, &.{ "git", "remote", "add", "origin", "https://bitbucket.org/team/repo.git" });
+    try runTestProcess(path, &.{ "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main" });
+    var shell = ShellGitClient.init(testing.allocator, io);
+    shell.cwd = .{ .path = path };
+    var leaf: ?diagnostics.Leaf = null;
+    shell.diagnostic = (diagnostics.Handle{}).withLeaf(&leaf);
+    const client = shell.gitClient();
+
+    const base = try client.defaultBaseRef(testing.allocator, "refs/heads/main");
+    defer testing.allocator.free(base);
+    try testing.expectEqualStrings("refs/remotes/origin/main", base);
+    try testing.expect(shell.diagnostic.failure(.validate, .{ .zig = error.NoRemote }, @src()).cause == .zig);
+
+    const remote_name = try client.repositoryRemote(testing.allocator, "refs/heads/main");
+    defer testing.allocator.free(remote_name);
+    try testing.expectEqualStrings("bitbucket.org/team/repo", remote_name);
+    try testing.expect(shell.diagnostic.failure(.validate, .{ .zig = error.NoRemote }, @src()).cause == .zig);
+
+    const remote_value = try client.remote(testing.allocator);
+    defer testing.allocator.free(remote_value.workspace);
+    defer testing.allocator.free(remote_value.repo_slug);
+    try testing.expectEqualStrings("team", remote_value.workspace);
+    try testing.expect(shell.diagnostic.failure(.validate, .{ .zig = error.NoRemote }, @src()).cause == .zig);
+}
 
 test "diagnostics Git metadata fallbacks propagate cancellation and allocation failure" {
     const Failure = struct {

@@ -444,14 +444,14 @@ pub const Client = struct {
         const parsed = try parseResponse(Wire, self.diagnostic, allocator, metadata_body);
         defer parsed.deinit();
         const metadata = parsed.value;
-        if (!std.mem.eql(u8, metadata.type, "commit_file")) return error.BlobTypeMismatch;
-        if (!std.mem.eql(u8, metadata.path, path)) return error.BlobPathMismatch;
-        if (!hashMatches(metadata.commit.hash, commit)) return error.BlobCommitMismatch;
-        if (!stringSlicesEqual(metadata.attributes, expected_attributes)) return error.BlobAttributesMismatch;
+        if (!std.mem.eql(u8, metadata.type, "commit_file")) return noted(self.diagnostic, error.BlobTypeMismatch, .validate, null);
+        if (!std.mem.eql(u8, metadata.path, path)) return noted(self.diagnostic, error.BlobPathMismatch, .validate, null);
+        if (!hashMatches(metadata.commit.hash, commit)) return noted(self.diagnostic, error.BlobCommitMismatch, .validate, null);
+        if (!stringSlicesEqual(metadata.attributes, expected_attributes)) return noted(self.diagnostic, error.BlobAttributesMismatch, .validate, null);
 
         const raw = try self.getFileBlob(allocator, repo_slug, commit, path);
         defer allocator.free(raw);
-        if (metadata.size != raw.len) return error.BlobSizeMismatch;
+        if (metadata.size != raw.len) return noted(self.diagnostic, error.BlobSizeMismatch, .validate, null);
         return raw.len;
     }
 
@@ -466,7 +466,7 @@ pub const Client = struct {
         var url_buf: std.ArrayList(u8) = .empty;
         defer url_buf.deinit(allocator);
         try url_buf.print(allocator, "{s}/repositories/{s}/{s}/src/{s}/", .{ base_url, self.cred.workspace, repo_slug, commit });
-        if (!git_path.isRepositoryRelative(path)) return error.InvalidPath;
+        if (!git_path.isRepositoryRelative(path)) return noted(self.diagnostic, error.InvalidPath, .prepare, null);
         try appendEncodedPath(allocator, &url_buf, path);
         if (metadata) try url_buf.appendSlice(allocator, "?format=meta");
         const url = try url_buf.toOwnedSlice(allocator);
@@ -1001,7 +1001,14 @@ pub const Client = struct {
         const slots = try allocator.alloc(Lists.Slot, opts.concurrency);
         for (slots) |*slot| slot.* = .{};
         defer {
-            for (slots) |*slot| slot.deinit(allocator);
+            for (slots) |*slot| {
+                if (slot.err) |err| {
+                    var diagnostic = self.diagnostic.withLeaf(&slot.leaf);
+                    diagnostic.context.page = slot.page_number;
+                    _ = diagnostic.failure(.read, .{ .zig = err }, @src());
+                }
+                slot.deinit(allocator);
+            }
             allocator.free(slots);
         }
         const completions = try allocator.alloc(PageCompletion, slots.len);
@@ -1682,7 +1689,7 @@ pub const Client = struct {
         const parsed = try parseResponse(Wire, self.diagnostic, allocator, metadata_body);
         defer parsed.deinit();
         const m = parsed.value;
-        if (!std.mem.eql(u8, m.type, "commit_file")) return error.BlobTypeMismatch;
+        if (!std.mem.eql(u8, m.type, "commit_file")) return noted(self.diagnostic, error.BlobTypeMismatch, .validate, null);
         const attrs = try allocator.alloc([]const u8, m.attributes.len);
         var copied: usize = 0;
         errdefer {
@@ -1998,6 +2005,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
         }
 
         fn complete(self: *Self, slot: *Slot) !void {
+            defer slot.err = null;
             const state = &self.lists[slot.position.list].pages.items[slot.position.number - 1];
             const items = self.accept(slot) catch |err| switch (err) {
                 error.OutOfMemory => {
@@ -4165,6 +4173,47 @@ test "checkFileBlob accepts nonempty equivalent commit prefixes and preserves va
         }
         try testing.expectEqual(case.expected_calls, fake.call_count);
     }
+}
+
+test "diagnostics blob validation replaces stale evidence with its own phase and cause" {
+    const cases = [_]struct { body: []const u8, err: anyerror }{
+        .{ .body = "{\"type\":\"directory\",\"path\":\"a\",\"commit\":{\"hash\":\"abc\"},\"size\":1,\"attributes\":[]}", .err = error.BlobTypeMismatch },
+        .{ .body = "{\"type\":\"commit_file\",\"path\":\"b\",\"commit\":{\"hash\":\"abc\"},\"size\":1,\"attributes\":[]}", .err = error.BlobPathMismatch },
+        .{ .body = "{\"type\":\"commit_file\",\"path\":\"a\",\"commit\":{\"hash\":\"def\"},\"size\":1,\"attributes\":[]}", .err = error.BlobCommitMismatch },
+        .{ .body = "{\"type\":\"commit_file\",\"path\":\"a\",\"commit\":{\"hash\":\"abc\"},\"size\":1,\"attributes\":[\"executable\"]}", .err = error.BlobAttributesMismatch },
+        .{ .body = "{\"type\":\"commit_file\",\"path\":\"a\",\"commit\":{\"hash\":\"abc\"},\"size\":2,\"attributes\":[]}", .err = error.BlobSizeMismatch },
+    };
+    for (cases) |case| {
+        const responses = [_]httpc_fixture.Canned{ .{ .body = case.body }, .{ .body = "x" } };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        var leaf: ?diagnostics.Leaf = null;
+        const boundary = (diagnostics.Handle{}).withLeaf(&leaf);
+        boundary.note(.{ .err = case.err, .phase = .rejection, .cause = .{ .http = .{ .status = 503, .classification = .server } } });
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+        try testing.expectError(case.err, bb.checkFileBlob(testing.allocator, "repo", "abc", "a", &.{}));
+        const failure = boundary.failure(.execute, .{ .zig = case.err }, @src());
+        try testing.expectEqual(diagnostics.Phase.validate, failure.phase);
+        try testing.expectEqual(case.err, failure.cause.zig);
+        if (case.err == error.BlobTypeMismatch) {
+            var metadata_fake: FakeHttpClient = .{ .body = case.body };
+            const metadata_bb = Client.init(metadata_fake.httpClient(), testCredential()).withDiagnostics(boundary);
+            boundary.note(.{ .err = case.err, .phase = .rejection });
+            try testing.expectError(case.err, metadata_bb.getFileMeta(testing.allocator, "repo", "abc", "a"));
+            const metadata_failure = boundary.failure(.execute, .{ .zig = case.err }, @src());
+            try testing.expectEqual(diagnostics.Phase.validate, metadata_failure.phase);
+            try testing.expectEqual(case.err, metadata_failure.cause.zig);
+        }
+    }
+    var fake: FakeHttpClient = .{};
+    var leaf: ?diagnostics.Leaf = null;
+    const boundary = (diagnostics.Handle{}).withLeaf(&leaf);
+    boundary.note(.{ .err = error.InvalidPath, .phase = .rejection });
+    const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+    try testing.expectError(error.InvalidPath, bb.getFileBlob(testing.allocator, "repo", "abc", "../a"));
+    const failure = boundary.failure(.execute, .{ .zig = error.InvalidPath }, @src());
+    try testing.expectEqual(diagnostics.Phase.prepare, failure.phase);
+    try testing.expectEqual(error.InvalidPath, failure.cause.zig);
+    try testing.expectEqual(@as(usize, 0), fake.call_count);
 }
 
 test "getFileBlob accepts empty bytes as a successful response" {
@@ -6491,4 +6540,64 @@ test "partial responses request exactly the decoded PullRequest and Repository f
         partialFields(PrListPage),
     );
     try testing.expectEqualStrings("values.slug,values.full_name,values.name,values.uuid,values.is_private,next,page,pagelen,size", partialFields(RepositoryPage));
+}
+
+test "diagnostics coordinator allocation failures keep every joined page failure record" {
+    for ([_]usize{ 1, 3 }) |concurrency| {
+        var failed_with_requests = false;
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            try testing.expect(fail_index < 100);
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+            defer testing.allocator.free(home);
+            var env = std.process.Environ.Map.init(testing.allocator);
+            defer env.deinit();
+            try env.put("XDG_STATE_HOME", home);
+            var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+            defer sink.deinit();
+            try testing.expect(sink.setEnabled(true) == .on);
+            var leaf: ?diagnostics.Leaf = null;
+            const boundary = sink.handle(.picker_list, .{}).withLeaf(&leaf);
+            var fake: FakeHttpClient = .{ .status = 429, .body = "{}" };
+            const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            const items = bb.listWorkspacePullRequests(testing.io, failing.allocator(), .{
+                .scope = .{ .repositories = .{ .slugs = &.{ "gamma", "alpha", "beta" }, .party = .{ .reviewer = "{reviewer}" } } },
+            }, .{ .concurrency = concurrency }) catch |err| {
+                switch (err) {
+                    error.OutOfMemory => if (fake.call_count > 0) {
+                        failed_with_requests = true;
+                    },
+                    error.RateLimited => {},
+                    else => return err,
+                }
+                _ = boundary.failure(.execute, .{ .zig = err }, @src());
+                const bytes = try sinkRecords(tmp, &sink);
+                defer testing.allocator.free(bytes);
+                var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+                var page_records: usize = 0;
+                var coordinator_records: usize = 0;
+                while (lines.next()) |line| {
+                    if (std.mem.endsWith(u8, line, " cause=http status=429 classification=rate_limit")) {
+                        try testing.expect(std.mem.indexOf(u8, line, "operation=picker_list phase=rejection ") != null);
+                        try testing.expect(std.mem.indexOf(u8, line, " page=1 ") != null);
+                        page_records += 1;
+                    } else {
+                        try testing.expect(std.mem.endsWith(u8, line, " cause=zig error=OutOfMemory"));
+                        coordinator_records += 1;
+                    }
+                }
+                try testing.expectEqual(fake.call_count, page_records);
+                try testing.expectEqual(@as(usize, @intFromBool(err == error.OutOfMemory)), coordinator_records);
+                try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+                if (!failing.has_induced_failure) break;
+                continue;
+            };
+            defer deinitSummaries(failing.allocator(), items);
+            return error.TestUnexpectedResult;
+        }
+        if (concurrency > 1) try testing.expect(failed_with_requests);
+    }
 }
