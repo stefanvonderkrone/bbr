@@ -28,11 +28,37 @@ pub fn writeAll(io: std.Io, bytes: []const u8) !void {
 }
 
 fn cause(file_writer: *const std.Io.File.Writer, err: anytype) (@TypeOf(err) || std.Io.File.Writer.Error || error{StdoutClosed}) {
-    if (err != error.WriteFailed) return err;
+    // A body can return only `error.WriteFailed`, a wider set, or a set that
+    // does not contain it. Each shape needs its own switch so a prong is neither
+    // missing nor unreachable.
+    if (comptime !errorSetHas(@TypeOf(err), "WriteFailed")) return err;
+    if (comptime errorSetOnly(@TypeOf(err), "WriteFailed")) {
+        return switch (err) {
+            error.WriteFailed => writeFailure(file_writer, err),
+        };
+    }
+    return switch (err) {
+        error.WriteFailed => writeFailure(file_writer, err),
+        else => err,
+    };
+}
+
+fn writeFailure(file_writer: *const std.Io.File.Writer, err: anytype) (@TypeOf(err) || std.Io.File.Writer.Error || error{StdoutClosed}) {
     return switch (file_writer.err orelse return err) {
         error.BrokenPipe => error.StdoutClosed,
         else => |failure| failure,
     };
+}
+
+fn errorSetHas(comptime Set: type, comptime name: []const u8) bool {
+    const set = @typeInfo(Set).error_set orelse return true;
+    for (set) |item| if (std.mem.eql(u8, item.name, name)) return true;
+    return false;
+}
+
+fn errorSetOnly(comptime Set: type, comptime name: []const u8) bool {
+    const set = @typeInfo(Set).error_set orelse return false;
+    return set.len == 1 and std.mem.eql(u8, set[0].name, name);
 }
 
 const FailingStdout = struct {

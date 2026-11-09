@@ -75,7 +75,9 @@ fn matchesId(id: []const u8, fallback: []const u8) bool {
     while (parts.next()) |part| {
         if (part.len == 0 or part.len > 6) return false;
         for (part) |byte| if (!std.ascii.isHex(byte)) return false;
-        const scalar = std.fmt.parseInt(u21, part, 16) catch return false;
+        const scalar = std.fmt.parseInt(u21, part, 16) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return false,
+        };
         if (scalar != (scalars.nextCodepoint() orelse return false)) return false;
     }
     return scalars.nextCodepoint() == null;

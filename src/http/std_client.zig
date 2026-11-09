@@ -7,13 +7,12 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const http = std.http;
 const client = @import("client.zig");
+const diagnostics = @import("../diagnostics.zig");
 const HttpClient = client.HttpClient;
 const Request = client.Request;
 const Response = client.Response;
-const diagnostics = @import("../diagnostics.zig");
 
 pub const StdHttpClient = struct {
-    diagnostic: diagnostics.Handle = .{},
     inner: http.Client,
     max_connection_count: std.atomic.Value(usize) = .init(0),
     track_connection_count: bool = false,
@@ -35,7 +34,6 @@ pub const StdHttpClient = struct {
         arena: Allocator,
         environ_map: *const std.process.Environ.Map,
     ) !void {
-        errdefer |err| _ = self.diagnostic.failure(.proxy, .{ .zig = err }, @src());
         try validateProxyEnvironment(environ_map);
         try self.inner.initDefaultProxies(arena, environ_map);
     }
@@ -57,18 +55,16 @@ pub const StdHttpClient = struct {
 
     fn send(ptr: *anyopaque, allocator: Allocator, req: Request) anyerror!Response {
         const self: *StdHttpClient = @ptrCast(@alignCast(ptr));
-        const diagnostic = if (req.diagnostic.sink != null) req.diagnostic else self.diagnostic;
-        var phase: diagnostics.Phase = .prepare;
-        errdefer |err| _ = diagnostic.failure(phase, .{ .zig = err }, @src());
-
+        var unused: client.Phase = .prepare;
+        const phase = req.phase orelse &unused;
+        phase.* = .prepare;
         // Translate our headers into std's borrowed-header slice.
         const extra = try allocator.alloc(http.Header, req.headers.len);
         defer allocator.free(extra);
         for (req.headers, extra) |h, *out| out.* = .{ .name = h.name, .value = h.value };
-
-        phase = .uri;
+        phase.* = .uri;
         const uri = try std.Uri.parse(req.url);
-        phase = .connect;
+        phase.* = .connect;
         var request = try self.inner.request(toStdMethod(req.method), uri, .{
             .extra_headers = extra,
             .headers = .{ .accept_encoding = .omit },
@@ -78,7 +74,7 @@ pub const StdHttpClient = struct {
         defer request.deinit();
         request.accept_encoding = @splat(false);
         request.accept_encoding[@intFromEnum(http.ContentEncoding.identity)] = true;
-        phase = .send_body;
+        phase.* = .send_body;
         if (req.body) |payload| {
             request.transfer_encoding = .{ .content_length = payload.len };
             var request_body = try request.sendBodyUnflushed(&.{});
@@ -98,7 +94,7 @@ pub const StdHttpClient = struct {
         }
 
         var redirect_buffer: [8 * 1024]u8 = undefined;
-        phase = .receive_head;
+        phase.* = .receive_head;
         var response = try request.receiveHead(&redirect_buffer);
         const status: u16 = @intFromEnum(response.head.status);
         const retry_after_ms = if (status == 429 or status >= 500 and status <= 599)
@@ -116,7 +112,7 @@ pub const StdHttpClient = struct {
         const has_body = !(status == 204 or status == 304 or (status >= 100 and status < 200));
         if (!has_body) request.connection.?.closing = true;
         if (has_body) {
-            phase = .receive_body;
+            phase.* = .receive_body;
             var transfer_buffer: [64]u8 = undefined;
             const reader = response.reader(&transfer_buffer);
             _ = reader.streamRemaining(&body.writer) catch |err| switch (err) {
@@ -200,14 +196,18 @@ pub fn parseRetryAfter(value: []const u8, now_seconds: i64) ?u64 {
     const trimmed = std.mem.trim(u8, value, " \t");
     if (trimmed.len == 0) return null;
     if (std.fmt.parseInt(u64, trimmed, 10)) |seconds| {
-        const milliseconds = std.math.mul(u64, seconds, std.time.ms_per_s) catch return null;
+        const milliseconds = std.math.mul(u64, seconds, std.time.ms_per_s) catch |err| switch (err) {
+            error.Overflow => return null,
+        };
         return if (milliseconds <= std.math.maxInt(i64)) milliseconds else null;
     } else |_| {}
 
     const target = parseHttpDate(trimmed) orelse return null;
     if (target <= now_seconds) return null;
     const delay: u64 = @intCast(target - now_seconds);
-    const milliseconds = std.math.mul(u64, delay, std.time.ms_per_s) catch return null;
+    const milliseconds = std.math.mul(u64, delay, std.time.ms_per_s) catch |err| switch (err) {
+        error.Overflow => return null,
+    };
     return if (milliseconds <= std.math.maxInt(i64)) milliseconds else null;
 }
 
@@ -217,12 +217,22 @@ fn parseHttpDate(value: []const u8) ?i64 {
         value[7] != ' ' or value[11] != ' ' or value[16] != ' ' or
         value[19] != ':' or value[22] != ':' or !std.mem.eql(u8, value[25..], " GMT")) return null;
     const weekday = parseWeekday(value[0..3]) orelse return null;
-    const day = std.fmt.parseInt(u8, value[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, value[5..7], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
     const month = parseMonth(value[8..11]) orelse return null;
-    const year = std.fmt.parseInt(u16, value[12..16], 10) catch return null;
-    const hour = std.fmt.parseInt(u8, value[17..19], 10) catch return null;
-    const minute = std.fmt.parseInt(u8, value[20..22], 10) catch return null;
-    const second = std.fmt.parseInt(u8, value[23..25], 10) catch return null;
+    const year = std.fmt.parseInt(u16, value[12..16], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
+    const hour = std.fmt.parseInt(u8, value[17..19], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
+    const minute = std.fmt.parseInt(u8, value[20..22], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
+    const second = std.fmt.parseInt(u8, value[23..25], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return null,
+    };
     if (year < 1970 or day == 0 or day > daysInMonth(year, month) or hour > 23 or minute > 59 or second > 59) return null;
 
     var days: i64 = 0;
@@ -437,8 +447,8 @@ fn spinUntilAtLeast(value: *std.atomic.Value(usize), minimum: usize) !void {
 }
 
 fn serveTwo(server: *std.Io.net.Server, release: *std.atomic.Value(bool), accepted: *std.atomic.Value(usize), io: Io) !void {
-    var first = try io.concurrent(serveOne, .{ try server.accept(io), release, accepted, io });
-    var second = try io.concurrent(serveOne, .{ try server.accept(io), release, accepted, io });
+    var first = try diagnostics.concurrent(io, serveOne, .{ try server.accept(io), release, accepted, io });
+    var second = try diagnostics.concurrent(io, serveOne, .{ try server.accept(io), release, accepted, io });
     try first.await(io);
     try second.await(io);
 }

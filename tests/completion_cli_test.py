@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-completion-test-") as data_home:
             b"list-pull-requests", b"set-verdict", b"completion --list-profiles",
             b"create-branch", b"list-branches", b"get-branch",
             b"create-pull-request", b"update-pull-request", b"decline-pull-request",
-            b"list-commit-pull-requests",
+            b"list-commit-pull-requests", b"list-default-reviewers",
             b"list-workspace-members", b"search-workspace-members",
             b"auth", b"login status logout",
         ):

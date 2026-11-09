@@ -232,6 +232,14 @@ pub fn build(b: *std.Build) void {
     diagnostic_check.addFileArg(b.path("tools/check_diagnostics.py"));
     diagnostic_check.addDirectoryArg(b.path("."));
     test_step.dependOn(&diagnostic_check.step);
+    const error_comparisons = b.addSystemCommand(&.{"python3"});
+    error_comparisons.addFileArg(b.path("tools/check_error_comparisons.py"));
+    error_comparisons.addDirectoryArg(b.path("."));
+    test_step.dependOn(&error_comparisons.step);
+    const task_spawns = b.addSystemCommand(&.{"python3"});
+    task_spawns.addFileArg(b.path("tools/check_task_spawns.py"));
+    task_spawns.addDirectoryArg(b.path("."));
+    test_step.dependOn(&task_spawns.step);
     const diagnostic_tests = b.addTest(.{ .root_module = exe.root_module, .filters = &.{"diagnostics"} });
     const diagnostic_core_tests = b.addTest(.{ .root_module = mod, .filters = &.{"diagnostics"} });
     const diagnostic_step = b.step("test-diagnostics", "Run diagnostic logging checks");

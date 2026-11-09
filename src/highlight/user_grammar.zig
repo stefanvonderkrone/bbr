@@ -226,8 +226,11 @@ pub const Registry = struct {
         }
         for (installations.items) |*installation| if (installation.enabled) {
             _ = load(installation, allocator, diagnostic_handle) catch |err| {
-                _ = diagnostic_handle.failure(.prepare, .{ .zig = err }, @src());
                 installation.load_error = err;
+                switch (err) {
+                    error.Reported => {},
+                    else => _ = diagnostic_handle.failure(.prepare, .{ .zig = err }, @src()),
+                }
             };
         };
         return .{ .allocator = allocator, .installations = try installations.toOwnedSlice(allocator), .diagnostic_handle = diagnostic_handle };
@@ -276,10 +279,8 @@ pub const Registry = struct {
             defer std.Io.Dir.cwd().deleteTree(inspection.io, temporary.root) catch |err| {
                 _ = diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
             };
-            var library = std.DynLib.open(temporary.path) catch |err| {
-                _ = diagnostic_handle.failure(.open, .{ .zig = err }, @src());
-                return error.NativeLibraryLoadFailed;
-            };
+            var library = std.DynLib.open(temporary.path) catch |err|
+                return failTranslated(diagnostic_handle, .open, "NativeLibraryLoadFailed", err, @src());
             errdefer library.close();
             const symbol = try allocator.dupeZ(u8, inspection.manifest.symbol);
             defer allocator.free(symbol);
@@ -293,12 +294,12 @@ pub const Registry = struct {
                 findFile(inspection.files, inspection.manifest.highlight_query).?.bytes,
                 if (inspection.manifest.locals_query) |path| findFile(inspection.files, path).?.bytes else "",
                 &diagnostic,
-            ) catch |err| {
-                if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidPredicate) {
-                    diagnostic.record(diagnostic_handle, @src());
+            ) catch |err| switch (err) {
+                error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidPredicate => {
                     diagnostic.report();
-                }
-                return err;
+                    return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src());
+                },
+                else => return err,
             };
             installation.loaded = .{ .library = library, .language = language, .package = package };
         }
@@ -328,7 +329,9 @@ pub const Report = struct {
     affected_built_in_grammars: []const []const u8,
 
     pub fn digestHex(self: Report, buffer: *[64]u8) []const u8 {
-        return std.fmt.bufPrint(buffer, "{x}", .{self.digest}) catch unreachable;
+        return std.fmt.bufPrint(buffer, "{x}", .{self.digest}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
     }
 
     pub fn writeTrustPrompt(self: Report, writer: *std.Io.Writer) !void {
@@ -363,17 +366,17 @@ pub const Inspection = struct {
     /// only after this check succeeds.
     pub fn validateTrusted(self: *Inspection, trusted_sha256: []const u8, diagnostic_handle: diagnostics.Handle) !void {
         var expected: [64]u8 = undefined;
-        _ = std.fmt.bufPrint(&expected, "{x}", .{self.report.digest}) catch unreachable;
+        _ = std.fmt.bufPrint(&expected, "{x}", .{self.report.digest}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         if (!std.ascii.eqlIgnoreCase(&expected, trusted_sha256)) return error.UntrustedDigest;
         const temporary = try self.writeTemporaryLibrary(diagnostic_handle);
         defer std.Io.Dir.cwd().deleteTree(self.io, temporary.root) catch |err| {
             _ = diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
         };
         const library_path = temporary.path;
-        var library = std.DynLib.open(library_path) catch |err| {
-            _ = diagnostic_handle.failure(.open, .{ .zig = err }, @src());
-            return error.NativeLibraryLoadFailed;
-        };
+        var library = std.DynLib.open(library_path) catch |err|
+            return failTranslated(diagnostic_handle, .open, "NativeLibraryLoadFailed", err, @src());
         defer library.close();
         const symbol = try self.arena.allocator().dupeZ(u8, self.manifest.symbol);
         const language_fn = library.lookup(*const fn () callconv(.c) ?*const c.TSLanguage, symbol) orelse return error.MissingLanguageSymbol;
@@ -413,7 +416,7 @@ pub fn inspect(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagn
     const files = if (archive)
         try readArchive(a, io, path, diagnostic_handle)
     else
-        try readFolder(a, io, path, diagnostic_handle);
+        try readFolder(a, io, path);
     const manifest_file = findFile(files, manifest_name) orelse return error.MissingManifest;
     const manifest = try parseManifest(a, manifest_file.bytes);
     try validateManifest(manifest);
@@ -452,7 +455,7 @@ const Manifest = struct {
 
 const File = struct { path: []const u8, bytes: []const u8 };
 
-fn readFolder(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagnostic_handle: diagnostics.Handle) ![]File {
+fn readFolder(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]File {
     var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
     defer dir.close(io);
     var walker = try dir.walk(allocator);
@@ -467,25 +470,22 @@ fn readFolder(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagno
         }
         const file_path = try allocator.dupe(u8, entry.path);
         if (!safePath(file_path)) return error.UnsafePath;
-        const bytes = try readRegularFile(allocator, io, dir, file_path, diagnostic_handle);
-        total_bytes = std.math.add(usize, total_bytes, bytes.len) catch return error.BundleTooLarge;
+        const bytes = try readRegularFile(allocator, io, dir, file_path);
+        total_bytes = std.math.add(usize, total_bytes, bytes.len) catch |err| switch (err) {
+            error.Overflow => return error.BundleTooLarge,
+        };
         if (total_bytes > max_file_bytes or files.items.len >= 1024) return error.BundleTooLarge;
         try files.append(allocator, .{ .path = file_path, .bytes = bytes });
     }
     return files.toOwnedSlice(allocator);
 }
 
-fn readRegularFile(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, diagnostic_handle: diagnostics.Handle) ![]u8 {
+fn readRegularFile(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) ![]u8 {
     var file = try dir.openFile(io, path, .{ .follow_symlinks = false, .resolve_beneath = true });
     defer file.close(io);
     var reader = file.reader(io, &.{});
     return reader.interface.allocRemaining(allocator, .limited(max_file_bytes)) catch |err| switch (err) {
-        error.ReadFailed => {
-            if (reader.err.? != error.Canceled) {
-                _ = diagnostic_handle.failure(.read, .{ .zig = reader.err.? }, @src());
-            }
-            return reader.err.?;
-        },
+        error.ReadFailed => return reader.err.?,
         else => |other| return other,
     };
 }
@@ -495,11 +495,9 @@ fn readArchive(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagn
     var input: std.Io.Reader = .fixed(compressed);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor = std.compress.flate.Decompress.init(&input, .gzip, &window);
-    const tar_bytes = decompressor.reader.allocRemaining(allocator, .limited(max_file_bytes + 1)) catch |err| {
-        if (err != error.StreamTooLong) {
-            _ = diagnostic_handle.failure(.decode, .{ .zig = decompressor.err orelse err }, @src());
-        }
-        return error.InvalidArchive;
+    const tar_bytes = decompressor.reader.allocRemaining(allocator, .limited(max_file_bytes + 1)) catch |err| switch (err) {
+        error.StreamTooLong => return error.InvalidArchive,
+        else => return failTranslated(diagnostic_handle, .decode, "InvalidArchive", decompressor.err orelse err, @src()),
     };
     if (tar_bytes.len > max_file_bytes) return error.ArchiveTooLarge;
     return parseTar(allocator, tar_bytes, diagnostic_handle);
@@ -517,29 +515,21 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, diagnostic_handle: 
             ended = true;
             break;
         }
-        const valid_checksum = validTarChecksum(header) catch |err| {
-            _ = diagnostic_handle.failure(.decode, .{ .zig = err }, @src());
-            return error.InvalidArchive;
-        };
+        const valid_checksum = validTarChecksum(header) catch |err|
+            return failTranslated(diagnostic_handle, .decode, "InvalidArchive", err, @src());
         if (!valid_checksum) return error.InvalidArchive;
-        var name = tarPath(header, allocator) catch |err| {
-            _ = diagnostic_handle.failure(.decode, .{ .zig = err }, @src());
-            return error.InvalidArchive;
-        };
+        var name = tarPath(header, allocator) catch |err|
+            return failTranslated(diagnostic_handle, .decode, "InvalidArchive", err, @src());
         const kind = header[156];
         if (kind == '5' and std.mem.endsWith(u8, name, "/")) name = name[0 .. name.len - 1];
         if (!safePath(name)) return error.UnsafePath;
         for (seen.items) |previous| if (std.mem.eql(u8, previous, name)) return error.DuplicateArchiveEntry;
         try seen.append(allocator, name);
-        const size = parseTarOctal(header[124..136]) catch |err| {
-            _ = diagnostic_handle.failure(.decode, .{ .zig = err }, @src());
-            return error.InvalidArchive;
-        };
+        const size = parseTarOctal(header[124..136]) catch |err|
+            return failTranslated(diagnostic_handle, .decode, "InvalidArchive", err, @src());
         const data_start = at + 512;
-        const data_end = std.math.add(usize, data_start, size) catch |err| {
-            _ = diagnostic_handle.failure(.decode, .{ .zig = err }, @src());
-            return error.InvalidArchive;
-        };
+        const data_end = std.math.add(usize, data_start, size) catch |err|
+            return failTranslated(diagnostic_handle, .decode, "InvalidArchive", err, @src());
         if (data_end > bytes.len) return error.InvalidArchive;
         if (kind == '5') {
             if (size != 0) return error.InvalidArchive;
@@ -647,7 +637,9 @@ fn parseManifest(allocator: std.mem.Allocator, source: []const u8) !Manifest {
 fn setRootField(manifest: *Manifest, key: []const u8, raw: []const u8) !void {
     if (std.mem.eql(u8, key, "tree_sitter_abi")) {
         if (manifest.tree_sitter_abi != null) return error.DuplicateManifestField;
-        manifest.tree_sitter_abi = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidManifest;
+        manifest.tree_sitter_abi = std.fmt.parseInt(u32, raw, 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return error.InvalidManifest,
+        };
         return;
     }
     const value = try parseString(raw);
@@ -681,7 +673,9 @@ fn parseStringArray(allocator: std.mem.Allocator, raw: []const u8, output: *std.
 
 fn validateManifest(manifest: Manifest) !void {
     if (!validName(manifest.name) or manifest.version.len == 0 or !validSymbol(manifest.symbol)) return error.InvalidGrammarIdentity;
-    _ = std.SemanticVersion.parse(manifest.version) catch return error.InvalidGrammarVersion;
+    _ = std.SemanticVersion.parse(manifest.version) catch |err| switch (err) {
+        error.InvalidVersion, error.Overflow => return error.InvalidGrammarVersion,
+    };
     if (!std.mem.eql(u8, manifest.os, @tagName(builtin.os.tag)) or !std.mem.eql(u8, manifest.arch, @tagName(builtin.cpu.arch))) return error.TargetMismatch;
     if (manifest.tree_sitter_abi == null or manifest.library.len == 0 or manifest.highlight_query.len == 0) return error.InvalidManifest;
     if (manifest.tree_sitter_abi.? < c.TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION or manifest.tree_sitter_abi.? > c.TREE_SITTER_LANGUAGE_VERSION) return error.TreeSitterAbiMismatch;
@@ -744,20 +738,20 @@ fn validateQuery(allocator: std.mem.Allocator, language: *const c.TSLanguage, so
     var query_error: c.TSQueryError = undefined;
     const query = c.ts_query_new(language, source.ptr, @intCast(source.len), &offset, &query_error) orelse {
         const failure = queryDiagnostic(source, offset, kind, query_error);
-        failure.record(diagnostic_handle, @src());
         if (diagnostic) |output| output.* = failure;
-        return if (kind == .highlight) error.InvalidHighlightQuery else error.InvalidLocalsQuery;
+        failure.report();
+        return diagnostic_handle.fail(.query, failure.cause().?, @src());
     };
     defer c.ts_query_delete(query);
     var predicate_diagnostic: predicate_mod.Diagnostic = undefined;
-    const predicates = predicate_mod.Set.validate(allocator, query, source, &predicate_diagnostic) catch |err| {
-        _ = diagnostic_handle.failure(.query, .{ .zig = err }, @src());
-        if (err == error.InvalidPredicate) {
+    const predicates = predicate_mod.Set.validate(allocator, query, source, &predicate_diagnostic) catch |err| switch (err) {
+        error.InvalidPredicate => {
             predicate_diagnostic.query_kind = kind;
-            predicate_diagnostic.record(diagnostic_handle, @src());
             if (diagnostic) |output| output.* = predicate_diagnostic;
-        }
-        return error.InvalidPredicate;
+            predicate_diagnostic.report();
+            return diagnostic_handle.fail(.query, predicate_diagnostic.cause() orelse .{ .zig = err }, @src());
+        },
+        else => return failTranslated(diagnostic_handle, .query, "InvalidPredicate", err, @src()),
     };
     defer predicates.deinit(allocator);
     if (kind == .locals and (!queryHasCapture(query, "local.definition") or !queryHasCapture(query, "local.reference"))) return error.InvalidLocalsQuery;
@@ -860,7 +854,9 @@ fn validSymbol(symbol: []const u8) bool {
 }
 
 fn hasTerminalControl(value: []const u8) bool {
-    var view = std.unicode.Utf8View.init(value) catch return true;
+    var view = std.unicode.Utf8View.init(value) catch |err| switch (err) {
+        error.InvalidUtf8 => return true,
+    };
     var iterator = view.iterator();
     while (iterator.nextCodepoint()) |codepoint| {
         if (codepoint <= 0x1f or codepoint >= 0x7f and codepoint <= 0x9f or codepoint >= 0x202a and codepoint <= 0x202e or codepoint >= 0x2066 and codepoint <= 0x2069) return true;
@@ -868,10 +864,18 @@ fn hasTerminalControl(value: []const u8) bool {
     return false;
 }
 
+/// Prints the translated meaning and the leaf cause for the CLI, then records the leaf cause once.
+fn failTranslated(handle: diagnostics.Handle, phase: diagnostics.Phase, comptime meaning: []const u8, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    std.debug.print("bbr grammar: " ++ meaning ++ " ({s})\n", .{@errorName(cause)});
+    return handle.fail(phase, .{ .zig = cause }, source);
+}
+
 fn parseDigest(hex: []const u8) ![32]u8 {
     if (hex.len != 64) return error.InvalidDigest;
     var digest: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&digest, hex) catch return error.InvalidDigest;
+    _ = std.fmt.hexToBytes(&digest, hex) catch |err| switch (err) {
+        error.InvalidCharacter, error.InvalidLength, error.NoSpaceLeft => return error.InvalidDigest,
+    };
     return digest;
 }
 
@@ -895,8 +899,8 @@ test "diagnostics retain malformed gzip cause without archive contents or path" 
     });
     const path = try std.fs.path.join(testing.allocator, &.{ home, "private_archive_path_7a4.tar.gz" });
     defer testing.allocator.free(path);
-    try testing.expectError(error.InvalidArchive, inspect(testing.allocator, testing.io, path, .{}));
-    try testing.expectError(error.InvalidArchive, inspect(testing.allocator, testing.io, path, sink.handle(.grammar, .{})));
+    try testing.expectError(error.Reported, inspect(testing.allocator, testing.io, path, .{}));
+    try testing.expectError(error.Reported, inspect(testing.allocator, testing.io, path, sink.handle(.grammar, .{})));
     var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
     defer dir.close(testing.io);
     var iterator = dir.iterate();
@@ -922,7 +926,7 @@ test "diagnostics preserve predicate allocation cause before InvalidPredicate co
     try testing.expect(sink.setEnabled(true) == .on);
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var diagnostic: ?predicate_mod.Diagnostic = null;
-    try testing.expectError(error.InvalidPredicate, validateQuery(
+    try testing.expectError(error.Reported, validateQuery(
         failing.allocator(),
         tree_sitter_javascript().?,
         "(identifier) @private_capture_48c",
@@ -986,7 +990,7 @@ test "folder inspection validates exact payloads and reports native trust" {
     try testing.expect(std.mem.indexOf(u8, output.written(), "native code") != null);
     try testing.expectError(error.UntrustedDigest, inspection.validateTrusted("00" ** 32, .{}));
     var trusted_digest: [64]u8 = undefined;
-    try testing.expectError(error.NativeLibraryLoadFailed, inspection.validateTrusted(inspection.report.digestHex(&trusted_digest), .{}));
+    try testing.expectError(error.Reported, inspection.validateTrusted(inspection.report.digestHex(&trusted_digest), .{}));
 }
 
 test "folder inspection rejects extra files links and changed payload bytes" {
@@ -1074,7 +1078,7 @@ test "trusted native validation checks ABI queries predicates and regexes" {
         .{ .path = "highlights.scm", .bytes = "((identifier) @x (#match? @x \"(?=x)\"))" },
         .{ .path = "locals.scm", .bytes = "(identifier) @local.definition\n(identifier) @local.reference" },
     };
-    try testing.expectError(error.InvalidPredicate, validateLanguage(testing.allocator, language, manifest, &invalid_query, null, .{}));
+    try testing.expectError(error.Reported, validateLanguage(testing.allocator, language, manifest, &invalid_query, null, .{}));
 
     manifest.locals_query = null;
     const local_predicate = [_]File{.{ .path = "highlights.scm", .bytes = "((identifier) @variable.builtin (#is-not? local))" }};
@@ -1195,7 +1199,7 @@ test "registry reuses exact receipts and loads a matching UserGrammar on first u
 
     try testing.expectEqualStrings("second", registry.matchName("src/exact.fixture", "").?);
     try testing.expectEqualStrings("first", registry.matchName("src/other.first", "").?);
-    try testing.expectError(error.NativeLibraryLoadFailed, registry.grammar("src/other.first", ""));
+    try testing.expectError(error.Reported, registry.grammar("src/other.first", ""));
     const statuses = try registry.statuses(testing.allocator);
     defer testing.allocator.free(statuses);
     try testing.expect(!statuses[0].valid);
@@ -1218,7 +1222,7 @@ test "registry rejects stale active receipts but lists invalid inactive installa
         .trusted_digest = digest,
         .receipt = .{ .bundle_digest = digest, .bbr_identity = "old-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
     }};
-    try testing.expectError(error.NativeLibraryLoadFailed, Registry.init(testing.allocator, testing.io, &stale, &.{}, "test-build", .{}));
+    try testing.expectError(error.Reported, Registry.init(testing.allocator, testing.io, &stale, &.{}, "test-build", .{}));
 
     var payload = try tmp.dir.openFile(testing.io, "fixture/payload", .{ .mode = .write_only });
     try payload.writeStreamingAll(testing.io, "tampered");
@@ -1249,7 +1253,9 @@ fn digestHex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     var result: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch unreachable;
+    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
     return result;
 }
 
@@ -1306,14 +1312,22 @@ fn testTar(allocator: std.mem.Allocator, entries: []const TarTestEntry) ![]u8 {
     for (entries) |entry| {
         var header: [512]u8 = @splat(0);
         @memcpy(header[0..entry[0].len], entry[0]);
-        _ = std.fmt.bufPrint(header[100..108], "{o:0>7}\x00", .{@as(usize, 0o644)}) catch unreachable;
-        _ = std.fmt.bufPrint(header[124..136], "{o:0>11}\x00", .{entry[2].len}) catch unreachable;
+        _ = std.fmt.bufPrint(header[100..108], "{o:0>7}\x00", .{@as(usize, 0o644)}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
+        std.debug.assert(entry[2].len <= 0o77777777777);
+        _ = std.fmt.bufPrint(header[124..136], "{o:0>11}\x00", .{entry[2].len}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         @memset(header[148..156], ' ');
         header[156] = entry[1];
         @memcpy(header[257..263], "ustar\x00");
         var checksum: usize = 0;
         for (header) |byte| checksum += byte;
-        _ = std.fmt.bufPrint(header[148..156], "{o:0>6}\x00 ", .{checksum}) catch unreachable;
+        std.debug.assert(checksum <= 0o777777);
+        _ = std.fmt.bufPrint(header[148..156], "{o:0>6}\x00 ", .{checksum}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         try output.appendSlice(allocator, &header);
         try output.appendSlice(allocator, entry[2]);
         try output.appendNTimes(allocator, 0, std.mem.alignForward(usize, entry[2].len, 512) - entry[2].len);

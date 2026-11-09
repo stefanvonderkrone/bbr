@@ -454,7 +454,10 @@ pub fn load(allocator: Allocator, io: std.Io, env: *const EnvMap) !?Loaded {
     }
     var location: ParseLocation = .{};
     const file = parseWithLocation(allocator, source, &location) catch |err| {
-        if (err == error.InvalidAuthFile) reportParseDiagnostic(io, path, location);
+        switch (err) {
+            error.InvalidAuthFile => reportParseDiagnostic(io, path, location),
+            else => {},
+        }
         return err;
     };
     return .{ .path = path, .file = file };
@@ -467,8 +470,12 @@ fn writeParseDiagnostic(writer: *std.Io.Writer, path: []const u8, location: Pars
 fn reportParseDiagnostic(io: std.Io, path: []const u8, location: ParseLocation) void {
     var buffer: [256]u8 = undefined;
     var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
-    writeParseDiagnostic(&writer.interface, path, location) catch return;
-    writer.interface.flush() catch {};
+    writeParseDiagnostic(&writer.interface, path, location) catch |err| switch (err) {
+        error.WriteFailed => return,
+    };
+    writer.interface.flush() catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
 }
 
 const file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
@@ -477,8 +484,12 @@ const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
 fn warnStorage(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buffer: [256]u8 = undefined;
     var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
-    writer.interface.print("warning: " ++ fmt ++ "\n", args) catch return;
-    writer.interface.flush() catch {};
+    writer.interface.print("warning: " ++ fmt ++ "\n", args) catch |err| switch (err) {
+        error.WriteFailed => return,
+    };
+    writer.interface.flush() catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
 }
 
 /// Ensure the `bbr` data directory exists and is private (`0700`).
@@ -925,7 +936,10 @@ fn checkParseAllocations(allocator: Allocator, source: []const u8, invalid: bool
     var no_remap = testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
     const checked = no_remap.allocator();
     var file = parse(checked, source) catch |err| {
-        if (invalid and err == error.InvalidAuthFile) return;
+        switch (err) {
+            error.InvalidAuthFile => if (invalid) return,
+            else => {},
+        }
         return err;
     };
     defer file.deinit(checked);

@@ -65,15 +65,21 @@ pub fn isHelp(arg: []const u8) bool {
 }
 
 pub fn parseU64(s: []const u8) ParseError!u64 {
-    return std.fmt.parseInt(u64, s, 10) catch return error.InvalidNumber;
+    return std.fmt.parseInt(u64, s, 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return error.InvalidNumber,
+    };
 }
 
 pub fn parseU32(s: []const u8) ParseError!u32 {
-    return std.fmt.parseInt(u32, s, 10) catch return error.InvalidNumber;
+    return std.fmt.parseInt(u32, s, 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return error.InvalidNumber,
+    };
 }
 
 pub fn parseUsize(s: []const u8) ParseError!usize {
-    return std.fmt.parseInt(usize, s, 10) catch return error.InvalidNumber;
+    return std.fmt.parseInt(usize, s, 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return error.InvalidNumber,
+    };
 }
 
 pub fn parseBool(text: []const u8) !bool {

@@ -51,13 +51,12 @@ pub const TreeSitterHighlighter = struct {
         inline for (std.meta.tags(grammar_match.BuiltInGrammar)) |grammar| {
             const source = grammarSource(grammar) orelse return error.MissingBuiltInGrammar;
             var diagnostic: predicate_mod.Diagnostic = undefined;
-            self.packages[self.package_count] = RuntimePackage.init(allocator, source.language, source.query, source.locals_query, &diagnostic) catch |err| {
-                _ = diagnostic_handle.failure(.prepare, .{ .zig = err }, @src());
-                if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidPredicate) {
-                    diagnostic.record(diagnostic_handle, @src());
+            self.packages[self.package_count] = RuntimePackage.init(allocator, source.language, source.query, source.locals_query, &diagnostic) catch |err| switch (err) {
+                error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidPredicate => {
                     diagnostic.report();
-                }
-                return err;
+                    return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src());
+                },
+                else => return err,
             };
             self.package_count += 1;
         }
@@ -81,7 +80,10 @@ pub const TreeSitterHighlighter = struct {
         if (self.registry) |registry| {
             if (registry.matchName(path, content) != null) {
                 const grammar = registry.grammar(path, content) catch |err| {
-                    _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
+                    switch (err) {
+                        error.Reported => {},
+                        else => _ = diagnostic.failure(.prepare, .{ .zig = err }, @src()),
+                    }
                     return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content, diagnostic) catch .{ .spans = &.{} };
                 };
                 if (grammar) |selected| {
@@ -376,8 +378,11 @@ test "diagnostics retain UserGrammar load and fallback allocation failures witho
     try testing.expectEqual(@as(usize, 0), fallback.spans.len);
     const bytes = try diagnosticBytes(tmp);
     defer testing.allocator.free(bytes);
-    for ([_][]const u8{ "error=NativeLibraryLoadFailed", "error=OutOfMemory", "phase=open", "source=highlight/user_grammar.zig:" }) |needle|
+    for ([_][]const u8{ "error=OutOfMemory", "phase=open", "source=highlight/user_grammar.zig:" }) |needle|
         try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
+    // The native library failure has one record: the leaf cause at the open, and no translated or repeated record.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "phase=open"));
+    try testing.expect(std.mem.indexOf(u8, bytes, "error=NativeLibraryLoadFailed") == null);
     for ([_][]const u8{ "private_path", "private_source", "not a library", path }) |secret|
         try testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
 
@@ -778,7 +783,9 @@ fn digestHex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     var result: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch unreachable;
+    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
     return result;
 }
 
