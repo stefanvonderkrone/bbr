@@ -232,6 +232,40 @@ class DiagnosticsCheckTest(unittest.TestCase):
         ))
         self.assertEqual(self.check("src/persist/sqlite_store.zig", text), [])
 
+    def client(self, text):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src/bitbucket").mkdir(parents=True)
+            (root / "src/bitbucket/types.zig").write_text("pub const ApiError = error{\n    /// 403\n    Forbidden,\n    MalformedResponse,\n};\n")
+            (root / checker.CLIENT).write_text(text)
+            return list(checker.violations(root))
+
+    def test_a_client_error_return_without_a_note_is_rejected(self):
+        # The account UUID check and the author check of client.zig before issue 09.
+        for line in (
+            "        if (parsed.value.uuid.len == 0) return error.MalformedResponse;",
+            "        if (before.author_uuid.len != 0 and std.mem.eql(u8, before.author_uuid, authenticated_account_uuid)) return .{ .api_error = error.Forbidden };",
+            "        const author = v.author orelse return error.MalformedResponse;",
+        ):
+            found = self.client(line)
+            self.assertEqual(len(found), 1, line)
+            self.assertIn("noted(diagnostic, error.X, phase, cause)", found[0])
+
+    def test_a_noted_return_a_status_mapping_and_test_blocks_are_allowed(self):
+        text = "\n".join((
+            "        if (parsed.value.uuid.len == 0) return noted(self.diagnostic, error.MalformedResponse, .validate, null);",
+            "        return .{ .api_error = noted(self.diagnostic, error.Forbidden, .validate, null) };",
+            "    return switch (status) {",
+            "        403 => error.Forbidden,",
+            "    };",
+            "    return error.OutOfMemory;",
+            "    // return error.Forbidden;",
+            'test "a rejection" {',
+            "    return error.Forbidden;",
+            "}",
+        ))
+        self.assertEqual(self.client(text), [])
+
     def test_the_checkout_passes(self):
         self.assertEqual(list(checker.violations(ROOT)), [])
 
