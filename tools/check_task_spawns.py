@@ -15,7 +15,7 @@ import sys
 from check_diagnostics import production
 from source_lines import zig_files
 
-SPAWN = re.compile(r"(?<!diagnostics)\.(concurrent|async)\(")
+SPAWN = re.compile(r"\.(concurrent|async)\(")
 OWNER = Path("src/diagnostics.zig")
 FIX = (
     "Start the task with diagnostics.concurrent or diagnostics.selectConcurrent, which reject "
@@ -29,10 +29,10 @@ def violations(root):
         if path == OWNER:
             continue
         for number, line in production(lines):
-            match = SPAWN.search(line)
-            if match is None:
-                continue
-            yield f"{path}:{number}: starts a task with `.{match.group(1)}(`. {FIX}"
+            for match in SPAWN.finditer(line):
+                if match[1] == "concurrent" and re.search(r"\bdiagnostics$", line[:match.start()]):
+                    continue
+                yield f"{path}:{number}: starts a task with `.{match.group(1)}(`. {FIX}"
 
 
 def main():

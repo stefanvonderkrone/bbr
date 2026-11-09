@@ -522,7 +522,7 @@ def main():
 
     state = load_state()
     sites = []
-    for path, _ in check_diagnostics.cause_drop_counts(ROOT).items():
+    for path in check_diagnostics.counts(ROOT, check_diagnostics.cause_drops):
         sites += find_sites(path, (ROOT / path).read_text(encoding="utf-8"))
     if args.list:
         for site in sites:

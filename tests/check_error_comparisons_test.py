@@ -53,6 +53,22 @@ class ErrorComparisonCheckTest(unittest.TestCase):
     def test_the_checkout_passes(self):
         self.assertEqual(list(checker.violations(ROOT)), [])
 
+    def test_both_operators_and_operand_orders_are_rejected(self):
+        for operator in ("==", "!="):
+            for left, right in (("err", "error.X"), ("error.X", "err")):
+                with self.subTest(operator=operator, left=left):
+                    self.assertEqual(len(self.check(f"fn f() void {{ if ({left} {operator} {right}) return; }}")), 1)
+
+    def test_multiline_comparisons_keep_the_first_line_number(self):
+        for expression in ("err ==\n // a comment\n error.X", "error.X\n != err"):
+            with self.subTest(expression=expression):
+                found = self.check("fn f() void {\n if (" + expression + ") return;\n}")
+                self.assertEqual(len(found), 1)
+                self.assertIn("presentation.zig:2:", found[0])
+
+    def test_two_runtime_error_values_are_allowed(self):
+        self.assertEqual(self.check("fn f(err: anyerror, leaf: Leaf) void { if (err != leaf.err) return; }"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

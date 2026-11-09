@@ -87,6 +87,14 @@ class DiagnosticsCheckTest(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn("no `else`", found[0])
 
+    def test_a_discarded_else_payload_is_a_drop(self):
+        text = "x() catch |err| switch (err) { else => |e| { _ = e; return error.WriteFailed; } };"
+        self.assertEqual(len(self.check("src/example.zig", text)), 1)
+
+    def test_a_named_prong_use_does_not_cover_an_else_drop(self):
+        text = "x() catch |err| switch (err) { error.ReadFailed => return err, else => return error.WriteFailed };"
+        self.assertEqual(len(self.check("src/example.zig", text)), 1)
+
     def test_an_else_prong_that_drops_the_cause_is_rejected(self):
         text = "\n".join((
             "    writeAtomically(allocator, io, config_path, next) catch |err| return switch (err) {",
@@ -243,6 +251,26 @@ class DiagnosticsCheckTest(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.check("src/tui/file_enrichment.zig", text), [])
+
+    def test_a_record_before_a_negative_numeric_fallback_is_allowed(self):
+        text = "x() catch |err| { diagnostic.record(err); return -1; };"
+        self.assertEqual(self.check("src/example.zig", text), [])
+
+    def test_an_early_error_return_before_a_record_is_allowed(self):
+        text = "x() catch |err| { if (skip) return error.Other; diagnostic.record(err); return; };"
+        self.assertEqual(self.check("src/example.zig", text), [])
+
+    def test_an_early_switch_return_before_a_record_is_allowed(self):
+        text = "x() catch |err| { switch (err) { error.Other => return err, else => {} } diagnostic.record(err); return; };"
+        self.assertEqual(self.check("src/example.zig", text), [])
+
+    def test_a_separate_switch_record_does_not_cover_an_unnamed_drop(self):
+        text = "x() catch |err| { switch (err) { error.OutOfMemory => diagnostic.record(err), else => {} } return; };"
+        self.assertEqual(len(self.check("src/example.zig", text)), 1)
+
+    def test_an_early_error_return_does_not_hide_a_later_record_and_error_return(self):
+        text = "x() catch |err| { if (skip) return error.Other; diagnostic.record(err); return err; };"
+        self.assertEqual(len(self.check("src/example.zig", text)), 1)
 
     def test_old_highlighting_warning_bypasses_the_sink(self):
         found = self.check("src/tui/presentation.zig", 'std.log.warn("code Highlighting failed: {s}", .{@errorName(err)});')
