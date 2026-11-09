@@ -1322,7 +1322,10 @@ pub const PrepareSession = struct {
     pub fn build(self: *PrepareSession) void {
         self.candidate.?.finishCreate(self.preferences, self.location) catch |err| {
             self.evidence = bbr.diagnostic.Failure.capture(.buffer_build, .prepare, .{ .command_id = self.command_id }, .{ .zig = err }, @src());
-            self.failure = if (err == error.OutOfMemory) .out_of_memory else .buffer_build_failed;
+            self.failure = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .buffer_build_failed,
+            };
             return;
         };
         self.ready = true;
@@ -3358,8 +3361,10 @@ pub const ThemePersisted = struct {
         no_config_location,
         /// config.toml does not parse with the new Theme.
         config_invalid,
-        /// Reading or writing failed, or the command could not start.
+        /// The write failed, or the command could not start.
         write_failed,
+        /// config.toml could not be read. The record names the read error.
+        read_failed,
     };
 };
 
@@ -3804,6 +3809,7 @@ pub const ActionError = enum {
     out_of_memory,
     theme_not_saved,
     theme_not_saved_invalid_config,
+    theme_not_saved_unreadable,
     persistence_failed,
     submission_already_active,
     submission_launch_failed,
@@ -3859,6 +3865,7 @@ pub const ActionError = enum {
     draft_descendant_locked,
     anchor_candidate_ambiguous,
     anchor_range_too_long,
+    anchor_range_descending,
     suggestion_anchor_not_new_side,
     replacement_pending,
 };
@@ -4397,9 +4404,9 @@ const Published = struct {
                     .emphasis_cache = &published.emphasis_cache,
                     .mention_names = &session.mention_names,
                 },
-            ) catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                return error.BufferBuildFailed;
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => return error.BufferBuildFailed,
             };
             published.visual_rows = try frame_mod.buildVisualRowsWithOptions(buffer_allocator, published.buffer.rows, cell_metrics, .{
                 .layout = preferences.layout,
@@ -4439,7 +4446,10 @@ const Published = struct {
             0,
             cell_metrics,
         );
-        published.search_corpus = published.bufferSearchCorpus(preferences, disclosures.items, published.isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BufferBuildFailed;
+        published.search_corpus = published.bufferSearchCorpus(preferences, disclosures.items, published.isolated_file, geometry) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => error.BufferBuildFailed,
+        };
         errdefer published.search_corpus.?.release();
         published.navigation = Nav.init(published.visual_rows.len, panes.diff_content.height);
         published.disclosure_inputs = try DisclosureInputs.create(published);
@@ -4794,9 +4804,9 @@ const Published = struct {
                 .emphasis_cache = &self.emphasis_cache,
                 .mention_names = &self.session.mention_names,
             },
-        ) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return error.BufferBuildFailed;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => return error.BufferBuildFailed,
         };
         const visual_rows = try frame_mod.buildVisualRowsWithOptions(allocator, candidate.rows, self.cell_metrics, .{
             .layout = preferences.layout,
@@ -4903,7 +4913,10 @@ const Published = struct {
         const search_corpus = if (reuse_search_corpus)
             null
         else
-            self.bufferSearchCorpus(preferences, expanded_disclosures, isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.SearchFailed;
+            self.bufferSearchCorpus(preferences, expanded_disclosures, isolated_file, geometry) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => error.SearchFailed,
+            };
         errdefer if (search_corpus) |corpus| corpus.release();
         const disclosure_inputs = if (reuse_search_corpus and self.disclosure_inputs_current) blk: {
             self.disclosure_inputs.retain();
@@ -7063,9 +7076,16 @@ pub const Presentation = struct {
             }
         }
         result.completion = if (clean) .clean else .partial;
-        const tree = SubmissionTree.createPersisted(self.allocator, notice.key, notice.operation_id, &review, run.items, result.completion) catch {
-            self.action_error = .out_of_memory;
-            return;
+        const tree = SubmissionTree.createPersisted(self.allocator, notice.key, notice.operation_id, &review, run.items, result.completion) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.action_error = .out_of_memory;
+                return;
+            },
+            error.DraftNotFound => {
+                self.reportFailure(.recovery_check, .prepare, err, @src());
+                self.action_error = .recovery_claim_failed;
+                return;
+            },
         };
         self.dependencies.reviews.completeSubmission(notice.operation_id, notice.key.storeKey(), result.completion) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
@@ -8169,10 +8189,12 @@ pub const Presentation = struct {
         if (state.open) return;
         self.cancelQueuedViewBuild(published);
         if (state.corpus == null) {
-            const corpus = published.reviewSearchCorpus() catch |err| {
-                self.reportFailure(.review_search, .prepare, err, @src());
-                self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_scan_failed;
-                return;
+            const corpus = published.reviewSearchCorpus() catch |err| switch (err) {
+                error.OutOfMemory => {
+                    self.reportFailure(.review_search, .prepare, err, @src());
+                    self.action_error = .out_of_memory;
+                    return;
+                },
             };
             state.corpus = corpus;
             state.candidate_count = corpus.candidates.len;
@@ -8310,7 +8332,10 @@ pub const Presentation = struct {
         state.opening_source = false;
         state.opening_identity = null;
         var query = search.Query.init(self.allocator, text) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.review_search, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
+                else => {},
+            }
             self.action_error = switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
                 error.OutOfMemory => .out_of_memory,
@@ -8344,9 +8369,15 @@ pub const Presentation = struct {
             return;
         }
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.review_search, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
+                else => {},
+            }
             query.deinit(self.allocator);
-            self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_invalid_query;
+            self.action_error = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .buffer_search_invalid_query,
+            };
             return;
         };
         const corpus = state.corpus orelse {
@@ -8484,9 +8515,19 @@ pub const Presentation = struct {
         if (!state.open or state.pending or state.query == null or state.source_scan_active or state.source_scanned == null) return;
         for (published.session.diff.files, 0..) |_, index| {
             if (state.source_scanned.?[index] or !published.session.enrichment.isTerminal(index)) continue;
-            var command: OwnedCommand = .{ .scan_review_source = ScanReviewSource.create(published, index) catch {
-                self.action_error = .out_of_memory;
-                return;
+            var command: OwnedCommand = .{ .scan_review_source = ScanReviewSource.create(published, index) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    self.action_error = .out_of_memory;
+                    return;
+                },
+                error.TooLong => {
+                    self.action_error = .buffer_search_query_too_long;
+                    return;
+                },
+                error.InvalidUtf8, error.LineEnding, error.Nul => {
+                    self.action_error = .buffer_search_invalid_query;
+                    return;
+                },
             } };
             self.commands.append(self.allocator, command) catch |err| {
                 self.reportFailure(.review_search, .admission, err, @src());
@@ -9175,7 +9216,10 @@ pub const Presentation = struct {
             return;
         }
         var query = search.Query.init(self.allocator, text) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.buffer_search, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.buffer_search, .prepare, err, @src()),
+                else => {},
+            }
             self.action_error = switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
                 error.OutOfMemory => .out_of_memory,
@@ -9184,9 +9228,15 @@ pub const Presentation = struct {
             return;
         };
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.buffer_search, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.buffer_search, .prepare, err, @src()),
+                else => {},
+            }
             query.deinit(self.allocator);
-            self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_invalid_query;
+            self.action_error = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .buffer_search_invalid_query,
+            };
             return;
         };
         const request_id = if (published.search_generation == std.math.maxInt(u64)) 1 else published.search_generation + 1;
@@ -10213,10 +10263,22 @@ pub const Presentation = struct {
     fn retryStaleBufferDisclosure(self: *Presentation, published: *Published) void {
         const input = &(published.buffer_search.input orelse return);
         const query = input.query orelse return;
-        const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch {
-            input.pending = false;
-            self.action_error = .out_of_memory;
-            return;
+        const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch |err| switch (err) {
+            error.OutOfMemory => {
+                input.pending = false;
+                self.action_error = .out_of_memory;
+                return;
+            },
+            error.TooLong => {
+                input.pending = false;
+                self.action_error = .buffer_search_query_too_long;
+                return;
+            },
+            error.InvalidUtf8, error.LineEnding, error.Nul => {
+                input.pending = false;
+                self.action_error = .buffer_search_invalid_query;
+                return;
+            },
         };
         const corpus = published.search_corpus orelse input.corpus;
         corpus.retain();
@@ -10715,8 +10777,13 @@ pub const Presentation = struct {
             lock,
             selected_root,
         ) catch |err| {
-            if (err != error.SubmissionAlreadyActive) self.reportFailure(.submission, .prepare, err, @src());
-            self.action_error = if (err == error.SubmissionAlreadyActive) .submission_already_active else .submission_start_failed;
+            switch (err) {
+                error.SubmissionAlreadyActive => self.action_error = .submission_already_active,
+                else => {
+                    self.reportFailure(.submission, .prepare, err, @src());
+                    self.action_error = .submission_start_failed;
+                },
+            }
             return;
         } orelse {
             self.action_error = .action_refused;
@@ -10796,7 +10863,10 @@ pub const Presentation = struct {
         const durable = self.durable_comment_edit orelse return;
         if (!durableIdentityMatches(durable.key, completed.identity) or durable.comment_id != completed.comment_id) return;
         if (completed.outcome == .definitive_failure) {
-            if (completed.outcome.definitive_failure == error.Unauthorized) self.authenticated_account_uuid = null;
+            switch (completed.outcome.definitive_failure) {
+                error.Unauthorized => self.authenticated_account_uuid = null,
+                else => {},
+            }
             self.restoreCommentEditComposer(durable);
             self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
             self.durable_comment_edit = null;
@@ -10836,7 +10906,10 @@ pub const Presentation = struct {
         const durable = self.durable_comment_delete orelse return;
         if (!durableIdentityMatches(durable.key, completed.identity) or durable.comment_id != completed.comment_id) return;
         if (completed.outcome == .definitive_failure) {
-            if (completed.outcome.definitive_failure == error.Unauthorized) self.authenticated_account_uuid = null;
+            switch (completed.outcome.definitive_failure) {
+                error.Unauthorized => self.authenticated_account_uuid = null,
+                else => {},
+            }
             self.restoreCommentDeleteConfirmation(durable);
             self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
             self.durable_comment_delete = null;
@@ -10997,9 +11070,21 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
-        const command = durable.retryPost(self.allocator) catch {
-            self.action_error = .out_of_memory;
-            return;
+        const command = durable.retryPost(self.allocator) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.action_error = .out_of_memory;
+                return;
+            },
+            error.DraftNotFound => {
+                self.reportFailure(.submission, .prepare, err, @src());
+                self.action_error = .persistence_failed;
+                return;
+            },
+            error.InvalidSubmissionState => {
+                self.reportFailure(.submission, .prepare, err, @src());
+                self.action_error = .submission_launch_failed;
+                return;
+            },
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
         self.action_error = null;
@@ -11400,7 +11485,10 @@ pub const Presentation = struct {
             self.reportFailure(.submission, .execute, err, @src());
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
-            self.action_error = if (err == error.OutOfMemory) .out_of_memory else .persistence_failed;
+            self.action_error = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .persistence_failed,
+            };
             return;
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
@@ -12259,7 +12347,10 @@ pub const Presentation = struct {
         };
         job.kind = .draft_save;
         job.new_draft = published.prepareDraft(self.dependencies.reviews, job.arena.allocator(), composer.toNewDraft()) catch |err| {
-            if (err == error.OutOfMemory) self.reportFailure(.composer, .prepare, err, @src());
+            switch (err) {
+                error.OutOfMemory => self.reportFailure(.composer, .prepare, err, @src()),
+                else => {},
+            }
             job.destroy();
             self.action_error = switch (err) {
                 error.AnchorRangeTooLong => .anchor_range_too_long,
@@ -12763,6 +12854,7 @@ pub const Presentation = struct {
         switch (persisted.outcome) {
             .saved => {},
             .config_invalid => self.action_error = .theme_not_saved_invalid_config,
+            .read_failed => self.action_error = .theme_not_saved_unreadable,
             .no_config_location, .write_failed => self.action_error = .theme_not_saved,
         }
     }
@@ -12790,9 +12882,12 @@ pub const Presentation = struct {
                 (overlay orelse return summaries.destroy()).populatePullRequests(loaded.work_id, summaries) catch |err| {
                     self.reportFailure(.picker_list, .admission, err, @src());
                     summaries.destroy();
-                    if (err == error.OutOfMemory) {
-                        self.closeListOverlay();
-                        self.action_error = .out_of_memory;
+                    switch (err) {
+                        error.OutOfMemory => {
+                            self.closeListOverlay();
+                            self.action_error = .out_of_memory;
+                        },
+                        else => {},
                     }
                     return;
                 };
@@ -13016,7 +13111,10 @@ pub const Presentation = struct {
             candidate.session.retain();
             self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
                 self.reportFailure(.session_load, .prepare, err, @src());
-                self.failReplacement(replacement, if (err == error.OutOfMemory) .out_of_memory else .pending_review_load_failed);
+                self.failReplacement(replacement, switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    else => .pending_review_load_failed,
+                });
             };
             return;
         }
@@ -13026,7 +13124,10 @@ pub const Presentation = struct {
                 candidate.session.retain();
                 self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
                     self.reportFailure(.session_load, .prepare, err, @src());
-                    self.failReplacement(replacement, if (err == error.OutOfMemory) .out_of_memory else .buffer_build_failed);
+                    self.failReplacement(replacement, switch (err) {
+                        error.OutOfMemory => .out_of_memory,
+                        else => .buffer_build_failed,
+                    });
                 };
                 return;
             };
@@ -13271,13 +13372,30 @@ fn reviewerVerdictRefusalError(refusal: ?ReviewerVerdictRefusal) ActionError {
 
 /// Why the source under the cursor cannot become an Anchor. Every reason is a
 /// refusal to guess, not a partially accepted range.
-fn candidateError(err: anyerror) ActionError {
+fn candidateError(err: error{
+    RangeTooLong,
+    AnchorRangeDescending,
+    SuggestionOnRemoved,
+    NotOnSource,
+    NotOnALine,
+    MixedSides,
+    AnchorSideAmbiguous,
+    NonContiguous,
+    CrossesFile,
+}) ActionError {
     return switch (err) {
         error.RangeTooLong => .anchor_range_too_long,
+        error.AnchorRangeDescending => .anchor_range_descending,
         error.SuggestionOnRemoved => .suggestion_anchor_not_new_side,
         error.NotOnSource, error.NotOnALine => .source_action_unavailable,
-        else => .anchor_candidate_ambiguous,
+        error.MixedSides, error.AnchorSideAmbiguous, error.NonContiguous, error.CrossesFile => .anchor_candidate_ambiguous,
     };
+}
+
+test "a descending Anchor is not a mixed-side range" {
+    try testing.expectEqual(ActionError.anchor_range_descending, candidateError(error.AnchorRangeDescending));
+    try testing.expectEqual(ActionError.anchor_candidate_ambiguous, candidateError(error.AnchorSideAmbiguous));
+    try testing.expectEqual(ActionError.anchor_candidate_ambiguous, candidateError(error.MixedSides));
 }
 
 /// The lines a replacement Anchor would cover. Bounded by `max_anchor_lines`,
@@ -13344,7 +13462,8 @@ fn reanchorCandidate(published: *const Published, kind: bbr.review.DraftKind, pr
     };
     anchor.validateShape() catch |err| return switch (err) {
         error.AnchorRangeTooLong => error.RangeTooLong,
-        else => error.MixedSides,
+        error.AnchorRangeDescending => error.AnchorRangeDescending,
+        error.AnchorSideAmbiguous => error.AnchorSideAmbiguous,
     };
     return .{ .file_index = file_index, .anchor = anchor, .lines = lines };
 }
@@ -18669,6 +18788,43 @@ test "M21 kernel Buffer Search releases stale work after Session replacement" {
     try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
 }
 
+test "a stale Buffer Search retry reports a text error" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+    const published = presentation.published.?;
+    published.buffer_search.input.?.query.?.text[0] = '\n';
+    presentation.retryStaleBufferDisclosure(published);
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+}
+
+test "a Review source scan reports a text error" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+    const published = presentation.published.?;
+    for (published.session.enrichment.statuses) |*status| {
+        status.old = .absent;
+        status.new = .absent;
+    }
+    published.review_search.query.?.text[0] = '\n';
+    published.review_search.pending = false;
+    published.review_search.source_scan_active = false;
+    if (published.review_search.source_scanned) |scanned| @memset(scanned, false);
+    presentation.maybeQueueReviewSourceScan(published);
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+}
+
 test "M21 kernel Buffer Search keeps the previous preview after a refused edit" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -20998,6 +21154,12 @@ test "a failed Theme save keeps the Theme and reports it, and a stale completion
     try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
     try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id, .outcome = .write_failed } });
     try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_enter });
+    const reread = presentation.takeCommand().?.persist_theme;
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = reread.command_id, .outcome = .read_failed } });
+    try testing.expectEqual(ThemeId.solarized_light, presentation.projection().theme);
+    try testing.expectEqual(ActionError.theme_not_saved_unreadable, presentation.projection().action_error.?);
 }
 
 test "a Theme Overlay query edit previews the top match" {
@@ -30043,6 +30205,59 @@ test "startup discovers and explicitly claims an interrupted Submission" {
     try testing.expectEqual(@as(bbr.review.TempId, 1), post.find_duplicate.draft.local_id);
 }
 
+var test_active_submission: ?*const fn (*anyopaque, Allocator) anyerror!?bbr.review.ActiveSubmissionRun = null;
+
+/// The store's active run with one more item, which names a Draft that the store does not hold.
+fn activeSubmissionNamingAMissingDraft(ptr: *anyopaque, allocator: Allocator) anyerror!?bbr.review.ActiveSubmissionRun {
+    var run = (try test_active_submission.?(ptr, allocator)) orelse return null;
+    const items = try allocator.alloc(bbr.review.SubmissionRunItem, run.items.len + 1);
+    @memcpy(items[0..run.items.len], run.items);
+    items[run.items.len] = .{ .temp_id = 99, .parent = null };
+    run.items = items;
+    return run;
+}
+
+test "Review recovery a terminal run that names a missing Draft fails its claim with one record" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "posted" });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "head", &.{.{ .temp_id = 1, .parent = null }});
+    try store.store().checkpointSubmission(operation_id, key.storeKey(), 1, .{ .posted = 900 }, null);
+    var vtable = store.store().vtable.*;
+    test_active_submission = vtable.active_submission;
+    defer test_active_submission = null;
+    vtable.active_submission = activeSubmissionNamingAMissingDraft;
+    var reviews = store.store();
+    reviews.vtable = &vtable;
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = reviews,
+        .submission_locks = locks.locks(),
+    }, .{ .diagnostic_state = .on, .viewport_rows = 8 });
+    defer presentation.deinit();
+    try testing.expect(presentation.projection().recovery != null);
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.recovery_claim_failed, presentation.projection().action_error.?);
+    var records: usize = 0;
+    while (presentation.takeCommand()) |command_value| {
+        var command = command_value;
+        defer command.deinit();
+        const failure = switch (command) {
+            .report_diagnostic => |failure| failure,
+            else => continue,
+        };
+        records += 1;
+        try testing.expectEqual(bbr.diagnostic.Operation.recovery_check, failure.operation);
+        try testing.expectEqual(error.DraftNotFound, failure.cause.zig);
+    }
+    try testing.expectEqual(@as(usize, 1), records);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.store().activeSubmission(arena.allocator())) != null);
+}
+
 test "recovery resumes only frozen participants and preserves parent remapping" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -32301,6 +32516,34 @@ test "queue allocation failure retains a POST completion for admission retry" {
     failing.fail_index = std.math.maxInt(usize);
     try presentation.dispatch(.{ .action = .submit });
     try testing.expect(presentation.projection().submission == null);
+}
+
+test "a paused POST retry with a missing Draft reports an invalid Submission" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retry launch" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .submission_locks = locks.locks() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var first = presentation.takeCommand().?;
+    const operation_id = first.post_draft.operation_id;
+    first.deinit();
+    try presentation.dispatch(.{ .post_draft_launch_failed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+    } });
+    presentation.durable_submission.?.review.drafts.clearRetainingCapacity();
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expectEqual(ActionError.submission_launch_failed, presentation.projection().action_error.?);
+    const failure = presentation.takeCommand().?.report_diagnostic;
+    try testing.expectEqual(error.InvalidSubmissionState, failure.cause.zig);
 }
 
 test "POST launch failure pauses without reporting a remote outcome and submit retries" {

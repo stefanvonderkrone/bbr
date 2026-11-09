@@ -41,8 +41,9 @@ pub const verbs = [_]Verb{
     .{ .name = "list-pull-requests", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .value_flags = &.{ "repository", "state", "source-branch", "pagelen", "page", "query", "sort", "concurrency", "limit" }, .switch_flags = &.{"no-follow"}, .handler = pullrequests.runList },
     .{ .name = "list-workspace-pull-requests", .summary = "list Workspace pull requests by author or reviewer", .help = pullrequests.workspace_list_help, .example = "bbr api list-workspace-pull-requests --reviewer '{reviewer}' --repository sample --repository other --state OPEN --state MERGED --limit 20", .value_flags = &.{ "author", "reviewer", "repository", "state", "query", "concurrency", "limit" }, .handler = pullrequests.runListWorkspace },
     .{ .name = "get-pull-request", .summary = "get one pull request", .help = pullrequests.get_help, .example = "bbr api get-pull-request --repository sample --pull-request-id 42", .value_flags = &.{ "repository", "pull-request-id" }, .handler = pullrequests.runGet },
-    .{ .name = "create-pull-request", .summary = "create a ready or draft pull request", .help = pullrequests.create_help, .example = "bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true", .value_flags = &.{ "repository", "title", "source-branch", "source-repository", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }, .switch_flags = &.{"clear-reviewers"}, .handler = pullrequests.runCreate },
-    .{ .name = "update-pull-request", .summary = "update an open pull request", .help = pullrequests.update_help, .example = "bbr api update-pull-request --repository sample --pull-request-id 42 --draft false", .value_flags = &.{ "repository", "pull-request-id", "title", "source-branch", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }, .switch_flags = &.{"clear-reviewers"}, .handler = pullrequests.runUpdate },
+    .{ .name = "list-default-reviewers", .summary = "list a repository's default reviewers", .help = repositories.default_reviewers_help, .example = "bbr api list-default-reviewers --repository sample --effective", .value_flags = &.{ "repository", "pagelen", "page", "concurrency", "limit" }, .switch_flags = &.{ "effective", "no-follow" }, .handler = repositories.runListDefaultReviewers },
+    .{ .name = "create-pull-request", .summary = "create a ready or draft pull request", .help = pullrequests.create_help, .example = "bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true", .value_flags = &.{ "repository", "title", "source-branch", "source-repository", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }, .switch_flags = &.{ "clear-reviewers", "default-reviewers", "effective" }, .handler = pullrequests.runCreate },
+    .{ .name = "update-pull-request", .summary = "update an open pull request", .help = pullrequests.update_help, .example = "bbr api update-pull-request --repository sample --pull-request-id 42 --draft false", .value_flags = &.{ "repository", "pull-request-id", "title", "source-branch", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }, .switch_flags = &.{ "clear-reviewers", "default-reviewers", "effective" }, .handler = pullrequests.runUpdate },
     .{ .name = "decline-pull-request", .summary = "close a pull request without merging", .help = pullrequests.decline_help, .example = "bbr api decline-pull-request --repository sample --pull-request-id 42", .value_flags = &.{ "repository", "pull-request-id" }, .handler = pullrequests.runDecline },
     .{ .name = "list-commit-pull-requests", .summary = "list pull requests for a commit", .help = pullrequests.commit_list_help, .example = "bbr api list-commit-pull-requests --repository sample --commit abc123 --limit 10", .value_flags = &.{ "repository", "commit", "pagelen", "page", "limit" }, .switch_flags = &.{"no-follow"}, .handler = pullrequests.runListCommit },
     .{ .name = "list-commits", .summary = "list commits (PR, revision, or from..to range)", .help = commits.help, .example = "bbr api list-commits --repository sample --revision main --limit 10", .value_flags = &.{ "repository", "pull-request-id", "revision", "from", "to", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = commits.run },
@@ -218,18 +219,23 @@ fn writeHelp(writer: *std.Io.Writer, name: ?[]const u8) !void {
 }
 
 fn isOptionError(err: anyerror) bool {
-    return err == error.UnknownFlag or err == error.MissingRequired or
-        err == error.MissingValue or err == error.InvalidNumber or err == error.BadRequest or
-        err == error.InvalidProfileName;
+    return switch (err) {
+        error.UnknownFlag,
+        error.MissingRequired,
+        error.MissingValue,
+        error.InvalidNumber,
+        error.BadRequest,
+        error.InvalidProfileName,
+        => true,
+        else => false,
+    };
 }
 
 fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*const bbr.bitbucket.Client.ErrorDetail) !void {
     try writer.writeAll("bbr api");
     if (verb) |v| try writer.print(" {s}", .{v.name});
     const api_error = if (detail) |d| d.reason else null;
-    const reported_error = if (detail) |d| d.reported_error else null;
-    if (api_error != null and (api_error.? == err or (reported_error != null and reported_error.? == err))) {
-        if (api_error.? != err) try writer.print(": {s}", .{@errorName(err)});
+    if (api_error != null and api_error.? == err) {
         try writer.print(": Bitbucket rejected request ({s})", .{@errorName(api_error.?)});
         if (detail.?.message) |message| try writer.print(": {s}", .{message});
         try writer.writeAll("\n");
@@ -245,10 +251,10 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*cons
     }
     if (verb) |v| {
         if (std.mem.eql(u8, v.name, "list-commit-pull-requests")) {
-            if (err == error.PullRequestLinksIndexing) {
-                try writer.writeAll("Bitbucket still indexes PullRequest links. Run the command again after indexing completes.\n");
-            } else if (err == error.NotFound) {
-                try writer.writeAll("The Repository or commit links were not found. Links can lack an index. Select 'Go to pull request' on the commit's details page to install the Pull Request Commit Links app.\n");
+            switch (err) {
+                error.PullRequestLinksIndexing => try writer.writeAll("Bitbucket still indexes PullRequest links. Run the command again after indexing completes.\n"),
+                error.NotFound => try writer.writeAll("The Repository or commit links were not found. Links can lack an index. Select 'Go to pull request' on the commit's details page to install the Pull Request Commit Links app.\n"),
+                else => {},
             }
         }
     }
@@ -465,6 +471,16 @@ test "every verb with --pagelen names its maximum in the help" {
     }
     try std.testing.expect(!failed);
     try std.testing.expect(std.mem.indexOf(u8, findVerb("list-pull-requests").?.help, "--pagelen accepts 1 to 50 ") != null);
+}
+
+test "every verb with --concurrency names its default in the help" {
+    var failed = false;
+    for (verbs) |verb| {
+        if (!contains(verb.value_flags, "concurrency") or std.mem.indexOf(u8, verb.help, "--concurrency bounds the parallel page requests of the whole command.\nIt defaults to ") != null) continue;
+        std.debug.print("bbr api {s}: its help does not include `workspaces.concurrencyHelp`\n", .{verb.name});
+        failed = true;
+    }
+    try std.testing.expect(!failed);
 }
 
 test "skills/bbr/VERBS.md lists every bbr api verb once" {
@@ -701,6 +717,68 @@ test "diagnostics the api boundary shows each failure and records it once" {
     }
 }
 
+/// Runs `whoami` against `fake` and returns the one record that the api boundary writes.
+fn leafEvidenceRecord(a: std.mem.Allocator, fake: *bbr.http.FakeHttpClient, message: []const u8) ![]u8 {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(home);
+    var sink_env = std.process.Environ.Map.init(a);
+    defer sink_env.deinit();
+    try sink_env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &sink_env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const diagnostic = sink.handle(.api, .{}).withLeaf(&leaf);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var output: TestOutput = .{};
+    const init = output.init(&env, &arena);
+    var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+    defer detail.deinit();
+    var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "user", .token = "token", .workspace = "workspace" });
+    bb.diagnostic = diagnostic;
+    bb.error_detail = &detail;
+    const verb = findVerb("whoami").?;
+    const err = if (verb.handler(init, bb, &.{}, true)) |_| return error.TestUnexpectedResult else |err| err;
+    try std.testing.expectEqual(error.Reported, reportFailure(init, verb, err, &detail, diagnostic));
+    try std.testing.expectEqualStrings(message, output.stderrBytes());
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+    defer a.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    return a.dupe(u8, only);
+}
+
+test "diagnostics the api boundary record holds the leaf evidence of a Bitbucket failure" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { fake: bbr.http.FakeHttpClient, message: []const u8, phase: []const u8, cause: []const u8 }{
+        .{ .fake = .{ .status = 503, .body = "{}" }, .message = "bbr api whoami: Bitbucket rejected request (ServerError)\n", .phase = "rejection", .cause = "cause=http status=503 classification=server" },
+        .{ .fake = .{ .status = 418, .body = "{}" }, .message = "bbr api whoami: Bitbucket rejected request (UnexpectedStatus)\n", .phase = "rejection", .cause = "cause=http status=418 classification=other" },
+        .{ .fake = .{ .body = "{" }, .message = "bbr api whoami: MalformedResponse\n", .phase = "decode", .cause = "cause=zig error=UnexpectedEndOfInput" },
+        .{ .fake = .{ .body = "{\"uuid\":7}" }, .message = "bbr api whoami: MalformedResponse\n", .phase = "decode", .cause = "cause=zig error=UnexpectedToken" },
+    };
+    for (cases) |case| {
+        var fake = case.fake;
+        const record = try leafEvidenceRecord(a, &fake, case.message);
+        defer a.free(record);
+        const prefix = try std.fmt.allocPrint(a, "operation=api phase={s} source=api/cli.zig:", .{case.phase});
+        defer a.free(prefix);
+        try std.testing.expect(std.mem.indexOf(u8, record, prefix) != null);
+        try std.testing.expect(std.mem.endsWith(u8, record, case.cause));
+    }
+}
+
 test "error writer formats option help and runtime errors without user values" {
     var buffer: [8192]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
@@ -816,8 +894,7 @@ test "unresolved verdict changes keep the domain error and the relevant API mess
             var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" });
             bb.error_detail = &detail;
             const init = output.init(&env, &arena);
-            try std.testing.expectError(error.ReviewerVerdictChangeFailed, pullrequests.runSetVerdict(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit=abc123" }, json));
-            try printError(init, findVerb("set-verdict"), error.ReviewerVerdictChangeFailed, &detail);
+            try std.testing.expectError(error.Reported, pullrequests.runSetVerdict(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit=abc123" }, json));
             try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
             try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
             try std.testing.expectEqual(@as(usize, 4), fake.call_count);
@@ -832,7 +909,7 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         "\"source\":{\"branch\":{\"name\":\"feature\"},\"commit\":{\"hash\":\"abc123\"}}," ++
         "\"destination\":{\"branch\":{\"name\":\"main\"},\"commit\":{\"hash\":\"def456\"}},\"participants\":[]}";
     const account: bbr.http.Canned = .{ .body = "{\"uuid\":\"{account}\"}" };
-    const cases = [_]struct { responses: []const bbr.http.Canned, expected_commit: []const u8 = "abc123", message: []const u8, cause: []const u8 }{
+    const cases = [_]struct { responses: []const bbr.http.Canned, expected_commit: []const u8 = "abc123", message: []const u8, phase: []const u8 = "", cause: []const u8 }{
         .{
             .responses = &.{ account, .{ .body = pr }, .{ .send_error = error.ConnectionResetByPeer }, .{ .body = pr } },
             .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: ConnectionResetByPeer\n",
@@ -847,12 +924,20 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         .{
             .responses = &.{ account, .{ .body = pr }, .{ .status = 403, .body = "{\"error\":{\"message\":\"Read denied\"}}" } },
             .message = "bbr api set-verdict: Bitbucket rejected request (Forbidden): Read denied\n",
-            .cause = "error=Forbidden",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=403 classification=authorization",
         },
         .{
             .responses = &.{ account, .{ .body = pr }, .{ .status = 429, .body = "{\"error\":{\"message\":\"Slow down\"}}" }, .{ .body = pr } },
             .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (RateLimited): Slow down\n",
-            .cause = "error=ReviewerVerdictChangeFailed",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=429 classification=rate_limit",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{}, .{ .status = 403, .body = "{\"error\":{\"message\":\"Read denied\"}}" } },
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (Forbidden): Read denied\n",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=403 classification=authorization",
         },
     };
     for (cases) |case| {
@@ -866,7 +951,8 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &env);
         defer sink.deinit();
         try std.testing.expect(sink.setEnabled(true) == .on);
-        const handle = sink.handle(.api, .{});
+        var leaf: ?bbr.diagnostic.Leaf = null;
+        const handle = sink.handle(.api, .{}).withLeaf(&leaf);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var output: TestOutput = .{};
@@ -879,6 +965,7 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
         const failure = if (pullrequests.runSetVerdict(init, bb, args, false)) |_| error.TestUnexpectedResult else |err| reportFailure(init, findVerb("set-verdict"), err, &detail, handle);
         try std.testing.expectEqual(error.Reported, failure);
+        try std.testing.expect(leaf == null);
         _ = sink.setEnabled(false);
         var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
         defer dir.close(std.testing.io);
@@ -891,6 +978,7 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         var records: usize = 0;
         while (lines.next()) |line| : (records += 1) {
             try std.testing.expect(std.mem.indexOf(u8, line, "operation=api ") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, case.phase) != null);
             try std.testing.expect(std.mem.endsWith(u8, line, case.cause));
         }
         try std.testing.expectEqual(@as(usize, 1), records);
@@ -914,7 +1002,7 @@ test "API lifecycle globals preserve every new value option and clear-reviewers 
             try std.testing.expect(!parsed.help_only);
         }
     }
-    try std.testing.expect(!takesValue("clear-reviewers"));
+    for ([_][]const u8{ "clear-reviewers", "default-reviewers", "effective" }) |name| try std.testing.expect(!takesValue(name));
     try std.testing.expectEqualStrings("update-pull-request", diagnosticVerb(&.{ "--clear-reviewers", "update-pull-request" }).?.name);
 }
 
@@ -953,6 +1041,181 @@ test "API lifecycle command handlers emit domain JSON and human draft state" {
             try findVerb(case.verb).?.handler(human.init(&env, &arena), bb, case.args, false);
             try std.testing.expect(std.mem.indexOf(u8, human.stdoutBytes(), if (case.list) "OPEN draft" else "draft: true") != null);
         }
+    }
+}
+
+const reviewed_pr =
+    \\{"id":42,"title":"Review","state":"OPEN","author":{"display_name":"Author","uuid":"{author}"},
+    \\ "source":{"branch":{"name":"feature"},"commit":{"hash":"abc123"}},
+    \\ "destination":{"branch":{"name":"main"},"commit":{"hash":"def456"}},"participants":[]}
+;
+const default_reviewers_page =
+    \\{"values":[{"type":"user","display_name":"Author","uuid":"{author}"},{"type":"user","display_name":"Ada","uuid":"{ada}"},
+    \\{"type":"user","display_name":"Bob","uuid":"{bob}"}]}
+;
+const effective_default_reviewers_page =
+    \\{"values":[{"type":"default_reviewer","reviewer_type":"project","user":{"display_name":"Grace","uuid":"{grace}"}},
+    \\{"type":"default_reviewer","reviewer_type":"repository","user":{"display_name":"Author","uuid":"{author}"}}]}
+;
+
+fn expectSentReviewers(fake: *const bbr.http.FakeHttpClient, expected: []const []const u8) !void {
+    const sent = try std.json.parseFromSlice(struct { reviewers: []const struct { uuid: []const u8 } }, std.testing.allocator, fake.lastBody().?, .{ .ignore_unknown_fields = true });
+    defer sent.deinit();
+    try std.testing.expectEqual(expected.len, sent.value.reviewers.len);
+    for (expected, sent.value.reviewers) |uuid, reviewer| try std.testing.expectEqualStrings(uuid, reviewer.uuid);
+}
+
+test "--default-reviewers reads the Author and the Default Reviewers before the PullRequest write" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const base = bbr.bitbucket.base_url ++ "/repositories/demo/sample";
+    for ([_]struct { verb: []const u8, args: []const []const u8, responses: []const bbr.http.Canned, urls: [3][]const u8, method: bbr.http.client.Method, reviewers: []const []const u8 }{
+        .{
+            .verb = "create-pull-request",
+            .args = &.{ "--repository=sample", "--title=Review", "--source-branch=feature", "--default-reviewers", "--reviewer={carol}", "--reviewer={ada}" },
+            .responses = &.{ .{ .body = "{\"uuid\":\"{author}\"}" }, .{ .body = default_reviewers_page }, .{ .body = reviewed_pr } },
+            .urls = .{ bbr.bitbucket.base_url ++ "/user", base ++ "/default-reviewers?pagelen=100", base ++ "/pullrequests" },
+            .method = .POST,
+            .reviewers = &.{ "{ada}", "{bob}", "{carol}" },
+        },
+        .{
+            .verb = "update-pull-request",
+            .args = &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers", "--effective" },
+            .responses = &.{ .{ .body = reviewed_pr }, .{ .body = effective_default_reviewers_page }, .{ .body = reviewed_pr } },
+            .urls = .{ base ++ "/pullrequests/42", base ++ "/effective-default-reviewers?pagelen=100", base ++ "/pullrequests/42" },
+            .method = .PUT,
+            .reviewers = &.{"{grace}"},
+        },
+    }) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try findVerb(case.verb).?.handler(output.init(&env, &arena), bb, case.args, true);
+        try std.testing.expectEqual(@as(usize, 3), fake.call_count);
+        for (case.urls, [_]bbr.http.client.Method{ .GET, .GET, case.method }, 0..) |url, method, index| {
+            try std.testing.expectEqualStrings(url, fake.urlAt(index).?);
+            try std.testing.expectEqual(method, fake.methodAt(index).?);
+        }
+        try expectSentReviewers(&fake, case.reviewers);
+        try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
+        const decoded = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(i64, 42), decoded.value.object.get("id").?.integer);
+        try std.testing.expect(std.mem.indexOf(u8, findVerb(case.verb).?.help, "Omitted reviewers use Bitbucket defaults") == null);
+    }
+}
+
+test "--default-reviewers leaves out an explicit Author with a warning and keeps stdout for the result" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_]struct { verb: []const u8, args: []const []const u8, responses: []const bbr.http.Canned, warning: []const u8 }{
+        .{
+            .verb = "create-pull-request",
+            .args = &.{ "--repository=sample", "--title=Review", "--source-branch=feature", "--reviewer={author}", "--default-reviewers" },
+            .responses = &.{ .{ .body = "{\"uuid\":\"{author}\"}" }, .{ .body = default_reviewers_page }, .{ .body = reviewed_pr } },
+            .warning = "bbr api create-pull-request: warning: --reviewer {author} is the PullRequest Author. bbr leaves it out.\n",
+        },
+        .{
+            .verb = "update-pull-request",
+            .args = &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers", "--reviewer={author}" },
+            .responses = &.{ .{ .body = reviewed_pr }, .{ .body = default_reviewers_page }, .{ .body = reviewed_pr } },
+            .warning = "bbr api update-pull-request: warning: --reviewer {author} is the PullRequest Author. bbr leaves it out.\n",
+        },
+    }) |case| {
+        for ([_]bool{ false, true }) |json| {
+            var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
+            const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+            var output: TestOutput = .{};
+            try findVerb(case.verb).?.handler(output.init(&env, &arena), bb, case.args, json);
+            try std.testing.expectEqualStrings(case.warning, output.stderrBytes());
+            try std.testing.expectEqual(@as(usize, 3), fake.call_count);
+            try expectSentReviewers(&fake, &.{ "{ada}", "{bob}" });
+            if (json) {
+                const decoded = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+                defer decoded.deinit();
+            } else try std.testing.expect(std.mem.startsWith(u8, output.stdoutBytes(), "#42 [OPEN] Review\n"));
+        }
+    }
+}
+
+test "a failed Author or Default Reviewer read sends no PullRequest write" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const forbidden: bbr.http.Canned = .{ .status = 403 };
+    for ([_]struct { verb: []const u8, args: []const []const u8, author: bbr.http.Canned }{
+        .{ .verb = "create-pull-request", .args = &.{ "--repository=sample", "--title=Review", "--source-branch=feature", "--default-reviewers" }, .author = .{ .body = "{\"uuid\":\"{author}\"}" } },
+        .{ .verb = "update-pull-request", .args = &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers", "--effective" }, .author = .{ .body = reviewed_pr } },
+    }) |case| {
+        for ([_][]const bbr.http.Canned{ &.{forbidden}, &.{ case.author, forbidden } }) |responses| {
+            var fake: bbr.http.FakeHttpClient = .{ .responses = responses, .max_calls = responses.len };
+            const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+            var output: TestOutput = .{};
+            try std.testing.expectError(error.Forbidden, findVerb(case.verb).?.handler(output.init(&env, &arena), bb, case.args, true));
+            try std.testing.expectEqual(responses.len, fake.call_count);
+            for (0..responses.len) |index| try std.testing.expectEqual(bbr.http.client.Method.GET, fake.methodAt(index).?);
+            try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+        }
+    }
+}
+
+test "--default-reviewers refuses an unknown Author before the PullRequest write" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const authorless_pr =
+        \\{"id":42,"title":"Review","state":"OPEN","source":{"branch":{"name":"feature"}},"destination":{"branch":{"name":"main"}}}
+    ;
+    for ([_]struct { verb: []const u8, args: []const []const u8, author: bbr.http.Canned }{
+        .{ .verb = "create-pull-request", .args = &.{ "--repository=sample", "--title=Review", "--source-branch=feature", "--default-reviewers" }, .author = .{ .body = "{\"uuid\":\"\"}" } },
+        .{ .verb = "update-pull-request", .args = &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers" }, .author = .{ .body = authorless_pr } },
+    }) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &.{case.author}, .max_calls = 1 };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try std.testing.expectError(error.MalformedResponse, findVerb(case.verb).?.handler(output.init(&env, &arena), bb, case.args, true));
+        try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+        try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+    }
+}
+
+test "--default-reviewers reads every Default Reviewer page before the PullRequest write" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const first_page = "{\"values\":[{\"uuid\":\"{ada}\",\"display_name\":\"Ada\"}],\"next\":\"" ++ bbr.bitbucket.base_url ++ "/repositories/demo/sample/default-reviewers?pagelen=100&cursor=two\"}";
+    const later_page = "{\"values\":[{\"uuid\":\"{bob}\",\"display_name\":\"Bob\"}]}";
+    for ([_]struct { verb: []const u8, args: []const []const u8, author: bbr.http.Canned, method: bbr.http.client.Method }{
+        .{ .verb = "create-pull-request", .args = &.{ "--repository=sample", "--title=Review", "--source-branch=feature", "--default-reviewers" }, .author = .{ .body = "{\"uuid\":\"{author}\"}" }, .method = .POST },
+        .{ .verb = "update-pull-request", .args = &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers" }, .author = .{ .body = reviewed_pr }, .method = .PUT },
+    }) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &.{ case.author, .{ .body = first_page }, .{ .body = later_page }, .{ .body = reviewed_pr } } };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try findVerb(case.verb).?.handler(output.init(&env, &arena), bb, case.args, true);
+        try std.testing.expectEqual(@as(usize, 4), fake.call_count);
+        try std.testing.expectEqual(case.method, fake.methodAt(3).?);
+        try expectSentReviewers(&fake, &.{ "{ada}", "{bob}" });
+
+        var failing: bbr.http.FakeHttpClient = .{ .responses = &.{ case.author, .{ .body = first_page }, .{ .status = 500 } }, .max_calls = 3 };
+        const failing_bb = bbr.bitbucket.Client.init(failing.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var failed: TestOutput = .{};
+        try std.testing.expectError(error.ServerError, findVerb(case.verb).?.handler(failed.init(&env, &arena), failing_bb, case.args, true));
+        try std.testing.expectEqual(@as(usize, 3), failing.call_count);
+        for (0..3) |index| try std.testing.expectEqual(bbr.http.client.Method.GET, failing.methodAt(index).?);
+        try std.testing.expectEqual(@as(usize, 0), failed.stdout_len);
     }
 }
 
@@ -1182,17 +1445,18 @@ test "Workspace Member search failure on any page produces no partial success ou
     }
 }
 
-test "a failed later page of a Repository, branch, or PullRequest list produces no stdout" {
+test "a failed later page of a Repository, branch, PullRequest, or Default Reviewer list produces no stdout" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    for ([_][]const u8{ "list-repositories", "list-branches", "list-pull-requests" }, [_][]const u8{
+    for ([_][]const u8{ "list-repositories", "list-branches", "list-pull-requests", "list-default-reviewers" }, [_][]const u8{
         "{\"slug\":\"r\"}",
         "{\"name\":\"b\",\"target\":{\"hash\":\"h\"}}",
         "{\"id\":1,\"title\":\"t\",\"state\":\"OPEN\",\"source\":{\"branch\":{\"name\":\"s\"}},\"destination\":{\"branch\":{\"name\":\"d\"}}}",
-    }, [_][]const u8{ "/repositories/demo", "/repositories/demo/sample/refs/branches", "/repositories/demo/sample/pullrequests" }) |verb, value, path| {
+        "{\"uuid\":\"{u}\",\"display_name\":\"d\"}",
+    }, [_][]const u8{ "/repositories/demo", "/repositories/demo/sample/refs/branches", "/repositories/demo/sample/pullrequests", "/repositories/demo/sample/default-reviewers" }) |verb, value, path| {
         const first = try std.fmt.allocPrint(arena.allocator(), "{{\"values\":[{s}],\"page\":1,\"pagelen\":1,\"size\":3,\"next\":\"{s}{s}?pagelen=1&page=2\"}}", .{ value, bbr.bitbucket.base_url, path });
         const responses = [_]bbr.http.Canned{ .{ .body = first }, .{ .request_key = "&page=2", .status = 500 } };
         for ([_]bool{ false, true }) |json| {
@@ -1208,13 +1472,13 @@ test "a failed later page of a Repository, branch, or PullRequest list produces 
     }
 }
 
-test "Repository, branch, and PullRequest lists reject an invalid --concurrency before HTTP" {
+test "Repository, branch, PullRequest, and Default Reviewer lists reject an invalid --concurrency before HTTP" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    for ([_][]const u8{ "list-repositories", "list-branches", "list-pull-requests" }) |verb| {
+    for ([_][]const u8{ "list-repositories", "list-branches", "list-pull-requests", "list-default-reviewers" }) |verb| {
         for ([_][]const []const u8{
             &.{ "--repository=sample", "--concurrency=0" },
             &.{ "--repository=sample", "--concurrency=x" },
@@ -1228,6 +1492,74 @@ test "Repository, branch, and PullRequest lists reject an invalid --concurrency 
             try std.testing.expectEqual(@as(usize, 0), fake.call_count);
         }
     }
+}
+
+test "list-default-reviewers prints each Default Reviewer with its reviewer type as text and JSON" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ada: bbr.bitbucket.DefaultReviewer = .{ .uuid = "{ada}", .display_name = "Ada", .reviewer_type = .repository };
+    const grace: bbr.bitbucket.DefaultReviewer = .{ .uuid = "{grace}", .display_name = "Grace", .reviewer_type = .project };
+    for ([_]struct { args: []const []const u8, body: []const u8, url: []const u8, text: []const u8, expected: []const bbr.bitbucket.DefaultReviewer }{
+        .{
+            .args = &.{"--repository=sample"},
+            .body = "{\"values\":[{\"type\":\"user\",\"display_name\":\"Ada\",\"uuid\":\"{ada}\"}]}",
+            .url = bbr.bitbucket.base_url ++ "/repositories/demo/sample/default-reviewers?pagelen=100",
+            .text = "{ada} Ada (repository)\nok: 1 Default Reviewer(s)\n",
+            .expected = &.{ada},
+        },
+        .{
+            .args = &.{ "--effective", "--repository", "sample" },
+            .body = "{\"values\":[{\"type\":\"default_reviewer\",\"reviewer_type\":\"project\",\"user\":{\"display_name\":\"Grace\",\"uuid\":\"{grace}\"}}," ++
+                "{\"type\":\"default_reviewer\",\"reviewer_type\":\"repository\",\"user\":{\"display_name\":\"Ada\",\"uuid\":\"{ada}\"}}]}",
+            .url = bbr.bitbucket.base_url ++ "/repositories/demo/sample/effective-default-reviewers?pagelen=100",
+            .text = "{grace} Grace (project)\n{ada} Ada (repository)\nok: 2 Default Reviewer(s)\n",
+            .expected = &.{ grace, ada },
+        },
+    }) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .body = case.body };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var human: TestOutput = .{};
+        try findVerb("list-default-reviewers").?.handler(human.init(&env, &arena), bb, case.args, false);
+        try std.testing.expectEqualStrings(case.text, human.stdoutBytes());
+        try std.testing.expectEqualStrings(case.url, fake.lastUrl().?);
+        var json: TestOutput = .{};
+        try findVerb("list-default-reviewers").?.handler(json.init(&env, &arena), bb, case.args, true);
+        try std.testing.expectEqual(@as(usize, 0), json.stderr_len);
+        const decoded = try std.json.parseFromSlice([]const bbr.bitbucket.DefaultReviewer, a, json.stdoutBytes(), .{});
+        defer decoded.deinit();
+        try std.testing.expectEqual(case.expected.len, decoded.value.len);
+        for (case.expected, decoded.value) |expected, reviewer| {
+            try std.testing.expectEqualStrings(expected.uuid, reviewer.uuid);
+            try std.testing.expectEqualStrings(expected.display_name, reviewer.display_name);
+            try std.testing.expectEqual(expected.reviewer_type, reviewer.reviewer_type);
+        }
+    }
+}
+
+test "list-default-reviewers rejects invalid options before HTTP" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fake: bbr.http.FakeHttpClient = .{};
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    var output: TestOutput = .{};
+    for ([_]struct { args: []const []const u8, err: anyerror }{
+        .{ .args = &.{"--effective"}, .err = error.MissingRequired },
+        .{ .args = &.{"--repository="}, .err = error.BadRequest },
+        .{ .args = &.{ "--repository=sample", "--repository=other" }, .err = error.BadRequest },
+        .{ .args = &.{ "--repository=sample", "--effective=true" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--repository=sample", "--query=uuid" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--repository=sample", "--sort=uuid" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--repository=sample", "--pagelen=101" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--repository=sample", "--page=0" }, .err = error.InvalidNumber },
+    }) |case| try std.testing.expectError(case.err, findVerb("list-default-reviewers").?.handler(output.init(&env, &arena), bb, case.args, true));
+    try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+    try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
 }
 
 test "list-workspace-pull-requests prints the named Repositories once in the given order and no stdout on a failed Repository" {

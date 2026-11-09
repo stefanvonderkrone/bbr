@@ -1,6 +1,6 @@
 # Ban error comparisons and require a Canceled prong
 
-Status: ready-for-agent
+Status: resolved
 Type: implementation
 Blocked by: 01
 Parent: ../PRD.md
@@ -33,3 +33,27 @@ Two checks keep the compiler able to see each error name.
 - `zig build test` passes.
 - The old line at `src/tui/presentation.zig:1325` fails the new check.
 - The rule table names each check, or marks the Canceled rule "Convention (no check)" with its reason.
+
+## Completion
+
+Production Zig no longer compares an error with `==` or `!=`. Each site switches on the error. `tools/check_error_comparisons.py` reads Zig through `zig_files` with `literals=False`, skips `test` blocks, and `zig build test` runs it. `tests/check_error_comparisons_test.py` rejects the old `src/tui/presentation.zig` line and an inequality. A comparison in a test, a string, or a comment still passes. Test comparisons in `src/api/files.zig` and `src/bitbucket/client.zig` stay.
+
+The Canceled rule is a convention with no line check. A line check cannot see an error set. A list of call names misses a `try` through another function. A `switch` with no `else` already requires a named `error.Canceled` prong. `std.Io.sleep` and `Group.await` return only `error{Canceled}`, so an `else` on those calls does not compile. The prong returns `error.Canceled`, calls `io.recancel()`, or is `unreachable` under `io.swapCancelProtection(.blocked)`.
+
+- `da46dfd` converts the TUI. A canceled blob retry in `src/tui/file_enrichment.zig` returns `error.Canceled` and does not send the second request. The catch baseline falls from 37 to 36.
+- `ee24f4e` converts `main`, the api verbs, config load, and stdout. stdout maps `error.WriteFailed` through the file error and returns every other error.
+- `1a6b7f6` converts the Bitbucket client, auth, and types. `Group.await` cleanup calls `io.recancel()`. The benchmark sleep returns `error.Canceled`.
+- `b5d148b` adds the check, the regression tests, and the `build.zig` step.
+- `0ebca1a` adds the `AGENTS.md` rows and the same rules in `.agents/skills/zig/errors.md`.
+
+A canceled Theme save was mapped to the read failure after `persistTheme` started returning `error.Canceled`. The status said `config.toml could not be read`. The follow-up `f709149` maps `error.Canceled` to the write failure, so the status says `config.toml could not be written`, and the handler calls `io.recancel()` after the diagnostic record. A canceled read takes the same status. Before this branch, a canceled read already used the read failure text.
+
+Checks:
+
+- `zig build test` after the Canceled edits: exit 0. `47/47 steps succeeded; 1546/1546 tests passed`. Log: `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/issue04-zig-test-2.log`.
+- The same command after the Theme save fix: exit 0. `47/47 steps succeeded; 1546/1546 tests passed`. Log: `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/issue04-zig-test-3.log`.
+- The red compile for the shadowed sleep capture is `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/issue04-zig-build-6.log`.
+- `python3 tools/check_diagnostics.py` passes. The catch baseline is 36. The record baseline is unchanged.
+- `python3 tools/check_agent_docs.py` passes.
+
+Review: Claude Opus 5.5 read the decision log and the commits. It found the Theme save mislabel. That fix is in the follow-up commit. The picker tick and the `Group.await` cleanups have no cancel test. The blob cancel test covers the 503 sleep, not the transport-error sleep. The five commits were cut from one green tree and were not built one by one.

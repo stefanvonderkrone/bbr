@@ -454,7 +454,10 @@ pub fn load(allocator: Allocator, io: std.Io, env: *const EnvMap) !?Loaded {
     }
     var location: ParseLocation = .{};
     const file = parseWithLocation(allocator, source, &location) catch |err| {
-        if (err == error.InvalidAuthFile) reportParseDiagnostic(io, path, location);
+        switch (err) {
+            error.InvalidAuthFile => reportParseDiagnostic(io, path, location),
+            else => {},
+        }
         return err;
     };
     return .{ .path = path, .file = file };
@@ -933,7 +936,10 @@ fn checkParseAllocations(allocator: Allocator, source: []const u8, invalid: bool
     var no_remap = testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
     const checked = no_remap.allocator();
     var file = parse(checked, source) catch |err| {
-        if (invalid and err == error.InvalidAuthFile) return;
+        switch (err) {
+            error.InvalidAuthFile => if (invalid) return,
+            else => {},
+        }
         return err;
     };
     defer file.deinit(checked);

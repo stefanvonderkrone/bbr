@@ -203,11 +203,13 @@ test "diagnostics a worker completion that carries error.Reported keeps the leaf
 }
 
 test "diagnostics a Bitbucket failure has one record from the worker boundary" {
-    const cases = [_]struct { fake: bbr.http.FakeHttpClient, cause: []const u8 }{
-        .{ .fake = .{ .body = "{" }, .cause = "cause=zig error=MalformedResponse" },
-        .{ .fake = .{ .send_error = error.ConnectionReset }, .cause = "cause=zig error=ConnectionReset" },
-        .{ .fake = .{ .status = 429, .body = "token" }, .cause = "cause=zig error=RateLimited" },
-        .{ .fake = .{ .status = 503, .body = "token" }, .cause = "cause=zig error=ServerError" },
+    const cases = [_]struct { fake: bbr.http.FakeHttpClient, cause: []const u8 = "source=tui/presentation_adapter.zig:", cause_end: []const u8 }{
+        .{ .fake = .{ .body = "{" }, .cause = "phase=decode source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=UnexpectedEndOfInput" },
+        .{ .fake = .{ .send_error = error.ConnectionReset, .send_phase = .receive_head }, .cause = "phase=receive_head source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=ConnectionReset" },
+        .{ .fake = .{ .status = 429, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=429 classification=rate_limit" },
+        .{ .fake = .{ .status = 503, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=503 classification=server" },
+        .{ .fake = .{ .status = 418, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=418 classification=other" },
+        .{ .fake = .{ .responses = &.{ .{ .body = "{\"values\":[],\"next\":\"https://api.bitbucket.org/2.0/next-page\"}" }, .{ .status = 503, .body = "{}" } } }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = " page=2 cause=http status=503 classification=server" },
     };
     for (cases) |case| {
         var tmp = testing.tmpDir(.{});
@@ -220,7 +222,8 @@ test "diagnostics a Bitbucket failure has one record from the worker boundary" {
         var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
         defer diagnostic_sink.deinit();
         try testing.expect(diagnostic_sink.setEnabled(true) == .on);
-        const handle = diagnostic_sink.handle(.picker_list, .{ .work_id = 41 });
+        var leaf: ?bbr.diagnostic.Leaf = null;
+        const handle = diagnostic_sink.handle(.picker_list, .{ .work_id = 41 }).withLeaf(&leaf);
         var fake = case.fake;
         const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "user", .token = "token", .workspace = "workspace" }).withDiagnostics(handle);
         var repository: [256]u8 = undefined;
@@ -240,8 +243,8 @@ test "diagnostics a Bitbucket failure has one record from the worker boundary" {
         _ = lines.next();
         const only = lines.next().?;
         try testing.expect(lines.next() == null);
-        try testing.expect(std.mem.indexOf(u8, only, "source=tui/presentation_adapter.zig:") != null);
-        try testing.expect(std.mem.endsWith(u8, only, case.cause));
+        try testing.expect(std.mem.indexOf(u8, only, case.cause) != null);
+        try testing.expect(std.mem.endsWith(u8, only, case.cause_end));
     }
 }
 
@@ -259,11 +262,11 @@ test "diagnostics a refused Reviewer Verdict change has one record from the work
         \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
         \\  "participants": [] }
     ;
-    const cases = [_]struct { responses: []const bbr.http.Canned, cause: []const u8 }{
-        .{ .responses = &.{.{ .status = 401, .body = "{}" }}, .cause = "cause=zig error=Unauthorized" },
-        .{ .responses = &.{ .{ .body = before }, .{ .status = 403, .body = "{}" } }, .cause = "cause=zig error=Forbidden" },
-        .{ .responses = &.{ .{ .body = before }, .{ .status = 503, .body = "{}" }, .{ .body = before } }, .cause = "cause=zig error=ServerError" },
-        .{ .responses = &.{ .{ .body = before }, .{ .send_error = error.ConnectionResetByPeer }, .{ .body = before } }, .cause = "cause=zig error=ConnectionResetByPeer" },
+    const cases = [_]struct { responses: []const bbr.http.Canned, cause: []const u8 = "command_id=5", cause_end: []const u8 }{
+        .{ .responses = &.{.{ .status = 401, .body = "{}" }}, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=401 classification=authentication" },
+        .{ .responses = &.{ .{ .body = before }, .{ .status = 403, .body = "{}" } }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=403 classification=authorization" },
+        .{ .responses = &.{ .{ .body = before }, .{ .status = 503, .body = "{}" }, .{ .body = before } }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=503 classification=server" },
+        .{ .responses = &.{ .{ .body = before }, .{ .send_error = error.ConnectionResetByPeer, .send_phase = .send_body }, .{ .body = before } }, .cause = "phase=send_body source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=ConnectionResetByPeer" },
     };
     for (cases) |case| {
         var tmp = testing.tmpDir(.{});
@@ -276,7 +279,8 @@ test "diagnostics a refused Reviewer Verdict change has one record from the work
         var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
         defer diagnostic_sink.deinit();
         try testing.expect(diagnostic_sink.setEnabled(true) == .on);
-        const handle = diagnostic_sink.handle(.verdict, .{});
+        var leaf: ?bbr.diagnostic.Leaf = null;
+        const handle = diagnostic_sink.handle(.verdict, .{}).withLeaf(&leaf);
         var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
         const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "user", .token = "token", .workspace = "workspace" }).withDiagnostics(handle);
         const Verdict = presentation.ChangeReviewerVerdict;
@@ -305,7 +309,8 @@ test "diagnostics a refused Reviewer Verdict change has one record from the work
         const only = lines.next().?;
         try testing.expect(lines.next() == null);
         try testing.expect(std.mem.indexOf(u8, only, "command_id=5") != null);
-        try testing.expect(std.mem.endsWith(u8, only, case.cause));
+        try testing.expect(std.mem.indexOf(u8, only, case.cause) != null);
+        try testing.expect(std.mem.endsWith(u8, only, case.cause_end));
     }
 }
 

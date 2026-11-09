@@ -25,6 +25,7 @@ Run `bbr api VERB --help` for flags. No flag tables here.
 - `list-pull-requests` — list PullRequests in a Repository. Example: `bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow`
 - `list-workspace-pull-requests`. List PullRequests across the Workspace by author UUID, or in the named Repositories by author or reviewer UUID. Example: `bbr api list-workspace-pull-requests --reviewer '{reviewer}' --repository sample --repository other --state OPEN --state MERGED --limit 20`
 - `get-pull-request` — get one PullRequest. Example: `bbr api get-pull-request --repository sample --pull-request-id 42`
+- `list-default-reviewers`. List the Default Reviewers that the Bitbucket web UI adds to a new PullRequest. `--effective` adds the Default Reviewers of the Project. Example: `bbr api list-default-reviewers --repository sample --effective`
 - `create-pull-request`. Create a Ready PullRequest or a Draft PullRequest. Example: `bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true`
 - `update-pull-request`. Update supplied fields on an open PullRequest. Example: `bbr api update-pull-request --repository sample --pull-request-id 42 --draft false`
 - `decline-pull-request`. Close a PullRequest without merging. Example: `bbr api decline-pull-request --repository sample --pull-request-id 42`
