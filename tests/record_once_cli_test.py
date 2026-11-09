@@ -17,6 +17,7 @@ binary = str(Path(sys.argv[1]).resolve())
 credentials = {"BITBUCKET_USERNAME": "record-once-user", "BITBUCKET_TOKEN": "record-once-token", "BITBUCKET_WORKSPACE": "record-once-workspace"}
 
 # (arguments, extra environment, stderr text, operation, cause) of the one record.
+# A failure whose leaf has more evidence names it in `evidence`, a part of the record.
 cases = (
     (["api", "whoami", "--json"], {}, b"bbr api whoami: MissingCredential (MissingUsername)\nRun `bbr auth login`", "api", "MissingUsername"),
     (["api", "frobnicate"], {}, b"bbr api: bad options (UnknownFlag)\n", "api", "UnknownFlag"),
@@ -63,7 +64,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
     config.parent.mkdir(parents=True)
     config.write_text("[logging]\nenabled = true\n")
     (root / "record-once-bad.tar.gz").write_bytes(b"\x1f\x8b\x09\x00\x00\x00\x00\x00\x00\x03not-gzip-content")
-    def check(args, extra, message, operation, cause, cwd=root, status=1):
+    def check(args, extra, message, operation, cause, cwd=root, status=1, evidence=""):
         before = logs(env)
         result = subprocess.run(
             [binary, *args], capture_output=True, env=dict(env, **extra), cwd=cwd, timeout=10, stdin=subprocess.DEVNULL,
@@ -74,22 +75,33 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
         assert b"error: Reported" not in result.stderr, (args, result.stderr)
         assert len(records) == 1, (args, records)
         assert f" operation={operation} " in records[0] and records[0].endswith(f" error={cause}"), (args, records)
+        assert evidence in records[0], (args, evidence, records)
 
     for case in cases:
         check(*case)
+    # The transport phase reaches the one record of a refused connection.
+    for args in (["api", "whoami"], ["auth", "status"]):
+        check(args, refused_proxy, b"ConnectionRefused", "api" if args[0] == "api" else "auth", "ConnectionRefused", evidence=" phase=connect ")
     # These Git failures print their message and end with status 0, as before.
     repository = root / "repository"
     repository.mkdir()
     git = ["git", "-c", "user.name=bbr", "-c", "user.email=bbr@example.invalid", "-c", "commit.gpgsign=false"]
     for command in (["init", "-q", "-b", "main"], ["commit", "-q", "--allow-empty", "-m", "base"]):
         subprocess.run([*git, *command], cwd=repository, env=env, check=True, capture_output=True)
-    check(["local", "main", "record-once-missing-source"], {}, b"bbr local: cannot resolve SourceRef 'record-once-missing-source': UnknownRef\n", "session_load", "UnknownRef", cwd=repository, status=0)
+    # A failed git command keeps its termination in the record of the error that names it.
+    check(
+        ["local", "main", "record-once-missing-source"], {}, b"bbr local: cannot resolve SourceRef 'record-once-missing-source': UnknownRef\n",
+        "session_load", "UnknownRef", cwd=repository, status=0, evidence=" cause=git termination=exited code=128 error=UnknownRef",
+    )
     check([], credentials, b"bbr: could not resolve a PR to open: NoRemote\n", "startup", "NoRemote", cwd=repository, status=0)
     # The detect probe lines show a Git error without a record. Startup resolution meets the
     # same error again and fails the command, which records it once.
     check(["detect"], credentials, b"branch: main\nremote: <NoRemote>\nerror: NoRemote\n", "startup", "NoRemote", cwd=repository)
     check(["detect"], credentials, b"branch: <NotAGitRepo>\nremote: <NoRemote>\nerror: NoRemote\n", "startup", "NoRemote")
-    check(["detect", "record-once"], credentials, b"branch: <NotAGitRepo>\nremote: <NoRemote>\nerror: NotAGitRepo\n", "startup", "NotAGitRepo")
+    check(
+        ["detect", "record-once"], credentials, b"branch: <NotAGitRepo>\nremote: <NoRemote>\nerror: NotAGitRepo\n",
+        "startup", "NotAGitRepo", evidence=" cause=git termination=exited code=128 error=NotAGitRepo",
+    )
     auth_file = root / "data/bbr/auth.toml"
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     auth_file.write_text("record-once-invalid")

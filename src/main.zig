@@ -47,7 +47,10 @@ pub fn main(init: std.process.Init) !void {
         }}),
         .off, .on => {},
     }
-    const diagnostic = sink.handle(.startup, .{});
+    // The CLI runs one command at a time, so its boundaries share one evidence slot.
+    // The TUI gives each worker its own.
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const diagnostic = sink.handle(.startup, .{}).withLeaf(&leaf);
     runMain(init, snapshot, diagnostic) catch |err| switch (err) {
         error.StdoutClosed => {},
         error.Reported => exitFailure(diagnostic, err, @src()),
@@ -147,9 +150,13 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
         if (std.mem.eql(u8, f, "check-blobs")) {
             var blob_owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
                 _ = diagnostic.forContext(.auth, .{}).failure(.read, .{ .zig = err }, @src());
-                if (err == error.InvalidAuthFile) return;
-                std.debug.print("skipped: blob checker needs a login (`bbr auth login`) or BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
-                return;
+                switch (err) {
+                    error.InvalidAuthFile => return,
+                    else => {
+                        std.debug.print("skipped: blob checker needs a login (`bbr auth login`) or BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
+                        return;
+                    },
+                }
             };
             defer blob_owned.deinit(gpa);
             return checkBlobsRun(init, gpa, blob_owned.credential(), &rest, diagnostic);
@@ -158,11 +165,15 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
 
     var owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
         _ = diagnostic.forContext(.auth, .{}).failure(.read, .{ .zig = err }, @src());
-        if (err == error.InvalidAuthFile) return;
-        std.debug.print("bbr: missing credential: {s}\nRun `bbr auth login` to save credentials, or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.\n", .{
-            @errorName(err),
-        });
-        return;
+        switch (err) {
+            error.InvalidAuthFile => return,
+            else => {
+                std.debug.print("bbr: missing credential: {s}\nRun `bbr auth login` to save credentials, or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.\n", .{
+                    @errorName(err),
+                });
+                return;
+            },
+        }
     };
     defer owned.deinit(gpa);
     const cred = owned.credential();
@@ -258,6 +269,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     const a = arena.allocator();
 
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    git.diagnostic = diagnostic;
 
     var client = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
     defer client.deinit();
@@ -358,6 +370,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
     defer arena.deinit();
     const a = arena.allocator();
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    git.diagnostic = diagnostic;
     const client = git.gitClient();
     const source_name = if (source_input) |value| value else client.currentBranch(a) catch |err| {
         _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
@@ -393,8 +406,9 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
     if (client.repositoryRemote(a, source.canonical)) |remote| {
         aliases[alias_count] = try std.fmt.allocPrint(a, "remote:{s}", .{remote});
         alias_count += 1;
-    } else |err| {
-        if (err != error.NoRemote) _ = diagnostic.forContext(.git, .{}).failure(.read, .{ .zig = err }, @src());
+    } else |err| switch (err) {
+        error.NoRemote => {},
+        else => _ = diagnostic.forContext(.git, .{}).failure(.read, .{ .zig = err }, @src()),
     }
     aliases[alias_count] = common_alias;
     alias_count += 1;
@@ -468,8 +482,9 @@ fn openStore(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.M
                 std.debug.print("bbr: could not open {s} ({s}); drafts won't persist this session\n", .{ path, @errorName(err) });
             },
         }
-    } else |err| {
-        if (err != error.NoStateHome) _ = diagnostic.forContext(.persistence, .{}).failure(.prepare, .{ .zig = err }, @src());
+    } else |err| switch (err) {
+        error.NoStateHome => {},
+        else => _ = diagnostic.forContext(.persistence, .{}).failure(.prepare, .{ .zig = err }, @src()),
     }
     return memoryStore(diagnostic);
 }
@@ -633,7 +648,10 @@ fn runAcquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bb
         session.loadSequentialWith(std.heap.page_allocator, bb, "pr-webapp", id);
     const candidate = loaded catch |err| {
         failures.* += 1;
-        if (err == error.RateLimited) rate_limited.* += 1;
+        switch (err) {
+            error.RateLimited => rate_limited.* += 1,
+            else => {},
+        }
         return @as(anyerror!u64, err);
     };
     defer candidate.destroy();
@@ -859,6 +877,7 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
     if (it.next()) |repo| input = .{ .repo_slug = repo };
 
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    git.diagnostic = diagnostic;
 
     // Report what the GitClient sees, so a failed detect is diagnosable.
     if (git.gitClient().currentBranch(a)) |b| {
@@ -1034,10 +1053,9 @@ fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fla
             exitFailure(diagnostic, error.MissingWorkspace, @src());
         };
         const token = readStdinToken(gpa, &stdin.interface) catch |err| {
-            if (err == error.OutOfMemory) {
-                std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
-            } else {
-                std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
+            switch (err) {
+                error.OutOfMemory => std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{}),
+                else => std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{}),
             }
             exitFailure(diagnostic, err, @src());
         };
@@ -1101,15 +1119,17 @@ fn loginValidateAndSave(init: std.process.Init, gpa: std.mem.Allocator, profile_
     const bb = bbr.bitbucket.Client.init(http_client.httpClient(), candidate).withDiagnostics(diagnostic);
 
     const uuid = bb.getAuthenticatedAccountUuid(gpa) catch |err| {
-        if (err == error.Unauthorized) std.debug.print("bbr: login failed: bad email/token (401); nothing saved\n", .{}) else std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
+        switch (err) {
+            error.Unauthorized => std.debug.print("bbr: login failed: bad email/token (401); nothing saved\n", .{}),
+            else => std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)}),
+        }
         exitFailure(diagnostic, err, @src());
     };
     defer gpa.free(uuid);
     bb.checkWorkspace(gpa, workspace) catch |err| {
-        if (err == error.NotFound or err == error.Forbidden) {
-            std.debug.print("bbr: login failed: workspace not found or not visible; nothing saved\n", .{});
-        } else {
-            std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
+        switch (err) {
+            error.NotFound, error.Forbidden => std.debug.print("bbr: login failed: workspace not found or not visible; nothing saved\n", .{}),
+            else => std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)}),
         }
         exitFailure(diagnostic, err, @src());
     };
@@ -1269,10 +1289,9 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     };
     defer gpa.free(uuid);
     bb.checkWorkspace(gpa, owned.workspace) catch |err| {
-        if (err == error.NotFound or err == error.Forbidden) {
-            std.debug.print("bbr: status failed: workspace '{s}' not found or not visible\n", .{owned.workspace});
-        } else {
-            std.debug.print("bbr: status failed: {s} ({s})\n", .{ statusFailureMessage(err, true), @errorName(err) });
+        switch (err) {
+            error.NotFound, error.Forbidden => std.debug.print("bbr: status failed: workspace '{s}' not found or not visible\n", .{owned.workspace}),
+            else => std.debug.print("bbr: status failed: {s} ({s})\n", .{ statusFailureMessage(err, true), @errorName(err) }),
         }
         exitFailure(diagnostic, err, @src());
     };
@@ -1282,10 +1301,12 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     const workspace_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_WORKSPACE") != null) "env" else "file";
     bbr.stdout.print(init.io, "profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
         owned.profile, owned.username, email_src, token_src, owned.workspace, workspace_src, uuid,
-    }) catch |err| {
-        if (err == error.StdoutClosed) return err;
-        std.debug.print("bbr: status failed: output error\n", .{});
-        exitFailure(diagnostic, err, @src());
+    }) catch |err| switch (err) {
+        error.StdoutClosed => return err,
+        else => {
+            std.debug.print("bbr: status failed: output error\n", .{});
+            exitFailure(diagnostic, err, @src());
+        },
     };
 }
 

@@ -25,6 +25,9 @@ RETURN = re.compile(r"\breturn\b")
 NO_NEW_ERROR = re.compile(r"(?:\.|\d|(?:null|true|false|undefined|try)\b|error\.Reported\b|(?!(?:if|switch)\b)[A-Za-z_][\w.]*\s*\()")
 # A SQLite result call must be the first argument of a `native` call on any receiver.
 NATIVE_WRAPPER = re.compile(r"\b\w+(?:\s*\.\s*\w+)*\s*\.\s*native\s*\(\s*$")
+# The client returns each error of this set only through `noted`, so its record never takes stale evidence.
+CLIENT = "src/bitbucket/client.zig"
+API_ERRORS = "src/bitbucket/types.zig"
 OPENS = "([{"
 CLOSES = ")]}"
 
@@ -40,6 +43,46 @@ def production(lines):
         depth += line.count("{") - line.count("}")
         if test_depth is not None and depth <= test_depth:
             test_depth = None
+
+
+def api_error_names(root):
+    """The members of `ApiError` in src/bitbucket/types.zig."""
+    for _, lines in zig_files(root, (API_ERRORS,), literals=False):
+        declaration = re.search(r"\bpub\s+const\s+ApiError\s*=\s*error\s*\{([^}]*)\}", "\n".join(lines))
+        if declaration:
+            return re.findall(r"[A-Za-z_]\w*", declaration[1])
+    return []
+
+
+def unnoted_client_returns(lines, names):
+    """The line of each returned `ApiError` member outside the error argument of `noted`."""
+    member = re.compile(r"\berror\s*\.\s*(?:" + "|".join(names) + r")\b")
+    text, line_of = joined(lines)
+    for returned in RETURN.finditer(text):
+        start = returned.end()
+        end = handler_end(text, start)
+        expression = text[start:end]
+        noted_arguments = set()
+        for call in re.finditer(r"\bnoted\s*\(", expression):
+            depth = 0
+            for index in range(call.end(), len(expression)):
+                char = expression[index]
+                if char in OPENS:
+                    depth += 1
+                elif char in CLOSES:
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif char == "," and depth == 0:
+                    argument = re.match(r"\s*(error\s*\.\s*\w+)\s*(?=,)", expression[index + 1:])
+                    if argument:
+                        noted_arguments.add(index + 1 + argument.start(1))
+                    break
+        for found in member.finditer(expression):
+            if re.match(r"(?:\s*,\s*error\s*\.\s*\w+)*\s*,?\s*=>", expression[found.end():]):
+                continue
+            if found.start() not in noted_arguments:
+                yield line_of(start + found.start())
 
 
 def unwrapped_sqlite_results(lines):
@@ -271,6 +314,15 @@ def violations(root):
                 )
             if str(path) == "src/main.zig" and re.search(r"\bstd\.process\.exit\s*\(", line) and owner != "exitFailure":
                 yield f"{path}:{number}: use exitFailure with the real cause and @src() before an error exit."
+        if str(path) == CLIENT and (root / API_ERRORS).exists():
+            names = api_error_names(root)
+            if not names:
+                yield f"{API_ERRORS}: declare `pub const ApiError = error{{ ... }}`, the client errors that {CLIENT} returns through `noted`."
+            for number in unnoted_client_returns(production_lines, names) if names else ():
+                yield (
+                    f"{path}:{number}: return a client error through `noted(diagnostic, error.X, phase, cause)`. "
+                    "It notes fresh evidence, so the boundary record does not take the evidence of an earlier failure."
+                )
         if str(path) == "src/persist/sqlite_store.zig":
             for number in unwrapped_sqlite_results(production_lines):
                 yield f"{path}:{number}: pass the SQLite result through SqliteStore.native before conversion or disposal."

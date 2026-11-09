@@ -51,5 +51,6 @@ with tempfile.TemporaryDirectory(prefix="bbr-git-launch-cli-") as directory:
     assert b"NotAGitRepo" not in result.stderr, result.stderr
     assert len(records) == 1, records
     assert records[0].endswith("cause=zig error=FileNotFound"), records
+    assert " phase=launch " in records[0], records
 
 print("A missing git binary shows FileNotFound once.")
