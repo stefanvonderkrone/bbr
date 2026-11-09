@@ -1,6 +1,7 @@
 # Close the remaining evidence and test gaps
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: poteto-agent subagent, /Volumes/Work/t3-code/error-handling-discipline (feat/evidence-gaps)
 Type: implementation
 Blocked by: 04, 05, 07
 Parent: ../PRD.md
