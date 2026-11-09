@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
         var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, init.io);
         const base = try git.gitClient().resolveRef(allocator, base_ref);
         const source = try git.gitClient().resolveRef(allocator, source_ref);
-        const raw_diff = try git.gitClient().diff(allocator, base.commit, source.commit);
+        const raw_diff = try git.gitClient().diff(allocator, base.commit, source.commit, .{});
         const diff = try bbr.diff.parse(allocator, raw_diff);
         var git_source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
         const name = try std.fmt.allocPrint(allocator, "LocalReview {s}..{s}", .{ base_ref, source_ref });
@@ -132,7 +132,7 @@ fn runFixture(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture) !void 
             run_count += 1;
             if (fixture.remote and run_count < samples_per_limit * limits.len)
                 io.sleep(std.Io.Duration.fromSeconds(10), .awake) catch |err| switch (err) {
-                    error.Canceled => return error.SleepFailed,
+                    error.Canceled => return error.Canceled,
                 };
         }
     }
@@ -166,7 +166,7 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
     var completion_buffer: [limits[limits.len - 1]]Selected = undefined;
     var select = std.Io.Select(Selected).init(io, &completion_buffer);
     defer select.group.await(io) catch |err| switch (err) {
-        error.Canceled => {},
+        error.Canceled => io.recancel(),
     };
     const start = std.Io.Clock.awake.now(io);
     var first_file_ms: u64 = 0;
@@ -178,7 +178,7 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
 
     while (active < limit and next < order.len) : (next += 1) {
         const file_index = order[next];
-        try select.concurrent(.file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
+        try bbr.diagnostics.selectConcurrent(&select, .file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
         active += 1;
     }
     while (active > 0) {
@@ -197,13 +197,16 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
             },
             .failed => |err| {
                 failures += 1;
-                if (err == error.RateLimited) rate_limited += 1;
+                switch (err) {
+                    error.RateLimited => rate_limited += 1,
+                    else => {},
+                }
             },
         }
         if (next < order.len) {
             const file_index = order[next];
             next += 1;
-            try select.concurrent(.file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
+            try bbr.diagnostics.selectConcurrent(&select, .file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
             active += 1;
         }
     }
@@ -247,7 +250,10 @@ fn lessThanFilePath(files: []const bbr.diff.File, lhs: usize, rhs: usize) bool {
 fn countFailure(side: file_enrichment.SideView, failures: *usize, rate_limited: *usize) void {
     if (side == .fetch_failed) {
         failures.* += 1;
-        if (side.fetch_failed == error.RateLimited) rate_limited.* += 1;
+        switch (side.fetch_failed) {
+            error.RateLimited => rate_limited.* += 1,
+            else => {},
+        }
     }
 }
 

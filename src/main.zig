@@ -47,12 +47,18 @@ pub fn main(init: std.process.Init) !void {
         }}),
         .off, .on => {},
     }
-    const diagnostic = sink.handle(.startup, .{});
+    // The CLI runs one command at a time, so its boundaries share one evidence slot.
+    // The TUI gives each worker its own.
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const diagnostic = sink.handle(.startup, .{}).withLeaf(&leaf);
     runMain(init, snapshot, diagnostic) catch |err| switch (err) {
         error.StdoutClosed => {},
+        error.Reported => exitFailure(diagnostic, err, @src()),
         else => {
-            _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
-            return err;
+            // The Zig start code printed this line and the trace when main returned the error.
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            exitFailure(diagnostic, err, @src());
         },
     };
 }
@@ -114,10 +120,7 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
     if (first) |f| {
         if (std.mem.eql(u8, f, "grammar")) return grammarRun(init, gpa, &rest, diagnostic.forContext(.grammar, .{}));
         if (std.mem.eql(u8, f, "demo")) {
-            var loaded = config.loadSnapshot(gpa, snapshot) catch |err| {
-                _ = diagnostic.forContext(.configuration, .{}).failure(.read, .{ .zig = err }, @src());
-                return err;
-            };
+            var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(diagnostic, err, @src());
             defer loaded.deinit(gpa);
             return switch (loaded) {
                 .ok => |*configuration| demoRun(init.io, gpa, init.environ_map, configuration, diagnostic),
@@ -147,9 +150,13 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
         if (std.mem.eql(u8, f, "check-blobs")) {
             var blob_owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
                 _ = diagnostic.forContext(.auth, .{}).failure(.read, .{ .zig = err }, @src());
-                if (err == error.InvalidAuthFile) return;
-                std.debug.print("skipped: blob checker needs a login (`bbr auth login`) or BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
-                return;
+                switch (err) {
+                    error.InvalidAuthFile => return,
+                    else => {
+                        std.debug.print("skipped: blob checker needs a login (`bbr auth login`) or BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
+                        return;
+                    },
+                }
             };
             defer blob_owned.deinit(gpa);
             return checkBlobsRun(init, gpa, blob_owned.credential(), &rest, diagnostic);
@@ -158,11 +165,15 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
 
     var owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
         _ = diagnostic.forContext(.auth, .{}).failure(.read, .{ .zig = err }, @src());
-        if (err == error.InvalidAuthFile) return;
-        std.debug.print("bbr: missing credential: {s}\nRun `bbr auth login` to save credentials, or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.\n", .{
-            @errorName(err),
-        });
-        return;
+        switch (err) {
+            error.InvalidAuthFile => return,
+            else => {
+                std.debug.print("bbr: missing credential: {s}\nRun `bbr auth login` to save credentials, or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.\n", .{
+                    @errorName(err),
+                });
+                return;
+            },
+        }
     };
     defer owned.deinit(gpa);
     const cred = owned.credential();
@@ -193,10 +204,7 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
         }
     }
 
-    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| {
-        _ = diagnostic.forContext(.configuration, .{}).failure(.read, .{ .zig = err }, @src());
-        return err;
-    };
+    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(diagnostic, err, @src());
     defer loaded.deinit(gpa);
     switch (loaded) {
         .ok => |*configuration| try openTui(init, gpa, cred, input, configuration, diagnostic),
@@ -204,8 +212,18 @@ fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnos
     }
 }
 
+/// The boundary of `bbr grammar`: it prints and records each failure of the command once.
 fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
-    errdefer |err| _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
+    grammarCommand(init, gpa, it, diagnostic) catch |err| switch (err) {
+        error.StdoutClosed, error.Reported => return err,
+        else => {
+            std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
+            return diagnostic.fail(.execute, .{ .zig = err }, @src());
+        },
+    };
+}
+
+fn grammarCommand(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(gpa);
     while (it.next()) |arg| try args.append(gpa, arg);
@@ -226,10 +244,7 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagn
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer, " \t\r"), "yes");
         if (approved) interactive_digest = previewed_digest;
     }
-    bbr.stdout.write(init.io, runGrammar, .{ gpa, init.io, init.environ_map, args.items, interactive_digest, diagnostic }) catch |err| {
-        if (err != error.StdoutClosed) std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
-        return @as(anyerror!void, err);
-    };
+    try bbr.stdout.write(init.io, runGrammar, .{ gpa, init.io, init.environ_map, args.items, interactive_digest, diagnostic });
 }
 
 fn writeTrustQuestion(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, path: []const u8, digest: *[32]u8, diagnostic: bbr.diagnostics.Handle) !void {
@@ -254,10 +269,9 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     const a = arena.allocator();
 
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
-    git.diagnostic = diagnostic.forContext(.git, .{});
+    git.diagnostic = diagnostic;
 
     var client = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(a, init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -318,7 +332,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null, diagnostic.forContext(.highlighting, .{}));
     defer tree_sitter_highlighter.deinit();
 
-    app.run(.{
+    try app.run(.{
         .diagnostic = diagnostic,
         .io = init.io,
         .gpa = gpa,
@@ -337,26 +351,15 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .submission_locks = os_locks.locks(),
-    }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id)) catch |err| {
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
-        if (tuiFatalMessage(err)) |message| {
-            std.debug.print("{s}\n", .{message});
-            return;
-        }
-        return err;
-    };
+    }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id));
 }
 
 fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapshot: bbr.config_source.Snapshot, diagnostic: bbr.diagnostics.Handle) anyerror!void {
-    errdefer |err| _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
     const base_input = it.next();
     const source_input = it.next();
     if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
-    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| {
-        _ = diagnostic.forContext(.configuration, .{}).failure(.read, .{ .zig = err }, @src());
-        return @as(anyerror!void, err);
-    };
+    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(diagnostic, err, @src());
     defer loaded.deinit(gpa);
     const configuration = switch (loaded) {
         .ok => |*value| value,
@@ -367,7 +370,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
     defer arena.deinit();
     const a = arena.allocator();
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
-    git.diagnostic = diagnostic.forContext(.git, .{});
+    git.diagnostic = diagnostic;
     const client = git.gitClient();
     const source_name = if (source_input) |value| value else client.currentBranch(a) catch |err| {
         _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
@@ -403,15 +406,22 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
     if (client.repositoryRemote(a, source.canonical)) |remote| {
         aliases[alias_count] = try std.fmt.allocPrint(a, "remote:{s}", .{remote});
         alias_count += 1;
-    } else |err| {
-        if (err != error.NoRemote) _ = diagnostic.forContext(.git, .{}).failure(.read, .{ .zig = err }, @src());
+    } else |err| switch (err) {
+        error.NoRemote => {},
+        else => _ = diagnostic.forContext(.git, .{}).failure(.read, .{ .zig = err }, @src()),
     }
     aliases[alias_count] = common_alias;
     alias_count += 1;
-    const repository_id = store.store().resolveRepository(aliases[0..alias_count]) catch |err| {
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
-        std.debug.print("bbr local: cannot resolve repository identity: {s}\n", .{@errorName(err)});
-        return;
+    const repository_id = store.store().resolveRepository(aliases[0..alias_count]) catch |err| switch (err) {
+        error.Reported => {
+            std.debug.print("bbr local: cannot resolve repository identity\n", .{});
+            return;
+        },
+        else => {
+            _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
+            std.debug.print("bbr local: cannot resolve repository identity: {s}\n", .{@errorName(err)});
+            return;
+        },
     };
     const key = presentation.OwnedReviewIdentity.initLocal(repository_id, base.canonical, source.canonical) catch |err| {
         _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
@@ -456,13 +466,6 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapsho
     }, null, key);
 }
 
-fn tuiFatalMessage(err: anyerror) ?[]const u8 {
-    return switch (err) {
-        error.FileEnrichmentOutOfMemory => "bbr: file enrichment ran out of memory; the review was not modified",
-        else => null,
-    };
-}
-
 /// Open the pending-review store at `<state home>/bbr/pending.db`, creating the
 /// directory. Falls back to an in-memory (non-durable) store when no state home
 /// resolves or the file can't be prepared, so the reviewer can still author this session.
@@ -471,13 +474,22 @@ fn openStore(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.M
         defer gpa.free(path);
         if (persist.SqliteStore.openDiagnostic(path, diagnostic.forContext(.persistence, .{}))) |s| {
             return s;
-        } else |err| {
-            _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
-            std.debug.print("bbr: could not open {s} ({s}); drafts won't persist this session\n", .{ path, @errorName(err) });
+        } else |err| switch (err) {
+            // The SQLite seam recorded the result code. The error name says nothing more.
+            error.Reported => std.debug.print("bbr: could not open {s}; drafts won't persist this session\n", .{path}),
+            else => {
+                _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
+                std.debug.print("bbr: could not open {s} ({s}); drafts won't persist this session\n", .{ path, @errorName(err) });
+            },
         }
-    } else |err| {
-        if (err != error.NoStateHome) _ = diagnostic.forContext(.persistence, .{}).failure(.prepare, .{ .zig = err }, @src());
+    } else |err| switch (err) {
+        error.NoStateHome => {},
+        else => _ = diagnostic.forContext(.persistence, .{}).failure(.prepare, .{ .zig = err }, @src()),
     }
+    return memoryStore(diagnostic);
+}
+
+fn memoryStore(diagnostic: bbr.diagnostics.Handle) persist.SqliteStore {
     return persist.SqliteStore.openDiagnostic(":memory:", diagnostic.forContext(.persistence, .{})) catch |err| {
         _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
         @panic("sqlite :memory: open failed");
@@ -514,7 +526,6 @@ fn rawComments(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbuck
     const pr_id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -530,7 +541,6 @@ fn rawComment(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucke
     const cid = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -545,7 +555,6 @@ fn checkRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.
     const id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -602,8 +611,8 @@ fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr
         var rate_limited: usize = 0;
         var max_connections: usize = 0;
         for (0..10) |sample_index| {
-            sequential[sample_index] = runAcquisitionSample(init, gpa, cred, id, false, &failures, &rate_limited, &max_connections, diagnostic) catch 0;
-            bounded[sample_index] = runAcquisitionSample(init, gpa, cred, id, true, &failures, &rate_limited, &max_connections, diagnostic) catch 0;
+            sequential[sample_index] = acquisitionSample(init, gpa, cred, id, false, &failures, &rate_limited, &max_connections, diagnostic);
+            bounded[sample_index] = acquisitionSample(init, gpa, cred, id, true, &failures, &rate_limited, &max_connections, diagnostic);
         }
         std.mem.sort(u64, &sequential, {}, std.sort.asc(u64));
         std.mem.sort(u64, &bounded, {}, std.sort.asc(u64));
@@ -617,12 +626,17 @@ fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr
     }
 }
 
+fn acquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, id: u64, bounded: bool, failures: *usize, rate_limited: *usize, max_connections: *usize, diagnostic: bbr.diagnostics.Handle) u64 {
+    return runAcquisitionSample(init, gpa, cred, id, bounded, failures, rate_limited, max_connections, diagnostic) catch |err| {
+        _ = diagnostic.forContext(.session_load, .{}).failure(.execute, .{ .zig = err }, @src());
+        return 0;
+    };
+}
+
 fn runAcquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, id: u64, bounded: bool, failures: *usize, rate_limited: *usize, max_connections: *usize, diagnostic: bbr.diagnostics.Handle) !u64 {
-    errdefer |err| _ = diagnostic.forContext(.session_load, .{}).failure(.execute, .{ .zig = err }, @src());
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
-    transport.diagnostic = diagnostic.forContext(.http, .{});
     defer transport.deinit();
     transport.enableConnectionCountTracking();
     try transport.initDefaultProxies(arena.allocator(), init.environ_map);
@@ -633,9 +647,11 @@ fn runAcquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bb
     else
         session.loadSequentialWith(std.heap.page_allocator, bb, "pr-webapp", id);
     const candidate = loaded catch |err| {
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
         failures.* += 1;
-        if (err == error.RateLimited) rate_limited.* += 1;
+        switch (err) {
+            error.RateLimited => rate_limited.* += 1,
+            else => {},
+        }
         return @as(anyerror!u64, err);
     };
     defer candidate.destroy();
@@ -653,7 +669,6 @@ fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bi
     if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -693,10 +708,12 @@ fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bit
     if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
-    transport.diagnostic = diagnostic.forContext(.http, .{});
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred).withDiagnostics(diagnostic);
+    try checkVerdict(gpa, bbr.bitbucket.Client.init(transport.httpClient(), cred).withDiagnostics(diagnostic), repo, pull_request_id, diagnostic);
+}
+
+fn checkVerdict(gpa: std.mem.Allocator, bb: bbr.bitbucket.Client, repo: []const u8, pull_request_id: u64, diagnostic: bbr.diagnostics.Handle) !void {
     const account_uuid = try bb.getAuthenticatedAccountUuid(gpa);
     defer gpa.free(account_uuid);
     const initial_pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
@@ -708,16 +725,16 @@ fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bit
     var restored = false;
     defer if (!restored) {
         if (restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial)) |result| {
-            if (!verdictChangeSucceeded(result)) _ = diagnostic.forContext(.verdict, .{}).failure(.cleanup, .{ .zig = error.ReviewerVerdictRestoreFailed }, @src());
+            if (!verdictChangeSucceeded(result)) _ = diagnostic.forContext(.verdict, .{}).failure(.cleanup, .{ .zig = verdictChangeCause(result, error.ReviewerVerdictRestoreFailed) }, @src());
         } else |err| {
             _ = diagnostic.forContext(.verdict, .{}).failure(.cleanup, .{ .zig = err }, @src());
         }
     };
 
     const changed = try bb.changeReviewerVerdict(gpa, repo, pull_request_id, initial_pull_request.source_commit, account_uuid, target);
-    if (!verdictChangeSucceeded(changed)) return error.ReviewerVerdictChangeFailed;
+    if (!verdictChangeSucceeded(changed)) return verdictChangeFailed(diagnostic, changed, error.ReviewerVerdictChangeFailed, @src());
     const restore_result = try restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial);
-    if (!verdictChangeSucceeded(restore_result)) return error.ReviewerVerdictRestoreFailed;
+    if (!verdictChangeSucceeded(restore_result)) return verdictChangeFailed(diagnostic, restore_result, error.ReviewerVerdictRestoreFailed, @src());
     restored = true;
     std.debug.print("ok: changed Reviewer Verdict from {s} to {s} and restored it\n", .{ @tagName(initial), @tagName(target) });
 }
@@ -735,6 +752,22 @@ fn restoreReviewerVerdict(
     return bb.changeReviewerVerdict(gpa, repo, pull_request_id, current.source_commit, account_uuid, target);
 }
 
+/// The cause that a failed change result names, else `failure`.
+fn verdictChangeCause(result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror) anyerror {
+    return switch (result) {
+        .api_error => |err| err,
+        .unresolved => |err| err orelse failure,
+        .success, .reconciled_success, .stale_source_commit => failure,
+    };
+}
+
+/// Shows a failed change with the cause that its result names, and records that cause once.
+fn verdictChangeFailed(diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    const cause = verdictChangeCause(result, failure);
+    std.debug.print("bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) });
+    return diagnostic.forContext(.verdict, .{}).fail(.execute, .{ .zig = cause }, source);
+}
+
 fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) bool {
     return switch (result) {
         .success, .reconciled_success => true,
@@ -749,7 +782,6 @@ fn checkBlobsRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbu
     var checked: [fixture_classes.len]bool = @splat(false);
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -845,7 +877,7 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
     if (it.next()) |repo| input = .{ .repo_slug = repo };
 
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
-    git.diagnostic = diagnostic.forContext(.git, .{});
+    git.diagnostic = diagnostic;
 
     // Report what the GitClient sees, so a failed detect is diagnosable.
     if (git.gitClient().currentBranch(a)) |b| {
@@ -856,7 +888,6 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
     } else |err| std.debug.print("remote: <{s}>\n", .{@errorName(err)});
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    client.diagnostic = diagnostic.forContext(.http, .{});
     defer client.deinit();
     try client.initDefaultProxies(a, init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
@@ -1022,10 +1053,9 @@ fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fla
             exitFailure(diagnostic, error.MissingWorkspace, @src());
         };
         const token = readStdinToken(gpa, &stdin.interface) catch |err| {
-            if (err == error.OutOfMemory) {
-                std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
-            } else {
-                std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
+            switch (err) {
+                error.OutOfMemory => std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{}),
+                else => std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{}),
             }
             exitFailure(diagnostic, err, @src());
         };
@@ -1081,7 +1111,6 @@ fn loginValidateAndSave(init: std.process.Init, gpa: std.mem.Allocator, profile_
     const auth = bbr.bitbucket.auth;
     const candidate: bbr.bitbucket.Credential = .{ .username = email, .token = token, .workspace = workspace };
     var http_client = bbr.http.StdHttpClient.init(gpa, init.io);
-    http_client.diagnostic = diagnostic.forContext(.http, .{});
     defer http_client.deinit();
     http_client.initDefaultProxies(init.arena.allocator(), init.environ_map) catch |err| {
         std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
@@ -1090,15 +1119,17 @@ fn loginValidateAndSave(init: std.process.Init, gpa: std.mem.Allocator, profile_
     const bb = bbr.bitbucket.Client.init(http_client.httpClient(), candidate).withDiagnostics(diagnostic);
 
     const uuid = bb.getAuthenticatedAccountUuid(gpa) catch |err| {
-        if (err == error.Unauthorized) std.debug.print("bbr: login failed: bad email/token (401); nothing saved\n", .{}) else std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
+        switch (err) {
+            error.Unauthorized => std.debug.print("bbr: login failed: bad email/token (401); nothing saved\n", .{}),
+            else => std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)}),
+        }
         exitFailure(diagnostic, err, @src());
     };
     defer gpa.free(uuid);
     bb.checkWorkspace(gpa, workspace) catch |err| {
-        if (err == error.NotFound or err == error.Forbidden) {
-            std.debug.print("bbr: login failed: workspace not found or not visible; nothing saved\n", .{});
-        } else {
-            std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
+        switch (err) {
+            error.NotFound, error.Forbidden => std.debug.print("bbr: login failed: workspace not found or not visible; nothing saved\n", .{}),
+            else => std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)}),
         }
         exitFailure(diagnostic, err, @src());
     };
@@ -1245,7 +1276,6 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     defer owned.deinit(gpa);
 
     var http_client = bbr.http.StdHttpClient.init(gpa, init.io);
-    http_client.diagnostic = diagnostic.forContext(.http, .{});
     defer http_client.deinit();
     http_client.initDefaultProxies(init.arena.allocator(), init.environ_map) catch |err| {
         std.debug.print("bbr: status failed: transport ({s})\n", .{@errorName(err)});
@@ -1259,10 +1289,9 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     };
     defer gpa.free(uuid);
     bb.checkWorkspace(gpa, owned.workspace) catch |err| {
-        if (err == error.NotFound or err == error.Forbidden) {
-            std.debug.print("bbr: status failed: workspace '{s}' not found or not visible\n", .{owned.workspace});
-        } else {
-            std.debug.print("bbr: status failed: {s} ({s})\n", .{ statusFailureMessage(err, true), @errorName(err) });
+        switch (err) {
+            error.NotFound, error.Forbidden => std.debug.print("bbr: status failed: workspace '{s}' not found or not visible\n", .{owned.workspace}),
+            else => std.debug.print("bbr: status failed: {s} ({s})\n", .{ statusFailureMessage(err, true), @errorName(err) }),
         }
         exitFailure(diagnostic, err, @src());
     };
@@ -1272,17 +1301,18 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     const workspace_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_WORKSPACE") != null) "env" else "file";
     bbr.stdout.print(init.io, "profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
         owned.profile, owned.username, email_src, token_src, owned.workspace, workspace_src, uuid,
-    }) catch |err| {
-        if (err == error.StdoutClosed) return err;
-        std.debug.print("bbr: status failed: output error\n", .{});
-        exitFailure(diagnostic, err, @src());
+    }) catch |err| switch (err) {
+        error.StdoutClosed => return err,
+        else => {
+            std.debug.print("bbr: status failed: output error\n", .{});
+            exitFailure(diagnostic, err, @src());
+        },
     };
 }
 
 /// `bbr auth login|status|logout` dispatcher. Credential management lives
 /// outside the TUI under this one group; there are no top-level aliases.
 fn authRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8, diagnostic: bbr.diagnostics.Handle) !void {
-    errdefer |err| _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
     const sub = rest.next() orelse {
         std.debug.print("usage: bbr auth (login|status|logout) [...]\n", .{});
         exitFailure(diagnostic, error.MissingRequired, @src());
@@ -1299,13 +1329,21 @@ fn authRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag
 }
 
 fn exitFailure(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) noreturn {
-    if (cause != error.LoginAborted) _ = diagnostic.failure(.execute, .{ .zig = cause }, source);
+    switch (cause) {
+        error.Reported, error.LoginAborted => {},
+        else => _ = diagnostic.failure(.execute, .{ .zig = cause }, source),
+    }
     std.process.exit(1);
 }
 
 fn invalidUsage(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) void {
     _ = diagnostic.forContext(.arguments, .{}).failure(.decode, .{ .zig = cause }, source);
     usage();
+}
+
+fn configLoadFailed(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    std.debug.print("bbr: could not load configuration: {s}\n", .{@errorName(cause)});
+    return diagnostic.forContext(.configuration, .{}).fail(.read, .{ .zig = cause }, source);
 }
 
 fn reportConfigFailure(diagnostic: bbr.diagnostics.Handle, failure: config.Failure) void {
@@ -1422,10 +1460,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
     };
 
     // Ephemeral in-memory store: the demo authors drafts but persists nothing.
-    var store = persist.SqliteStore.openDiagnostic(":memory:", diagnostic.forContext(.persistence, .{})) catch |err| {
-        _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
-        @panic("sqlite :memory: open failed");
-    };
+    var store = memoryStore(diagnostic);
     defer store.deinit();
     var plain_highlighter: bbr.highlight.PlainHighlighter = .{};
     try app.run(.{
@@ -1540,14 +1575,6 @@ test "pending.db and submission locks live under an absolute XDG_STATE_HOME, els
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, "relative/state", .{}));
 }
 
-test "File Enrichment OOM has a distinct fatal message" {
-    try std.testing.expectEqualStrings(
-        "bbr: file enrichment ran out of memory; the review was not modified",
-        tuiFatalMessage(error.FileEnrichmentOutOfMemory).?,
-    );
-    try std.testing.expect(tuiFatalMessage(error.NotFound) == null);
-}
-
 test "diagnostics pending store fallback records preparation failure but not absent state home" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -1588,6 +1615,50 @@ test "diagnostics pending store fallback records preparation failure but not abs
     defer allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "operation=persistence phase=prepare") != null);
     try testing.expect(std.mem.indexOf(u8, text, @errorName(cause)) != null);
+}
+
+test "diagnostics an unresolved check-verdict change has one record and reaches exitFailure as Reported" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const pr =
+        "{\"id\":42,\"title\":\"Review\",\"state\":\"OPEN\",\"author\":{\"display_name\":\"Ada\",\"uuid\":\"{author}\"}," ++
+        "\"source\":{\"branch\":{\"name\":\"feature\"},\"commit\":{\"hash\":\"abc123\"}}," ++
+        "\"destination\":{\"branch\":{\"name\":\"main\"},\"commit\":{\"hash\":\"def456\"}},\"participants\":[]}";
+    const responses = [_]bbr.http.Canned{
+        .{ .body = "{\"uuid\":\"{account}\"}" },
+        .{ .body = pr },
+        .{ .body = pr },
+        .{ .send_error = error.ConnectionResetByPeer },
+        .{ .body = pr },
+        .{ .body = pr },
+        .{ .body = pr },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const handle = sink.handle(.verdict, .{});
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "w" }).withDiagnostics(handle);
+    try testing.expectError(error.Reported, checkVerdict(testing.allocator, bb, "repo", 42, handle));
+    try testing.expectEqual(responses.len, fake.call_count);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.endsWith(u8, only, "error=ConnectionResetByPeer"));
 }
 
 test "login reader trims lines and preserves empty input and EOF errors" {

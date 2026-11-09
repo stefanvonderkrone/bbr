@@ -95,10 +95,12 @@ pub const Session = struct {
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try a.dupe(u8, span.mention);
                 entry.value_ptr.* = "";
-                const user = bb.getUser(scratch.allocator(), span.mention) catch |err| {
-                    _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
-                    if (err == error.OutOfMemory) return err;
-                    continue;
+                const user = bb.getUser(scratch.allocator(), span.mention) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+                        continue;
+                    },
                 };
                 const name = if (validMentionName(user.display_name)) user.display_name else user.nickname;
                 if (validMentionName(name)) entry.value_ptr.* = try std.fmt.allocPrint(a, "@{s}", .{name});
@@ -176,9 +178,11 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     var comments_started = false;
     var required_failed = false;
 
-    try select.concurrent(.pull_request, acquirePullRequest, .{ &pr_branch, bb, repo, id });
+    // Each branch task binds its branch's slot, and the join below adopts the slot of the returned failure.
+    const task_bb = bb.withDiagnostics(bb.diagnostic.withLeaf(null));
+    try bbr.diagnostics.selectConcurrent(&select, .pull_request, acquirePullRequest, .{ &pr_branch, task_bb, repo, id });
     active += 1;
-    try select.concurrent(.account, acquireAccount, .{ &account_branch, bb });
+    try bbr.diagnostics.selectConcurrent(&select, .account, acquireAccount, .{ &account_branch, task_bb });
     active += 1;
 
     while (active > 0) {
@@ -204,20 +208,32 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
         while (!required_failed and active < 2) {
             if (comments_ready and !comments_started) {
                 const pr = pr_branch.value.?;
-                try select.concurrent(.comments, acquireComments, .{ &comments_branch, bb, repo, id, pr.source_commit, pr.destination_commit });
+                try bbr.diagnostics.selectConcurrent(&select, .comments, acquireComments, .{ &comments_branch, task_bb, repo, id, pr.source_commit, pr.destination_commit });
                 comments_started = true;
                 active += 1;
             } else if (!raw_diff_started) {
-                try select.concurrent(.raw_diff, acquireRawDiff, .{ &diff_branch, bb, repo, id });
+                try bbr.diagnostics.selectConcurrent(&select, .raw_diff, acquireRawDiff, .{ &diff_branch, task_bb, repo, id });
                 raw_diff_started = true;
                 active += 1;
             } else break;
         }
     }
 
-    if (pr_branch.err) |err| return err;
-    if (diff_branch.err) |err| return err;
-    if (comments_branch.err) |err| return err;
+    // The worker records the returned failure with its branch's evidence. A second failed
+    // branch has no other record.
+    var failed: ?anyerror = null;
+    const outcomes = [_]struct { err: ?anyerror, leaf: *?bbr.diagnostic.Leaf }{
+        .{ .err = pr_branch.err, .leaf = &pr_branch.leaf },
+        .{ .err = diff_branch.err, .leaf = &diff_branch.leaf },
+        .{ .err = comments_branch.err, .leaf = &comments_branch.leaf },
+    };
+    for (outcomes) |outcome| if (outcome.err) |err| {
+        if (failed == null) {
+            failed = err;
+            bb.diagnostic.adopt(outcome.leaf);
+        } else _ = bb.diagnostic.withLeaf(outcome.leaf).failure(.read, .{ .zig = err }, @src());
+    };
+    if (failed) |err| return err;
 
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
@@ -230,7 +246,10 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     const a = s.arena.allocator();
 
     s.authenticated_account_uuid = account_branch.value;
-    s.authenticated_account_unauthorized = if (account_branch.err) |err| err == error.Unauthorized else false;
+    s.authenticated_account_unauthorized = if (account_branch.err) |err| switch (err) {
+        error.Unauthorized => true,
+        else => false,
+    } else false;
 
     const pr = pr_branch.value.?;
     s.source = .{ .remote = pr };
@@ -282,7 +301,10 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     s.authenticated_account_unauthorized = false;
     s.authenticated_account_uuid = bb.getAuthenticatedAccountUuid(a) catch |err| blk: {
         _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
-        s.authenticated_account_unauthorized = err == error.Unauthorized;
+        s.authenticated_account_unauthorized = switch (err) {
+            error.Unauthorized => true,
+            else => false,
+        };
         break :blk null;
     };
     const pr = try bb.getPullRequest(a, repo, id);
@@ -319,6 +341,12 @@ fn Branch(comptime T: type) type {
         arena: std.heap.ArenaAllocator,
         value: ?T = null,
         err: ?anyerror = null,
+        /// The branch's own evidence slot, because branches fetch concurrently.
+        leaf: ?bbr.diagnostic.Leaf = null,
+
+        fn client(self: *@This(), bb: Client) Client {
+            return bb.withDiagnostics(bb.diagnostic.withLeaf(&self.leaf));
+        }
 
         fn init(backing: Allocator) @This() {
             return .{ .arena = std.heap.ArenaAllocator.init(backing) };
@@ -327,32 +355,30 @@ fn Branch(comptime T: type) type {
 }
 
 fn acquirePullRequest(branch: *Branch(PullRequest), bb: Client, repo: []const u8, id: u64) void {
-    branch.value = bb.getPullRequest(branch.arena.allocator(), repo, id) catch |err| {
-        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+    branch.value = branch.client(bb).getPullRequest(branch.arena.allocator(), repo, id) catch |err| {
         branch.err = err;
         return;
     };
 }
 
 fn acquireAccount(branch: *Branch([]u8), bb: Client) void {
-    branch.value = bb.getAuthenticatedAccountUuid(branch.arena.allocator()) catch |err| {
-        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+    const client = branch.client(bb);
+    branch.value = client.getAuthenticatedAccountUuid(branch.arena.allocator()) catch |err| {
+        _ = client.diagnostic.failure(.read, .{ .zig = err }, @src());
         branch.err = err;
         return;
     };
 }
 
 fn acquireRawDiff(branch: *Branch([]u8), bb: Client, repo: []const u8, id: u64) void {
-    branch.value = bb.getDiff(branch.arena.allocator(), repo, id) catch |err| {
-        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+    branch.value = branch.client(bb).getDiff(branch.arena.allocator(), repo, id) catch |err| {
         branch.err = err;
         return;
     };
 }
 
 fn acquireComments(branch: *Branch([]bbr.review.Comment), bb: Client, repo: []const u8, id: u64, source: []const u8, destination: []const u8) void {
-    branch.value = bb.getComments(branch.arena.allocator(), repo, id, .{ .source = source, .destination = destination }) catch |err| {
-        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+    branch.value = branch.client(bb).getComments(branch.arena.allocator(), repo, id, .{ .source = source, .destination = destination }) catch |err| {
         branch.err = err;
         return;
     };
@@ -366,6 +392,7 @@ pub fn loadLocalWith(
     git: bbr.git.GitClient,
     base_ref: ?[]const u8,
     source_ref: ?[]const u8,
+    diagnostic: bbr.diagnostics.Handle,
 ) !*Session {
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
@@ -387,6 +414,7 @@ pub fn loadLocalWith(
         .git = git,
         .base_commit = base.commit,
         .source_commit = source.commit,
+        .diagnostic = diagnostic,
     };
     s.diff = try bbr.diff.loadFromSource(a, diff_source.source());
     s.enrichment = try file_enrichment.Storage.init(a, s.diff.files);
@@ -534,7 +562,7 @@ test "loadLocalWith resolves defaults and builds a source-neutral Session" {
     };
     // The fake returns one canned resolution, so pass a base spelling whose
     // identity is not asserted here; the shell integration test covers both.
-    const s = try loadLocalWith(std.heap.page_allocator, fake.gitClient(), "main", null);
+    const s = try loadLocalWith(std.heap.page_allocator, fake.gitClient(), "main", null, .{});
     defer s.destroy();
 
     try testing.expectEqualStrings("Git", s.header.source_label);
@@ -556,6 +584,35 @@ test "loadWith surfaces an error and leaks nothing" {
     try testing.expectError(error.NotFound, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
     try testing.expect(fake.callCount() >= 2);
     try testing.expect(fake.callCount() <= 3);
+}
+
+test "diagnostics a returned acquisition failure is left to the worker boundary" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]Canned{
+        .{ .request_key = "/user", .status = 200, .body = "{ \"uuid\": \"{ada}\" }" },
+        .{ .request_key = "/pullrequests/7/diff", .body = "" },
+        .{ .request_key = "/pullrequests/7/comments", .body = "{ \"values\": [] }" },
+        .{ .request_key = "/pullrequests/7", .send_error = error.ConnectionReset, .send_phase = .receive_head },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.session_load, .{}).withLeaf(&leaf);
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(boundary);
+    try testing.expectError(error.ConnectionReset, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
+    try testing.expectEqual(@as(u64, 0), sink.sequence);
+    // The worker boundary's record carries the transport phase of the failed branch.
+    const recorded = boundary.failure(.execute, .{ .zig = error.ConnectionReset }, @src());
+    try testing.expectEqual(bbr.diagnostic.Phase.receive_head, recorded.phase);
+    try testing.expectEqual(@as(u64, 1), sink.sequence);
 }
 
 test "Authenticated Account failure preserves a read-only Candidate Session" {
@@ -779,4 +836,74 @@ fn testRemoteResponses(account_status: u16) [4]Canned {
         .{ .request_key = "/pullrequests/7/comments", .body = "{ \"values\": [] }" },
         .{ .request_key = "/pullrequests/7", .body = pr_json },
     };
+}
+
+test "diagnostics a failed local git command keeps its termination in the worker record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.session_load, .{}).withLeaf(&leaf);
+    // The file system root is not inside a Git worktree, so git rev-parse exits with 128.
+    var git = bbr.git.ShellGitClient.init(testing.allocator, testing.io);
+    git.cwd = .{ .path = "/" };
+    git.diagnostic = boundary;
+    try testing.expectError(error.NotAGitRepo, loadLocalWith(testing.allocator, git.gitClient(), null, null, boundary));
+    const recorded = boundary.failure(.execute, .{ .zig = error.NotAGitRepo }, @src());
+    try testing.expectEqual(bbr.diagnostic.Phase.execute, recorded.phase);
+    try testing.expectEqual(error.NotAGitRepo, recorded.cause.git.err.?);
+    try testing.expectEqual(@as(u32, 128), recorded.cause.git.code);
+}
+
+test "diagnostics a failed local diff keeps its termination in one worker record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    try env.put("HOME", home);
+    try env.put("GIT_CONFIG_NOSYSTEM", "1");
+    try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    const commands = [_][]const []const u8{
+        &.{ "git", "init", "-b", "main" },
+        &.{ "git", "-c", "user.name=Reviewer", "-c", "user.email=reviewer@example.test", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "base" },
+        &.{ "git", "config", "diff.algorithm", "invalid" },
+    };
+    for (commands) |argv| {
+        const result = try std.process.run(testing.allocator, testing.io, .{
+            .argv = argv,
+            .cwd = .{ .path = home },
+            .environ_map = &env,
+        });
+        defer testing.allocator.free(result.stdout);
+        defer testing.allocator.free(result.stderr);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    }
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.session_load, .{}).withLeaf(&leaf);
+    var git = bbr.git.ShellGitClient.init(testing.allocator, testing.io);
+    git.cwd = .{ .path = home };
+    git.diagnostic = boundary;
+
+    try testing.expectError(error.UnknownRef, loadLocalWith(testing.allocator, git.gitClient(), "main", "main", boundary));
+    try testing.expectEqual(@as(u64, 0), sink.sequence);
+    const recorded = boundary.failure(.execute, .{ .zig = error.UnknownRef }, @src());
+    try testing.expectEqual(@as(u64, 1), sink.sequence);
+    try testing.expectEqual(bbr.diagnostic.Phase.execute, recorded.phase);
+    try testing.expectEqual(.git, std.meta.activeTag(recorded.cause));
+    try testing.expectEqual(error.UnknownRef, recorded.cause.git.err.?);
+    try testing.expectEqual(.exited, recorded.cause.git.kind);
+    try testing.expectEqual(@as(u32, 128), recorded.cause.git.code);
 }
