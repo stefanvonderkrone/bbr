@@ -95,6 +95,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-api-auth-test-") as data_home:
         ("update-pull-request", b"--draft true|false"),
         ("decline-pull-request", b"--pull-request-id N"),
         ("list-commit-pull-requests", b"--commit HASH"),
+        ("list-default-reviewers", b"--effective"),
         ("list-workspace-members", b"--no-follow"),
         ("search-workspace-members", b"--concurrency N"),
     ):

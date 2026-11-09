@@ -1,6 +1,6 @@
 # Close the remaining evidence and test gaps
 
-Status: ready-for-agent
+Status: resolved
 Type: implementation
 Blocked by: 04, 05, 07
 Parent: ../PRD.md
@@ -41,6 +41,28 @@ Each failure must keep its leaf evidence in its one record, and each changed fai
 
 ## Comments
 
+### Local Diff evidence recheck, 2026-11-09
+
+The test "diagnostics a failed local diff keeps its termination in one worker record" calls `loadLocalWith` on a real WorkingCopy.
+Both Refs resolve, but an invalid local `diff.algorithm` makes `git diff` exit with code 128.
+The test checks that no earlier record exists and that the boundary's one record holds the Git termination.
+Dropping the handle in `GitSource.read` makes the test fail with `expected .git, found .zig`.
+The red and green logs are `red.log` and `green-worktree.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/issue09-local-diff-evidence/`.
+The detached worktree is removed.
+The catch baseline stays at 35, and the record baseline lists no file.
+
+### Return-statement lint recheck, 2026-11-09
+
+The checker now checks all client error members in a complete return expression.
+The multiline result and conditional return regression tests fail with the old checker and pass with the new checker.
+The multiline `noted` acceptance test passes with both checkers.
+The red logs are `issue09-lint-red-*.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/`.
+The green log is `issue09-lint-green.log` in the same directory.
+No new failure producer lacked a note.
+The broader check also found the pure `classify` and `asApiError` mappings.
+`classify` now names its mapped result before return, and `asApiError` casts the matched error instead of repeating it.
+Neither mapping writes evidence, and `Client.send` still notes the rejection status.
+
 ### Triage, 2026-11-09
 
 Ready for an agent. Each item names its source, its cause, and an outcome that the acceptance accepts, so no item needs the operator.
@@ -79,3 +101,30 @@ Each TUI worker builds its `PresentationSinkContext` per work item, so a slot li
 I found no path that does step 1 and step 2 for the same name in one slot. I did not prove that no such path exists.
 
 Fix: each structural `MalformedResponse` site notes its own evidence, so every client error return writes a fresh note. A line check in `src/bitbucket/client.zig` can enforce that each `return error.` of a client error is next to a note.
+
+## Completion
+
+Commits on `feat/evidence-gaps`, in order. Each one builds alone, and each passes `zig build`, `check_diagnostics.py`, `check_error_comparisons.py`, and `check_task_spawns.py`. The decision log is `decisions-09.tsv`. The red logs are under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/issue09-*.log`.
+
+- `2a8df48`: the blob cancel test does not depend on the retry delay. The retry `Io` waits on an `Event` that nobody sets, so only the cancel ends the wait. The old test fails under a 150 ms delay of the main thread. The new test passes under the same delay. The test also covers the transport-error wait of the blob retry. When that prong returns `null`, the test fails.
+- `dde0b99`: `bbr api set-verdict` with a Bitbucket rejection behind an unresolved change prints the same message at the leaf and records the client error through `fail`. The record holds the HTTP status, and the CLI slot ends empty. `ErrorDetail.reported_error` had no other user, so it is gone. The user-visible text does not change.
+- `91ab5e6`: every client error return in `src/bitbucket/client.zig` goes through `noted`. An input check notes `phase=prepare`, and a response with the wrong structure notes `phase=validate`. An item decoder that can reject an item takes the page handle, so an item decode failure on a sequential list page names its page. `Handle.explain` stays as it is. A record of an unrelated error must not drop the evidence of the next record (the test "diagnostics a boundary record takes the leaf evidence of its own error once").
+- `3e98c30`: `tools/check_diagnostics.py` rejects a return of an `ApiError` member in `src/bitbucket/client.zig` that does not go through `noted`. On the `client.zig` of `dde0b99` it rejects 32 returns, such as the account UUID check and the author `Forbidden` result.
+- `0577024`: `GitClient.diff` and `GitClient.blob` take the handle of their caller. A local blob read records its Git termination with its File side. Each Anchor transition read owns a slot on its stack, so a resolver on any thread keeps its own evidence.
+- `8ddccd4`: when both File sides fail with `error.OutOfMemory`, the new side's failure has its own record. The catch baseline of `src/tui/file_enrichment.zig` goes from 1 to 0.
+- `2af60e2`: tests for the cancel of `pickerTickWorker` in its wait and in a post to a full event queue, and for a terminal recovery claim whose run names a missing Draft. The run comes from a store `active_submission` that adds the missing Draft, because the store refuses such a run.
+- `b827855`: a test runs `presentationLoadWorker`, so the Debug spawn check reaches the worker Session load. A worker that spawns its load with its own slot panics in this test.
+- The last commit updates `AGENTS.md`, ADR-0014, `docs/diagnostic-logging.md`, and this issue.
+
+Items that stay open, with the reason:
+
+- The two `Group.await` cleanups have no cancel test. In `listPagesConcurrent`, the cleanup runs under `swapCancelProtection(.blocked)` whenever a task started, and an empty group returns before any cancel point (`std/Io.zig:1283`). So `error.Canceled` cannot reach that prong. `src/benchmark/file_acquisition.zig` has no test module.
+- The descending Anchor message has no UI test. `spanFromLines` returns `NonContiguous` for rows that do not ascend, so `reanchorCandidate` cannot build a descending range. The `candidateError` mapping and the status text have unit tests.
+- A `Handle` with a slot behind a pointer or a type-erased source, a slot moved to the wrong parent, and a spawn that no test reaches stay conventions in `AGENTS.md`, with their reasons.
+- The test of a canceled post shows that the worker ends without its tick. The `io.recancel()` call in that prong has no effect that a test can see, because the worker returns right after it.
+
+Baselines: the catch baseline goes from 36 to 35. The record baseline lists no file.
+
+Checks: `zig build test` exit 0 on aarch64-macos after the last code commit, and `python3 tools/check_agent_docs.py` passes.
+
+Review: no separate reviewer ran in this session. The red and green runs are the evidence for each item.

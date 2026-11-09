@@ -11,7 +11,6 @@
 1 src/logging_config.zig
 1 src/review/draft.zig
 6 src/tui/config.zig
-1 src/tui/file_enrichment.zig
 1 src/tui/frame.zig
 4 src/tui/presentation.zig
 1 src/tui/render.zig

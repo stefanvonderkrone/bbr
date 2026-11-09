@@ -932,6 +932,7 @@ fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, spawn_diagnostic: bbr.
                 git.gitClient(),
                 command.key.baseRef(),
                 command.key.sourceRef(),
+                diagnostic,
             );
         },
     };
@@ -1724,6 +1725,53 @@ test "diagnostics a transport OutOfMemory on one File side keeps its phase in th
     try std.testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
 }
 
+test "diagnostics the worker Session load spawns with its own slot and its one record keeps the status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(std.testing.allocator, std.testing.io, &env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/2.0/user", .body = "{\"uuid\":\"{account}\"}" },
+        .{ .request_key = "/pullrequests/7/diff", .body = "" },
+        .{ .request_key = "/pullrequests/7", .status = 404, .body = "{}" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    // The worker gets the spawn handle and client, which have no slot, as `drainPresentationCommands` passes them.
+    // A Debug build panics when the worker spawns its load with a handle that has a slot.
+    const spawn_handle = sink.handle(.session_load, .{ .work_id = 4 });
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(spawn_handle);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    presentationLoadWorker(&loop, 4, spawn_handle, std.testing.io, client, .{
+        .command_id = 8,
+        .intent = 3,
+        .key = try presentation.OwnedReviewIdentity.init("ws", "repo", 7),
+    });
+    var event = (try loop.tryEvent()) orelse return error.TestUnexpectedResult;
+    defer event.presentation_done.input.deinit();
+    const loaded = event.presentation_done.input.session_loaded;
+    try std.testing.expectEqual(error.NotFound, loaded.outcome.failed);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "operation=session_load phase=rejection source=tui/app.zig:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "work_id=4") != null);
+    try std.testing.expect(std.mem.endsWith(u8, only, "cause=http status=404 classification=not_found"));
+}
+
 test "diagnostics an initial load that the store reported shows its message and keeps one record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2060,6 +2108,53 @@ test "stopping a Picker tick cancels and reaps its sleeping future" {
     cancelPresentationWork(&work, io, 19);
 
     try std.testing.expectEqual(@as(usize, 0), work.items.len);
+}
+
+/// Set when a test Picker tick reaches its wait, so the test cancels it there.
+var test_picker_tick_waits: std.Io.Event = .unset;
+
+/// A Picker tick wait that only a cancel ends.
+fn testSleepUntilCanceled(userdata: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+    const io: std.Io = .{ .userdata = userdata, .vtable = std.testing.io.vtable };
+    test_picker_tick_waits.set(io);
+    var never: std.Io.Event = .unset;
+    return never.wait(io);
+}
+
+/// A Picker tick wait that ends at once.
+fn testSleepNotAtAll(userdata: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+    test_picker_tick_waits.set(.{ .userdata = userdata, .vtable = std.testing.io.vtable });
+}
+
+fn testPickerTickIo(vtable: *std.Io.VTable, sleep: @FieldType(std.Io.VTable, "sleep")) std.Io {
+    vtable.* = std.testing.io.vtable.*;
+    vtable.sleep = sleep;
+    test_picker_tick_waits = .unset;
+    return .{ .userdata = std.testing.io.userdata, .vtable = vtable };
+}
+
+test "a Picker tick canceled in its wait posts no tick" {
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, testSleepUntilCanceled);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var future = try std.testing.io.concurrent(pickerTickWorker, .{ &loop, 3, 7, worker_io });
+    try test_picker_tick_waits.wait(std.testing.io);
+    future.cancel(std.testing.io);
+    try std.testing.expect((try loop.tryEvent()) == null);
+}
+
+test "a Picker tick canceled while the event queue is full ends without its tick" {
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, testSleepNotAtAll);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var capacity: usize = 0;
+    while (try loop.tryPostEvent(.{ .picker_tick = .{ .future_id = 1, .scope = 1 } })) capacity += 1;
+    var future = try std.testing.io.concurrent(pickerTickWorker, .{ &loop, 3, 7, worker_io });
+    try test_picker_tick_waits.wait(std.testing.io);
+    future.cancel(std.testing.io);
+    var queued: usize = 0;
+    while (try loop.tryEvent()) |event| : (queued += 1) try std.testing.expectEqual(@as(u64, 1), event.picker_tick.future_id);
+    try std.testing.expectEqual(capacity, queued);
 }
 
 fn testStalledLoad(io: std.Io) anyerror!*Session {
