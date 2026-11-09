@@ -51,3 +51,4 @@ These come from research.md. Each issue names the questions that it must answer 
 - [06 Record each failure once through fail](issues/06-record-once-through-fail.md)
 - [07 Keep the leaf evidence in the one record](issues/07-keep-leaf-evidence-in-the-one-record.md)
 - [08 Close the remaining record gaps](issues/08-close-the-remaining-record-gaps.md)
+- [09 Close the remaining evidence and test gaps](issues/09-close-the-remaining-evidence-and-test-gaps.md)
