@@ -2407,7 +2407,7 @@ pub fn deinitFileMeta(allocator: Allocator, m: Client.FileMeta) void {
 
 /// Map HTTP status to an `ApiError`; return normally on 2xx.
 fn classify(status: u16) ApiError!void {
-    return switch (status) {
+    const result: ApiError!void = switch (status) {
         200...299 => {},
         400 => error.BadRequest,
         401 => error.Unauthorized,
@@ -2418,6 +2418,7 @@ fn classify(status: u16) ApiError!void {
         500...599 => error.ServerError,
         else => error.UnexpectedStatus,
     };
+    return result;
 }
 
 fn httpClass(reason: ApiError) diagnostics.HttpClass {
@@ -2435,15 +2436,16 @@ fn httpClass(reason: ApiError) diagnostics.HttpClass {
 
 pub fn asApiError(err: anyerror) ?ApiError {
     return switch (err) {
-        error.Unauthorized => error.Unauthorized,
-        error.Forbidden => error.Forbidden,
-        error.BadRequest => error.BadRequest,
-        error.NotFound => error.NotFound,
-        error.RateLimited => error.RateLimited,
-        error.Conflict => error.Conflict,
-        error.ServerError => error.ServerError,
-        error.UnexpectedStatus => error.UnexpectedStatus,
-        error.MalformedResponse => error.MalformedResponse,
+        error.Unauthorized,
+        error.Forbidden,
+        error.BadRequest,
+        error.NotFound,
+        error.RateLimited,
+        error.Conflict,
+        error.ServerError,
+        error.UnexpectedStatus,
+        error.MalformedResponse,
+        => @errorCast(err),
         else => null,
     };
 }

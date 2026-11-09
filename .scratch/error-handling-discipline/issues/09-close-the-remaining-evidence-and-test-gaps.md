@@ -41,6 +41,18 @@ Each failure must keep its leaf evidence in its one record, and each changed fai
 
 ## Comments
 
+### Return-statement lint recheck, 2026-11-09
+
+The checker now checks all client error members in a complete return expression.
+The multiline result and conditional return regression tests fail with the old checker and pass with the new checker.
+The multiline `noted` acceptance test passes with both checkers.
+The red logs are `issue09-lint-red-*.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/`.
+The green log is `issue09-lint-green.log` in the same directory.
+No new failure producer lacked a note.
+The broader check also found the pure `classify` and `asApiError` mappings.
+`classify` now names its mapped result before return, and `asApiError` casts the matched error instead of repeating it.
+Neither mapping writes evidence, and `Client.send` still notes the rejection status.
+
 ### Triage, 2026-11-09
 
 Ready for an agent. Each item names its source, its cause, and an outcome that the acceptance accepts, so no item needs the operator.

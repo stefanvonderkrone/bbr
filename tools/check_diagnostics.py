@@ -55,18 +55,34 @@ def api_error_names(root):
 
 
 def unnoted_client_returns(lines, names):
-    """The line of each `return` of an `ApiError` member that does not go through `noted`.
-
-    The member can follow the `return` directly or inside a result, such as
-    `return .{ .api_error = error.Forbidden }`.
-    """
+    """The line of each returned `ApiError` member outside the error argument of `noted`."""
     member = re.compile(r"\berror\s*\.\s*(?:" + "|".join(names) + r")\b")
-    for number, line in lines:
-        for start in (match.end() for match in RETURN.finditer(line)):
-            found = member.search(line, start)
-            if found and "noted(" not in line[start : found.start()]:
-                yield number
-                break
+    text, line_of = joined(lines)
+    for returned in RETURN.finditer(text):
+        start = returned.end()
+        end = handler_end(text, start)
+        expression = text[start:end]
+        noted_arguments = set()
+        for call in re.finditer(r"\bnoted\s*\(", expression):
+            depth = 0
+            for index in range(call.end(), len(expression)):
+                char = expression[index]
+                if char in OPENS:
+                    depth += 1
+                elif char in CLOSES:
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif char == "," and depth == 0:
+                    argument = re.match(r"\s*(error\s*\.\s*\w+)\s*(?=,)", expression[index + 1:])
+                    if argument:
+                        noted_arguments.add(index + 1 + argument.start(1))
+                    break
+        for found in member.finditer(expression):
+            if re.match(r"(?:\s*,\s*error\s*\.\s*\w+)*\s*,?\s*=>", expression[found.end():]):
+                continue
+            if found.start() not in noted_arguments:
+                yield line_of(start + found.start())
 
 
 def unwrapped_sqlite_results(lines):

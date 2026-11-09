@@ -251,13 +251,39 @@ class DiagnosticsCheckTest(unittest.TestCase):
             self.assertEqual(len(found), 1, line)
             self.assertIn("noted(diagnostic, error.X, phase, cause)", found[0])
 
-    def test_a_noted_return_a_status_mapping_and_test_blocks_are_allowed(self):
+    def test_a_multiline_client_error_result_without_a_note_is_rejected(self):
+        found = self.client("return .{\n    .api_error = error.Forbidden,\n};")
+        self.assertEqual(len(found), 1)
+        self.assertIn("client.zig:2:", found[0])
+
+    def test_each_client_error_in_a_conditional_return_needs_its_own_note(self):
+        found = self.client("return if (c) noted(diagnostic, error.Forbidden, .validate, null) else error.MalformedResponse;")
+        self.assertEqual(len(found), 1)
+        self.assertIn("client.zig:1:", found[0])
+
+    def test_a_multiline_noted_client_error_return_is_allowed(self):
+        text = "return noted(\n    diagnostic,\n    error.Forbidden,\n    .validate,\n    null,\n);"
+        self.assertEqual(self.client(text), [])
+
+    def test_a_note_in_another_argument_does_not_cover_a_client_error(self):
+        found = self.client("return other(noted(diagnostic, error.Forbidden, .validate, null), error.MalformedResponse);")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(self.client("return noted(error.Forbidden, err, .validate, null);")), 1)
+
+    def test_a_switch_return_checks_results_not_error_patterns(self):
+        text = "return switch (err) {\n    error.Forbidden,\n    error.MalformedResponse,\n    => error.Forbidden,\n};"
+        found = self.client(text)
+        self.assertEqual(len(found), 1)
+        self.assertIn("client.zig:4:", found[0])
+
+    def test_a_return_in_a_switch_prong_ends_before_the_next_prong(self):
+        text = "switch (err) {\n    error.Forbidden => return,\n    error.MalformedResponse => {},\n}"
+        self.assertEqual(self.client(text), [])
+
+    def test_a_noted_return_and_test_blocks_are_allowed(self):
         text = "\n".join((
             "        if (parsed.value.uuid.len == 0) return noted(self.diagnostic, error.MalformedResponse, .validate, null);",
             "        return .{ .api_error = noted(self.diagnostic, error.Forbidden, .validate, null) };",
-            "    return switch (status) {",
-            "        403 => error.Forbidden,",
-            "    };",
             "    return error.OutOfMemory;",
             "    // return error.Forbidden;",
             'test "a rejection" {',
