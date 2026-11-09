@@ -80,3 +80,37 @@ Commit `c52f4ea` protects that completion when cancellation meets a full event q
 The new test fails on detached `50a69d1` and passes with the fix. It checks one completion and zero remaining tracked work.
 The logs are `wait-retirement-red-50a69d1.log`, `wait-retirement-green.log`, and `wait-retirement-full.log` in the parent evidence directory.
 The full native suite passes all 1,596 tests.
+
+### 2026-11-09 benchmark cancellation follow-up
+
+F18 is valid. `runSample` counted a canceled enrichment as a failure and scheduled another File.
+It now returns `error.Canceled` before it changes the failure count or schedules another File.
+Cleanup cancels the remaining tasks and releases every completed result in the Select queue.
+The Select buffer holds at least as many results as the active task limit.
+
+The benchmark has no test module in `build.zig`, so this path has compile coverage only.
+`zig build bench-file-acquisition -- invalid` compiles the executable, then returns the expected `InvalidArguments` error.
+The log is `f18-benchmark-compile.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/pr22-d-evidence/`.
+No runtime test reaches a canceled benchmark sample.
+
+### 2026-11-09 File Enrichment join follow-up
+
+F19 is valid. A side can return `error.Canceled` without cancellation of the worker that joins it.
+`Future.await` returns the child's result. It does not make the child's cancellation request the worker's own request.
+The installed Zig 0.16 `Threaded.recancelInner` requires the current task to hold the consumed cancellation state.
+The old `dropSide` called `io.recancel()` on a child-only error and caused a panic.
+
+The join now returns `error.Canceled` without `recancel` when either side returns cancellation.
+It releases the sibling result and records a displaced OutOfMemory failure once through that side's own diagnostic slot.
+It adopts old-side evidence only when it returns the old-side error.
+The join no longer needs the `dropSide` helper.
+
+The child-only cancellation test uses the real I/O implementation, not a fake `recancel` function.
+It checks the returned cancellation, one old-side OutOfMemory record, and no old-side evidence in the parent slot.
+A second test cancels the worker during the remaining side's read and checks cancellation and completed cleanup.
+The existing two-OutOfMemory test still checks one record per side.
+
+The detached `c8eab63` reproduction exits 1 and panics in `dropSide` through `Threaded.recancelInner`.
+The fixed diagnostic tests exit 0. The full suite exits 0 with `49/49 steps succeeded; 1597/1597 tests passed`.
+The logs are `f19-red.log`, `f19-green.log`, and `f19-full.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/pr22-d-evidence/`.
+The catch baseline stays at 33. The record baseline stays empty.

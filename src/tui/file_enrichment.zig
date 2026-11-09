@@ -289,14 +289,30 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
             },
         };
     };
-    const old = old_future.await(io) catch |err| {
-        req.diagnostic.adopt(&old_slot);
+    const old = if (old_future.await(io)) |value| value else |err| {
         const cancellation_propagates = switch (err) {
             error.Canceled => true,
             error.OutOfMemory => false,
         };
         const remaining = if (cancellation_propagates) new_future.cancel(io) else new_future.await(io);
-        dropSide(io, task_req, .new, remaining, &new_slot, cancellation_propagates);
+        if (remaining) |value| {
+            var cleanup = value;
+            cleanup.deinit();
+        } else |remaining_error| switch (remaining_error) {
+            error.Canceled => {
+                switch (err) {
+                    error.Canceled => {},
+                    error.OutOfMemory => {
+                        _ = sideDiagnostic(req.diagnostic.withLeaf(&old_slot), .old).failure(.execute, .{ .zig = err }, @src());
+                    },
+                }
+                return error.Canceled;
+            },
+            error.OutOfMemory => {
+                _ = sideDiagnostic(req.diagnostic.withLeaf(&new_slot), .new).failure(.execute, .{ .zig = remaining_error }, @src());
+            },
+        }
+        req.diagnostic.adopt(&old_slot);
         return err;
     };
     errdefer {
@@ -311,22 +327,6 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
         },
     };
     return .{ .old = old, .new = new };
-}
-
-/// Releases a side that the result drops. The caller receives the failure of the other side,
-/// so a failure of this side has its record here, with the evidence of its own slot.
-fn dropSide(io: std.Io, req: Request, side: Side, outcome: error{ OutOfMemory, Canceled }!SideResult, task_slot: *?bbr.diagnostic.Leaf, cancellation_propagates: bool) void {
-    var result = outcome catch |err| switch (err) {
-        error.Canceled => {
-            if (!cancellation_propagates) io.recancel();
-            return;
-        },
-        error.OutOfMemory => {
-            _ = sideDiagnostic(req.diagnostic.withLeaf(task_slot), side).failure(.execute, .{ .zig = err }, @src());
-            return;
-        },
-    };
-    result.deinit();
 }
 
 pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{ OutOfMemory, Canceled }!Result {
@@ -1931,11 +1931,6 @@ test "diagnostics a canceled first blob attempt returns without a retry" {
 }
 
 test "diagnostics File Enrichment propagates a canceled side in sequential and concurrent reads" {
-    var vtable = testing.io.vtable.*;
-    vtable.recancel = struct {
-        fn recancel(_: ?*anyopaque) void {}
-    }.recancel;
-    const io: std.Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
     for ([_]bool{ false, true }) |concurrent| {
         for ([_]bbr.diff.FileStatus{ .modified, .added, .removed }) |status| {
             var fake: bbr.http.FakeHttpClient = .{ .send_error = error.Canceled };
@@ -1951,7 +1946,7 @@ test "diagnostics File Enrichment propagates a canceled side in sequential and c
                 .max_file_bytes = 0,
             };
             var result = if (concurrent)
-                enrichConcurrent(io, testing.allocator, bb, plain.highlighter(), request)
+                enrichConcurrent(testing.io, testing.allocator, bb, plain.highlighter(), request)
             else
                 enrich(testing.allocator, bb, plain.highlighter(), request);
             if (result) |*value| {
@@ -1963,26 +1958,27 @@ test "diagnostics File Enrichment propagates a canceled side in sequential and c
     }
 }
 
-test "diagnostics File Enrichment rearms a canceled sibling when the other side runs out of memory" {
-    const Rearmed = struct {
-        var count: usize = 0;
-
-        fn recancel(_: ?*anyopaque) void {
-            count += 1;
-        }
-    };
-    Rearmed.count = 0;
-    var vtable = testing.io.vtable.*;
-    vtable.recancel = Rearmed.recancel;
-    const io: std.Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+test "diagnostics File Enrichment propagates child cancellation and records the displaced side failure once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.file_enrichment, .{ .command_id = 10 }).withLeaf(&leaf);
     const responses = [_]bbr.http.Canned{
         .{ .request_key = "/destination/", .send_error = error.OutOfMemory },
         .{ .request_key = "/source/", .send_error = error.Canceled },
     };
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(boundary);
     var plain: bbr.highlight.PlainHighlighter = .{};
-    try testing.expectError(error.OutOfMemory, enrichConcurrent(io, testing.allocator, bb, plain.highlighter(), .{
+    try testing.expectError(error.Canceled, enrichConcurrent(testing.io, testing.allocator, bb, plain.highlighter(), .{
         .repo = "repo",
         .status = .modified,
         .source_commit = "source",
@@ -1990,8 +1986,65 @@ test "diagnostics File Enrichment rearms a canceled sibling when the other side 
         .old_path = "file.zig",
         .new_path = "file.zig",
         .max_file_bytes = 0,
+        .diagnostic = boundary,
     }));
-    try testing.expectEqual(@as(usize, 1), Rearmed.count);
+    try testing.expect(leaf == null);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only, "side=old") != null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
+}
+
+test "diagnostics File Enrichment propagates worker cancellation while it joins the remaining side" {
+    const Source = struct {
+        io: std.Io,
+        started: std.Io.Event = .unset,
+        stopped: std.atomic.Value(bool) = .init(false),
+
+        fn read(ptr: *anyopaque, _: Allocator, commit: []const u8, _: []const u8, _: bbr.diagnostics.Handle) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, commit, "destination")) return error.OutOfMemory;
+            defer self.stopped.store(true, .release);
+            self.started.set(self.io);
+            var never: std.Io.Event = .unset;
+            try never.wait(self.io);
+            unreachable;
+        }
+    };
+    var source: Source = .{ .io = testing.io };
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    const request: Request = .{
+        .repo = "repo",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "file.zig",
+        .new_path = "file.zig",
+        .max_file_bytes = 0,
+    };
+    var future = try testing.io.concurrent(enrichFromConcurrent, .{
+        testing.io,
+        testing.allocator,
+        BlobSource{ .ptr = &source, .read_fn = Source.read },
+        plain.highlighter(),
+        request,
+    });
+    defer if (future.cancel(testing.io)) |value| {
+        var result = value;
+        result.deinit();
+    } else |_| {};
+    try source.started.wait(testing.io);
+    try testing.expectError(error.Canceled, future.cancel(testing.io));
+    try testing.expect(source.stopped.load(.acquire));
 }
 
 /// A retry wait that only a cancel ends, so the test does not race the retry delay.
