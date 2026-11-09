@@ -1738,6 +1738,7 @@ test "diagnostics the worker Session load spawns with its own slot and its one r
     try std.testing.expect(sink.setEnabled(true) == .on);
     const responses = [_]bbr.http.Canned{
         .{ .request_key = "/2.0/user", .body = "{\"uuid\":\"{account}\"}" },
+        .{ .request_key = "/pullrequests/7/diff", .body = "" },
         .{ .request_key = "/pullrequests/7", .status = 404, .body = "{}" },
     };
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
