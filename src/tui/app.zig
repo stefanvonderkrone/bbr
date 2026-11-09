@@ -2063,6 +2063,53 @@ test "stopping a Picker tick cancels and reaps its sleeping future" {
     try std.testing.expectEqual(@as(usize, 0), work.items.len);
 }
 
+/// Set when a test Picker tick reaches its wait, so the test cancels it there.
+var test_picker_tick_waits: std.Io.Event = .unset;
+
+/// A Picker tick wait that only a cancel ends.
+fn testSleepUntilCanceled(userdata: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+    const io: std.Io = .{ .userdata = userdata, .vtable = std.testing.io.vtable };
+    test_picker_tick_waits.set(io);
+    var never: std.Io.Event = .unset;
+    return never.wait(io);
+}
+
+/// A Picker tick wait that ends at once.
+fn testSleepNotAtAll(userdata: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+    test_picker_tick_waits.set(.{ .userdata = userdata, .vtable = std.testing.io.vtable });
+}
+
+fn testPickerTickIo(vtable: *std.Io.VTable, sleep: @FieldType(std.Io.VTable, "sleep")) std.Io {
+    vtable.* = std.testing.io.vtable.*;
+    vtable.sleep = sleep;
+    test_picker_tick_waits = .unset;
+    return .{ .userdata = std.testing.io.userdata, .vtable = vtable };
+}
+
+test "a Picker tick canceled in its wait posts no tick" {
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, testSleepUntilCanceled);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var future = try std.testing.io.concurrent(pickerTickWorker, .{ &loop, 3, 7, worker_io });
+    try test_picker_tick_waits.wait(std.testing.io);
+    future.cancel(std.testing.io);
+    try std.testing.expect((try loop.tryEvent()) == null);
+}
+
+test "a Picker tick canceled while the event queue is full ends without its tick" {
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, testSleepNotAtAll);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var capacity: usize = 0;
+    while (try loop.tryPostEvent(.{ .picker_tick = .{ .future_id = 1, .scope = 1 } })) capacity += 1;
+    var future = try std.testing.io.concurrent(pickerTickWorker, .{ &loop, 3, 7, worker_io });
+    try test_picker_tick_waits.wait(std.testing.io);
+    future.cancel(std.testing.io);
+    var queued: usize = 0;
+    while (try loop.tryEvent()) |event| : (queued += 1) try std.testing.expectEqual(@as(u64, 1), event.picker_tick.future_id);
+    try std.testing.expectEqual(capacity, queued);
+}
+
 fn testStalledLoad(io: std.Io) anyerror!*Session {
     try io.sleep(std.Io.Duration.fromSeconds(60), .awake);
     return error.TestUnexpectedResult;

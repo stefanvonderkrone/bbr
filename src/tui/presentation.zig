@@ -30205,6 +30205,59 @@ test "startup discovers and explicitly claims an interrupted Submission" {
     try testing.expectEqual(@as(bbr.review.TempId, 1), post.find_duplicate.draft.local_id);
 }
 
+var test_active_submission: ?*const fn (*anyopaque, Allocator) anyerror!?bbr.review.ActiveSubmissionRun = null;
+
+/// The store's active run with one more item, which names a Draft that the store does not hold.
+fn activeSubmissionNamingAMissingDraft(ptr: *anyopaque, allocator: Allocator) anyerror!?bbr.review.ActiveSubmissionRun {
+    var run = (try test_active_submission.?(ptr, allocator)) orelse return null;
+    const items = try allocator.alloc(bbr.review.SubmissionRunItem, run.items.len + 1);
+    @memcpy(items[0..run.items.len], run.items);
+    items[run.items.len] = .{ .temp_id = 99, .parent = null };
+    run.items = items;
+    return run;
+}
+
+test "Review recovery a terminal run that names a missing Draft fails its claim with one record" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "posted" });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "head", &.{.{ .temp_id = 1, .parent = null }});
+    try store.store().checkpointSubmission(operation_id, key.storeKey(), 1, .{ .posted = 900 }, null);
+    var vtable = store.store().vtable.*;
+    test_active_submission = vtable.active_submission;
+    defer test_active_submission = null;
+    vtable.active_submission = activeSubmissionNamingAMissingDraft;
+    var reviews = store.store();
+    reviews.vtable = &vtable;
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = reviews,
+        .submission_locks = locks.locks(),
+    }, .{ .diagnostic_state = .on, .viewport_rows = 8 });
+    defer presentation.deinit();
+    try testing.expect(presentation.projection().recovery != null);
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.recovery_claim_failed, presentation.projection().action_error.?);
+    var records: usize = 0;
+    while (presentation.takeCommand()) |command_value| {
+        var command = command_value;
+        defer command.deinit();
+        const failure = switch (command) {
+            .report_diagnostic => |failure| failure,
+            else => continue,
+        };
+        records += 1;
+        try testing.expectEqual(bbr.diagnostic.Operation.recovery_check, failure.operation);
+        try testing.expectEqual(error.DraftNotFound, failure.cause.zig);
+    }
+    try testing.expectEqual(@as(usize, 1), records);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.store().activeSubmission(arena.allocator())) != null);
+}
+
 test "recovery resumes only frozen participants and preserves parent remapping" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
