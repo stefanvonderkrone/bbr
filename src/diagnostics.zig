@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("diagnostic.zig");
 const xdg = @import("xdg.zig");
 pub const Failure = value.Failure;
@@ -6,6 +7,8 @@ pub const State = value.State;
 pub const Context = value.Context;
 pub const Cause = value.Cause;
 pub const GrammarRule = value.GrammarRule;
+pub const Leaf = value.Leaf;
+pub const HttpClass = value.HttpClass;
 pub const Operation = value.Operation;
 pub const Phase = value.Phase;
 
@@ -13,13 +16,38 @@ pub const Handle = struct {
     sink: ?*Sink = null,
     operation: Operation = .startup,
     context: Context = .{},
+    /// The boundary's slot for the evidence of the last failure that a client returned.
+    /// One task at a time writes it, so a concurrent fan-out gives each task its own slot.
+    leaf: ?*?Leaf = null,
 
     pub fn forContext(self: Handle, operation: Operation, context: Context) Handle {
-        return .{ .sink = self.sink, .operation = operation, .context = context };
+        return .{ .sink = self.sink, .operation = operation, .context = context, .leaf = self.leaf };
+    }
+
+    pub fn withLeaf(self: Handle, slot: ?*?Leaf) Handle {
+        var result = self;
+        result.leaf = slot;
+        return result;
+    }
+
+    /// Keeps the evidence for the boundary's one record of `leaf.err` and records nothing.
+    pub fn note(self: Handle, leaf: Leaf) void {
+        const slot = self.leaf orelse return;
+        var noted = leaf;
+        noted.page = noted.page orelse self.context.page;
+        slot.* = noted;
+    }
+
+    /// Moves the evidence of a task's own slot into this handle's slot and empties the task's
+    /// slot. A fan-out calls it after the join for the failure that it returns.
+    pub fn adopt(self: Handle, task_slot: *?Leaf) void {
+        const leaf = task_slot.* orelse return;
+        task_slot.* = null;
+        self.note(leaf);
     }
 
     pub fn failure(self: Handle, phase: Phase, cause: Cause, comptime source: std.builtin.SourceLocation) Failure {
-        const result = Failure.capture(self.operation, phase, self.context, cause, source);
+        const result = self.explain(Failure.capture(self.operation, phase, self.context, cause, source));
         self.record(result);
         return result;
     }
@@ -31,10 +59,93 @@ pub const Handle = struct {
         return error.Reported;
     }
 
+    /// Drops a Failure whose cause is `error.Reported`, because the layer that returned it
+    /// already recorded the failure. A boundary that forgets its `error.Reported` prong
+    /// therefore writes no second record.
+    /// A Failure whose cause is the error in the slot takes the slot's evidence, so the
+    /// failure keeps one record that holds it.
     pub fn record(self: Handle, failure_value: Failure) void {
-        if (self.sink) |sink| sink.record(failure_value);
+        if (failure_value.reported()) return;
+        const explained = self.explain(failure_value);
+        if (self.sink) |sink| sink.record(explained);
+    }
+
+    fn explain(self: Handle, failure_value: Failure) Failure {
+        const slot = self.leaf orelse return failure_value;
+        const leaf = slot.* orelse return failure_value;
+        const explained = failure_value.explainedBy(leaf) orelse return failure_value;
+        slot.* = null;
+        return explained;
     }
 };
+
+/// `std.Io.concurrent` for production code. A task never shares a slot: two tasks that note
+/// into one slot overwrite each other's evidence. So no `Handle` in `args` carries a slot.
+/// The spawner passes the task its own slot by pointer, the task binds it with `withLeaf`,
+/// and the spawner calls `Handle.adopt` after the join. A Debug build panics on a Handle
+/// with a slot in `args`.
+pub fn concurrent(
+    io: std.Io,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) std.Io.ConcurrentError!std.Io.Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
+    rejectSharedSlot(args);
+    return io.concurrent(function, args);
+}
+
+/// `std.Io.Select.concurrent` with the check of `concurrent`.
+pub fn selectConcurrent(
+    select: anytype,
+    comptime field: @TypeOf(select.*).Field,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) std.Io.ConcurrentError!void {
+    rejectSharedSlot(args);
+    return select.concurrent(field, function, args);
+}
+
+fn rejectSharedSlot(args: anytype) void {
+    if (builtin.mode != .Debug) return;
+    if (holdsSlot(args)) @panic("a concurrent task got a diagnostics.Handle with an evidence slot. " ++
+        "Pass it withLeaf(null), give the task its own slot by pointer, and adopt that slot after the join.");
+}
+
+/// Whether `subject` holds a `Handle` with a slot, in itself, a field, an optional, an array
+/// element, or the active field of a tagged union. A pointer is not followed.
+pub fn holdsSlot(subject: anytype) bool {
+    const T = @TypeOf(subject);
+    if (T == Handle) return subject.leaf != null;
+    if (comptime !mayHoldHandle(T)) return false;
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.fields) |field| {
+            if (!field.is_comptime and holdsSlot(@field(subject, field.name))) return true;
+        },
+        .optional => if (subject) |child| return holdsSlot(child),
+        .array => for (subject) |item| {
+            if (holdsSlot(item)) return true;
+        },
+        .@"union" => switch (subject) {
+            inline else => |payload| return holdsSlot(payload),
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn mayHoldHandle(comptime T: type) bool {
+    if (T == Handle) return true;
+    return switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.fields) |field| {
+            if (!field.is_comptime and mayHoldHandle(field.type)) break true;
+        } else false,
+        .optional => |info| mayHoldHandle(info.child),
+        .array => |info| mayHoldHandle(info.child),
+        .@"union" => |info| info.tag_type != null and inline for (info.fields) |field| {
+            if (mayHoldHandle(field.type)) break true;
+        } else false,
+        else => false,
+    };
+}
 
 pub const Sink = struct {
     allocator: std.mem.Allocator,
@@ -123,7 +234,7 @@ pub const Sink = struct {
         self.actual = .{ .unavailable = failure_value };
     }
 
-    pub fn record(self: *Sink, failure_value: Failure) void {
+    fn record(self: *Sink, failure_value: Failure) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.actual != .on) return;
@@ -151,7 +262,10 @@ pub const Sink = struct {
         switch (failure_value.cause) {
             .zig => |err| try writer.print(" cause=zig error={s}", .{@errorName(err)}),
             .http => |http| try writer.print(" cause=http status={d} classification={s}", .{ http.status, @tagName(http.classification) }),
-            .git => |git| try writer.print(" cause=git termination={s} code={d}", .{ @tagName(git.kind), git.code }),
+            .git => |git| {
+                try writer.print(" cause=git termination={s} code={d}", .{ @tagName(git.kind), git.code });
+                if (git.err) |err| try writer.print(" error={s}", .{@errorName(err)});
+            },
             .sqlite => |sqlite| try writer.print(" cause=sqlite result={d} extended={d}", .{ sqlite.result, sqlite.extended }),
             .grammar => |grammar| try writer.print(" cause=grammar rule={s} code={d} offset={d}", .{ @tagName(grammar.rule), grammar.code, grammar.offset }),
         }
@@ -248,6 +362,79 @@ test "diagnostics fail records the leaf cause once and propagates error.Reported
     try testing.expect(lines.next() == null);
     try testing.expect(std.mem.indexOf(u8, only, "operation=grammar phase=read source=diagnostics.zig:") != null);
     try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=LeafFailure"));
+}
+
+fn boundaryWithoutReportedProng(handle: Handle) void {
+    propagatingCaller(handle) catch |err| {
+        _ = handle.failure(.execute, .{ .zig = err }, @src());
+    };
+}
+
+test "diagnostics a boundary that records error.Reported writes no second record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testHome(&env, tmp);
+    var sink = Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    boundaryWithoutReportedProng(sink.handle(.grammar, .{}));
+    try testing.expectEqual(@as(u64, 1), sink.sequence);
+    _ = sink.handle(.grammar, .{}).failure(.execute, .{ .zig = error.Unrecorded }, @src());
+    try testing.expectEqual(@as(u64, 2), sink.sequence);
+}
+
+test "diagnostics a task argument holds a slot only through a Handle with a slot" {
+    var slot: ?Leaf = null;
+    const Client = struct { diagnostic: Handle, retries: [2]u8 = .{ 0, 0 } };
+    const Work = union(enum) { idle, fetch: Client };
+    const with_slot: Handle = (Handle{}).withLeaf(&slot);
+    const without_slot: Handle = .{};
+    try std.testing.expect(holdsSlot(.{ with_slot, 1 }));
+    try std.testing.expect(holdsSlot(.{ @as(u8, 1), Client{ .diagnostic = with_slot } }));
+    try std.testing.expect(holdsSlot(.{@as(?Client, .{ .diagnostic = with_slot })}));
+    try std.testing.expect(holdsSlot(.{[_]Handle{ without_slot, with_slot }}));
+    try std.testing.expect(holdsSlot(.{Work{ .fetch = .{ .diagnostic = with_slot } }}));
+    try std.testing.expect(!holdsSlot(.{ without_slot, Client{ .diagnostic = without_slot }, Work.idle, &slot }));
+    try std.testing.expect(!holdsSlot(.{ with_slot.withLeaf(null), @as(?Client, null) }));
+}
+
+test "diagnostics a boundary record takes the leaf evidence of its own error once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testHome(&env, tmp);
+    var sink = Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var slot: ?Leaf = null;
+    const boundary = sink.handle(.api, .{}).withLeaf(&slot);
+    const client = boundary.forContext(.bitbucket, .{ .page = 3 });
+    client.note(.{ .err = error.ServerError, .phase = .rejection, .cause = .{ .http = .{ .status = 502, .classification = .server } } });
+    _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+    _ = boundary.failure(.execute, .{ .zig = error.ServerError }, @src());
+    _ = boundary.failure(.execute, .{ .zig = error.ServerError }, @src());
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const other = lines.next().?;
+    const explained = lines.next().?;
+    const later = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, other, "phase=execute ") != null);
+    try testing.expect(std.mem.endsWith(u8, other, "cause=zig error=OutOfMemory"));
+    try testing.expect(std.mem.indexOf(u8, explained, "operation=api phase=rejection ") != null);
+    try testing.expect(std.mem.endsWith(u8, explained, " page=3 cause=http status=502 classification=server"));
+    try testing.expect(std.mem.indexOf(u8, later, "phase=execute ") != null);
+    try testing.expect(std.mem.endsWith(u8, later, "cause=zig error=ServerError"));
 }
 
 fn writeMany(handle: Handle) void {

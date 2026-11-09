@@ -1,6 +1,6 @@
 # Error handling discipline
 
-Status: ready-for-agent
+Status: claimed
 Implementation directory: .
 
 ## Problem
@@ -24,8 +24,8 @@ Its section "Implications for bbr" lists 11 proposals. This PRD adopts five of t
 3. A boundary rule says where `try` stops. Inside a module, code uses `try`. Code records each failure exactly once. See research proposal 4 and [ADR-0014](../../docs/adr/0014-a-failure-is-recorded-once-and-error-reported-marks-it.md).
 4. A line check bans `== error.` comparisons. A `catch` switch on an error set that contains `error.Canceled` names `error.Canceled` in its own prong. See research proposals 6 and 7.
 5. `Handle.fail` records a failure and returns `error.Reported`. A site that records a failure and must still fail upward returns it, and the callers above keep `try`. A boundary records every error except `error.Reported`. See research proposal 5 and [ADR-0014](../../docs/adr/0014-a-failure-is-recorded-once-and-error-reported-marks-it.md).
-   This answers research open question 2. The boundary owns the user message. It tells a recorded error from an unrecorded one by the name. `error.Reported` means that a layer below recorded the failure through its Handle, and every other error has no record yet. When logging is off, that record writes nothing. `error.Reported` also drops the name of the cause. So a site shows its own message before `fail` when its boundary prints or branches on the error name. Otherwise the site returns the error without a record.
-   Issue 06 converts the sites that record and then return a plain error. Until then, the rule holds for new code only.
+   This answers research open question 2. The boundary owns the user message. It tells a recorded error from an unrecorded one by the name. `error.Reported` means that a layer below recorded the failure through its Handle, and every other error has no record yet. When logging is off, that record writes nothing. `error.Reported` also drops the name of the cause. So, after TigerBeetle, a CLI-path site prints its own message before `fail` when its boundary prints or branches on the error name. At a translation site that message names the leaf cause and the translated meaning. A TUI-path site cannot print, so it returns the error without a record. The operator made this decision on 2026-11-08.
+   Issue 06 converted the sites that recorded and then returned a plain error. Issue 08 tracks the gaps that remain.
 
 ## Out of scope
 
@@ -49,3 +49,6 @@ These come from research.md. Each issue names the questions that it must answer 
 - [04 Ban error comparisons and require a Canceled prong](issues/04-ban-error-comparisons-require-canceled-prong.md)
 - [05 Fix the out-of-memory mislabels](issues/05-fix-out-of-memory-mislabels.md)
 - [06 Record each failure once through fail](issues/06-record-once-through-fail.md)
+- [07 Keep the leaf evidence in the one record](issues/07-keep-leaf-evidence-in-the-one-record.md)
+- [08 Close the remaining record gaps](issues/08-close-the-remaining-record-gaps.md)
+- [09 Close the remaining evidence and test gaps](issues/09-close-the-remaining-evidence-and-test-gaps.md)

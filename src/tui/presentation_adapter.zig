@@ -186,8 +186,14 @@ pub fn externalEdit(
     }
     const read_limit = if (command.max_bytes == std.math.maxInt(usize)) command.max_bytes else command.max_bytes + 1;
     const returned = std.Io.Dir.cwd().readFileAlloc(io, file_path, a, .limited(read_limit)) catch |err| {
-        if (err != error.StreamTooLong) completed.evidence = externalEditFailure(command, .read, err, @src());
-        completed.outcome = if (err == error.StreamTooLong) .too_large else .failed;
+        switch (err) {
+            error.StreamTooLong => {},
+            else => completed.evidence = externalEditFailure(command, .read, err, @src()),
+        }
+        completed.outcome = switch (err) {
+            error.StreamTooLong => .too_large,
+            else => .failed,
+        };
         retain = false;
         return completed;
     };
@@ -329,7 +335,10 @@ pub fn executeCommentDelete(command: *presentation.DeleteComment, client: bbr.bi
         command.identity.pullRequestId(),
         command.comment_id,
     )) |_| .deleted else |err| blk: {
-        if (err != error.NotFound) evidence = bbr.diagnostic.Failure.capture(.mutation, .execute, .{ .command_id = command.command_id }, .{ .zig = err }, @src());
+        switch (err) {
+            error.NotFound => {},
+            else => evidence = bbr.diagnostic.Failure.capture(.mutation, .execute, .{ .command_id = command.command_id }, .{ .zig = err }, @src()),
+        }
         break :blk switch (err) {
             error.NotFound => .not_found,
             error.Unauthorized => .{ .definitive_failure = error.Unauthorized },
@@ -371,7 +380,19 @@ pub fn executeReviewerVerdict(
         .target = command.target,
         .outcome = .adapter_failed,
     } };
+    const cause: ?anyerror = switch (result) {
+        .api_error => |err| err,
+        .unresolved => |err| err,
+        .success, .reconciled_success, .stale_source_commit => null,
+    };
     return .{ .reviewer_verdict_changed = .{
+        .evidence = if (cause) |err| bbr.diagnostic.Failure.capture(
+            .verdict,
+            if (bbr.bitbucket.asApiError(err) != null) .rejection else .execute,
+            .{ .command_id = command.command_id },
+            .{ .zig = err },
+            @src(),
+        ) else null,
         .command_id = command.command_id,
         .identity = command.identity,
         .target = command.target,

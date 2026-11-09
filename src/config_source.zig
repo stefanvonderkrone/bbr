@@ -11,7 +11,13 @@ pub const Snapshot = struct {
         const path = xdg.configFile(allocator, env) catch |err| return .{ .read_error = err };
         const resolved = path orelse return .{};
         const source = readRegular(allocator, io, resolved) catch |err| {
-            return .{ .path = resolved, .read_error = if (err == error.FileNotFound) null else err };
+            return .{
+                .path = resolved,
+                .read_error = switch (err) {
+                    error.FileNotFound => null,
+                    else => err,
+                },
+            };
         };
         return .{ .path = resolved, .source = source };
     }

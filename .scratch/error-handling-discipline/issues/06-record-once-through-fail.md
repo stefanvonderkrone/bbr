@@ -1,6 +1,6 @@
 # Record each failure once through fail
 
-Status: ready-for-agent
+Status: resolved
 Type: implementation
 Blocked by: 03
 Parent: ../PRD.md
@@ -37,8 +37,9 @@ Notes on some sites:
 
 - `src/main.zig:51` is `main`. It is the CLI boundary, so it ends through `exitFailure` instead of a record and a return.
 - `src/api/cli.zig:314` and `321` show the message through `printError` before they return. They can return through `fail` after `printError`.
-- `src/highlight/user_grammar.zig:279` and `377` translate the `std.DynLib.open` error to `error.NativeLibraryLoadFailed`. The CLI shows that name, because the Zig start code logs the name of an error that `main` returns. ADR-0014 says that such a site has no choice without a loss. Decide it here, and write the reason in the Completion section.
+- `src/highlight/user_grammar.zig:279` and `377` translate the `std.DynLib.open` error to `error.NativeLibraryLoadFailed`. The CLI shows that name, because the Zig start code logs the name of an error that `main` returns.
 - `src/api/cli.zig:339` translates `error.MissingUsername`, `error.MissingToken`, and `error.MissingWorkspace` to `error.MissingCredential`, and `writeError` branches on that name. This is a translation site whose new name a boundary uses.
+- The operator decided the translation sites on 2026-11-08, after TigerBeetle: the leaf has the most context for the message. A CLI-path site prints a message that names the leaf cause and the translated meaning, and then it returns `fail`. A TUI-path site whose boundary branches on the name returns the plain error without a record. ADR-0014 holds the rule.
 - `src/highlight/tree_sitter_highlighter.zig:54` records twice in one handler. It records the Zig error and then the predicate diagnostic.
 - `enrichSide` in `src/tui/file_enrichment.zig` has the error set `error{OutOfMemory}`. Its handlers at 319 and 338 record the error and return it when it is `error.OutOfMemory`. `error.Reported` in that set changes each caller's switch.
 
@@ -60,7 +61,7 @@ When the store converts, consider a check for a `native` check before a plain `S
    - Each worker entry point that turns an error into completion evidence, such as the workers in `src/tui/app.zig` and `src/tui/presentation_runtime.zig`.
    - Each CLI subcommand boundary that prints an error, such as `writeError` in `src/api/cli.zig`.
 2. Before you convert a site, find the boundary above it.
-   If that boundary prints `@errorName(err)` or branches on the error name, show the message at the site first, or return the error without a record.
+   If that boundary prints `@errorName(err)` or branches on the error name, a CLI-path site prints its message first and returns `fail`, and a TUI-path site returns the error without a record.
    Otherwise return `diagnostic.fail(phase, cause, @src())`.
 3. Convert the `errdefer |err|` records to a `catch` with `fail` on the call that has the evidence, or remove them.
 4. Convert the SQLite sites outside the check.
@@ -74,3 +75,67 @@ When the store converts, consider a check for a `native` check before a plain `S
 - Each CLI failure that printed a name before this issue still prints a message for that failure. A `*_cli_test.py` check proves it for the config load failure of `runMain`.
 - `zig build test` passes.
 - `python3 tools/check_agent_docs.py` passes.
+
+## Completion
+
+Branch `feat/record-once`, on `feat/try-boundary-rule`.
+
+Commits:
+
+- `c86f685` docs: print the message at the leaf, after TigerBeetle.
+- `2677ccd` tests: pin the runMain configuration failure message.
+- `0a7185c` diagnostics: teach the boundaries to skip error.Reported.
+- `df3c7b2` api: show and record each api failure once.
+- `ccc8733` cli: record each CLI entry failure once in main and completion.
+- `c2cf0f9` grammar: record each Grammar failure once and name its leaf cause.
+- `796ba86` tui: record TUI failures once at the worker and adapter boundaries.
+- `fc9c39a` http: record an invalid proxy setting once.
+- `b1fc56e` persist: record each SQLite failure once at the seam.
+- `71602ae` bitbucket: leave each decode failure to the boundary.
+- `a01a43a` http: record each transport failure once at the boundary.
+- `836a980` git: record each Git failure once at the boundary.
+- A review commit fixes the doubles and drops that the review found.
+- The commit that adds this section updates `docs/diagnostic-logging.md`, ADR-0014, `.agents/skills/zig/errors.md`, and the record-once row of `AGENTS.md`.
+
+The HTTP transport, the Bitbucket client, and the Git client return their typed errors without a record. The plan converted `StdHttpClient.send` to `fail`, but its callers branch on the error names, so the operator decision of 2026-11-08 applies. ADR-0014 now says so.
+
+Acceptance:
+
+- `tools/diagnostic_record_baseline.txt` lists no file.
+- Boundary tests read exactly one record: `tests/record_once_cli_test.py` and `tests/config_load_cli_test.py` for `main` and `exitFailure`, "diagnostics the api boundary shows each failure and records it once" for the CLI subcommand boundary, "diagnostics a store failure through fail keeps one record when Presentation shows it" for Presentation, and "diagnostics a worker completion that carries error.Reported keeps the leaf's one record" and "diagnostics a Bitbucket failure has one record from the worker boundary" for the workers.
+- Each CLI failure that printed a name still prints a message. `tests/config_load_cli_test.py` proves it for the config load failure of `runMain`. The SQLite open message in `openStore` lost the redundant "(Open)" suffix.
+- `zig build test` exits 0. `python3 tools/check_agent_docs.py` passes.
+
+Review: a read-only review of the last five commits found a second SQLite record on each failed finalize, a second record of a failed Session acquisition, two dropped causes in the Reviewer Verdict change, and a changed message for a failed Git launch. The review commit fixes all four. The remaining items are under Comments.
+
+Second review: a review of the branch found ten more items. The fix run of 2026-11-08 committed these:
+
+- `cc72665` diagnostics: drop a Reported record in the Handle. `Handle.record` drops a Failure whose cause is `error.Reported` in every build.
+- `1be62ba` cli: open the in-memory store in one place.
+- `beada5e` tui: record each store failure once behind a Presentation error. The Published write sites return `error.Reported` after their capture instead of `PersistenceFailed`, and `Published.create` loads the pending review with `try`, so the replacement boundary records the real cause. The two requeue catches in `acceptPreparedSession` now record. The test "diagnostics a store failure behind a translated Presentation error keeps one record" found seven second records and one requeue with no record before the fix.
+- `941ef9e` bitbucket: record each HTTP rejection once at its boundary. `Client.send` and `checkFileBlob` record nothing. The retried first blob attempt records its rejection. The worker test gains 429 and 503 cases, which found a second record before the fix.
+- `79d147d` diagnostics: record Git transition and discarded page failures once. `GitAnchorResolver` takes a required Handle and records the first failure of each transition. `PagedLists.finish` records each failed page that the caller does not receive.
+- `98fb277` tests: pin the bbr local store failure messages in `tests/store_message_cli_test.py`.
+- `431943a` bitbucket: record a Reviewer Verdict reason once on both paths. `changeReviewerVerdict` records only the causes that its result drops, and the caller records the reason that the result names. The verdict test now checks the phase and cause of each record.
+- The commit that adds this paragraph files issue 07, adds the Git launch site to issue 05, and updates ADR-0014, `docs/diagnostic-logging.md`, and the record-once row of `AGENTS.md`.
+
+Each commit ran `zig build test` with exit 0. The record baseline lists no file. The catch baseline went from 58 to 55: the classification switch in `Client.send` and the two uncaptured `git.diff` catches in `src/review/anchor.zig` are gone.
+
+## Comments
+
+Remaining work, outside the checked sites:
+
+- Issue 07 owns the leaf evidence that the one record lost: the JSON error behind `MalformedResponse`, the HTTP phase, the exact HTTP status, the page number of a failed page, and the Git exit code and stderr.
+- `detectRun` in `src/main.zig` prints the Git error name without a record.
+- Issue 05 owns the Git launch catch in `runRaw`, which shows `NotAGitRepo` for a missing git binary.
+- An unresolved Reviewer Verdict change after a lost connection has two records on the `bbr api` path: the transport cause from `changeReviewerVerdict` and `ReviewerVerdictChangeFailed` from the api boundary. `checkMutationRun` in `src/main.zig` has the same pair. The TUI path has one record.
+- `runPresentation` in `src/tui/app.zig` prints "bbr: could not load the pending review drafts" when the initial load fails with `error.Reported`. Only the demo passes an initial Session, and its `:memory:` store fails only on `SQLITE_NOMEM`, so no test reaches the message.
+- `Published.createInputs` in `src/tui/presentation.zig` turns a resolver error, such as `OutOfMemory`, into an unavailable scope with an uncaptured `catch .unavailable`, so it has no record. `GitAnchorResolver` records only Git and parse failures.
+- `listPagesConcurrent` in `src/bitbucket/client.zig` can leave through `try` before `PagedLists.finish`, for example on `OutOfMemory`. Other failed pages then have no record.
+- No test reads the record count of a refused `bbr api set-reviewer-verdict`. The worker test covers the TUI path, and the client test shows that the client records no reason that the result names.
+
+Corrections to the first Comments of this issue:
+
+- "The page number of a failed page" was lost was too broad at that time. The rejection record of `Client.send` kept the page. Commit `941ef9e` removed that record, so the page is now lost for a rejection too, except for a page that `PagedLists.finish` discards.
+- "The `git` cause variant in `src/diagnostic.zig` has no producer left" was wrong. The External Edit adapter in `src/tui/presentation_adapter.zig` produces it for a failed editor exit. The `http` cause variant has no producer since `941ef9e`.
+- The items for `Client.send`, `GitAnchorResolver`, and the `PagedLists` page after the limit are fixed by `941ef9e` and `79d147d`.

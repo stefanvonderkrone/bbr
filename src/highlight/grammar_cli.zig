@@ -115,14 +115,8 @@ pub const Store = struct {
         defer atomic.deinit(self.io);
         var buffer: [4096]u8 = undefined;
         var writer = atomic.file.writer(self.io, &buffer);
-        writer.interface.writeAll(output.items) catch |err| {
-            _ = self.diagnostic_handle.failure(.write, .{ .zig = writer.err orelse err }, @src());
-            return err;
-        };
-        writer.interface.flush() catch |err| {
-            _ = self.diagnostic_handle.failure(.write, .{ .zig = writer.err orelse err }, @src());
-            return err;
-        };
+        writer.interface.writeAll(output.items) catch |err| return writer.err orelse err;
+        writer.interface.flush() catch |err| return writer.err orelse err;
         try atomic.replace(self.io);
     }
 
@@ -257,7 +251,6 @@ pub fn run(
         defer allocator.free(removed_name);
         try store.dir.rename(removed.name, store.dir, removed_name, io);
         store.writeRegistry() catch |err| {
-            _ = diagnostic_handle.failure(.write, .{ .zig = err }, @src());
             try store.entries.insert(store.arena.allocator(), index, removed);
             store.dir.rename(removed_name, store.dir, removed.name, io) catch |rollback_err| {
                 _ = diagnostic_handle.failure(.cleanup, .{ .zig = rollback_err }, @src());
