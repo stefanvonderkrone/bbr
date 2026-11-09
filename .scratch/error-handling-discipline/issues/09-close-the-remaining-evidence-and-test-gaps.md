@@ -1,6 +1,6 @@
 # Close the remaining evidence and test gaps
 
-Status: needs-triage
+Status: ready-for-agent
 Type: implementation
 Blocked by: 04, 05, 07
 Parent: ../PRD.md
@@ -38,3 +38,18 @@ Each failure must keep its leaf evidence in its one record, and each changed fai
 - Each slot rule has a check, or the `AGENTS.md` rule table marks it as a convention with its reason.
 - Each listed path has a test that fails when its behavior breaks, or this issue states why no test can reach it.
 - `zig build test` passes. The record baseline lists no file, and the catch baseline does not rise.
+
+## Comments
+
+### Triage, 2026-11-09
+
+Ready for an agent. Each item names its source, its cause, and an outcome that the acceptance accepts, so no item needs the operator.
+Work the items in this order, because the first ones carry the most risk:
+
+1. Make the blob cancel test independent of the 100 ms sleep. A flaky test hides the next real failure.
+2. Pass a `diagnostics.Handle` to the Git client for the local blob read, so the termination reaches the record of the File side. Treat the Anchor transition the same way only if each resolver thread can own its slot.
+3. Add the missing cancel tests and the record for a second File side that fails with `error.OutOfMemory`.
+4. Check each slot rule, or mark it as a convention in the `AGENTS.md` rule table with its reason.
+
+An item can end as "stays lost" or "no test can reach it" when the issue states the reason.
+The translated-error evidence and the stale-evidence item are the most likely to end that way.
