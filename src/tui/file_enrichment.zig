@@ -27,7 +27,8 @@ pub const RemoteBlobSource = struct {
 
     fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, request: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *RemoteBlobSource = @ptrCast(@alignCast(ptr));
-        const diagnostic = if (request.sink != null) request else self.client.diagnostic;
+        // The request names the slot, because the sides of one File read concurrently through one source.
+        const diagnostic = (if (request.sink != null) request else self.client.diagnostic).withLeaf(request.leaf);
         const io = self.retry_io orelse return self.client.withDiagnostics(diagnostic).getFileBlob(allocator, self.repo, commit, path);
         if (try self.firstAttempt(io, allocator, commit, path, diagnostic)) |bytes| return bytes;
         return switch (try self.attemptClient(diagnostic, 2).getFileBlobAttempt(allocator, self.repo, commit, path)) {
@@ -85,9 +86,9 @@ pub const GitBlobSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, _: bbr.diagnostics.Handle) anyerror![]u8 {
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *GitBlobSource = @ptrCast(@alignCast(ptr));
-        return self.client.blob(allocator, commit, path);
+        return self.client.blob(allocator, commit, path, diagnostic);
     }
 };
 
@@ -259,18 +260,27 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
     if (req.status == .added or req.status == .removed)
         return enrichFrom(backing, source, highlighter, req);
 
-    var old_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old, sideDiagnostic(req.diagnostic, .old) }) catch |err| {
+    // Each side task notes into its own slot, and the join moves the slot of the failure that
+    // it returns to the caller's slot.
+    var task_req = req;
+    task_req.diagnostic = req.diagnostic.withLeaf(null);
+    var old_slot: ?bbr.diagnostic.Leaf = null;
+    var new_slot: ?bbr.diagnostic.Leaf = null;
+    var old_future = bbr.diagnostics.concurrent(io, enrichSideTask, .{ backing, source, highlighter, task_req, .old, &old_slot }) catch |err| {
         _ = req.diagnostic.failure(.launch, .{ .zig = err }, @src());
         return enrichFrom(backing, source, highlighter, req);
     };
-    var new_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new) }) catch |launch_error| {
+    var new_future = bbr.diagnostics.concurrent(io, enrichSideTask, .{ backing, source, highlighter, task_req, .new, &new_slot }) catch |launch_error| {
         _ = req.diagnostic.failure(.launch, .{ .zig = launch_error }, @src());
         const old = old_future.await(io) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => {
+                req.diagnostic.adopt(&old_slot);
+                return error.OutOfMemory;
+            },
         };
         return .{
             .old = old,
-            .new = enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new)) catch |err| {
+            .new = enrichRequestSide(backing, source, highlighter, req, .new, req.diagnostic) catch |err| {
                 var cleanup = old;
                 cleanup.deinit();
                 return err;
@@ -278,8 +288,8 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
         };
     };
     const old = old_future.await(io) catch |err| {
-        var new = new_future.await(io) catch return error.OutOfMemory;
-        new.deinit();
+        req.diagnostic.adopt(&old_slot);
+        dropSide(task_req, .new, new_future.await(io), &new_slot);
         return err;
     };
     errdefer {
@@ -287,24 +297,47 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
         cleanup.deinit();
     }
     const new = new_future.await(io) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => {
+            req.diagnostic.adopt(&new_slot);
+            return error.OutOfMemory;
+        },
     };
     return .{ .old = old, .new = new };
+}
+
+/// Releases a side that the result drops. The caller receives the failure of the other side,
+/// so a failure of this side has its record here, with the evidence of its own slot.
+fn dropSide(req: Request, side: Side, outcome: error{OutOfMemory}!SideResult, task_slot: *?bbr.diagnostic.Leaf) void {
+    var result = outcome catch |err| {
+        _ = sideDiagnostic(req.diagnostic.withLeaf(task_slot), side).failure(.execute, .{ .zig = err }, @src());
+        return;
+    };
+    result.deinit();
 }
 
 pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
     var result: Result = .{ .old = .absent, .new = .absent };
     errdefer result.deinit();
-    if (req.status != .added) {
-        result.old = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old, sideDiagnostic(req.diagnostic, .old));
-    }
-    if (req.status != .removed) {
-        result.new = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new, sideDiagnostic(req.diagnostic, .new));
-    }
+    if (req.status != .added) result.old = try enrichRequestSide(backing, source, highlighter, req, .old, req.diagnostic);
+    if (req.status != .removed) result.new = try enrichRequestSide(backing, source, highlighter, req, .new, req.diagnostic);
     return result;
 }
 
-fn sideDiagnostic(handle: bbr.diagnostics.Handle, side: @FieldType(bbr.diagnostic.Context, "side")) bbr.diagnostics.Handle {
+const Side = @typeInfo(@FieldType(bbr.diagnostic.Context, "side")).optional.child;
+
+fn enrichSideTask(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request, side: Side, task_slot: *?bbr.diagnostic.Leaf) error{OutOfMemory}!SideResult {
+    return enrichRequestSide(backing, source, highlighter, req, side, req.diagnostic.withLeaf(task_slot));
+}
+
+fn enrichRequestSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request, side: Side, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
+    const commit, const path, const known = switch (side) {
+        .old => .{ req.destination_commit, req.old_path, req.content.old },
+        .new => .{ req.source_commit, req.new_path, req.content.new },
+    };
+    return enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, commit, path, known, sideDiagnostic(diagnostic, side));
+}
+
+fn sideDiagnostic(handle: bbr.diagnostics.Handle, side: Side) bbr.diagnostics.Handle {
     var context = handle.context;
     context.side = side;
     return handle.forContext(.file_enrichment, context);
@@ -1717,26 +1750,182 @@ test "a retried remote blob read records its first attempt with the File side" {
     try testing.expect(records > 0);
 }
 
+test "diagnostics a transport OutOfMemory on one File side keeps its phase in the boundary record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/destination/", .send_error = error.OutOfMemory, .send_phase = .receive_body },
+        .{ .request_key = "/source/", .status = 200, .body = "new" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.file_enrichment, .{ .command_id = 5 }).withLeaf(&leaf);
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(boundary);
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    try testing.expectError(error.OutOfMemory, enrichConcurrent(testing.io, testing.allocator, bb, plain.highlighter(), .{
+        .repo = "repo",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "file.zig",
+        .new_path = "file.zig",
+        .max_file_bytes = 0,
+        .diagnostic = boundary,
+    }));
+    _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only, "operation=file_enrichment phase=receive_body source=tui/file_enrichment.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
+}
+
+test "diagnostics a second File side that fails with OutOfMemory has its own record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/destination/", .send_error = error.OutOfMemory, .send_phase = .receive_body },
+        .{ .request_key = "/source/", .send_error = error.OutOfMemory, .send_phase = .send_body },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.file_enrichment, .{ .command_id = 6 }).withLeaf(&leaf);
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(boundary);
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    try testing.expectError(error.OutOfMemory, enrichConcurrent(testing.io, testing.allocator, bb, plain.highlighter(), .{
+        .repo = "repo",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "file.zig",
+        .new_path = "file.zig",
+        .max_file_bytes = 0,
+        .diagnostic = boundary,
+    }));
+    _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const dropped = lines.next() orelse return error.TestUnexpectedResult;
+    const returned = lines.next() orelse return error.TestUnexpectedResult;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, dropped, "operation=file_enrichment phase=send_body ") != null);
+    try testing.expect(std.mem.indexOf(u8, dropped, "side=new") != null);
+    try testing.expect(std.mem.endsWith(u8, dropped, "cause=zig error=OutOfMemory"));
+    try testing.expect(std.mem.indexOf(u8, returned, "operation=file_enrichment phase=receive_body ") != null);
+    try testing.expect(std.mem.endsWith(u8, returned, "cause=zig error=OutOfMemory"));
+}
+
+test "diagnostics a failed local blob read keeps the git termination in the record of its File side" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    // The file system root is not inside a Git worktree, so git show exits with 128.
+    var git = bbr.git.ShellGitClient.init(testing.allocator, testing.io);
+    git.cwd = .{ .path = "/" };
+    var source: GitBlobSource = .{ .client = git.gitClient() };
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var result = try enrichFrom(testing.allocator, source.source(), plain.highlighter(), .{
+        .repo = "repo",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "file.zig",
+        .new_path = "file.zig",
+        .max_file_bytes = 0,
+        .diagnostic = sink.handle(.file_enrichment, .{ .command_id = 9 }).withLeaf(&leaf),
+    });
+    defer result.deinit();
+    try testing.expectEqual(error.BlobNotFound, result.old.fetch_failed);
+    try testing.expectEqual(error.BlobNotFound, result.new.fetch_failed);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    for ([_][]const u8{ "side=old", "side=new" }) |side| {
+        const line = lines.next().?;
+        try testing.expect(std.mem.indexOf(u8, line, "operation=file_enrichment phase=execute ") != null);
+        try testing.expect(std.mem.indexOf(u8, line, side) != null);
+        try testing.expect(std.mem.endsWith(u8, line, "cause=git termination=exited code=128 error=BlobNotFound"));
+    }
+    try testing.expect(lines.next() == null);
+}
+
 fn readRemoteBlob(remote: *RemoteBlobSource) anyerror![]u8 {
     return remote.source().read(testing.allocator, "source", "file.zig", .{});
 }
 
+/// A retry wait that only a cancel ends, so the test does not race the retry delay.
+fn sleepUntilCanceled(userdata: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+    var never: std.Io.Event = .unset;
+    return never.wait(.{ .userdata = userdata, .vtable = testing.io.vtable });
+}
+
 test "a canceled remote blob retry returns error.Canceled and does not send the second request" {
-    const responses = [_]bbr.http.Canned{
+    var retry_vtable = testing.io.vtable.*;
+    retry_vtable.sleep = sleepUntilCanceled;
+    const retry_io: std.Io = .{ .userdata = testing.io.userdata, .vtable = &retry_vtable };
+    const first_attempts = [_]bbr.http.Canned{
         .{ .status = 503, .body = "failure" },
-        .{ .status = 200, .body = "should-not-be-read" },
+        .{ .send_error = error.ConnectionResetByPeer, .send_phase = .receive_head },
     };
-    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
-    var remote: RemoteBlobSource = .{ .client = bb, .repo = "repo", .retry_io = testing.io };
-    var future = try testing.io.concurrent(readRemoteBlob, .{&remote});
-    var waits: usize = 0;
-    while (fake.callCount() == 0) : (waits += 1) {
-        if (waits == 2000) return error.TestUnexpectedResult;
-        try testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    for (first_attempts) |first_attempt| {
+        const responses = [_]bbr.http.Canned{ first_attempt, .{ .status = 200, .body = "should-not-be-read" } };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        var remote: RemoteBlobSource = .{ .client = bb, .repo = "repo", .retry_io = retry_io };
+        var future = try testing.io.concurrent(readRemoteBlob, .{&remote});
+        var waits: usize = 0;
+        while (fake.callCount() == 0) : (waits += 1) {
+            if (waits == 2000) return error.TestUnexpectedResult;
+            try testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        }
+        try testing.expectError(error.Canceled, future.cancel(testing.io));
+        try testing.expectEqual(@as(usize, 1), fake.callCount());
     }
-    try testing.expectError(error.Canceled, future.cancel(testing.io));
-    try testing.expectEqual(@as(usize, 1), fake.callCount());
 }
 
 test "File Content Status is independent per expected side and from Highlighting" {

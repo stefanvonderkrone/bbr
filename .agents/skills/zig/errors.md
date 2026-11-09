@@ -9,6 +9,9 @@
   `Handle.fail` in `src/diagnostics.zig` records the Failure and returns `error.Reported`.
   The callers above keep `try`.
 - When the function has no new evidence to add, return the error and record nothing. The boundary records it once.
+- When a client that the boundary branches on has evidence that the error name drops, such as an HTTP status or a Git exit code, call `Handle.note` with a `diagnostic.Leaf` for that error and return the error.
+  `note` records nothing. `Handle.record` puts the evidence into the boundary's one record of the same error.
+  A concurrent fan-out gives each task its own slot (`Handle.withLeaf`), because a slot has one writer at a time.
 - Keep records out of `errdefer |err|`. An `errdefer` runs only when the function returns the error, so the layer above records the same failure again.
 - At a boundary, give `error.Reported` its own prong that records nothing. Record every other error once.
   `Handle.record` drops `error.Reported`, so the prong keeps the name `Reported` out of the message, not out of the file.

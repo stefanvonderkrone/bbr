@@ -5,6 +5,7 @@ const bbr = @import("bbr");
 const arg = @import("args.zig");
 const out = @import("output.zig");
 const ws = @import("workspaces.zig");
+const repositories = @import("repositories.zig");
 
 pub const list_help =
     \\usage: bbr api list-pull-requests --repository SLUG [--state OPEN|MERGED|DECLINED|SUPERSEDED] [--source-branch NAME]
@@ -13,7 +14,7 @@ pub const list_help =
     \\List pull requests (GET .../pullrequests).
     \\--state ignores letter case. The default is OPEN.
     \\
-++ ws.pagingHelp(bbr.bitbucket.max_pagelen.pull_requests);
+++ ws.pagingHelp(bbr.bitbucket.max_pagelen.pull_requests, ws.default_concurrency);
 
 pub const workspace_list_help =
     \\usage: bbr api list-workspace-pull-requests --author UUID [--reviewer UUID]
@@ -32,7 +33,7 @@ pub const workspace_list_help =
     \\A repeated Repository is scanned once.
     \\Repeat --state to select several states. --state ignores letter case. The default is OPEN.
     \\--query is a Bitbucket q expression. The command joins it to its own filter with AND.
-++ ws.concurrency_help ++
+++ ws.concurrencyHelp(ws.default_concurrency) ++
     \\--limit caps the total. A failed request fails the complete list, unless all its rows
     \\come after the first --limit rows. HTTP 429 is not retried.
     \\
@@ -46,10 +47,15 @@ pub const get_help =
 const mutation_options =
     \\      [--destination-branch NAME]
     \\      [--description TEXT | --description-file PATH] [--reviewer UUID ... | --clear-reviewers]
-    \\      [--draft true|false] [--close-source-branch true|false] [--json]
+    \\      [--default-reviewers [--effective]] [--draft true|false] [--close-source-branch true|false] [--json]
     \\
     \\--reviewer replaces the reviewer list. --clear-reviewers sends an empty list.
-    \\Omitted reviewers use Bitbucket defaults on create and stay unchanged on update.
+    \\Bitbucket adds no Default Reviewers through the API. --default-reviewers sends the Repository's
+    \\Default Reviewers plus the --reviewer values and leaves out the PullRequest Author.
+    \\It prints a warning on stderr when a --reviewer value names the Author.
+    \\--effective uses the Effective Default Reviewers, which add the Default Reviewers of the Project.
+    \\On update, --default-reviewers replaces the reviewer list.
+    \\Without a reviewer flag, create sends no reviewers and update leaves them unchanged.
     \\Description files must not exceed 1 MiB. Flags can appear in any order.
     \\
 ;
@@ -308,13 +314,36 @@ fn printPullRequest(init: std.process.Init, pr: bbr.bitbucket.PullRequest, json:
     }
 }
 
+/// `--default-reviewers`, with `--effective` and the `--reviewer` values to add.
+const DefaultReviewerFlags = struct { effective: bool, add: []const []const u8 };
+
+/// The reviewer flags of a create or update. The parser rejects every other combination.
+const ReviewerFlags = union(enum) {
+    /// No reviewer flag. Create sends no reviewers, and update keeps them.
+    keep,
+    /// The `--reviewer` values, or none for `--clear-reviewers`.
+    set: []const []const u8,
+    defaults: DefaultReviewerFlags,
+
+    /// The reviewers that the flags name before a Default Reviewer read. Null keeps the reviewers.
+    fn named(self: ReviewerFlags) ?[]const []const u8 {
+        return switch (self) {
+            .keep => null,
+            .set => |uuids| uuids,
+            .defaults => |defaults| defaults.add,
+        };
+    }
+};
+
 const MutationArgs = struct {
     repository: ?[]const u8 = null,
     pr_id: ?u64 = null,
+    /// `mutatePullRequest` sets `opts.reviewers` from `reviewer_flags`.
     opts: bbr.bitbucket.PullRequestOptions = .{},
     description_file: ?[]const u8 = null,
+    /// Owns the `--reviewer` values that `reviewer_flags` borrows.
     reviewers: std.ArrayList([]const u8) = .empty,
-    clear_reviewers: bool = false,
+    reviewer_flags: ReviewerFlags = .keep,
 
     fn deinit(self: *MutationArgs, a: std.mem.Allocator) void {
         self.reviewers.deinit(a);
@@ -325,6 +354,9 @@ fn parseMutation(a: std.mem.Allocator, args: []const []const u8, create: bool) !
     var cur: arg.Cursor = .{ .args = args };
     var p: MutationArgs = .{};
     errdefer p.deinit(a);
+    var clear_reviewers = false;
+    var default_reviewers = false;
+    var effective = false;
     while (cur.next()) |text| {
         const f = arg.splitFlag(text) orelse return error.UnknownFlag;
         if (std.mem.eql(u8, f.name, "repository")) {
@@ -347,7 +379,13 @@ fn parseMutation(a: std.mem.Allocator, args: []const []const u8, create: bool) !
             try p.reviewers.append(a, try arg.takeValue(&cur, f));
         } else if (std.mem.eql(u8, f.name, "clear-reviewers")) {
             if (f.value != null) return error.UnknownFlag;
-            p.clear_reviewers = true;
+            clear_reviewers = true;
+        } else if (std.mem.eql(u8, f.name, "default-reviewers")) {
+            if (f.value != null) return error.UnknownFlag;
+            default_reviewers = true;
+        } else if (std.mem.eql(u8, f.name, "effective")) {
+            if (f.value != null) return error.UnknownFlag;
+            effective = true;
         } else if (std.mem.eql(u8, f.name, "draft")) {
             try arg.setOption(bool, &p.opts.draft, try arg.parseBool(try arg.takeValue(&cur, f)));
         } else if (std.mem.eql(u8, f.name, "close-source-branch")) {
@@ -360,14 +398,26 @@ fn parseMutation(a: std.mem.Allocator, args: []const []const u8, create: bool) !
         const id = p.pr_id orelse return error.MissingRequired;
         if (id == 0) return error.InvalidNumber;
     }
-    if (p.clear_reviewers and p.reviewers.items.len != 0) return error.BadRequest;
-    p.opts.reviewers = if (p.clear_reviewers) &.{} else if (p.reviewers.items.len != 0) p.reviewers.items else null;
+    if (effective and !default_reviewers) return error.BadRequest;
+    if (clear_reviewers and (p.reviewers.items.len != 0 or default_reviewers)) return error.BadRequest;
+    p.reviewer_flags = if (default_reviewers)
+        .{ .defaults = .{ .effective = effective, .add = p.reviewers.items } }
+    else if (clear_reviewers)
+        .{ .set = &.{} }
+    else if (p.reviewers.items.len != 0)
+        .{ .set = p.reviewers.items }
+    else
+        .keep;
     if (p.description_file) |path| {
         if (path.len == 0 or p.opts.description != null) return error.BadRequest;
         // A file is an explicit description change, even before it is read.
         p.opts.description = "";
     }
-    try p.opts.validate(create);
+    // `opts.reviewers` stays null until `mutatePullRequest`. Validate the named reviewers now,
+    // so that bad flags send no request.
+    var named = p.opts;
+    named.reviewers = p.reviewer_flags.named();
+    try named.validate(create);
     return p;
 }
 
@@ -377,10 +427,53 @@ fn mutatePullRequest(a: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client,
     const description = if (p.description_file) |path| try out.readFile(io, a, path) else null;
     defer if (description) |text| a.free(text);
     if (description) |text| p.opts.description = text;
+    var reads = std.heap.ArenaAllocator.init(a);
+    defer reads.deinit();
+    p.opts.reviewers = switch (p.reviewer_flags) {
+        .keep => null,
+        .set => |uuids| uuids,
+        .defaults => |defaults| try withDefaultReviewers(reads.allocator(), io, bb, p.repository.?, if (create) null else p.pr_id.?, defaults),
+    };
     return if (create)
         bb.createPullRequest(a, p.repository.?, p.opts)
     else
         bb.updatePullRequest(a, p.repository.?, p.pr_id.?, p.opts);
+}
+
+/// Reads the PullRequest Author and the Default Reviewers, then merges them with `defaults.add`.
+/// `pr_id` is null on create, where the Authenticated Account becomes the Author.
+fn withDefaultReviewers(a: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client, repository: []const u8, pr_id: ?u64, defaults: DefaultReviewerFlags) ![]const []const u8 {
+    const author = if (pr_id) |id| (try bb.getPullRequest(a, repository, id)).author_uuid else try bb.getAuthenticatedAccountUuid(a);
+    if (author.len == 0) return error.MalformedResponse;
+    const concurrency = ws.effectiveConcurrency(repositories.default_reviewers_concurrency, std.Thread.getCpuCount());
+    const listed = try bb.listDefaultReviewers(io, a, repository, defaults.effective, .{}, concurrency);
+    const selection = try mergeReviewerUuids(a, listed, defaults.add, author);
+    if (selection.dropped_explicit_author) {
+        const verb = if (pr_id == null) "create-pull-request" else "update-pull-request";
+        try out.printWarning(io, verb, "--reviewer {s} is the PullRequest Author. bbr leaves it out.", .{author});
+    }
+    return selection.uuids;
+}
+
+const ReviewerSelection = struct { uuids: []const []const u8, dropped_explicit_author: bool };
+
+/// The Default Reviewers in Bitbucket order, then `explicit`. Each UUID appears once, and the
+/// first wins. `author` never appears. `dropped_explicit_author` is true only when `explicit` names it.
+fn mergeReviewerUuids(allocator: std.mem.Allocator, defaults: []const bbr.bitbucket.DefaultReviewer, explicit: []const []const u8, author: []const u8) !ReviewerSelection {
+    var uuids: std.ArrayList([]const u8) = try .initCapacity(allocator, defaults.len + explicit.len);
+    errdefer uuids.deinit(allocator);
+    for (defaults) |reviewer| addReviewer(&uuids, reviewer.uuid, author);
+    for (explicit) |uuid| addReviewer(&uuids, uuid, author);
+    const dropped = for (explicit) |uuid| {
+        if (std.mem.eql(u8, uuid, author)) break true;
+    } else false;
+    return .{ .uuids = try uuids.toOwnedSlice(allocator), .dropped_explicit_author = dropped };
+}
+
+fn addReviewer(uuids: *std.ArrayList([]const u8), uuid: []const u8, author: []const u8) void {
+    if (std.mem.eql(u8, uuid, author)) return;
+    for (uuids.items) |seen| if (std.mem.eql(u8, seen, uuid)) return;
+    uuids.appendAssumeCapacity(uuid);
 }
 
 pub fn runCreate(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
@@ -554,19 +647,24 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
         .success, .reconciled_success => {},
         .api_error => |err| return err,
         .stale_source_commit => return error.ReviewerVerdictChangeFailed,
-        .unresolved => |cause| {
-            const transport = cause orelse return error.ReviewerVerdictChangeFailed;
-            if (bbr.bitbucket.asApiError(transport) == null) {
-                // The api boundary shows only a Bitbucket rejection with its cause, so this site shows the transport cause.
-                const reported = bb.diagnostic.fail(.execute, .{ .zig = transport }, @src());
-                var buf: [256]u8 = undefined;
-                var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
-                try stderr.interface.print("bbr api set-verdict: ReviewerVerdictChangeFailed: {s}\n", .{@errorName(transport)});
-                try stderr.interface.flush();
-                return reported;
+        .unresolved => |unresolved| {
+            const cause = unresolved orelse return error.ReviewerVerdictChangeFailed;
+            // The message names the translated meaning and the client cause, and the record
+            // takes the client cause, so the record keeps the evidence that the client noted.
+            var buf: [512]u8 = undefined;
+            var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
+            const writer = &stderr.interface;
+            try writer.writeAll("bbr api set-verdict: ReviewerVerdictChangeFailed");
+            const rejection = if (bb.error_detail) |detail| detail.reason else null;
+            if (bbr.bitbucket.asApiError(cause) == null) {
+                try writer.print(": {s}", .{@errorName(cause)});
+            } else if (rejection) |reason| {
+                try writer.print(": Bitbucket rejected request ({s})", .{@errorName(reason)});
+                if (bb.error_detail.?.message) |message| try writer.print(": {s}", .{message});
             }
-            if (bb.error_detail) |detail| detail.reported_error = error.ReviewerVerdictChangeFailed;
-            return error.ReviewerVerdictChangeFailed;
+            try writer.writeByte('\n');
+            try writer.flush();
+            return bb.diagnostic.fail(.execute, .{ .zig = cause }, @src());
         },
     }
     const name: []const u8 = switch (result) {
@@ -751,6 +849,14 @@ test "list-workspace-pull-requests accepts --concurrency with or without --repos
     try std.testing.expectEqual(@as(usize, 0), fake.call_count);
 }
 
+test "PullRequest list helps state the concurrency default of their parsers" {
+    try std.testing.expectEqual(ws.default_concurrency, (try parseList(&.{"--repository=sample"})).concurrency);
+    const workspace = try parseWorkspaceList(std.testing.allocator, &.{"--author={a}"});
+    try std.testing.expectEqual(ws.default_concurrency, workspace.options.concurrency);
+    for ([_][]const u8{ list_help, workspace_list_help }) |help|
+        try std.testing.expect(std.mem.indexOf(u8, help, ws.concurrencyHelp(ws.default_concurrency)) != null);
+}
+
 test "set-verdict rejects a spoofed uuid before HTTP" {
     var fake: bbr.http.FakeHttpClient = .{};
     const bb = testClient(&fake);
@@ -812,15 +918,40 @@ test "API lifecycle mutation parser preserves optional values and reviewer repla
     try std.testing.expectEqual(@as(?bool, true), created.opts.draft);
     try std.testing.expectEqual(@as(?bool, false), created.opts.close_source_branch);
     try std.testing.expectEqualStrings("", created.opts.description.?);
-    try std.testing.expectEqual(@as(usize, 2), created.opts.reviewers.?.len);
+    try std.testing.expectEqual(@as(usize, 2), created.reviewer_flags.set.len);
     var minimal = try parseMutation(a, &.{ "--repository=sample", "--title=Change", "--source-branch=feature" }, true);
     defer minimal.deinit(a);
     try std.testing.expect(minimal.opts.draft == null);
-    try std.testing.expect(minimal.opts.reviewers == null);
+    try std.testing.expect(minimal.reviewer_flags == .keep);
     var cleared = try parseMutation(a, &.{ "--clear-reviewers", "--repository=sample", "--pull-request-id=42", "--draft", "false" }, false);
     defer cleared.deinit(a);
-    try std.testing.expectEqual(@as(usize, 0), cleared.opts.reviewers.?.len);
+    try std.testing.expectEqual(@as(usize, 0), cleared.reviewer_flags.set.len);
     try std.testing.expectEqual(@as(?bool, false), cleared.opts.draft);
+    var defaults = try parseMutation(a, &.{ "--repository=sample", "--pull-request-id=42", "--effective", "--default-reviewers", "--reviewer={ada}" }, false);
+    defer defaults.deinit(a);
+    try std.testing.expect(defaults.reviewer_flags.defaults.effective);
+    try std.testing.expectEqualStrings("{ada}", defaults.reviewer_flags.defaults.add[0]);
+}
+
+test "mergeReviewerUuids keeps the Default Reviewer order, adds new --reviewer values, and leaves out the Author" {
+    const a = std.testing.allocator;
+    const defaults = [_]bbr.bitbucket.DefaultReviewer{
+        .{ .uuid = "{bob}", .display_name = "Bob", .reviewer_type = .project },
+        .{ .uuid = "{author}", .display_name = "Author", .reviewer_type = .repository },
+        .{ .uuid = "{ada}", .display_name = "Ada", .reviewer_type = .repository },
+        .{ .uuid = "{bob}", .display_name = "Bob", .reviewer_type = .repository },
+    };
+    for ([_]struct { explicit: []const []const u8, uuids: []const []const u8, dropped: bool }{
+        .{ .explicit = &.{}, .uuids = &.{ "{bob}", "{ada}" }, .dropped = false },
+        .{ .explicit = &.{ "{carol}", "{ada}", "{carol}" }, .uuids = &.{ "{bob}", "{ada}", "{carol}" }, .dropped = false },
+        .{ .explicit = &.{ "{author}", "{ADA}", "ada" }, .uuids = &.{ "{bob}", "{ada}", "{ADA}", "ada" }, .dropped = true },
+    }) |case| {
+        const selection = try mergeReviewerUuids(a, &defaults, case.explicit, "{author}");
+        defer a.free(selection.uuids);
+        try std.testing.expectEqual(case.uuids.len, selection.uuids.len);
+        for (case.uuids, selection.uuids) |expected, uuid| try std.testing.expectEqualStrings(expected, uuid);
+        try std.testing.expectEqual(case.dropped, selection.dropped_explicit_author);
+    }
 }
 
 test "API lifecycle invalid mutation options fail before HTTP" {
@@ -836,9 +967,16 @@ test "API lifecycle invalid mutation options fail before HTTP" {
         &.{ "--repository=sample", "--pull-request-id=42", "--reviewer={ada}", "--clear-reviewers" },
         &.{ "--repository=sample", "--pull-request-id=42", "--description=", "--description-file=unused" },
         &.{ "--repository=sample", "--pull-request-id=42", "--description-file=" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--effective", "--draft=true" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers", "--clear-reviewers" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--clear-reviewers", "--default-reviewers", "--effective" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers", "--reviewer=" },
     }) |args| try std.testing.expectError(error.BadRequest, mutatePullRequest(a, std.testing.io, bb, args, false));
+    try std.testing.expectError(error.BadRequest, mutatePullRequest(a, std.testing.io, bb, &.{ "--repository=sample", "--title=Change", "--source-branch=feature", "--effective" }, true));
     try std.testing.expectError(error.MissingRequired, mutatePullRequest(a, std.testing.io, bb, &.{"--repository=sample"}, true));
-    try std.testing.expectError(error.UnknownFlag, mutatePullRequest(a, std.testing.io, bb, &.{ "--repository=sample", "--pull-request-id=42", "--clear-reviewers=true" }, false));
+    try std.testing.expectError(error.MissingRequired, mutatePullRequest(a, std.testing.io, bb, &.{ "--repository=sample", "--source-branch=feature", "--default-reviewers" }, true));
+    for ([_][]const u8{ "--clear-reviewers=true", "--default-reviewers=true", "--effective=true" }) |flag|
+        try std.testing.expectError(error.UnknownFlag, mutatePullRequest(a, std.testing.io, bb, &.{ "--repository=sample", "--pull-request-id=42", "--default-reviewers", flag }, false));
     for ([_][]const []const u8{
         &.{ "--repository=sample", "--pull-request-id=42", "--source-repository=fork/sample" },
         &.{ "--repository=sample", "--pull-request-id=42", "--title=Change", "--source-repository", "fork/sample" },

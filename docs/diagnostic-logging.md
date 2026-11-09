@@ -58,7 +58,11 @@ Available numeric context follows the source field.
 It can include the command ID, work ID, Session Epoch, OperationId, Draft ID, File index, File side, attempt, or page.
 Absent context fields do not appear.
 Native cause fields retain the Git termination kind and code, or SQLite primary and extended codes.
-No code records an HTTP cause now. An HTTP rejection has a Zig cause that names its classification, such as `RateLimited`.
+A Git cause of a failed git command also names the typed error, such as `error=UnknownRef`. A git launch failure has `phase=launch` and the launch error.
+An HTTP rejection has `phase=rejection` and an HTTP cause with the status and its classification, such as `status=503 classification=server`.
+A transport failure has the phase of the step that failed, such as `connect` or `receive_head`, and the transport error.
+A response that is not valid JSON has `phase=decode` and the JSON parse error, such as `UnexpectedEndOfInput`. The caller sees `MalformedResponse`.
+A failed list page has its page number, also when one of its items fails to decode.
 A Grammar cause names its `rule`: `query` with the Tree-sitter query error code, `regex` with the regex engine code, or a predicate rule such as `unknown_operator` with code 0. Each Grammar cause has the byte offset in the query, but never the query text.
 Zig causes use the original error name where capture precedes domain conversion.
 
@@ -115,7 +119,11 @@ Each failure has one record ([ADR-0014](adr/0014-a-failure-is-recorded-once-and-
 A site that records a failure and still fails returns `error.Reported`, and the boundaries above write nothing more for it.
 `Handle.record` drops a Failure whose cause is `error.Reported`, so a boundary that records it by mistake writes no second record.
 The Bitbucket client, the HTTP transport, and the Git client record nothing, because their callers branch on the error name.
-The boundary that receives such an error records it, so its record names the typed error, not the HTTP status, the transport phase, the JSON error, the page number, or the Git exit code.
+They note their evidence in a slot that the boundary owns, and the boundary's one record of that error holds it.
+Each concurrent task notes into its own slot, and the join moves the slot of the returned failure to the boundary's slot.
+The evidence does not reach a record of another error. A translation site on a CLI path prints the translated meaning and records the client error, so the record keeps the evidence. `bbr api set-verdict` does this for an unresolved Reviewer Verdict change.
+Every client error return notes fresh evidence, so a record never takes the evidence of an earlier failure with the same name. An input check notes `phase=prepare`, and a response that has the wrong structure notes `phase=validate`.
+A local blob read and a Git Anchor transition pass the slot of their own failure to the Git client, so their record keeps the Git termination.
 A site that turns a failure into an outcome without its cause records it, like a boundary. Examples are a retried first blob attempt, an unavailable Anchor transition, and a list page that the result does not need.
 
 Normal cancellation, no matches, optional missing files, Submission lock contention, unsupported Grammars, and configured size limits are not operational errors.

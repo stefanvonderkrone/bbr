@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
         var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, init.io);
         const base = try git.gitClient().resolveRef(allocator, base_ref);
         const source = try git.gitClient().resolveRef(allocator, source_ref);
-        const raw_diff = try git.gitClient().diff(allocator, base.commit, source.commit);
+        const raw_diff = try git.gitClient().diff(allocator, base.commit, source.commit, .{});
         const diff = try bbr.diff.parse(allocator, raw_diff);
         var git_source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
         const name = try std.fmt.allocPrint(allocator, "LocalReview {s}..{s}", .{ base_ref, source_ref });
@@ -178,7 +178,7 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
 
     while (active < limit and next < order.len) : (next += 1) {
         const file_index = order[next];
-        try select.concurrent(.file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
+        try bbr.diagnostics.selectConcurrent(&select, .file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
         active += 1;
     }
     while (active > 0) {
@@ -206,7 +206,7 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
         if (next < order.len) {
             const file_index = order[next];
             next += 1;
-            try select.concurrent(.file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
+            try bbr.diagnostics.selectConcurrent(&select, .file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
             active += 1;
         }
     }

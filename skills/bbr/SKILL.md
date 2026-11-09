@@ -1,6 +1,6 @@
 ---
 name: bbr
-description: Bitbucket Cloud work through bbr api. Use for account ID or UUID lookup, member UUID lookup by name, reviewer assignment, Branches, PullRequest creation, draft-to-ready updates, decline, PullRequests by author or reviewer, commit lookup, and Reviewer Verdicts. Also use for Workspaces, Repositories, diffs, file bytes, Comments, Tasks, and the Authenticated Account.
+description: Bitbucket Cloud work through bbr api. Use for account ID or UUID lookup, member UUID lookup by name, reviewer assignment, Default Reviewers, Branches, PullRequest creation, draft-to-ready updates, decline, PullRequests by author or reviewer, commit lookup, and Reviewer Verdicts. Also use for Workspaces, Repositories, diffs, file bytes, Comments, Tasks, and the Authenticated Account.
 ---
 
 # bbr api — Bitbucket Cloud CLI
@@ -97,7 +97,9 @@ For a fork source, use `--source-repository WORKSPACE/SLUG` with `--source-branc
 
 Use `update-pull-request --draft false` to make a Draft PullRequest ready. Use `--draft true` to make it a draft. The command changes only supplied fields. An empty description clears the description.
 
-Repeated `--reviewer UUID` options replace the complete reviewer list. `--clear-reviewers` sends an empty list. Omitted reviewers use Bitbucket defaults on creation and stay unchanged on update. Do not combine `--reviewer` with `--clear-reviewers`.
+Repeated `--reviewer UUID` options replace the complete reviewer list. `--clear-reviewers` sends an empty list. Do not combine `--reviewer` with `--clear-reviewers`. Without a reviewer flag, `create-pull-request` sends no reviewers and `update-pull-request` keeps them.
+
+The Bitbucket web UI adds the Default Reviewers of the Repository to a new PullRequest. The API adds none. When the user wants these reviewers, add `--default-reviewers`. The command then sends the Default Reviewers and the `--reviewer` values. Add `--effective` to use the Effective Default Reviewers, which also include the Default Reviewers of the Project. The command leaves out the PullRequest Author. It prints a warning on stderr when a `--reviewer` value names the Author. On update, `--default-reviewers` replaces the reviewer list. Do not combine `--default-reviewers` with `--clear-reviewers`. Run `list-default-reviewers --repository SLUG` to show the Default Reviewers before a write.
 
 Approval uses `set-verdict --verdict approved` with the expected SourceCommit. `decline-pull-request` closes the PullRequest without merging. Decline is not a Reviewer Verdict.
 
@@ -113,4 +115,4 @@ The Pull Request Commit Links app must exist. Bitbucket installs it when someone
 
 ## Keep current
 
-`bbr api --help` lists verbs. `bbr api VERB --help` defines flags. Follow help on conflict. Use the canonical terms Workspace, Workspace Member, Repository, Branch, PullRequest, Draft PullRequest, Ready PullRequest, Comment, Task, Reviewer Verdict, and Authenticated Account.
+`bbr api --help` lists verbs. `bbr api VERB --help` defines flags. Follow help on conflict. Use the canonical terms Workspace, Workspace Member, Repository, Branch, PullRequest, Draft PullRequest, Ready PullRequest, Default Reviewer, Effective Default Reviewer, Comment, Task, Reviewer Verdict, and Authenticated Account.
