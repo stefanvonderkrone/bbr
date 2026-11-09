@@ -139,3 +139,15 @@ Corrections to the first Comments of this issue:
 - "The page number of a failed page" was lost was too broad at that time. The rejection record of `Client.send` kept the page. Commit `941ef9e` removed that record, so the page is now lost for a rejection too, except for a page that `PagedLists.finish` discards.
 - "The `git` cause variant in `src/diagnostic.zig` has no producer left" was wrong. The External Edit adapter in `src/tui/presentation_adapter.zig` produces it for a failed editor exit. The `http` cause variant has no producer since `941ef9e`.
 - The items for `Client.send`, `GitAnchorResolver`, and the `PagedLists` page after the limit are fixed by `941ef9e` and `79d147d`.
+
+### 2026-11-09 re-verification
+
+Commit `defe67a` removes the record before the plain error return in `highlightBuiltIn`.
+File Enrichment now receives the same error and writes exactly one record. The File content stays readable.
+UserGrammar fallback still records each consumed failure once. Expected `FileTooLarge` and `InvalidUtf8` outcomes stay unrecorded.
+The checker now follows same-file void recording helpers, including calls between helpers.
+Its regression test rejects the old `recordHighlightFailure(diagnostic, err); return err;` handler.
+The catch baseline falls from 35 to 33 because both fallback catches now capture and record their causes.
+The record baseline stays empty.
+The behavioral test and checker tests fail on the old code and pass with the fix.
+The logs are `item-c-red.log`, `item-c-checker-red.log`, `item-c-green.log`, and `item-c-native-green.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/`.

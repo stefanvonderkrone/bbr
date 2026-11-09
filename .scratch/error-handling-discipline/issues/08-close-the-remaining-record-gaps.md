@@ -50,3 +50,14 @@ Each red run is in `decisions-08.tsv`. A read-only review of the whole diff foun
 
 Remaining for issue 07: on the api path, an unresolved change whose cause is an `ApiError` still records `ReviewerVerdictChangeFailed`, not the rejection name. The message shows the rejection, and the TUI and `check-verdict` records name it.
 
+## Comments
+
+### 2026-11-09 re-verification
+
+Commit `aab419e` restores record-first handling in `runSetVerdict` and the other CLI `fail` sites.
+A failed stderr write can no longer skip the record of the client cause.
+The Reviewer Verdict test refuses stderr writes and reads exactly one cause record with its client evidence.
+The CLI test also uses a read-only stderr descriptor and checks one original cause record for each failed command.
+Both tests fail on `74a091a` and pass with the fix. Normal CLI text stays unchanged.
+The red logs are `record-once-stderr-red.log` and `record-once-stderr-cli-red.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/`.
+The green logs are `record-once-stderr-isolated-green.log` and `record-once-stderr-full-green.log` in the same directory.

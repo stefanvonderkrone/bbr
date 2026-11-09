@@ -57,3 +57,26 @@ Checks:
 - `python3 tools/check_agent_docs.py` passes.
 
 Review: Claude Opus 5.5 read the decision log and the commits. It found the Theme save mislabel. That fix is in the follow-up commit. The picker tick and the `Group.await` cleanups have no cancel test. The blob cancel test covers the 503 sleep, not the transport-error sleep. The five commits were cut from one green tree and were not built one by one.
+
+## Comments
+
+### 2026-11-09 re-verification
+
+Commit `50a69d1` restores cancellation handling in the wait, blob, mention, account, auth permission, Git metadata, and benchmark auth paths.
+It also propagates hidden `OutOfMemory` errors, as the request requires. Other fallback behavior stays unchanged.
+Canceled workers retain their retirement completions. File Enrichment joins the remaining side and rearms a secondary cancellation when necessary.
+
+Eleven new tests fail on detached `74a091a` and pass with the fix.
+They cover retry suppression, canceled reads, worker retirement, account and mention acquisition, Git failures, and auth file state.
+Benchmark auth resolution has compile coverage only. Its `main` has no injected auth seam, so selecting that error needs a new production interface.
+No other listed site was dismissed as unreachable.
+
+The logs are `red-final.log` and `green-final.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/item-b-evidence/`.
+The cancellation fixes keep the existing catch counts. The independent Highlighting fix `defe67a` lowers the baseline from 35 to 33.
+The record baseline stays empty. No visible text literal changed.
+
+Review found a second wait retirement gap after a successful sleep.
+Commit `c52f4ea` protects that completion when cancellation meets a full event queue.
+The new test fails on detached `50a69d1` and passes with the fix. It checks one completion and zero remaining tracked work.
+The logs are `wait-retirement-red-50a69d1.log`, `wait-retirement-green.log`, and `wait-retirement-full.log` in the parent evidence directory.
+The full native suite passes all 1,596 tests.
