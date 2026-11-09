@@ -861,3 +861,49 @@ test "diagnostics a failed local git command keeps its termination in the worker
     try testing.expectEqual(error.NotAGitRepo, recorded.cause.git.err.?);
     try testing.expectEqual(@as(u32, 128), recorded.cause.git.code);
 }
+
+test "diagnostics a failed local diff keeps its termination in one worker record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    try env.put("HOME", home);
+    try env.put("GIT_CONFIG_NOSYSTEM", "1");
+    try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    const commands = [_][]const []const u8{
+        &.{ "git", "init", "-b", "main" },
+        &.{ "git", "-c", "user.name=Reviewer", "-c", "user.email=reviewer@example.test", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "base" },
+        &.{ "git", "config", "diff.algorithm", "invalid" },
+    };
+    for (commands) |argv| {
+        const result = try std.process.run(testing.allocator, testing.io, .{
+            .argv = argv,
+            .cwd = .{ .path = home },
+            .environ_map = &env,
+        });
+        defer testing.allocator.free(result.stdout);
+        defer testing.allocator.free(result.stderr);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    }
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const boundary = sink.handle(.session_load, .{}).withLeaf(&leaf);
+    var git = bbr.git.ShellGitClient.init(testing.allocator, testing.io);
+    git.cwd = .{ .path = home };
+    git.diagnostic = boundary;
+
+    try testing.expectError(error.UnknownRef, loadLocalWith(testing.allocator, git.gitClient(), "main", "main", boundary));
+    try testing.expectEqual(@as(u64, 0), sink.sequence);
+    const recorded = boundary.failure(.execute, .{ .zig = error.UnknownRef }, @src());
+    try testing.expectEqual(@as(u64, 1), sink.sequence);
+    try testing.expectEqual(bbr.diagnostic.Phase.execute, recorded.phase);
+    try testing.expectEqual(.git, std.meta.activeTag(recorded.cause));
+    try testing.expectEqual(error.UnknownRef, recorded.cause.git.err.?);
+    try testing.expectEqual(.exited, recorded.cause.git.kind);
+    try testing.expectEqual(@as(u32, 128), recorded.cause.git.code);
+}

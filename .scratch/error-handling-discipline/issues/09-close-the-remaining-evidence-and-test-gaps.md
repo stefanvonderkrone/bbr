@@ -41,6 +41,16 @@ Each failure must keep its leaf evidence in its one record, and each changed fai
 
 ## Comments
 
+### Local Diff evidence recheck, 2026-11-09
+
+The test "diagnostics a failed local diff keeps its termination in one worker record" calls `loadLocalWith` on a real WorkingCopy.
+Both Refs resolve, but an invalid local `diff.algorithm` makes `git diff` exit with code 128.
+The test checks that no earlier record exists and that the boundary's one record holds the Git termination.
+Dropping the handle in `GitSource.read` makes the test fail with `expected .git, found .zig`.
+The red and green logs are `red.log` and `green-worktree.log` under `/private/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/issue09-local-diff-evidence/`.
+The detached worktree is removed.
+The catch baseline stays at 35, and the record baseline lists no file.
+
 ### Return-statement lint recheck, 2026-11-09
 
 The checker now checks all client error members in a complete return expression.
