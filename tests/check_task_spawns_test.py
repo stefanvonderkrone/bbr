@@ -40,6 +40,8 @@ class TaskSpawnCheckTest(unittest.TestCase):
 
     def test_a_spawn_through_diagnostics_is_allowed(self):
         text = "\n".join((
+            'const bbr = @import("bbr");',
+            'const diagnostics = @import("../diagnostics.zig");',
             "fn start(io: std.Io) void {",
             "    var future = try bbr.diagnostics.concurrent(io, work, .{});",
             "    try diagnostics.selectConcurrent(&select, .page, fetch, .{});",
@@ -66,7 +68,37 @@ class TaskSpawnCheckTest(unittest.TestCase):
         self.assertEqual(len(found), 1)
 
     def test_an_allowed_wrapper_does_not_hide_another_spawn_on_its_line(self):
-        text = "fn f() void { bbr.diagnostics.concurrent(io, work, .{}); task_diagnostics.concurrent(work, .{}); }"
+        text = 'const bbr = @import("bbr");\nfn f() void { bbr.diagnostics.concurrent(io, work, .{}); task_diagnostics.concurrent(work, .{}); }'
+        self.assertEqual(len(self.check(text)), 1)
+
+    def test_a_wrapper_call_split_across_lines_is_allowed(self):
+        # zig fmt keeps a chain that the author breaks before its `.concurrent(`.
+        text = "\n".join((
+            'const bbr = @import("bbr");',
+            'const diagnostics = bbr.diagnostics;',
+            "fn start(io: std.Io) void {",
+            "    var a = try diagnostics",
+            "        .concurrent(io, work, .{});",
+            "    var b = try bbr",
+            "        .diagnostics",
+            "        .concurrent(io, work, .{});",
+            "}",
+        ))
+        self.assertEqual(self.check(text), [])
+
+    def test_a_spawn_split_across_lines_is_rejected(self):
+        text = "fn start(io: std.Io) void {\n    var future = try io\n        .concurrent(work, .{});\n}\n"
+        found = self.check(text)
+        self.assertEqual(len(found), 1)
+        self.assertIn("src/bitbucket/client.zig:3:", found[0])
+
+    def test_a_receiver_named_diagnostics_that_is_not_the_wrapper_is_rejected(self):
+        for declaration in ("", "const diagnostics = std.Io;", 'const bbr = @import("other");'):
+            text = declaration + "\nfn start(diagnostics: std.Io) void {\n    _ = diagnostics.concurrent(work, .{});\n    _ = bbr.diagnostics.concurrent(io, work, .{});\n}\n"
+            self.assertEqual(len(self.check(text)), 2, declaration)
+
+    def test_a_local_named_diagnostics_beside_no_wrapper_import_is_rejected(self):
+        text = "fn start(io: std.Io) void {\n    const diagnostics = io;\n    _ = diagnostics.concurrent(work, .{});\n}\n"
         self.assertEqual(len(self.check(text)), 1)
 
 
