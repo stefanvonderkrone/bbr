@@ -68,7 +68,11 @@ pub fn main(init: std.process.Init) !void {
             error.InvalidCharacter, error.Overflow => return usage(),
         };
         if (arguments.next() != null) return usage();
-        var owned = bbr.bitbucket.auth.resolve(allocator, init.io, init.environ_map, null) catch return error.MissingCredential;
+        var owned = bbr.bitbucket.auth.resolve(allocator, init.io, init.environ_map, null) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MissingCredential,
+        };
         defer owned.deinit(allocator);
         const credential = owned.credential();
         var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);

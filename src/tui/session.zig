@@ -96,6 +96,7 @@ pub const Session = struct {
                 entry.key_ptr.* = try a.dupe(u8, span.mention);
                 entry.value_ptr.* = "";
                 const user = bb.getUser(scratch.allocator(), span.mention) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
                     error.OutOfMemory => return err,
                     else => {
                         _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
@@ -195,7 +196,13 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
                     required_failed = true;
                 }
             },
-            .account => active -= 1,
+            .account => {
+                active -= 1;
+                if (account_branch.err) |err| switch (err) {
+                    error.Canceled, error.OutOfMemory => required_failed = true,
+                    else => {},
+                };
+            },
             .raw_diff => {
                 active -= 1;
                 required_failed = required_failed or diff_branch.err != null;
@@ -223,15 +230,26 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     // branch has no other record.
     var failed: ?anyerror = null;
     const outcomes = [_]struct { err: ?anyerror, leaf: *?bbr.diagnostic.Leaf }{
+        .{ .err = if (account_branch.err) |err| switch (err) {
+            error.Canceled, error.OutOfMemory => err,
+            else => null,
+        } else null, .leaf = &account_branch.leaf },
         .{ .err = pr_branch.err, .leaf = &pr_branch.leaf },
         .{ .err = diff_branch.err, .leaf = &diff_branch.leaf },
         .{ .err = comments_branch.err, .leaf = &comments_branch.leaf },
     };
-    for (outcomes) |outcome| if (outcome.err) |err| {
-        if (failed == null) {
-            failed = err;
-            bb.diagnostic.adopt(outcome.leaf);
-        } else _ = bb.diagnostic.withLeaf(outcome.leaf).failure(.read, .{ .zig = err }, @src());
+    for (outcomes) |outcome| if (outcome.err) |err| switch (err) {
+        error.Canceled => failed = error.Canceled,
+        else => {},
+    };
+    for (outcomes) |outcome| if (outcome.err) |err| switch (err) {
+        error.Canceled => {},
+        else => {
+            if (failed == null) {
+                failed = err;
+                bb.diagnostic.adopt(outcome.leaf);
+            } else _ = bb.diagnostic.withLeaf(outcome.leaf).failure(.read, .{ .zig = err }, @src());
+        },
     };
     if (failed) |err| return err;
 
@@ -299,13 +317,17 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     const a = s.arena.allocator();
 
     s.authenticated_account_unauthorized = false;
-    s.authenticated_account_uuid = bb.getAuthenticatedAccountUuid(a) catch |err| blk: {
-        _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
-        s.authenticated_account_unauthorized = switch (err) {
-            error.Unauthorized => true,
-            else => false,
-        };
-        break :blk null;
+    s.authenticated_account_uuid = bb.getAuthenticatedAccountUuid(a) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => blk: {
+            _ = bb.diagnostic.failure(.read, .{ .zig = err }, @src());
+            s.authenticated_account_unauthorized = switch (err) {
+                error.Unauthorized => true,
+                else => false,
+            };
+            break :blk null;
+        },
     };
     const pr = try bb.getPullRequest(a, repo, id);
     s.source = .{ .remote = pr };
@@ -364,7 +386,10 @@ fn acquirePullRequest(branch: *Branch(PullRequest), bb: Client, repo: []const u8
 fn acquireAccount(branch: *Branch([]u8), bb: Client) void {
     const client = branch.client(bb);
     branch.value = client.getAuthenticatedAccountUuid(branch.arena.allocator()) catch |err| {
-        _ = client.diagnostic.failure(.read, .{ .zig = err }, @src());
+        switch (err) {
+            error.Canceled, error.OutOfMemory => {},
+            else => _ = client.diagnostic.failure(.read, .{ .zig = err }, @src()),
+        }
         branch.err = err;
         return;
     };
@@ -519,6 +544,60 @@ test "remote Session resolves each prose mention once and retains failed mention
         try testing.expect(fake.maxActiveRequests() <= 2);
         try testing.expect(std.mem.startsWith(u8, s.threads[0].root.body, "@{id} @{id}"));
     }
+}
+
+test "diagnostics mention cancellation stops the sequential and concurrent Session load" {
+    for ([_]bool{ false, true }) |sequential| {
+        const base = testRemoteResponses(200);
+        const responses = [_]Canned{
+            .{ .request_key = "/users/id", .send_error = error.Canceled },
+            base[0],
+            base[1],
+            .{ .request_key = "/pullrequests/7/comments", .body = "{\"values\":[{\"id\":1,\"content\":{\"raw\":\"@{id}\"},\"user\":{\"display_name\":\"Ada\"}}]}" },
+            base[3],
+        };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        const result = if (sequential) loadSequentialWith(testing.allocator, bb, "repo", 7) else loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7);
+        if (result) |s| {
+            s.destroy();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        try testing.expectError(error.Canceled, result);
+    }
+}
+
+test "diagnostics account cancellation and allocation failure stop the sequential and concurrent Session load" {
+    for ([_]bool{ false, true }) |sequential| {
+        for ([_]anyerror{ error.Canceled, error.OutOfMemory }) |err| {
+            const base = testRemoteResponses(200);
+            const responses = [_]Canned{
+                .{ .request_key = "/user", .send_error = err },
+                base[1],
+                base[2],
+                base[3],
+            };
+            var fake: FakeHttpClient = .{ .responses = &responses };
+            const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+            const result = if (sequential) loadSequentialWith(testing.allocator, bb, "repo", 7) else loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7);
+            if (result) |s| {
+                s.destroy();
+                return error.TestUnexpectedResult;
+            } else |_| {}
+            try testing.expectError(err, result);
+        }
+    }
+}
+
+test "diagnostics Session cancellation takes priority over another failed acquisition" {
+    const responses = [_]Canned{
+        .{ .request_key = "/user", .send_error = error.Canceled },
+        .{ .request_key = "/pullrequests/7", .send_error = error.OutOfMemory },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    try testing.expectError(error.Canceled, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
+    try testing.expectEqual(@as(usize, 2), fake.callCount());
 }
 
 test "mention acquisition failures keep a usable Session and release failed allocations" {

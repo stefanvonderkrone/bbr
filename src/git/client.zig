@@ -232,7 +232,11 @@ pub const ShellGitClient = struct {
         if (std.mem.startsWith(u8, source_ref, heads)) {
             const branch = source_ref[heads.len..];
             const key = try std.fmt.allocPrint(sa, "branch.{s}.remote", .{branch});
-            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch "origin";
+            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => "origin",
+            };
             if (std.mem.eql(u8, remote_name, ".")) return error.NoDefaultBaseRef;
         }
         const remote_head = try std.fmt.allocPrint(sa, "refs/remotes/{s}/HEAD", .{remote_name});
@@ -318,7 +322,11 @@ pub const ShellGitClient = struct {
         if (std.mem.startsWith(u8, source_ref, heads)) {
             const branch = source_ref[heads.len..];
             const key = try std.fmt.allocPrint(sa, "branch.{s}.remote", .{branch});
-            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch "origin";
+            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => "origin",
+            };
             if (std.mem.eql(u8, remote_name, ".")) return error.NoRemote;
         }
         const url = try self.run(sa, &.{ "git", "remote", "get-url", remote_name }, error.NoRemote);
@@ -330,8 +338,11 @@ pub const ShellGitClient = struct {
     /// Returns an empty slice when none are configured. All memory is `sa`-owned.
     fn readInsteadOf(self: *ShellGitClient, sa: Allocator) ![]Rewrite {
         // A missing key makes git exit 1; treat that as "no rewrites".
-        const out = self.run(sa, &.{ "git", "config", "--get-regexp", "url\\..*\\.insteadof" }, error.NoRemote) catch
-            return &.{};
+        const out = self.run(sa, &.{ "git", "config", "--get-regexp", "url\\..*\\.insteadof" }, error.NoRemote) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return &.{},
+        };
 
         var list: std.ArrayList(Rewrite) = .empty;
         var lines = std.mem.splitScalar(u8, out, '\n');
@@ -351,6 +362,34 @@ pub const ShellGitClient = struct {
         return list.toOwnedSlice(sa);
     }
 };
+
+test "diagnostics Git metadata fallbacks propagate cancellation and allocation failure" {
+    const Failure = struct {
+        var err: std.process.SpawnError = error.Canceled;
+        var calls: usize = 0;
+
+        fn spawn(_: ?*anyopaque, _: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+            calls += 1;
+            return err;
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.processSpawn = Failure.spawn;
+    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    for ([_]std.process.SpawnError{ error.Canceled, error.OutOfMemory }) |err| {
+        Failure.err = err;
+        var shell = ShellGitClient.init(testing.allocator, io);
+        Failure.calls = 0;
+        try testing.expectError(err, shell.gitClient().defaultBaseRef(testing.allocator, "refs/heads/main"));
+        try testing.expectEqual(@as(usize, 1), Failure.calls);
+        Failure.calls = 0;
+        try testing.expectError(err, shell.gitClient().repositoryRemote(testing.allocator, "refs/heads/main"));
+        try testing.expectEqual(@as(usize, 1), Failure.calls);
+        Failure.calls = 0;
+        try testing.expectError(err, shell.readInsteadOf(testing.allocator));
+        try testing.expectEqual(@as(usize, 1), Failure.calls);
+    }
+}
 
 /// Test double: returns canned values (or errors) for each seam call.
 pub const FakeGitClient = struct {

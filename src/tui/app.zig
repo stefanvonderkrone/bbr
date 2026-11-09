@@ -975,7 +975,24 @@ fn presentationEnrichmentWorker(
     command: presentation.EnrichFile,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    presentation_runtime.deliver(presentationSink(&sink_context), enrichFileInput(&sink_context, io, client, highlighter, command));
+    const input = enrichFileInput(&sink_context, io, client, highlighter, command) catch |err| switch (err) {
+        error.Canceled => {
+            io.recancel();
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            presentation_runtime.deliver(presentationSink(&sink_context), .{ .file_enrichment_completed = .{
+                .command_id = command.command_id,
+                .work_id = command.work_id,
+                .session_epoch = command.session_epoch,
+                .file_index = command.file_index,
+                .outcome = .{ .failed = .launch_failed },
+            } });
+            return;
+        },
+    };
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    presentation_runtime.deliver(presentationSink(&sink_context), input);
 }
 
 /// The worker's File Enrichment. The request and the client note into the worker's slot, so
@@ -986,7 +1003,7 @@ fn enrichFileInput(
     client: ?bbr.bitbucket.Client,
     highlighter: bbr.highlight.Highlighter,
     command: presentation.EnrichFile,
-) presentation.OwnedInput {
+) error{Canceled}!presentation.OwnedInput {
     var request = command.request();
     request.diagnostic = sink_context.handle();
     const enriched = switch (command.source) {
@@ -999,10 +1016,12 @@ fn enrichFileInput(
     };
     var evidence: ?bbr.diagnostic.Failure = null;
     const outcome: presentation.FileEnrichmentOutcome = if (enriched) |result| .{ .completed = result } else |err| failed: {
+        switch (err) {
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory => {},
+        }
         evidence = bbr.diagnostic.Failure.capture(.file_enrichment, .execute, sink_context.diagnostic.context, .{ .zig = err }, @src());
-        break :failed .{ .failed = switch (err) {
-            error.OutOfMemory => .out_of_memory,
-        } };
+        break :failed .{ .failed = .out_of_memory };
     };
     return .{ .file_enrichment_completed = .{
         .evidence = evidence,
@@ -1050,11 +1069,14 @@ fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, diagnostic: bbr.dia
 
 fn presentationWaitWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, io: std.Io, wait: presentation.WaitSubmission) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch |err| {
-        var completed = wait;
-        completed.evidence = bbr.diagnostic.Failure.capture(.submission, .execute, diagnostic.context, .{ .zig = err }, @src());
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_launch_failed = completed });
-        return;
+    io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch |err| switch (err) {
+        error.Canceled => {
+            io.recancel();
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_launch_failed = wait });
+            return;
+        },
     };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_completed = wait });
 }
@@ -1672,6 +1694,44 @@ fn testBoundedText(comptime T: type, value: []const u8) T {
     return text;
 }
 
+test "diagnostics a canceled File Enrichment worker keeps its retirement completion and rearms cancellation" {
+    const Rearmed = struct {
+        var count: usize = 0;
+
+        fn recancel(_: ?*anyopaque) void {
+            count += 1;
+        }
+    };
+    Rearmed.count = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.recancel = Rearmed.recancel;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var fake: bbr.http.FakeHttpClient = .{ .send_error = error.Canceled };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    const Command = presentation.EnrichFile;
+    presentationEnrichmentWorker(&loop, 9, .{}, io, client, plain.highlighter(), .{
+        .work_id = 9,
+        .session_epoch = 1,
+        .file_index = 0,
+        .source = .{ .remote = testBoundedText(@FieldType(@FieldType(Command, "source"), "remote"), "repo") },
+        .source_commit = testBoundedText(@FieldType(Command, "source_commit"), "source"),
+        .destination_commit = testBoundedText(@FieldType(Command, "destination_commit"), "destination"),
+        .old_path = testBoundedText(@FieldType(Command, "old_path"), "file.zig"),
+        .new_path = testBoundedText(@FieldType(Command, "new_path"), "file.zig"),
+        .status = .modified,
+        .max_file_bytes = 0,
+    });
+    var done = (try loop.tryEvent()).?.presentation_done;
+    defer done.input.deinit();
+    try std.testing.expectEqual(@as(u64, 9), done.work_id);
+    try std.testing.expect(done.input.file_enrichment_completed.evidence == null);
+    try std.testing.expectEqual(presentation.FileEnrichmentOutcome{ .failed = .launch_failed }, done.input.file_enrichment_completed.outcome);
+    try std.testing.expectEqual(@as(usize, 1), Rearmed.count);
+    try std.testing.expect((try loop.tryEvent()) == null);
+}
+
 test "diagnostics a transport OutOfMemory on one File side keeps its phase in the worker record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1694,7 +1754,7 @@ test "diagnostics a transport OutOfMemory on one File side keeps its phase in th
     var sink_context: PresentationSinkContext = .{ .loop = undefined, .work_id = 9, .diagnostic = spawn_handle };
     const Command = presentation.EnrichFile;
     var plain: bbr.highlight.PlainHighlighter = .{};
-    var input = enrichFileInput(&sink_context, std.testing.io, client, plain.highlighter(), .{
+    var input = try enrichFileInput(&sink_context, std.testing.io, client, plain.highlighter(), .{
         .work_id = 9,
         .session_epoch = 1,
         .file_index = 0,
@@ -2140,6 +2200,28 @@ test "a Picker tick canceled in its wait posts no tick" {
     var future = try std.testing.io.concurrent(pickerTickWorker, .{ &loop, 3, 7, worker_io });
     try test_picker_tick_waits.wait(std.testing.io);
     future.cancel(std.testing.io);
+    try std.testing.expect((try loop.tryEvent()) == null);
+}
+
+test "diagnostics a canceled Submission wait retires its worker without failure evidence" {
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, testSleepUntilCanceled);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var futures: std.ArrayList(PresentationWork) = .empty;
+    defer futures.deinit(std.testing.allocator);
+    var future = try std.testing.io.concurrent(presentationWaitWorker, .{ &loop, 3, bbr.diagnostics.Handle{}, worker_io, presentation.WaitSubmission{
+        .operation_id = 1,
+        .temp_id = 1,
+        .ms = 60000,
+    } });
+    try test_picker_tick_waits.wait(std.testing.io);
+    future.cancel(std.testing.io);
+    try futures.append(std.testing.allocator, .{ .id = 3, .future = future });
+    const done = (try loop.tryEvent()).?.presentation_done;
+    try std.testing.expectEqual(@as(u64, 3), done.work_id);
+    try std.testing.expect(done.input.submission_wait_launch_failed.evidence == null);
+    reapPresentationWork(&futures, std.testing.io, done.work_id);
+    try std.testing.expectEqual(@as(usize, 0), futures.items.len);
     try std.testing.expect((try loop.tryEvent()) == null);
 }
 

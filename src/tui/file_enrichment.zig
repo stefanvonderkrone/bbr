@@ -42,6 +42,7 @@ pub const RemoteBlobSource = struct {
     fn firstAttempt(self: *RemoteBlobSource, io: std.Io, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) !?[]u8 {
         const client = self.attemptClient(diagnostic, 1);
         const response = client.getFileBlobAttempt(allocator, self.repo, commit, path) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
             error.OutOfMemory, error.InvalidPath => return err,
             else => {
                 _ = client.diagnostic.failure(.read, .{ .zig = err }, @src());
@@ -244,19 +245,19 @@ fn resultSideBytes(side: SideResult) usize {
     return if (side == .owned) side.owned.retained_bytes else 0;
 }
 
-pub fn enrich(backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+pub fn enrich(backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, req: Request) error{ OutOfMemory, Canceled }!Result {
     var remote: RemoteBlobSource = .{ .client = bb, .repo = req.repo };
     return enrichFrom(backing, remote.source(), highlighter, req);
 }
 
 /// Fetch both present remote sides at the same time. Each side retains its own
 /// outcome and owned arena, as in the sequential path.
-pub fn enrichConcurrent(io: std.Io, backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+pub fn enrichConcurrent(io: std.Io, backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, req: Request) error{ OutOfMemory, Canceled }!Result {
     var remote: RemoteBlobSource = .{ .client = bb, .repo = req.repo, .retry_io = io };
     return enrichFromConcurrent(io, backing, remote.source(), highlighter, req);
 }
 
-pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{ OutOfMemory, Canceled }!Result {
     if (req.status == .added or req.status == .removed)
         return enrichFrom(backing, source, highlighter, req);
 
@@ -273,6 +274,7 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
     var new_future = bbr.diagnostics.concurrent(io, enrichSideTask, .{ backing, source, highlighter, task_req, .new, &new_slot }) catch |launch_error| {
         _ = req.diagnostic.failure(.launch, .{ .zig = launch_error }, @src());
         const old = old_future.await(io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
             error.OutOfMemory => {
                 req.diagnostic.adopt(&old_slot);
                 return error.OutOfMemory;
@@ -289,7 +291,12 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
     };
     const old = old_future.await(io) catch |err| {
         req.diagnostic.adopt(&old_slot);
-        dropSide(task_req, .new, new_future.await(io), &new_slot);
+        const cancellation_propagates = switch (err) {
+            error.Canceled => true,
+            error.OutOfMemory => false,
+        };
+        const remaining = if (cancellation_propagates) new_future.cancel(io) else new_future.await(io);
+        dropSide(io, task_req, .new, remaining, &new_slot, cancellation_propagates);
         return err;
     };
     errdefer {
@@ -297,6 +304,7 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
         cleanup.deinit();
     }
     const new = new_future.await(io) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
         error.OutOfMemory => {
             req.diagnostic.adopt(&new_slot);
             return error.OutOfMemory;
@@ -307,15 +315,21 @@ pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, 
 
 /// Releases a side that the result drops. The caller receives the failure of the other side,
 /// so a failure of this side has its record here, with the evidence of its own slot.
-fn dropSide(req: Request, side: Side, outcome: error{OutOfMemory}!SideResult, task_slot: *?bbr.diagnostic.Leaf) void {
-    var result = outcome catch |err| {
-        _ = sideDiagnostic(req.diagnostic.withLeaf(task_slot), side).failure(.execute, .{ .zig = err }, @src());
-        return;
+fn dropSide(io: std.Io, req: Request, side: Side, outcome: error{ OutOfMemory, Canceled }!SideResult, task_slot: *?bbr.diagnostic.Leaf, cancellation_propagates: bool) void {
+    var result = outcome catch |err| switch (err) {
+        error.Canceled => {
+            if (!cancellation_propagates) io.recancel();
+            return;
+        },
+        error.OutOfMemory => {
+            _ = sideDiagnostic(req.diagnostic.withLeaf(task_slot), side).failure(.execute, .{ .zig = err }, @src());
+            return;
+        },
     };
     result.deinit();
 }
 
-pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{ OutOfMemory, Canceled }!Result {
     var result: Result = .{ .old = .absent, .new = .absent };
     errdefer result.deinit();
     if (req.status != .added) result.old = try enrichRequestSide(backing, source, highlighter, req, .old, req.diagnostic);
@@ -325,11 +339,11 @@ pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highl
 
 const Side = @typeInfo(@FieldType(bbr.diagnostic.Context, "side")).optional.child;
 
-fn enrichSideTask(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request, side: Side, task_slot: *?bbr.diagnostic.Leaf) error{OutOfMemory}!SideResult {
+fn enrichSideTask(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request, side: Side, task_slot: *?bbr.diagnostic.Leaf) error{ OutOfMemory, Canceled }!SideResult {
     return enrichRequestSide(backing, source, highlighter, req, side, req.diagnostic.withLeaf(task_slot));
 }
 
-fn enrichRequestSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request, side: Side, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
+fn enrichRequestSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request, side: Side, diagnostic: bbr.diagnostics.Handle) error{ OutOfMemory, Canceled }!SideResult {
     const commit, const path, const known = switch (side) {
         .old => .{ req.destination_commit, req.old_path, req.content.old },
         .new => .{ req.source_commit, req.new_path, req.content.new },
@@ -343,7 +357,7 @@ fn sideDiagnostic(handle: bbr.diagnostics.Handle, side: Side) bbr.diagnostics.Ha
     return handle.forContext(.file_enrichment, context);
 }
 
-fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, known: ?bbr.diff.FileContentStatus, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
+fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, known: ?bbr.diff.FileContentStatus, diagnostic: bbr.diagnostics.Handle) error{ OutOfMemory, Canceled }!SideResult {
     const status: bbr.diff.FileContentStatus = known orelse .{ .text = null };
     return switch (status) {
         .binary => |size| .{ .binary = size },
@@ -352,7 +366,7 @@ fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.h
     };
 }
 
-fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) error{OutOfMemory}!SideResult {
+fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) error{ OutOfMemory, Canceled }!SideResult {
     const side = try backing.create(OwnedSide);
     errdefer backing.destroy(side);
     side.references = .init(1);
@@ -361,6 +375,7 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
     const allocator = side.arena.allocator();
 
     side.blob = source.read(allocator, commit, path, diagnostic) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidPath => {
             side.destroy();
@@ -1896,6 +1911,87 @@ test "diagnostics a failed local blob read keeps the git termination in the reco
 
 fn readRemoteBlob(remote: *RemoteBlobSource) anyerror![]u8 {
     return remote.source().read(testing.allocator, "source", "file.zig", .{});
+}
+
+test "diagnostics a canceled first blob attempt returns without a retry" {
+    const responses = [_]bbr.http.Canned{
+        .{ .send_error = error.Canceled },
+        .{ .status = 200, .body = "must-not-be-read" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var remote: RemoteBlobSource = .{ .client = bb, .repo = "repo", .retry_io = testing.io };
+    const result = readRemoteBlob(&remote);
+    if (result) |bytes| {
+        testing.allocator.free(bytes);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectError(error.Canceled, result);
+    try testing.expectEqual(@as(usize, 1), fake.callCount());
+}
+
+test "diagnostics File Enrichment propagates a canceled side in sequential and concurrent reads" {
+    var vtable = testing.io.vtable.*;
+    vtable.recancel = struct {
+        fn recancel(_: ?*anyopaque) void {}
+    }.recancel;
+    const io: std.Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    for ([_]bool{ false, true }) |concurrent| {
+        for ([_]bbr.diff.FileStatus{ .modified, .added, .removed }) |status| {
+            var fake: bbr.http.FakeHttpClient = .{ .send_error = error.Canceled };
+            const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+            var plain: bbr.highlight.PlainHighlighter = .{};
+            const request: Request = .{
+                .repo = "repo",
+                .status = status,
+                .source_commit = "source",
+                .destination_commit = "destination",
+                .old_path = "file.zig",
+                .new_path = "file.zig",
+                .max_file_bytes = 0,
+            };
+            var result = if (concurrent)
+                enrichConcurrent(io, testing.allocator, bb, plain.highlighter(), request)
+            else
+                enrich(testing.allocator, bb, plain.highlighter(), request);
+            if (result) |*value| {
+                value.deinit();
+                return error.TestUnexpectedResult;
+            } else |_| {}
+            try testing.expectError(error.Canceled, result);
+        }
+    }
+}
+
+test "diagnostics File Enrichment rearms a canceled sibling when the other side runs out of memory" {
+    const Rearmed = struct {
+        var count: usize = 0;
+
+        fn recancel(_: ?*anyopaque) void {
+            count += 1;
+        }
+    };
+    Rearmed.count = 0;
+    var vtable = testing.io.vtable.*;
+    vtable.recancel = Rearmed.recancel;
+    const io: std.Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/destination/", .send_error = error.OutOfMemory },
+        .{ .request_key = "/source/", .send_error = error.Canceled },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    try testing.expectError(error.OutOfMemory, enrichConcurrent(io, testing.allocator, bb, plain.highlighter(), .{
+        .repo = "repo",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "file.zig",
+        .new_path = "file.zig",
+        .max_file_bytes = 0,
+    }));
+    try testing.expectEqual(@as(usize, 1), Rearmed.count);
 }
 
 /// A retry wait that only a cancel ends, so the test does not race the retry delay.
