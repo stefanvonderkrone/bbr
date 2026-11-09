@@ -280,6 +280,19 @@ pub const Client = struct {
         return parseBranch(self.diagnostic, allocator, response);
     }
 
+    /// GET /repositories/{workspace}/{repo}/default-reviewers. With `effective`, GET
+    /// .../effective-default-reviewers, which adds the Default Reviewers of the Project.
+    /// See `followPages` for `io` and `concurrency`. Free the result with `deinitDefaultReviewers`.
+    pub fn listDefaultReviewers(self: Client, io: std.Io, allocator: Allocator, repo_slug: []const u8, effective: bool, opts: PageOptions, concurrency: usize) ![]types.DefaultReviewer {
+        const url = try self.repositoryEndpoint(allocator, repo_slug, if (effective) "/effective-default-reviewers" else "/default-reviewers");
+        defer allocator.free(url);
+        const page = largestPage(opts, max_pagelen.default_reviewers);
+        return if (effective)
+            self.followPages(io, allocator, types.DefaultReviewer, EffectiveDefaultReviewerJson, dupeEffectiveDefaultReviewer, deinitDefaultReviewer, url, page, page.pagelen.?, concurrency)
+        else
+            self.followPages(io, allocator, types.DefaultReviewer, DefaultReviewerJson, dupeDefaultReviewer, deinitDefaultReviewer, url, page, page.pagelen.?, concurrency);
+    }
+
     fn repositoryEndpoint(self: Client, allocator: Allocator, repo_slug: []const u8, suffix: []const u8) ![]u8 {
         if (repo_slug.len == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         var url: std.ArrayList(u8) = .empty;
@@ -2310,6 +2323,43 @@ pub fn deinitBranches(allocator: Allocator, branches: []types.Branch) void {
     allocator.free(branches);
 }
 
+/// An account of the plain Default Reviewer list, and the `user` of an effective entry.
+const DefaultReviewerJson = struct {
+    uuid: []const u8,
+    display_name: []const u8 = "",
+};
+
+/// An unknown `reviewer_type` fails the decode, so the page is a `MalformedResponse`.
+const EffectiveDefaultReviewerJson = struct {
+    reviewer_type: types.DefaultReviewerType,
+    user: DefaultReviewerJson,
+};
+
+fn dupeDefaultReviewer(allocator: Allocator, wire: DefaultReviewerJson) !types.DefaultReviewer {
+    return dupeReviewerAccount(allocator, wire, .repository);
+}
+
+fn dupeEffectiveDefaultReviewer(allocator: Allocator, wire: EffectiveDefaultReviewerJson) !types.DefaultReviewer {
+    return dupeReviewerAccount(allocator, wire.user, wire.reviewer_type);
+}
+
+fn dupeReviewerAccount(allocator: Allocator, account: DefaultReviewerJson, reviewer_type: types.DefaultReviewerType) !types.DefaultReviewer {
+    if (account.uuid.len == 0) return error.MalformedResponse;
+    const uuid = try allocator.dupe(u8, account.uuid);
+    errdefer allocator.free(uuid);
+    return .{ .uuid = uuid, .display_name = try allocator.dupe(u8, account.display_name), .reviewer_type = reviewer_type };
+}
+
+fn deinitDefaultReviewer(allocator: Allocator, reviewer: types.DefaultReviewer) void {
+    allocator.free(reviewer.uuid);
+    allocator.free(reviewer.display_name);
+}
+
+pub fn deinitDefaultReviewers(allocator: Allocator, reviewers: []types.DefaultReviewer) void {
+    for (reviewers) |reviewer| deinitDefaultReviewer(allocator, reviewer);
+    allocator.free(reviewers);
+}
+
 fn pullRequestBody(allocator: Allocator, opts: types.PullRequestOptions) ![]u8 {
     const Endpoint = struct {
         branch: ?struct { name: []const u8 } = null,
@@ -2482,6 +2532,7 @@ pub const max_pagelen = struct {
     pub const commits: u32 = 100;
     pub const workspaces: u32 = 100;
     pub const members: u32 = 100;
+    pub const default_reviewers: u32 = 100;
 };
 
 /// Without a requested `pagelen`, request the largest page. The default of 10 costs up to
@@ -5728,12 +5779,14 @@ const PagedVerb = enum {
     repositories,
     branches,
     pull_requests,
+    default_reviewers,
 
     fn endpoint(verb: PagedVerb) []const u8 {
         return switch (verb) {
             .repositories => base_url ++ "/repositories/check24",
             .branches => base_url ++ "/repositories/check24/repo/refs/branches",
             .pull_requests => base_url ++ "/repositories/check24/repo/pullrequests",
+            .default_reviewers => base_url ++ "/repositories/check24/repo/default-reviewers",
         };
     }
 
@@ -5746,6 +5799,7 @@ const PagedVerb = enum {
                 .repositories => try std.fmt.allocPrint(a, "{{\"slug\":\"r{d}\"}}", .{row}),
                 .branches => try std.fmt.allocPrint(a, "{{\"name\":\"b{d}\",\"target\":{{\"hash\":\"h\"}}}}", .{row}),
                 .pull_requests => try std.fmt.allocPrint(a, "{{\"id\":{d},\"title\":\"t\",\"state\":\"OPEN\",\"source\":{{\"branch\":{{\"name\":\"s\"}}}},\"destination\":{{\"branch\":{{\"name\":\"d\"}}}}}}", .{row}),
+                .default_reviewers => try std.fmt.allocPrint(a, "{{\"uuid\":\"u{d}\",\"display_name\":\"d\"}}", .{row}),
             };
             const next = if (number < count) try std.fmt.allocPrint(a, ",\"next\":\"{s}?pagelen=2&page={d}\"", .{ verb.endpoint(), number + 1 }) else "";
             const size = if (include_size) try std.fmt.allocPrint(a, ",\"size\":{d}", .{2 * count}) else "";
@@ -5766,6 +5820,7 @@ const PagedVerb = enum {
             .repositories => for (try bb.listRepositories(testing.io, a, "check24", page, concurrency)) |item| try rows.append(a, try std.fmt.parseInt(u64, item.slug[1..], 10)),
             .branches => for (try bb.listBranches(testing.io, a, "repo", page, concurrency)) |item| try rows.append(a, try std.fmt.parseInt(u64, item.name[1..], 10)),
             .pull_requests => for (try bb.listPullRequestsPage(testing.io, a, "repo", .{}, page, concurrency)) |item| try rows.append(a, item.id),
+            .default_reviewers => for (try bb.listDefaultReviewers(testing.io, a, "repo", false, page, concurrency)) |item| try rows.append(a, try std.fmt.parseInt(u64, item.uuid[1..], 10)),
         }
         return rows.items;
     }
@@ -5776,7 +5831,7 @@ const PagedVerb = enum {
     }
 };
 
-test "Repository, branch, and PullRequest lists overlap at most the concurrency and keep page order" {
+test "Repository, branch, PullRequest, and Default Reviewer lists overlap at most the concurrency and keep page order" {
     for (std.enums.values(PagedVerb)) |verb| {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
@@ -5802,7 +5857,7 @@ test "Repository, branch, and PullRequest lists overlap at most the concurrency 
     }
 }
 
-test "Repository, branch, and PullRequest lists honor no-follow, limit, and a start page" {
+test "Repository, branch, PullRequest, and Default Reviewer lists honor no-follow, limit, and a start page" {
     for (std.enums.values(PagedVerb)) |verb| {
         for ([_]struct { opts: PageOptions, rows: []const u64, calls: usize, first: []const u8 }{
             .{ .opts = .{ .follow = false, .page = 2 }, .rows = &.{ 3, 4 }, .calls = 1, .first = "page=2" },
@@ -5821,7 +5876,7 @@ test "Repository, branch, and PullRequest lists honor no-follow, limit, and a st
     }
 }
 
-test "Repository, branch, and PullRequest lists without a size follow next links one page at a time" {
+test "Repository, branch, PullRequest, and Default Reviewer lists without a size follow next links one page at a time" {
     for (std.enums.values(PagedVerb)) |verb| {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
@@ -5831,6 +5886,59 @@ test "Repository, branch, and PullRequest lists without a size follow next links
         try testing.expectEqual(@as(usize, 3), fake.callCount());
         try testing.expectEqual(@as(usize, 1), fake.maxActiveRequests());
     }
+}
+
+const default_reviewers_page =
+    \\{"pagelen":100,"page":1,"size":1,"values":[{"type":"user","display_name":"Ada Lovelace","uuid":"{ada}",
+    \\"links":{"html":{"href":"https://bitbucket.org/%7Bada%7D/"}},"created_on":"2020-01-01T00:00:00+00:00"}]}
+;
+const effective_default_reviewers_page =
+    \\{"pagelen":100,"page":1,"size":2,"values":[
+    \\{"type":"default_reviewer","reviewer_type":"project","user":{"type":"user","display_name":"Grace Hopper","uuid":"{grace}"}},
+    \\{"type":"default_reviewer","reviewer_type":"repository","user":{"type":"user","display_name":"Ada Lovelace","uuid":"{ada}"}}]}
+;
+
+test "Default Reviewer lists read the plain and the effective endpoint with their reviewer types" {
+    const ada: types.DefaultReviewer = .{ .uuid = "{ada}", .display_name = "Ada Lovelace", .reviewer_type = .repository };
+    const grace: types.DefaultReviewer = .{ .uuid = "{grace}", .display_name = "Grace Hopper", .reviewer_type = .project };
+    for ([_]struct { effective: bool, body: []const u8, url: []const u8, expected: []const types.DefaultReviewer }{
+        .{ .effective = false, .body = default_reviewers_page, .url = base_url ++ "/repositories/check24/repo/default-reviewers?pagelen=100", .expected = &.{ada} },
+        .{ .effective = true, .body = effective_default_reviewers_page, .url = base_url ++ "/repositories/check24/repo/effective-default-reviewers?pagelen=100", .expected = &.{ grace, ada } },
+    }) |case| {
+        var fake: FakeHttpClient = .{ .body = case.body };
+        const items = try Client.init(fake.httpClient(), testCredential()).listDefaultReviewers(testing.io, testing.allocator, "repo", case.effective, .{}, 2);
+        defer deinitDefaultReviewers(testing.allocator, items);
+        try testing.expectEqualStrings(case.url, fake.lastUrl().?);
+        try testing.expectEqual(case.expected.len, items.len);
+        for (case.expected, items) |expected, item| {
+            try testing.expectEqualStrings(expected.uuid, item.uuid);
+            try testing.expectEqualStrings(expected.display_name, item.display_name);
+            try testing.expectEqual(expected.reviewer_type, item.reviewer_type);
+        }
+    }
+}
+
+test "Default Reviewer lists reject an empty UUID and an unknown reviewer type" {
+    for ([_]struct { effective: bool, body: []const u8 }{
+        .{ .effective = false, .body = "{\"values\":[{\"uuid\":\"\",\"display_name\":\"Ada\"}]}" },
+        .{ .effective = true, .body = "{\"values\":[{\"reviewer_type\":\"repository\",\"user\":{\"uuid\":\"\",\"display_name\":\"Ada\"}}]}" },
+        .{ .effective = true, .body = "{\"values\":[{\"reviewer_type\":\"workspace\",\"user\":{\"uuid\":\"{ada}\",\"display_name\":\"Ada\"}}]}" },
+    }) |case| {
+        for ([_]bool{ true, false }) |follow| {
+            var fake: FakeHttpClient = .{ .body = case.body };
+            const bb = Client.init(fake.httpClient(), testCredential());
+            try testing.expectError(error.MalformedResponse, bb.listDefaultReviewers(testing.io, testing.allocator, "repo", case.effective, .{ .follow = follow }, 2));
+        }
+    }
+}
+
+fn defaultReviewerAllocations(a: Allocator) !void {
+    var fake: FakeHttpClient = .{ .body = effective_default_reviewers_page };
+    deinitDefaultReviewers(a, try Client.init(fake.httpClient(), testCredential()).listDefaultReviewers(testing.io, a, "repo", true, .{}, 2));
+}
+
+test "Default Reviewer allocation failures release every decoded reviewer" {
+    try testing.checkAllAllocationFailures(testing.allocator, defaultReviewerAllocations, .{});
 }
 
 fn repositoryPullRequestAllocations(a: Allocator) !void {
