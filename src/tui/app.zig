@@ -1078,6 +1078,8 @@ fn presentationWaitWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics
             return;
         },
     };
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_completed = wait });
 }
 
@@ -2237,6 +2239,62 @@ test "a Picker tick canceled while the event queue is full ends without its tick
     var queued: usize = 0;
     while (try loop.tryEvent()) |event| : (queued += 1) try std.testing.expectEqual(@as(u64, 1), event.picker_tick.future_id);
     try std.testing.expectEqual(capacity, queued);
+}
+
+test "diagnostics a completed Submission wait canceled with a full event queue still retires its worker" {
+    const Race = struct {
+        var delivery: std.Io.Event = .unset;
+
+        fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const io: std.Io = .{ .userdata = userdata, .vtable = std.testing.io.vtable };
+            testSleepUntilCanceled(userdata, timeout) catch |err| switch (err) {
+                error.Canceled => io.recancel(),
+            };
+        }
+
+        fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const io: std.Io = .{ .userdata = userdata, .vtable = std.testing.io.vtable };
+            try io.checkCancel();
+            delivery.set(io);
+            return io.vtable.futexWait(userdata, ptr, expected, timeout);
+        }
+
+        fn run(loop: *Loop, io: std.Io, wait: presentation.WaitSubmission) void {
+            presentationWaitWorker(loop, 3, .{}, io, wait);
+            delivery.set(std.testing.io);
+        }
+
+        fn drain(loop: *Loop, count: usize) !void {
+            try delivery.wait(std.testing.io);
+            for (0..count) |_| try std.testing.expectEqual(@as(u64, 1), (try loop.nextEvent()).picker_tick.future_id);
+        }
+    };
+    Race.delivery = .unset;
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, Race.sleep);
+    var queue_vtable = std.testing.io.vtable.*;
+    queue_vtable.futexWait = Race.futexWait;
+    var loop: Loop = .init(.{ .userdata = std.testing.io.userdata, .vtable = &queue_vtable }, undefined, undefined);
+    var capacity: usize = 0;
+    while (try loop.tryPostEvent(.{ .picker_tick = .{ .future_id = 1, .scope = 1 } })) capacity += 1;
+    var futures: std.ArrayList(PresentationWork) = .empty;
+    defer futures.deinit(std.testing.allocator);
+    const wait: presentation.WaitSubmission = .{ .operation_id = 1, .temp_id = 1, .ms = 1 };
+    var future = try std.testing.io.concurrent(Race.run, .{ &loop, worker_io, wait });
+    try test_picker_tick_waits.wait(std.testing.io);
+    var drain = try std.testing.io.concurrent(Race.drain, .{ &loop, capacity });
+    defer drain.await(std.testing.io) catch unreachable;
+    future.cancel(std.testing.io);
+    try drain.await(std.testing.io);
+    try futures.append(std.testing.allocator, .{ .id = 3, .future = future });
+    const event = (try loop.tryEvent()) orelse return error.TestUnexpectedResult;
+    const done = event.presentation_done;
+    try std.testing.expectEqual(@as(u64, 3), done.work_id);
+    try std.testing.expectEqualDeep(wait, done.input.submission_wait_completed);
+    try std.testing.expect(done.input.submission_wait_completed.evidence == null);
+    reapPresentationWork(&futures, std.testing.io, done.work_id);
+    try std.testing.expectEqual(@as(usize, 0), futures.items.len);
+    try std.testing.expect((try loop.tryEvent()) == null);
 }
 
 fn testStalledLoad(io: std.Io) anyerror!*Session {
