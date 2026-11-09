@@ -1791,22 +1791,34 @@ fn readRemoteBlob(remote: *RemoteBlobSource) anyerror![]u8 {
     return remote.source().read(testing.allocator, "source", "file.zig", .{});
 }
 
+/// A retry wait that only a cancel ends, so the test does not race the retry delay.
+fn sleepUntilCanceled(userdata: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+    var never: std.Io.Event = .unset;
+    return never.wait(.{ .userdata = userdata, .vtable = testing.io.vtable });
+}
+
 test "a canceled remote blob retry returns error.Canceled and does not send the second request" {
-    const responses = [_]bbr.http.Canned{
+    var retry_vtable = testing.io.vtable.*;
+    retry_vtable.sleep = sleepUntilCanceled;
+    const retry_io: std.Io = .{ .userdata = testing.io.userdata, .vtable = &retry_vtable };
+    const first_attempts = [_]bbr.http.Canned{
         .{ .status = 503, .body = "failure" },
-        .{ .status = 200, .body = "should-not-be-read" },
+        .{ .send_error = error.ConnectionResetByPeer, .send_phase = .receive_head },
     };
-    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
-    var remote: RemoteBlobSource = .{ .client = bb, .repo = "repo", .retry_io = testing.io };
-    var future = try testing.io.concurrent(readRemoteBlob, .{&remote});
-    var waits: usize = 0;
-    while (fake.callCount() == 0) : (waits += 1) {
-        if (waits == 2000) return error.TestUnexpectedResult;
-        try testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    for (first_attempts) |first_attempt| {
+        const responses = [_]bbr.http.Canned{ first_attempt, .{ .status = 200, .body = "should-not-be-read" } };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        var remote: RemoteBlobSource = .{ .client = bb, .repo = "repo", .retry_io = retry_io };
+        var future = try testing.io.concurrent(readRemoteBlob, .{&remote});
+        var waits: usize = 0;
+        while (fake.callCount() == 0) : (waits += 1) {
+            if (waits == 2000) return error.TestUnexpectedResult;
+            try testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        }
+        try testing.expectError(error.Canceled, future.cancel(testing.io));
+        try testing.expectEqual(@as(usize, 1), fake.callCount());
     }
-    try testing.expectError(error.Canceled, future.cancel(testing.io));
-    try testing.expectEqual(@as(usize, 1), fake.callCount());
 }
 
 test "File Content Status is independent per expected side and from Highlighting" {
