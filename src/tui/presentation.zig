@@ -9868,7 +9868,14 @@ pub const Presentation = struct {
             };
             self.refreshStaleRepairTree();
         }
-        if (job.kind != .enrichment or !job.enrichment_speculative) self.action_error = null;
+        if (job.kind != .enrichment) {
+            self.action_error = null;
+        } else if (!job.enrichment_speculative) {
+            // A File Enrichment runs beside other work, so it clears only an error of the enrichment path.
+            if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
+                self.action_error = null;
+            };
+        }
         // After the success reset, so a failure stays visible.
         if (parent_reposted) self.republishPostedParent(published);
         if (job.enrichment_file) |index| {
@@ -13316,6 +13323,14 @@ fn captureAnchorSnapshot(allocator: Allocator, file: bbr.diff.File, selected: []
         };
     }
     return null;
+}
+
+/// The errors that `acceptFileEnrichment` and a failed enrichment build show.
+fn setByFileEnrichment(err: ActionError) bool {
+    return switch (err) {
+        .file_enrichment_launch_failed, .buffer_build_failed, .out_of_memory, .source_action_unavailable, .action_refused => true,
+        else => false,
+    };
 }
 
 fn normalizeActionError(err: BufferTransactionError) ActionError {
@@ -31161,6 +31176,64 @@ test "portable key input owns help overlay capture" {
     try presentation.dispatch(.{ .key = .{ .codepoint = 'q', .text = "q" } });
     try testing.expect(presentation.projection().help == null);
     try testing.expect(!presentation.projection().shutting_down);
+}
+
+test "Review recovery Picker stale failures do not close a newly opened Picker" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    try state.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    const stale = state.takeCommand().?.list_pull_requests;
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try state.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    const current = state.takeCommand().?.list_pull_requests;
+    try state.dispatch(.{ .pull_requests_loaded = .{ .command_id = stale.command_id, .work_id = stale.work_id, .outcome = .{ .failed = bbr.diagnostic.Failure.capture(.picker_list, .execute, .{}, .{ .zig = error.ServerError }, @src()) } } });
+    try testing.expect(testListOverlay(&state, .pull_request_picker) != null);
+    try testing.expect(state.projection().action_error == null);
+    try state.dispatch(.{ .pull_requests_loaded = .{
+        .command_id = current.command_id,
+        .work_id = current.work_id,
+        .outcome = .{ .loaded = try PullRequestSummaries.create(testing.allocator) },
+    } });
+    try testing.expect(testListOverlay(&state, .pull_request_picker) != null);
+}
+
+test "Review recovery Picker worker launch failure also closes the Picker" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    try state.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    var command = state.takeCommand().?;
+    try state.dispatch(try command.launchFailed(error.TestLaunchFailure));
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error.?);
+    try testing.expect(testListOverlay(&state, .pull_request_picker) == null);
+}
+
+test "Review recovery Picker error survives an unrelated File Enrichment completion" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    try state.dispatch(.ensure_focused_enrichment);
+    const enrich = state.takeCommand().?.enrich_file;
+    try state.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    const list = state.takeCommand().?.list_pull_requests;
+    try state.dispatch(.{ .pull_requests_loaded = .{
+        .command_id = list.command_id,
+        .work_id = list.work_id,
+        .outcome = .{ .failed = bbr.diagnostic.Failure.capture(.picker_list, .execute, .{}, .{ .zig = error.ServerError }, @src()) },
+    } });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error.?);
+    try completeTestEnrichment(&state, enrich);
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
 }
 
 test "portable Picker input loads summaries and selects a replacement" {
