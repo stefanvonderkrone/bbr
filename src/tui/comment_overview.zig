@@ -38,7 +38,9 @@ pub const State = struct {
     pub fn setQuery(self: *State, text: []const u8) void {
         var len: usize = 0;
         while (len < text.len) {
-            const size = std.unicode.utf8ByteSequenceLength(text[len]) catch break;
+            const size = std.unicode.utf8ByteSequenceLength(text[len]) catch |err| switch (err) {
+                error.Utf8InvalidStartByte => break,
+            };
             if (len + size > text.len or len + size > self.query_buf.len) break;
             len += size;
         }

@@ -123,7 +123,9 @@ pub fn drawCommentOverview(scratch: std.mem.Allocator, win: vaxis.Window, review
     win.clear();
     const frame = review.frame;
     const overview = frame.overview;
-    const title = std.fmt.allocPrint(scratch, "Comment Overview {d}/{d}", .{ overview.listing.matches, overview.listing.records }) catch "Comment Overview";
+    const title = std.fmt.allocPrint(scratch, "Comment Overview {d}/{d}", .{ overview.listing.matches, overview.listing.records }) catch |err| switch (err) {
+        error.OutOfMemory => "Comment Overview",
+    };
     const rects = view_paint.paint(layouts.OverviewPaneSlot, layouts.commentOverviewPanes, layouts.OverviewPanes{
         .sidebar_focused = frame.focus == .sidebar,
         .sidebar_scroll = .{ .total = frame.file_tree.entries.len, .offset = frame.file_tree.scroll },
@@ -148,7 +150,9 @@ fn overviewChips(scratch: std.mem.Allocator, overview: *const comment_overview.F
     const filter: []const u8 = if (overview.filter_path.len == 0)
         ""
     else
-        std.fmt.allocPrint(scratch, "in {s}{s}", .{ overview.filter_path, if (directory) "/" else "" }) catch "in …";
+        std.fmt.allocPrint(scratch, "in {s}{s}", .{ overview.filter_path, if (directory) "/" else "" }) catch |err| switch (err) {
+            error.OutOfMemory => "in …",
+        };
     return .{
         .{ .text = filter, .active = true },
         .{ .text = "u unresolved", .active = state.unresolved_only },
@@ -257,7 +261,9 @@ fn overviewScopeLabel(scratch: std.mem.Allocator, record: comment_overview.Recor
             else
                 std.fmt.allocPrint(scratch, "{s}:L{d}-L{d}{s}{s}", .{ path, top, bottom, side, state });
         },
-    } catch "";
+    } catch |err| switch (err) {
+        error.OutOfMemory => "",
+    };
 }
 
 /// A path longer than 40 cells loses its start, and `…` takes its first cell.
@@ -270,7 +276,9 @@ fn overviewPath(scratch: std.mem.Allocator, path: []const u8, metrics: @import("
         rest = rest[measured.byte_len..];
         width -|= measured.cell_width;
     }
-    return std.fmt.allocPrint(scratch, "…{s}", .{rest}) catch rest;
+    return std.fmt.allocPrint(scratch, "…{s}", .{rest}) catch |err| switch (err) {
+        error.OutOfMemory => rest,
+    };
 }
 
 /// Paint `texts` from the left of `row`. A row that does not fit stops one

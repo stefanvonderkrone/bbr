@@ -23,6 +23,7 @@ pub const Operation = enum {
     buffer_build,
     buffer_search,
     review_search,
+    comment_overview,
     composer,
     help,
     clipboard,

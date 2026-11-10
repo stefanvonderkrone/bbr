@@ -9345,13 +9345,17 @@ pub const Presentation = struct {
             else
                 .{ .file_index = file_index, .relation = .old, .old_line = anchor.from };
         };
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
-            self.action_error = .out_of_memory;
-            return;
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.action_error = .out_of_memory;
+                return;
+            },
         };
-        const job = DisclosureBuild.create(published, destination.preferences, .{ .base = published.disclosure_keys, .add = required }, published.search_generation, published.buffer_search.active) catch {
-            self.action_error = .out_of_memory;
-            return;
+        const job = DisclosureBuild.create(published, destination.preferences, .{ .base = published.disclosure_keys, .add = required }, published.search_generation, published.buffer_search.active) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.action_error = .out_of_memory;
+                return;
+            },
         };
         job.kind = .overview_destination;
         published.overview_destination_generation +%= 1;
@@ -10084,9 +10088,11 @@ pub const Presentation = struct {
                 self.action_error = .overview_entry_unavailable;
                 return;
             }
-            disclosures.appendSlice(self.allocator, job.disclosures) catch {
-                self.action_error = .out_of_memory;
-                return;
+            disclosures.appendSlice(self.allocator, job.disclosures) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    self.action_error = .out_of_memory;
+                    return;
+                },
             };
         }
         const parent_reposted = if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
@@ -10880,7 +10886,8 @@ pub const Presentation = struct {
     /// Presentation Frame.
     fn showCommentOverview(self: *Presentation, published: *Published, reveal: ?review_card.Owner) ?comment_overview.Filters {
         if (published.main_pane == .comment_overview and reveal == null) return .initEmpty();
-        const staged = published.stageOverviewIndex(self.authenticatedAccountUuid()) catch {
+        const staged = published.stageOverviewIndex(self.authenticatedAccountUuid()) catch |err| {
+            self.reportFailure(.comment_overview, .prepare, err, @src());
             self.action_error = .out_of_memory;
             return null;
         };
@@ -10897,16 +10904,20 @@ pub const Presentation = struct {
             state.clear(cleared);
             state.selected = owner;
         }
-        const tree = published.stageFileTree(.comment_overview, state.file_tree_filter orelse .root) catch {
-            if (staged != null) published.overview_indexes.abort();
-            self.action_error = .out_of_memory;
-            return null;
+        const tree = published.stageFileTree(.comment_overview, state.file_tree_filter orelse .root) catch |err| switch (err) {
+            error.OutOfMemory => {
+                if (staged != null) published.overview_indexes.abort();
+                self.action_error = .out_of_memory;
+                return null;
+            },
         };
         state.apply(.{ .file_tree_filter = tree.entries[tree.cursor].identity });
-        published.publishOverview(staged, state) catch {
-            published.trees.abort();
-            self.action_error = .out_of_memory;
-            return null;
+        published.publishOverview(staged, state) catch |err| switch (err) {
+            error.OutOfMemory => {
+                published.trees.abort();
+                self.action_error = .out_of_memory;
+                return null;
+            },
         };
         published.trees.commit();
         published.tree = tree;
@@ -10927,7 +10938,8 @@ pub const Presentation = struct {
     /// Closes the query input. A `restore` change that fails keeps the
     /// input open with the edited query.
     fn closeOverviewQuery(self: *Presentation, published: *Published, restore: ?comment_overview.Change) void {
-        if (restore) |change| published.changeOverview(self.authenticatedAccountUuid(), change) catch {
+        if (restore) |change| published.changeOverview(self.authenticatedAccountUuid(), change) catch |err| {
+            self.reportFailure(.comment_overview, .prepare, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -10950,7 +10962,8 @@ pub const Presentation = struct {
     fn changeOverview(self: *Presentation, published: *Published, change: comment_overview.Change) void {
         published.navigation.count = 0;
         if (published.main_pane != .comment_overview) return;
-        published.changeOverview(self.authenticatedAccountUuid(), change) catch {
+        published.changeOverview(self.authenticatedAccountUuid(), change) catch |err| {
+            self.reportFailure(.comment_overview, .prepare, err, @src());
             self.action_error = .out_of_memory;
             return;
         };
@@ -10959,9 +10972,11 @@ pub const Presentation = struct {
 
     fn showDiffPane(self: *Presentation, published: *Published) void {
         if (published.main_pane == .diff_pane) return;
-        const tree = published.stageFileTree(.diff_pane, if (published.sidebarEntry()) |entry| entry.identity else null) catch {
-            self.action_error = .out_of_memory;
-            return;
+        const tree = published.stageFileTree(.diff_pane, if (published.sidebarEntry()) |entry| entry.identity else null) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.action_error = .out_of_memory;
+                return;
+            },
         };
         published.trees.commit();
         published.tree = tree;
@@ -10979,7 +10994,8 @@ pub const Presentation = struct {
         var state = published.overview;
         state.apply(.{ .file_tree_filter = if (published.sidebarEntry()) |entry| entry.identity else null });
         if (!published.overview_index_stale and sameFileTreeFilter(state.file_tree_filter, published.overview.file_tree_filter)) return;
-        published.rebuildOverview(self.authenticatedAccountUuid(), state) catch {
+        published.rebuildOverview(self.authenticatedAccountUuid(), state) catch |err| {
+            self.reportFailure(.comment_overview, .prepare, err, @src());
             self.action_error = .out_of_memory;
         };
     }

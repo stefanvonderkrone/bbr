@@ -1971,7 +1971,9 @@ test "M23 inline unclosed Suggestion keeps earlier formatting and literal code c
 const scalar_metrics: CellMetrics = .{ .ptr = &scalar_context, .vtable = &.{ .next = scalarNext } };
 const scalar_context: u8 = 0;
 fn scalarNext(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
-    return .{ .byte_len = std.unicode.utf8ByteSequenceLength(text[0]) catch 1, .cell_width = 1 };
+    return .{ .byte_len = std.unicode.utf8ByteSequenceLength(text[0]) catch |err| switch (err) {
+        error.Utf8InvalidStartByte => 1,
+    }, .cell_width = 1 };
 }
 
 fn expectExcerpt(expected: []const u8, raw: []const u8, names: *const MentionNames, max_bytes: usize) !void {
