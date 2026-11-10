@@ -99,7 +99,9 @@ pub fn drawReview(
     var diff_scroll = paneScroll(frame, .diff_pane);
     const track = view_mod.solve(layouts.PaneSlot, layouts.panes, layouts.Panes{}, .{ .width = win.width, .height = win.height }).get(.diff).track;
     const hits = if (frame.buffer_search_ranges) frame.search_ranges else &.{};
-    diff_scroll.marks = scroll_marks.project(scratch, track.height, diff_scroll.total, frame.row_marks, hits) catch &.{};
+    diff_scroll.marks = scroll_marks.project(scratch, track.height, diff_scroll.total, frame.row_marks, hits) catch |err| switch (err) {
+        error.OutOfMemory => &.{},
+    };
     const panes = view_paint.paint(layouts.PaneSlot, layouts.panes, layouts.Panes{
         .sidebar_focused = frame.focus == .sidebar,
         .sidebar_scroll = paneScroll(frame, .sidebar),

@@ -59,7 +59,7 @@ pub fn project(
     total: usize,
     row_marks: []const RowMark,
     hits: []const frame.ProjectedSourceRange,
-) ![]const ?view.ScrollMark {
+) Allocator.Error![]const ?view.ScrollMark {
     if (extent == 0 or total <= extent) return &.{};
     const cells = try allocator.alloc(?view.ScrollMark, extent);
     @memset(cells, null);
