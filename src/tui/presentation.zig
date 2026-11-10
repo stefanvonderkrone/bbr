@@ -4085,11 +4085,12 @@ fn activeNumber(index: ?usize) ?usize {
 }
 
 const BufferTransactionError = error{ BufferBuildFailed, SearchFailed, OutOfMemory };
-const FileReadToggleError = error{ FileUnverifiable, PersistenceFailed, OutOfMemory };
+const FileReadToggleError = error{ FileUnverifiable, FileReadStoreMissing, Reported, OutOfMemory };
 
 const FileReadState = struct {
     entries: []FileReadEntry,
-    load_failed: bool = false,
+    /// A failed receipt load. Every File stays unread, and Presentation records it when it publishes.
+    load_failure: ?bbr.diagnostic.Failure = null,
 };
 
 /// Reads File Read Receipts and never writes them. A File is read only when a
@@ -4115,9 +4116,12 @@ fn loadFileReads(
         .fingerprint = if (shared.get(file.displayPath()).?) null else bbr.review.file_read.fingerprint(file),
     };
     const reads = store orelse return .{ .entries = entries };
-    const receipts = reads.load(scratch.allocator(), identity) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .entries = entries, .load_failed = true };
+    const receipts = reads.load(scratch.allocator(), identity) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{
+            .entries = entries,
+            .load_failure = bbr.diagnostic.Failure.capture(.persistence, .read, .{}, .{ .zig = err }, @src()),
+        },
     };
     var by_path: std.StringHashMapUnmanaged(bbr.review.FileReviewFingerprint) = .empty;
     try by_path.ensureTotalCapacity(scratch.allocator(), @intCast(receipts.len));
@@ -5300,7 +5304,7 @@ const Published = struct {
     fn toggleFileRead(self: *Published, store: ?bbr.review.FileReadStore, file_index: usize) FileReadToggleError!void {
         const entry = self.file_reads.entries[file_index];
         const value = entry.fingerprint orelse return error.FileUnverifiable;
-        const reads = store orelse return error.PersistenceFailed;
+        const reads = store orelse return error.FileReadStoreMissing;
         const staged_reads = try self.allocator.dupe(FileReadEntry, self.file_reads.entries);
         defer self.allocator.free(staged_reads);
         staged_reads[file_index].read = !entry.read;
@@ -5308,9 +5312,10 @@ const Published = struct {
         const identity = self.key.identity();
         const path = self.session.diff.files[file_index].displayPath();
         const persisted = if (entry.read) reads.delete(identity, path) else reads.put(identity, path, value);
-        persisted catch {
+        persisted catch |err| {
             staged.discard(self);
-            return error.PersistenceFailed;
+            self.diagnostic_failure = bbr.diagnostic.Failure.capture(.persistence, .write, .{ .session_epoch = self.epoch, .file_index = file_index }, .{ .zig = err }, @src());
+            return error.Reported;
         };
         self.file_reads.entries[file_index].read = !entry.read;
         staged.publish(self);
@@ -6495,7 +6500,10 @@ pub const Presentation = struct {
                 };
             if (initial.session.authenticated_account_unauthorized) self.authenticated_account_uuid = null;
             // A later recovery claim failure replaces this warning, because it concerns a Durable Operation.
-            if (self.published.?.file_reads.load_failed) self.action_error = .file_read_load_failed;
+            if (self.published.?.file_reads.load_failure) |failure| {
+                self.action_error = .file_read_load_failed;
+                self.reportEvidence(failure);
+            }
         }
         self.discoverRecovery();
         return self;
@@ -8272,7 +8280,7 @@ pub const Presentation = struct {
             .toggle_file_read => published.toggleFileRead(self.dependencies.file_reads, published.focusedFile().?) catch |err| {
                 self.action_error = switch (err) {
                     error.FileUnverifiable => .file_read_unverifiable,
-                    error.PersistenceFailed => .file_read_save_failed,
+                    error.FileReadStoreMissing, error.Reported => .file_read_save_failed,
                     error.OutOfMemory => .out_of_memory,
                 };
             },
@@ -13320,7 +13328,11 @@ pub const Presentation = struct {
         self.interaction_revision +%= 1;
         self.replacement = null;
         self.replacement_error = null;
-        self.action_error = if (candidate.file_reads.load_failed) .file_read_load_failed else null;
+        self.action_error = null;
+        if (candidate.file_reads.load_failure) |failure| {
+            self.action_error = .file_read_load_failed;
+            self.reportEvidence(failure);
+        }
         if (replacement.cause == .reconciliation) if (self.durable_comment_edit) |durable| {
             if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
                 self.durable_comment_edit = null;
@@ -33245,6 +33257,40 @@ test "M22 read a failed receipt write keeps the previous weight and reports file
     try testing.expect(!try testFileUnread(&presentation, 0));
     try testing.expectEqual(before, presentation.projection().revision.frame);
     try testing.expectEqual(@as(usize, 1), try testReceiptCount(reads.store(), m22_remote));
+}
+
+fn testFileReadFailures(presentation: *Presentation, phase: bbr.diagnostic.Phase, cause: anyerror) !usize {
+    var count: usize = 0;
+    while (presentation.takeCommand()) |command_value| {
+        var command = command_value;
+        defer command.deinit();
+        if (command != .report_diagnostic) continue;
+        try testing.expectEqual(bbr.diagnostic.Operation.persistence, command.report_diagnostic.operation);
+        try testing.expectEqual(phase, command.report_diagnostic.phase);
+        try testing.expectEqual(cause, command.report_diagnostic.cause.zig);
+        count += 1;
+    }
+    return count;
+}
+
+test "diagnostics a failed receipt load and a failed receipt write each have one record" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    reads.fail_load = true;
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+        .diagnostic_state = .on,
+    });
+    defer presentation.deinit();
+    try testing.expectEqual(ActionError.file_read_load_failed, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(usize, 1), try testFileReadFailures(&presentation, .read, error.InjectedLoadFailure));
+
+    reads.fail_put = true;
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expectEqual(ActionError.file_read_save_failed, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(usize, 1), try testFileReadFailures(&presentation, .write, error.InjectedPutFailure));
 }
 
 test "M22 read without a FileReadStore m reports file_read_save_failed and keeps the File unread" {
