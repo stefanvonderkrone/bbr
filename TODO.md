@@ -405,7 +405,7 @@ bbr downloads a GrammarLibrary on first use, checks it against a SHA-256 pinned 
 and loads it. The queries, GrammarMatch rules, and Injection rules stay in the executable. The
 full write-up is [the M33 brief](.scratch/m33-builtin-grammar-libraries/brief.md).
 
-- [ ] Grill the brief, then write the SPEC and the ADR that replaces the compiled-in parser delivery of ADR-0009 and ADR-0014.
+- [ ] Grill the brief, then write the SPEC and the ADR that replaces the compiled-in parser delivery of ADR-0009 and ADR-0017.
 - [ ] Build each BuiltInGrammar parser as a GrammarLibrary per release target. Pin the SHA-256 of each GrammarLibrary in the executable that the same build makes.
 - [ ] Publish the GrammarLibraries with each release. Change the release publication rules and their tests to the new asset set.
 - [ ] Download, verify, store, and load a GrammarLibrary on first use, off the input and paint path. Show plain text until the Spans arrive. Never send a Bitbucket Credential with a GrammarLibrary request.

@@ -7,7 +7,7 @@ Blocked by: none
 This brief is the full write-up of option B for the size of the bbr executable.
 The requirements live in the M33 section of [TODO.md](../../TODO.md).
 The vocabulary lives in [the Highlighting glossary](../../src/highlight/GLOSSARY.md).
-The delivery model that M33 changes is in [ADR-0009](../../docs/adr/0009-built-in-grammars-now-user-grammars-later.md) and [ADR-0014](../../docs/adr/0014-builtin-grammar-queries-come-from-nvim-treesitter.md).
+The delivery model that M33 changes is in [ADR-0009](../../docs/adr/0009-built-in-grammars-now-user-grammars-later.md) and [ADR-0017](../../docs/adr/0017-builtin-grammar-queries-come-from-nvim-treesitter.md).
 The measurements come from [the M27 binary size record](../m27-zig-builtin-grammar/binary-size.md).
 The comparison with other review tools is in `research-diff-highlighting-tuicr-hunk.md`, a local report outside the repository.
 
@@ -96,7 +96,7 @@ The glossary gets this term after the grilling.
   The design below can still keep a Grammar linked later, because the identity stays in the executable.
 - **TextMate or Shiki grammars**, as tuicr and hunk use.
   These grammars are smaller.
-  But bbr would lose its full-file parsing quality and its nvim-treesitter queries from ADR-0014.
+  But bbr would lose its full-file parsing quality and its nvim-treesitter queries from ADR-0017.
 - **Wasm Grammars.**
   A Wasm runtime adds its own size and work, and M27 deferred that research.
 
