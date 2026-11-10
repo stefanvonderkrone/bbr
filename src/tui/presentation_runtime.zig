@@ -10,6 +10,7 @@ const adapter = @import("presentation_adapter.zig");
 const search = @import("search.zig");
 
 pub const CompletionSink = struct {
+    diagnostic: bbr.diagnostics.Handle = .{},
     ptr: *anyopaque,
     post_fn: *const fn (*anyopaque, presentation.OwnedInput) anyerror!void,
 
@@ -46,7 +47,67 @@ pub fn drain(executor: CommandExecutor, sink: CompletionSink, commands: []presen
 
 pub fn deliver(sink: CompletionSink, input_value: presentation.OwnedInput) void {
     var input = input_value;
-    sink.post(input) catch input.deinit();
+    recordFailures(sink.diagnostic, input);
+    sink.post(input) catch |err| {
+        _ = sink.diagnostic.failure(.post, .{ .zig = err }, @src());
+        input.deinit();
+    };
+}
+
+pub fn commandHandle(command: presentation.OwnedCommand, handle: bbr.diagnostics.Handle, work_id: ?u64) bbr.diagnostics.Handle {
+    const diagnostic = command.diagnosticContext(work_id);
+    return handle.forContext(diagnostic.operation, diagnostic.context);
+}
+
+pub fn recordFailures(handle: bbr.diagnostics.Handle, input: presentation.OwnedInput) void {
+    switch (input) {
+        .external_edit_completed => |completed| {
+            if (completed.evidence) |failure| record(handle, failure);
+            if (completed.secondary_evidence) |failure| record(handle, failure);
+        },
+        .recovery_checked => |completed| switch (completed.outcome) {
+            .failed => |failure| record(handle, failure),
+            .current_source => {},
+        },
+        .pull_requests_loaded => |completed| switch (completed.outcome) {
+            .failed => |failure| record(handle, failure),
+            .loaded => {},
+        },
+        inline .session_loaded,
+        .session_prepared,
+        .file_enrichment_completed,
+        .code_highlight_completed,
+        .post_draft_completed,
+        .post_draft_launch_failed,
+        .comment_edit_completed,
+        .comment_edit_launch_failed,
+        .comment_delete_completed,
+        .comment_delete_launch_failed,
+        .reviewer_verdict_changed,
+        .submission_wait_completed,
+        .submission_wait_launch_failed,
+        .duplicate_checked,
+        .clipboard_completed,
+        .theme_persisted,
+        .buffer_search_scanned,
+        .buffer_disclosure_built,
+        .review_source_scanned,
+        .adjacent_detected,
+        .browser_repositories_loaded,
+        .browser_pull_requests_loaded,
+        .summary_cache_loaded,
+        .summary_cache_saved,
+        => |completed| if (completed.evidence) |failure| record(handle, failure),
+        .diagnostics_changed, .choose_pull_request, .start_browser, .detect_startup, .key, .mouse, .push_count_digit, .resize_viewport, .resize, .action, .composer, .unknown_resolution, .reanchor, .delete_confirmation, .ensure_focused_enrichment, .picker_tick, .dismiss_submission_result, .request_shutdown => {},
+    }
+}
+
+fn record(handle: bbr.diagnostics.Handle, value: bbr.diagnostic.Failure) void {
+    var failure = value;
+    inline for (@typeInfo(bbr.diagnostic.Context).@"struct".fields) |field| {
+        if (@field(failure.context, field.name) == null) @field(failure.context, field.name) = @field(handle.context, field.name);
+    }
+    handle.record(failure);
 }
 
 pub fn executePost(
@@ -67,6 +128,207 @@ pub fn executeCommentDelete(sink: CompletionSink, command: *presentation.DeleteC
 
 const std = @import("std");
 const testing = std.testing;
+
+test "diagnostics records an actual Picker error before stale completion disposal" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer diagnostic_sink.deinit();
+    try testing.expect(diagnostic_sink.setEnabled(true) == .on);
+    const Reject = struct {
+        sink: *bbr.diagnostics.Sink,
+        saw_record: bool = false,
+        fn post(ptr: *anyopaque, _: presentation.OwnedInput) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.saw_record = self.sink.sequence != 0;
+            return error.StaleCompletion;
+        }
+    };
+    var reject: Reject = .{ .sink = &diagnostic_sink };
+    var fake: bbr.http.FakeHttpClient = .{ .send_error = error.ConnectionReset };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "secret-user", .token = "secret-token", .workspace = "workspace" });
+    var repository: [256]u8 = undefined;
+    @memcpy(repository[0..4], "repo");
+    deliver(.{ .ptr = &reject, .post_fn = Reject.post, .diagnostic = diagnostic_sink.handle(.picker_list, .{ .work_id = 43 }) }, adapter.listPullRequests(testing.allocator, client, .{ .command_id = 31, .work_id = 41, .repository = .{ .bytes = repository, .len = 4 } }));
+    try testing.expect(reject.saw_record);
+    _ = diagnostic_sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    for ([_][]const u8{ "ConnectionReset", "command_id=31", "work_id=41", "presentation_adapter.zig" }) |needle|
+        try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "secret-token") == null);
+}
+
+fn failingListing(handle: bbr.diagnostics.Handle) error{Reported}!void {
+    return handle.fail(.read, .{ .zig = error.LeafListingFailure }, @src());
+}
+
+test "diagnostics a worker completion that carries error.Reported keeps the leaf's one record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer diagnostic_sink.deinit();
+    try testing.expect(diagnostic_sink.setEnabled(true) == .on);
+    const handle = diagnostic_sink.handle(.picker_list, .{ .work_id = 43 });
+    const err = if (failingListing(handle)) |_| unreachable else |err| err;
+    var sink: CapturingSink = .{};
+    var completion = sink.sink();
+    completion.diagnostic = handle;
+    deliver(completion, .{ .pull_requests_loaded = .{ .work_id = 43, .outcome = .{
+        .failed = bbr.diagnostic.Failure.capture(.picker_list, .execute, .{}, .{ .zig = err }, @src()),
+    } } });
+    try testing.expect(sink.input.?.pull_requests_loaded.outcome.failed.reported());
+    _ = diagnostic_sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only, "source=tui/presentation_runtime.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=LeafListingFailure"));
+}
+
+test "diagnostics a Bitbucket failure has one record from the worker boundary" {
+    const cases = [_]struct { fake: bbr.http.FakeHttpClient, cause: []const u8 = "source=tui/presentation_adapter.zig:", cause_end: []const u8 }{
+        .{ .fake = .{ .body = "{" }, .cause = "phase=decode source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=UnexpectedEndOfInput" },
+        .{ .fake = .{ .send_error = error.ConnectionReset, .send_phase = .receive_head }, .cause = "phase=receive_head source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=ConnectionReset" },
+        .{ .fake = .{ .status = 429, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=429 classification=rate_limit" },
+        .{ .fake = .{ .status = 503, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=503 classification=server" },
+        .{ .fake = .{ .status = 418, .body = "token" }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=418 classification=other" },
+        .{ .fake = .{ .responses = &.{ .{ .body = "{\"values\":[],\"next\":\"https://api.bitbucket.org/2.0/next-page\"}" }, .{ .status = 503, .body = "{}" } } }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = " page=2 cause=http status=503 classification=server" },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer diagnostic_sink.deinit();
+        try testing.expect(diagnostic_sink.setEnabled(true) == .on);
+        var leaf: ?bbr.diagnostic.Leaf = null;
+        const handle = diagnostic_sink.handle(.picker_list, .{ .work_id = 41 }).withLeaf(&leaf);
+        var fake = case.fake;
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "user", .token = "token", .workspace = "workspace" }).withDiagnostics(handle);
+        var repository: [256]u8 = undefined;
+        @memcpy(repository[0..4], "repo");
+        var sink: CapturingSink = .{};
+        var completion = sink.sink();
+        completion.diagnostic = handle;
+        deliver(completion, adapter.listPullRequests(testing.allocator, client, .{ .command_id = 31, .work_id = 41, .repository = .{ .bytes = repository, .len = 4 } }));
+        _ = diagnostic_sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next().?;
+        try testing.expect(lines.next() == null);
+        try testing.expect(std.mem.indexOf(u8, only, case.cause) != null);
+        try testing.expect(std.mem.endsWith(u8, only, case.cause_end));
+    }
+}
+
+fn testBoundedText(comptime T: type, value: []const u8) T {
+    var text: T = .{ .len = value.len };
+    @memcpy(text.bytes[0..value.len], value);
+    return text;
+}
+
+test "diagnostics a refused Reviewer Verdict change has one record from the worker boundary" {
+    const before =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [] }
+    ;
+    const cases = [_]struct { responses: []const bbr.http.Canned, cause: []const u8 = "command_id=5", cause_end: []const u8 }{
+        .{ .responses = &.{.{ .status = 401, .body = "{}" }}, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=401 classification=authentication" },
+        .{ .responses = &.{ .{ .body = before }, .{ .status = 403, .body = "{}" } }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=403 classification=authorization" },
+        .{ .responses = &.{ .{ .body = before }, .{ .status = 503, .body = "{}" }, .{ .body = before } }, .cause = "phase=rejection source=tui/presentation_adapter.zig:", .cause_end = "cause=http status=503 classification=server" },
+        .{ .responses = &.{ .{ .body = before }, .{ .send_error = error.ConnectionResetByPeer, .send_phase = .send_body }, .{ .body = before } }, .cause = "phase=send_body source=tui/presentation_adapter.zig:", .cause_end = "cause=zig error=ConnectionResetByPeer" },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer diagnostic_sink.deinit();
+        try testing.expect(diagnostic_sink.setEnabled(true) == .on);
+        var leaf: ?bbr.diagnostic.Leaf = null;
+        const handle = diagnostic_sink.handle(.verdict, .{}).withLeaf(&leaf);
+        var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "user", .token = "token", .workspace = "workspace" }).withDiagnostics(handle);
+        const Verdict = presentation.ChangeReviewerVerdict;
+        const command: Verdict = .{
+            .command_id = 5,
+            .identity = .{ .value = try presentation.OwnedReviewIdentity.init("workspace", "repo", 42) },
+            .expected_source_commit = testBoundedText(@FieldType(Verdict, "expected_source_commit"), "abc123"),
+            .authenticated_account_uuid = testBoundedText(@FieldType(Verdict, "authenticated_account_uuid"), "{me}"),
+            .target = .approved,
+        };
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var sink: CapturingSink = .{};
+        var completion = sink.sink();
+        completion.diagnostic = handle;
+        deliver(completion, adapter.executeReviewerVerdict(arena.allocator(), command, client));
+        _ = diagnostic_sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next().?;
+        try testing.expect(lines.next() == null);
+        try testing.expect(std.mem.indexOf(u8, only, "command_id=5") != null);
+        try testing.expect(std.mem.indexOf(u8, only, case.cause) != null);
+        try testing.expect(std.mem.endsWith(u8, only, case.cause_end));
+    }
+}
+
+test "diagnostics launch failure retains actual cause and command work identities" {
+    var command: presentation.OwnedCommand = .{ .list_pull_requests = .{ .command_id = 19, .work_id = 29, .repository = .{ .bytes = undefined, .len = 0 } } };
+    var input = try command.launchFailed(error.ConcurrencyUnavailable);
+    defer input.deinit();
+    const failure = input.pull_requests_loaded.outcome.failed;
+    try testing.expectEqual(error.ConcurrencyUnavailable, failure.cause.zig);
+    try testing.expectEqual(@as(?u64, 19), failure.context.command_id);
+    try testing.expectEqual(@as(?u64, 29), failure.context.work_id);
+    try testing.expectEqual(@as(u64, 29), input.pull_requests_loaded.work_id);
+}
 
 test "M23 highlighting closed completion sink releases owned result storage" {
     const highlighting = @import("code_highlighting.zig");
@@ -136,7 +398,7 @@ const ScriptedExecutor = struct {
         const self: *ScriptedExecutor = @ptrCast(@alignCast(ptr));
         self.tags[self.count] = std.meta.activeTag(command.*);
         self.count += 1;
-        deliver(sink, try command.launchFailed());
+        deliver(sink, try command.launchFailed(error.ScriptedLaunchFailure));
     }
 };
 
@@ -260,7 +522,7 @@ test "Buffer Search launch failure keeps correlation and releases its command" {
             std.heap.page_allocator.destroy(corpus);
         }
         var owned: presentation.OwnedCommand = .{ .scan_buffer_search = command };
-        var input = try owned.launchFailed();
+        var input = try owned.launchFailed(error.ScriptedLaunchFailure);
         defer input.deinit();
         const completed = input.buffer_search_scanned;
         try testing.expectEqual(@as(presentation.CommandId, 41), completed.command_id);

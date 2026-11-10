@@ -6,6 +6,8 @@ const grammar_match = @import("grammar_match.zig");
 const predicate_mod = @import("query_predicates.zig");
 const RuntimePackage = @import("runtime_package.zig").RuntimePackage;
 const c = predicate_mod.c;
+const bbr = @import("bbr");
+const diagnostics = bbr.diagnostics;
 
 const max_file_bytes = 64 * 1024 * 1024;
 const manifest_name = "grammar.toml";
@@ -149,6 +151,7 @@ pub const RuntimeGrammar = struct {
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     installations: []Installation,
+    diagnostic_handle: diagnostics.Handle = .{},
 
     const Installation = struct {
         name: []u8,
@@ -171,6 +174,7 @@ pub const Registry = struct {
         entries: []const RegistryEntry,
         overrides: []const MatchOverride,
         bbr_identity: []const u8,
+        diagnostic_handle: diagnostics.Handle,
     ) !Registry {
         var installations: std.ArrayList(Installation) = .empty;
         errdefer {
@@ -181,7 +185,7 @@ pub const Registry = struct {
         for (entries) |entry| {
             const name = try allocator.dupe(u8, entry.name);
             errdefer allocator.free(name);
-            var inspection = inspect(allocator, io, entry.path) catch |err| {
+            var inspection = inspect(allocator, io, entry.path, diagnostic_handle) catch |err| {
                 if (entry.enabled) return err;
                 try installations.append(allocator, .{ .name = name, .enabled = false });
                 continue;
@@ -202,7 +206,7 @@ pub const Registry = struct {
             const rules = try effectiveRules(entry.name, inspection.report.rules, overrides);
             if (entry.enabled and !(if (entry.receipt) |receipt| receipt.matches(inspection.report.digest, bbr_identity) else false)) {
                 var digest_buffer: [64]u8 = undefined;
-                try inspection.validateTrusted(inspection.report.digestHex(&digest_buffer));
+                try inspection.validateTrusted(inspection.report.digestHex(&digest_buffer), diagnostic_handle);
             }
             try installations.append(allocator, .{
                 .name = name,
@@ -222,11 +226,15 @@ pub const Registry = struct {
             }
         }
         for (installations.items) |*installation| if (installation.enabled) {
-            _ = load(installation, allocator) catch |err| {
+            _ = load(installation, allocator, diagnostic_handle) catch |err| {
                 installation.load_error = err;
+                switch (err) {
+                    error.Reported => {},
+                    else => _ = diagnostic_handle.failure(.prepare, .{ .zig = err }, @src()),
+                }
             };
         };
-        return .{ .allocator = allocator, .installations = try installations.toOwnedSlice(allocator) };
+        return .{ .allocator = allocator, .installations = try installations.toOwnedSlice(allocator), .diagnostic_handle = diagnostic_handle };
     }
 
     pub fn deinit(self: *Registry) void {
@@ -247,7 +255,7 @@ pub const Registry = struct {
 
     pub fn grammar(self: *Registry, path: []const u8, content: []const u8) !?RuntimeGrammar {
         const installation = self.select(path, content) orelse return null;
-        return try load(installation, self.allocator);
+        return try load(installation, self.allocator, self.diagnostic_handle);
     }
 
     pub fn matchName(self: *Registry, path: []const u8, content: []const u8) ?[]const u8 {
@@ -264,13 +272,16 @@ pub const Registry = struct {
         return null;
     }
 
-    fn load(installation: *Installation, allocator: std.mem.Allocator) !RuntimeGrammar {
+    fn load(installation: *Installation, allocator: std.mem.Allocator, diagnostic_handle: diagnostics.Handle) !RuntimeGrammar {
         if (installation.load_error) |err| return err;
         const inspection = &(installation.inspection orelse return error.InvalidUserGrammarInstallation);
         if (installation.loaded == null) {
-            const temporary = try inspection.writeTemporaryLibrary();
-            defer std.Io.Dir.cwd().deleteTree(inspection.io, temporary.root) catch {};
-            var library = std.DynLib.open(temporary.path) catch return error.NativeLibraryLoadFailed;
+            const temporary = try inspection.writeTemporaryLibrary(diagnostic_handle);
+            defer std.Io.Dir.cwd().deleteTree(inspection.io, temporary.root) catch |err| {
+                _ = diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
+            };
+            var library = std.DynLib.open(temporary.path) catch |err|
+                return failTranslated(inspection.io, diagnostic_handle, .open, "NativeLibraryLoadFailed", err, @src());
             errdefer library.close();
             const symbol = try allocator.dupeZ(u8, inspection.manifest.symbol);
             defer allocator.free(symbol);
@@ -284,9 +295,12 @@ pub const Registry = struct {
                 findFile(inspection.files, inspection.manifest.highlight_query).?.bytes,
                 if (inspection.manifest.locals_query) |path| findFile(inspection.files, path).?.bytes else "",
                 &diagnostic,
-            ) catch |err| {
-                if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidPredicate) diagnostic.report();
-                return err;
+            ) catch |err| switch (err) {
+                error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidPredicate => {
+                    diagnostic.report();
+                    return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src());
+                },
+                else => return err,
             };
             installation.loaded = .{ .library = library, .language = language, .package = package };
         }
@@ -316,7 +330,9 @@ pub const Report = struct {
     affected_built_in_grammars: []const []const u8,
 
     pub fn digestHex(self: Report, buffer: *[64]u8) []const u8 {
-        return std.fmt.bufPrint(buffer, "{x}", .{self.digest}) catch unreachable;
+        return std.fmt.bufPrint(buffer, "{x}", .{self.digest}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
     }
 
     pub fn writeTrustPrompt(self: Report, writer: *std.Io.Writer) !void {
@@ -349,20 +365,25 @@ pub const Inspection = struct {
 
     /// Trust is exact and case-insensitive hexadecimal. Native code is loaded
     /// only after this check succeeds.
-    pub fn validateTrusted(self: *Inspection, trusted_sha256: []const u8) !void {
+    pub fn validateTrusted(self: *Inspection, trusted_sha256: []const u8, diagnostic_handle: diagnostics.Handle) !void {
         var expected: [64]u8 = undefined;
-        _ = std.fmt.bufPrint(&expected, "{x}", .{self.report.digest}) catch unreachable;
+        _ = std.fmt.bufPrint(&expected, "{x}", .{self.report.digest}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         if (!std.ascii.eqlIgnoreCase(&expected, trusted_sha256)) return error.UntrustedDigest;
-        const temporary = try self.writeTemporaryLibrary();
-        defer std.Io.Dir.cwd().deleteTree(self.io, temporary.root) catch {};
+        const temporary = try self.writeTemporaryLibrary(diagnostic_handle);
+        defer std.Io.Dir.cwd().deleteTree(self.io, temporary.root) catch |err| {
+            _ = diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
+        };
         const library_path = temporary.path;
-        var library = std.DynLib.open(library_path) catch return error.NativeLibraryLoadFailed;
+        var library = std.DynLib.open(library_path) catch |err|
+            return failTranslated(self.io, diagnostic_handle, .open, "NativeLibraryLoadFailed", err, @src());
         defer library.close();
         const symbol = try self.arena.allocator().dupeZ(u8, self.manifest.symbol);
         const language_fn = library.lookup(*const fn () callconv(.c) ?*const c.TSLanguage, symbol) orelse return error.MissingLanguageSymbol;
         const language = language_fn() orelse return error.InvalidLanguageSymbol;
         self.diagnostic = null;
-        try validateLanguage(self.arena.allocator(), language, self.manifest, self.files, &self.diagnostic);
+        try validateLanguage(self.io, self.arena.allocator(), language, self.manifest, self.files, &self.diagnostic, diagnostic_handle);
     }
 
     pub fn writeBundle(self: *const Inspection, dir: std.Io.Dir) !void {
@@ -372,12 +393,14 @@ pub const Inspection = struct {
         }
     }
 
-    fn writeTemporaryLibrary(self: *Inspection) !struct { root: []const u8, path: []const u8 } {
+    fn writeTemporaryLibrary(self: *Inspection, diagnostic_handle: diagnostics.Handle) !struct { root: []const u8, path: []const u8 } {
         var random: [16]u8 = undefined;
         try self.io.randomSecure(&random);
         const root = try std.fmt.allocPrint(self.arena.allocator(), "/tmp/bbr-usergrammar-{x}", .{random});
         try std.Io.Dir.createDirAbsolute(self.io, root, .default_dir);
-        errdefer std.Io.Dir.cwd().deleteTree(self.io, root) catch {};
+        errdefer std.Io.Dir.cwd().deleteTree(self.io, root) catch |err| {
+            _ = diagnostic_handle.failure(.cleanup, .{ .zig = err }, @src());
+        };
         var dir = try std.Io.Dir.openDirAbsolute(self.io, root, .{});
         defer dir.close(self.io);
         if (std.fs.path.dirname(self.manifest.library)) |parent| try dir.createDirPath(self.io, parent);
@@ -386,13 +409,13 @@ pub const Inspection = struct {
     }
 };
 
-pub fn inspect(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Inspection {
+pub fn inspect(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagnostic_handle: diagnostics.Handle) !Inspection {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
     const archive = std.mem.endsWith(u8, path, ".tar.gz");
     const files = if (archive)
-        try readArchive(a, io, path)
+        try readArchive(a, io, path, diagnostic_handle)
     else
         try readFolder(a, io, path);
     const manifest_file = findFile(files, manifest_name) orelse return error.MissingManifest;
@@ -449,7 +472,9 @@ fn readFolder(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]Fil
         const file_path = try allocator.dupe(u8, entry.path);
         if (!safePath(file_path)) return error.UnsafePath;
         const bytes = try readRegularFile(allocator, io, dir, file_path);
-        total_bytes = std.math.add(usize, total_bytes, bytes.len) catch return error.BundleTooLarge;
+        total_bytes = std.math.add(usize, total_bytes, bytes.len) catch |err| switch (err) {
+            error.Overflow => return error.BundleTooLarge,
+        };
         if (total_bytes > max_file_bytes or files.items.len >= 1024) return error.BundleTooLarge;
         try files.append(allocator, .{ .path = file_path, .bytes = bytes });
     }
@@ -466,17 +491,20 @@ fn readRegularFile(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, pa
     };
 }
 
-fn readArchive(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]File {
+fn readArchive(allocator: std.mem.Allocator, io: std.Io, path: []const u8, diagnostic_handle: diagnostics.Handle) ![]File {
     const compressed = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_file_bytes));
     var input: std.Io.Reader = .fixed(compressed);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor = std.compress.flate.Decompress.init(&input, .gzip, &window);
-    const tar_bytes = decompressor.reader.allocRemaining(allocator, .limited(max_file_bytes + 1)) catch return error.InvalidArchive;
+    const tar_bytes = decompressor.reader.allocRemaining(allocator, .limited(max_file_bytes + 1)) catch |err| switch (err) {
+        error.StreamTooLong => return error.InvalidArchive,
+        else => return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", decompressor.err orelse err, @src()),
+    };
     if (tar_bytes.len > max_file_bytes) return error.ArchiveTooLarge;
-    return parseTar(allocator, tar_bytes);
+    return parseTar(io, allocator, tar_bytes, diagnostic_handle);
 }
 
-fn parseTar(allocator: std.mem.Allocator, bytes: []const u8) ![]File {
+fn parseTar(io: std.Io, allocator: std.mem.Allocator, bytes: []const u8, diagnostic_handle: diagnostics.Handle) ![]File {
     var files: std.ArrayList(File) = .empty;
     var seen: std.ArrayList([]const u8) = .empty;
     var at: usize = 0;
@@ -488,16 +516,21 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8) ![]File {
             ended = true;
             break;
         }
-        if (!validTarChecksum(header)) return error.InvalidArchive;
-        var name = tarPath(header, allocator) catch return error.InvalidArchive;
+        const valid_checksum = validTarChecksum(header) catch |err|
+            return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", err, @src());
+        if (!valid_checksum) return error.InvalidArchive;
+        var name = tarPath(header, allocator) catch |err|
+            return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", err, @src());
         const kind = header[156];
         if (kind == '5' and std.mem.endsWith(u8, name, "/")) name = name[0 .. name.len - 1];
         if (!safePath(name)) return error.UnsafePath;
         for (seen.items) |previous| if (std.mem.eql(u8, previous, name)) return error.DuplicateArchiveEntry;
         try seen.append(allocator, name);
-        const size = parseTarOctal(header[124..136]) catch return error.InvalidArchive;
+        const size = parseTarOctal(header[124..136]) catch |err|
+            return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", err, @src());
         const data_start = at + 512;
-        const data_end = std.math.add(usize, data_start, size) catch return error.InvalidArchive;
+        const data_end = std.math.add(usize, data_start, size) catch |err|
+            return failTranslated(io, diagnostic_handle, .decode, "InvalidArchive", err, @src());
         if (data_end > bytes.len) return error.InvalidArchive;
         if (kind == '5') {
             if (size != 0) return error.InvalidArchive;
@@ -520,8 +553,8 @@ fn tarPath(header: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     return if (prefix.len == 0) allocator.dupe(u8, name) else std.fs.path.join(allocator, &.{ prefix, name });
 }
 
-fn validTarChecksum(header: []const u8) bool {
-    const expected = parseTarOctal(header[148..156]) catch return false;
+fn validTarChecksum(header: []const u8) !bool {
+    const expected = try parseTarOctal(header[148..156]);
     var sum: usize = 0;
     for (header, 0..) |byte, index| sum += if (index >= 148 and index < 156) ' ' else byte;
     return sum == expected;
@@ -605,7 +638,9 @@ fn parseManifest(allocator: std.mem.Allocator, source: []const u8) !Manifest {
 fn setRootField(manifest: *Manifest, key: []const u8, raw: []const u8) !void {
     if (std.mem.eql(u8, key, "tree_sitter_abi")) {
         if (manifest.tree_sitter_abi != null) return error.DuplicateManifestField;
-        manifest.tree_sitter_abi = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidManifest;
+        manifest.tree_sitter_abi = std.fmt.parseInt(u32, raw, 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return error.InvalidManifest,
+        };
         return;
     }
     const value = try parseString(raw);
@@ -639,7 +674,9 @@ fn parseStringArray(allocator: std.mem.Allocator, raw: []const u8, output: *std.
 
 fn validateManifest(manifest: Manifest) !void {
     if (!validName(manifest.name) or manifest.version.len == 0 or !validSymbol(manifest.symbol)) return error.InvalidGrammarIdentity;
-    _ = std.SemanticVersion.parse(manifest.version) catch return error.InvalidGrammarVersion;
+    _ = std.SemanticVersion.parse(manifest.version) catch |err| switch (err) {
+        error.InvalidVersion, error.Overflow => return error.InvalidGrammarVersion,
+    };
     if (!std.mem.eql(u8, manifest.os, @tagName(builtin.os.tag)) or !std.mem.eql(u8, manifest.arch, @tagName(builtin.cpu.arch))) return error.TargetMismatch;
     if (manifest.tree_sitter_abi == null or manifest.library.len == 0 or manifest.highlight_query.len == 0) return error.InvalidManifest;
     if (manifest.tree_sitter_abi.? < c.TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION or manifest.tree_sitter_abi.? > c.TREE_SITTER_LANGUAGE_VERSION) return error.TreeSitterAbiMismatch;
@@ -688,35 +725,39 @@ fn canonicalDigest(files: []const File) [32]u8 {
     return hasher.finalResult();
 }
 
-fn validateLanguage(allocator: std.mem.Allocator, language: *const c.TSLanguage, manifest: Manifest, files: []const File, diagnostic: ?*?predicate_mod.Diagnostic) !void {
+fn validateLanguage(io: std.Io, allocator: std.mem.Allocator, language: *const c.TSLanguage, manifest: Manifest, files: []const File, diagnostic: ?*?predicate_mod.Diagnostic, diagnostic_handle: diagnostics.Handle) !void {
     if (c.ts_language_abi_version(language) != manifest.tree_sitter_abi.?) return error.TreeSitterAbiMismatch;
     const highlight = findFile(files, manifest.highlight_query).?.bytes;
-    const requires_locals = try validateQuery(allocator, language, highlight, .highlight, diagnostic);
+    const requires_locals = try validateQuery(io, allocator, language, highlight, .highlight, diagnostic, diagnostic_handle);
     if (manifest.locals_query) |path| {
-        if (try validateQuery(allocator, language, findFile(files, path).?.bytes, .locals, diagnostic)) return error.InvalidLocalsQuery;
+        if (try validateQuery(io, allocator, language, findFile(files, path).?.bytes, .locals, diagnostic, diagnostic_handle)) return error.InvalidLocalsQuery;
     } else if (requires_locals) return error.MissingLocalsQuery;
 }
 
-fn validateQuery(allocator: std.mem.Allocator, language: *const c.TSLanguage, source: []const u8, kind: predicate_mod.Diagnostic.QueryKind, diagnostic: ?*?predicate_mod.Diagnostic) !bool {
+fn validateQuery(io: std.Io, allocator: std.mem.Allocator, language: *const c.TSLanguage, source: []const u8, kind: predicate_mod.Diagnostic.QueryKind, diagnostic: ?*?predicate_mod.Diagnostic, diagnostic_handle: diagnostics.Handle) !bool {
     var offset: u32 = 0;
     var query_error: c.TSQueryError = undefined;
     const query = c.ts_query_new(language, source.ptr, @intCast(source.len), &offset, &query_error) orelse {
-        if (diagnostic) |output| output.* = queryDiagnostic(source, offset, kind);
-        return if (kind == .highlight) error.InvalidHighlightQuery else error.InvalidLocalsQuery;
+        const failure = queryDiagnostic(source, offset, kind, query_error);
+        if (diagnostic) |output| output.* = failure;
+        return bbr.cli_failure.fail(io, diagnostic_handle, .query, failure.cause().?, @src(), predicate_mod.Diagnostic.write, .{failure});
     };
     defer c.ts_query_delete(query);
     var predicate_diagnostic: predicate_mod.Diagnostic = undefined;
-    const predicates = predicate_mod.Set.validate(allocator, query, source, &predicate_diagnostic) catch {
-        predicate_diagnostic.query_kind = kind;
-        if (diagnostic) |output| output.* = predicate_diagnostic;
-        return error.InvalidPredicate;
+    const predicates = predicate_mod.Set.validate(allocator, query, source, &predicate_diagnostic) catch |err| switch (err) {
+        error.InvalidPredicate => {
+            predicate_diagnostic.query_kind = kind;
+            if (diagnostic) |output| output.* = predicate_diagnostic;
+            return bbr.cli_failure.fail(io, diagnostic_handle, .query, predicate_diagnostic.cause() orelse .{ .zig = err }, @src(), predicate_mod.Diagnostic.write, .{predicate_diagnostic});
+        },
+        else => return failTranslated(io, diagnostic_handle, .query, "InvalidPredicate", err, @src()),
     };
     defer predicates.deinit(allocator);
     if (kind == .locals and (!queryHasCapture(query, "local.definition") or !queryHasCapture(query, "local.reference"))) return error.InvalidLocalsQuery;
     return predicates.requiresLocals();
 }
 
-fn queryDiagnostic(source: []const u8, offset: u32, kind: predicate_mod.Diagnostic.QueryKind) predicate_mod.Diagnostic {
+fn queryDiagnostic(source: []const u8, offset: u32, kind: predicate_mod.Diagnostic.QueryKind, query_error: c.TSQueryError) predicate_mod.Diagnostic {
     var line: u32 = 1;
     var column: u32 = 1;
     for (source[0..@min(@as(usize, offset), source.len)]) |byte| {
@@ -725,7 +766,7 @@ fn queryDiagnostic(source: []const u8, offset: u32, kind: predicate_mod.Diagnost
             column = 1;
         } else column += 1;
     }
-    return .{ .kind = .invalid_query, .source_offset = offset, .line = line, .column = column, .query_kind = kind };
+    return .{ .kind = .invalid_query, .source_offset = offset, .line = line, .column = column, .query_kind = kind, .query_error = query_error };
 }
 
 fn queryHasCapture(query: *const c.TSQuery, expected: []const u8) bool {
@@ -812,7 +853,9 @@ fn validSymbol(symbol: []const u8) bool {
 }
 
 fn hasTerminalControl(value: []const u8) bool {
-    var view = std.unicode.Utf8View.init(value) catch return true;
+    var view = std.unicode.Utf8View.init(value) catch |err| switch (err) {
+        error.InvalidUtf8 => return true,
+    };
     var iterator = view.iterator();
     while (iterator.nextCodepoint()) |codepoint| {
         if (codepoint <= 0x1f or codepoint >= 0x7f and codepoint <= 0x9f or codepoint >= 0x202a and codepoint <= 0x202e or codepoint >= 0x2066 and codepoint <= 0x2069) return true;
@@ -820,15 +863,85 @@ fn hasTerminalControl(value: []const u8) bool {
     return false;
 }
 
+fn failTranslated(io: std.Io, handle: diagnostics.Handle, phase: diagnostics.Phase, comptime meaning: []const u8, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    return bbr.cli_failure.fail(io, handle, phase, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr grammar: " ++ meaning ++ " ({s})\n", .{@errorName(cause)} });
+}
+
 fn parseDigest(hex: []const u8) ![32]u8 {
     if (hex.len != 64) return error.InvalidDigest;
     var digest: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&digest, hex) catch return error.InvalidDigest;
+    _ = std.fmt.hexToBytes(&digest, hex) catch |err| switch (err) {
+        error.InvalidCharacter, error.InvalidLength, error.NoSpaceLeft => return error.InvalidDigest,
+    };
     return digest;
 }
 
 const testing = std.testing;
 extern fn tree_sitter_javascript() callconv(.c) ?*const c.TSLanguage;
+
+test "diagnostics retain malformed gzip cause without archive contents or path" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "private_archive_path_7a4.tar.gz",
+        .data = "\x1f\x8b\x09\x00\x00\x00\x00\x00\x00\x03private_archive_content_7a4",
+    });
+    const path = try std.fs.path.join(testing.allocator, &.{ home, "private_archive_path_7a4.tar.gz" });
+    defer testing.allocator.free(path);
+    try testing.expectError(error.Reported, inspect(testing.allocator, testing.io, path, .{}));
+    try testing.expectError(error.Reported, inspect(testing.allocator, testing.io, path, sink.handle(.grammar, .{})));
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    for ([_][]const u8{ "operation=grammar phase=decode", "source=highlight/user_grammar.zig:", "error=BadGzipHeader" }) |needle|
+        try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
+    for ([_][]const u8{ "private_archive_path_7a4", "private_archive_content_7a4", home }) |sentinel|
+        try testing.expect(std.mem.indexOf(u8, bytes, sentinel) == null);
+}
+
+test "diagnostics preserve predicate allocation cause before InvalidPredicate conversion" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var diagnostic: ?predicate_mod.Diagnostic = null;
+    try testing.expectError(error.Reported, validateQuery(
+        testing.io,
+        failing.allocator(),
+        tree_sitter_javascript().?,
+        "(identifier) @private_capture_48c",
+        .highlight,
+        &diagnostic,
+        sink.handle(.grammar, .{}),
+    ));
+    try testing.expect(diagnostic == null);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "error=OutOfMemory") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "private_capture_48c") == null);
+}
 
 test "folder inspection validates exact payloads and reports native trust" {
     var tmp = testing.tmpDir(.{});
@@ -864,7 +977,7 @@ test "folder inspection validates exact payloads and reports native trust" {
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/bundle", .{&tmp.sub_path});
     defer testing.allocator.free(path);
 
-    var inspection = try inspect(testing.allocator, io, path);
+    var inspection = try inspect(testing.allocator, io, path, .{});
     defer inspection.deinit();
     try testing.expectEqualStrings("fixture", inspection.report.name);
     try testing.expectEqualStrings("1.2.3", inspection.report.version);
@@ -873,9 +986,9 @@ test "folder inspection validates exact payloads and reports native trust" {
     defer output.deinit();
     try inspection.report.writeTrustPrompt(&output.writer);
     try testing.expect(std.mem.indexOf(u8, output.written(), "native code") != null);
-    try testing.expectError(error.UntrustedDigest, inspection.validateTrusted("00" ** 32));
+    try testing.expectError(error.UntrustedDigest, inspection.validateTrusted("00" ** 32, .{}));
     var trusted_digest: [64]u8 = undefined;
-    try testing.expectError(error.NativeLibraryLoadFailed, inspection.validateTrusted(inspection.report.digestHex(&trusted_digest)));
+    try testing.expectError(error.Reported, inspection.validateTrusted(inspection.report.digestHex(&trusted_digest), .{}));
 }
 
 test "folder inspection rejects extra files links and changed payload bytes" {
@@ -890,16 +1003,16 @@ test "folder inspection rejects extra files links and changed payload bytes" {
     try tmp.dir.writeFile(io, .{ .sub_path = "bundle/grammar.toml", .data = manifest });
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/bundle", .{&tmp.sub_path});
     defer testing.allocator.free(path);
-    try testing.expectError(error.PayloadDigestMismatch, inspect(testing.allocator, io, path));
+    try testing.expectError(error.PayloadDigestMismatch, inspect(testing.allocator, io, path, .{}));
 
     try tmp.dir.writeFile(io, .{ .sub_path = "bundle/payload", .data = "expected" });
     try tmp.dir.writeFile(io, .{ .sub_path = "bundle/extra", .data = "x" });
-    try testing.expectError(error.UndeclaredFile, inspect(testing.allocator, io, path));
+    try testing.expectError(error.UndeclaredFile, inspect(testing.allocator, io, path, .{}));
 
     try tmp.dir.symLink(io, "bundle", "linked-bundle", .{ .is_directory = true });
     const linked_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/linked-bundle", .{&tmp.sub_path});
     defer testing.allocator.free(linked_path);
-    try testing.expectError(error.NotDir, inspect(testing.allocator, io, linked_path));
+    try testing.expectError(error.NotDir, inspect(testing.allocator, io, linked_path, .{}));
 }
 
 test "tar parser rejects duplicate unsafe and linked entries" {
@@ -907,17 +1020,17 @@ test "tar parser rejects duplicate unsafe and linked entries" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const regular = try testTar(allocator, &.{ .{ "grammar.toml", '0', "x" }, .{ "payload", '0', "y" } });
-    const files = try parseTar(allocator, regular);
+    const files = try parseTar(testing.io, allocator, regular, .{});
     try testing.expectEqual(@as(usize, 2), files.len);
 
     const duplicate = try testTar(allocator, &.{ .{ "x", '0', "a" }, .{ "x", '0', "b" } });
-    try testing.expectError(error.DuplicateArchiveEntry, parseTar(allocator, duplicate));
+    try testing.expectError(error.DuplicateArchiveEntry, parseTar(testing.io, allocator, duplicate, .{}));
     const unsafe = try testTar(allocator, &.{.{ "../x", '0', "a" }});
-    try testing.expectError(error.UnsafePath, parseTar(allocator, unsafe));
+    try testing.expectError(error.UnsafePath, parseTar(testing.io, allocator, unsafe, .{}));
     const link = try testTar(allocator, &.{.{ "x", '2', "" }});
-    try testing.expectError(error.NonRegularFile, parseTar(allocator, link));
+    try testing.expectError(error.NonRegularFile, parseTar(testing.io, allocator, link, .{}));
     const duplicate_dir = try testTar(allocator, &.{ .{ "queries/", '5', "" }, .{ "queries/", '5', "" } });
-    try testing.expectError(error.DuplicateArchiveEntry, parseTar(allocator, duplicate_dir));
+    try testing.expectError(error.DuplicateArchiveEntry, parseTar(testing.io, allocator, duplicate_dir, .{}));
 }
 
 test "tar.gz inspection uses the same logical bundle" {
@@ -938,7 +1051,7 @@ test "tar.gz inspection uses the same logical bundle" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "bundle.tar.gz", .data = compressed.written() });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/bundle.tar.gz", .{&tmp.sub_path});
 
-    var inspection = try inspect(testing.allocator, testing.io, path);
+    var inspection = try inspect(testing.allocator, testing.io, path, .{});
     defer inspection.deinit();
     try testing.expectEqualStrings("fixture", inspection.report.name);
 }
@@ -954,20 +1067,20 @@ test "trusted native validation checks ABI queries predicates and regexes" {
         .highlight_query = "highlights.scm",
         .locals_query = "locals.scm",
     };
-    try validateLanguage(testing.allocator, language, manifest, &valid_files, null);
+    try validateLanguage(testing.io, testing.allocator, language, manifest, &valid_files, null, .{});
 
     manifest.tree_sitter_abi.? -= 1;
-    try testing.expectError(error.TreeSitterAbiMismatch, validateLanguage(testing.allocator, language, manifest, &valid_files, null));
+    try testing.expectError(error.TreeSitterAbiMismatch, validateLanguage(testing.io, testing.allocator, language, manifest, &valid_files, null, .{}));
     manifest.tree_sitter_abi = c.ts_language_abi_version(language);
     const invalid_query = [_]File{
         .{ .path = "highlights.scm", .bytes = "((identifier) @x (#match? @x \"(?=x)\"))" },
         .{ .path = "locals.scm", .bytes = "(identifier) @local.definition\n(identifier) @local.reference" },
     };
-    try testing.expectError(error.InvalidPredicate, validateLanguage(testing.allocator, language, manifest, &invalid_query, null));
+    try testing.expectError(error.Reported, validateLanguage(testing.io, testing.allocator, language, manifest, &invalid_query, null, .{}));
 
     manifest.locals_query = null;
     const local_predicate = [_]File{.{ .path = "highlights.scm", .bytes = "((identifier) @variable.builtin (#is-not? local))" }};
-    try testing.expectError(error.MissingLocalsQuery, validateLanguage(testing.allocator, language, manifest, &local_predicate, null));
+    try testing.expectError(error.MissingLocalsQuery, validateLanguage(testing.io, testing.allocator, language, manifest, &local_predicate, null, .{}));
 }
 
 test "canonical digest changes with any declared byte" {
@@ -1066,10 +1179,10 @@ test "registry reuses exact receipts and loads a matching UserGrammar on first u
     defer testing.allocator.free(first_path);
     const second_path = try writeRegistryBundle(&tmp, "second", ".other", "also not a library");
     defer testing.allocator.free(second_path);
-    var first_inspection = try inspect(testing.allocator, testing.io, first_path);
+    var first_inspection = try inspect(testing.allocator, testing.io, first_path, .{});
     const first_digest = first_inspection.report.digest;
     first_inspection.deinit();
-    var second_inspection = try inspect(testing.allocator, testing.io, second_path);
+    var second_inspection = try inspect(testing.allocator, testing.io, second_path, .{});
     const second_digest = second_inspection.report.digest;
     second_inspection.deinit();
     const entries = [_]RegistryEntry{
@@ -1079,12 +1192,12 @@ test "registry reuses exact receipts and loads a matching UserGrammar on first u
     var registry = try Registry.init(testing.allocator, testing.io, &entries, &.{.{
         .name = "second",
         .rules = .{ .filenames = &.{"exact.fixture"} },
-    }}, "test-build");
+    }}, "test-build", .{});
     defer registry.deinit();
 
     try testing.expectEqualStrings("second", registry.matchName("src/exact.fixture", "").?);
     try testing.expectEqualStrings("first", registry.matchName("src/other.first", "").?);
-    try testing.expectError(error.NativeLibraryLoadFailed, registry.grammar("src/other.first", ""));
+    try testing.expectError(error.Reported, registry.grammar("src/other.first", ""));
     const statuses = try registry.statuses(testing.allocator);
     defer testing.allocator.free(statuses);
     try testing.expect(!statuses[0].valid);
@@ -1096,7 +1209,7 @@ test "registry rejects stale active receipts but lists invalid inactive installa
     defer tmp.cleanup();
     const path = try writeRegistryBundle(&tmp, "fixture", ".fixture", "not a library");
     defer testing.allocator.free(path);
-    var inspection = try inspect(testing.allocator, testing.io, path);
+    var inspection = try inspect(testing.allocator, testing.io, path, .{});
     const digest = inspection.report.digest;
     inspection.deinit();
 
@@ -1107,13 +1220,13 @@ test "registry rejects stale active receipts but lists invalid inactive installa
         .trusted_digest = digest,
         .receipt = .{ .bundle_digest = digest, .bbr_identity = "old-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
     }};
-    try testing.expectError(error.NativeLibraryLoadFailed, Registry.init(testing.allocator, testing.io, &stale, &.{}, "test-build"));
+    try testing.expectError(error.Reported, Registry.init(testing.allocator, testing.io, &stale, &.{}, "test-build", .{}));
 
     var payload = try tmp.dir.openFile(testing.io, "fixture/payload", .{ .mode = .write_only });
     try payload.writeStreamingAll(testing.io, "tampered");
     payload.close(testing.io);
     const inactive = [_]RegistryEntry{.{ .name = "fixture", .path = path, .enabled = false, .trusted_digest = digest }};
-    var registry = try Registry.init(testing.allocator, testing.io, &inactive, &.{}, "test-build");
+    var registry = try Registry.init(testing.allocator, testing.io, &inactive, &.{}, "test-build", .{});
     defer registry.deinit();
     const statuses = try registry.statuses(testing.allocator);
     defer testing.allocator.free(statuses);
@@ -1124,21 +1237,23 @@ test "registry rejects stale active receipts but lists invalid inactive installa
     const untampered_path = try writeRegistryBundle(&tmp, "inactive", ".inactive", "bytes");
     defer testing.allocator.free(untampered_path);
     const untrusted_inactive = [_]RegistryEntry{.{ .name = "inactive", .path = untampered_path, .enabled = false, .trusted_digest = @splat(0) }};
-    var untrusted_registry = try Registry.init(testing.allocator, testing.io, &untrusted_inactive, &.{}, "test-build");
+    var untrusted_registry = try Registry.init(testing.allocator, testing.io, &untrusted_inactive, &.{}, "test-build", .{});
     defer untrusted_registry.deinit();
     const untrusted_statuses = try untrusted_registry.statuses(testing.allocator);
     defer testing.allocator.free(untrusted_statuses);
     try testing.expect(!untrusted_statuses[0].valid);
 
     const active = [_]RegistryEntry{.{ .name = "fixture", .path = path, .enabled = true, .trusted_digest = digest }};
-    try testing.expectError(error.PayloadDigestMismatch, Registry.init(testing.allocator, testing.io, &active, &.{}, "test-build"));
+    try testing.expectError(error.PayloadDigestMismatch, Registry.init(testing.allocator, testing.io, &active, &.{}, "test-build", .{}));
 }
 
 fn digestHex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     var result: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch unreachable;
+    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
     return result;
 }
 
@@ -1195,14 +1310,22 @@ fn testTar(allocator: std.mem.Allocator, entries: []const TarTestEntry) ![]u8 {
     for (entries) |entry| {
         var header: [512]u8 = @splat(0);
         @memcpy(header[0..entry[0].len], entry[0]);
-        _ = std.fmt.bufPrint(header[100..108], "{o:0>7}\x00", .{@as(usize, 0o644)}) catch unreachable;
-        _ = std.fmt.bufPrint(header[124..136], "{o:0>11}\x00", .{entry[2].len}) catch unreachable;
+        _ = std.fmt.bufPrint(header[100..108], "{o:0>7}\x00", .{@as(usize, 0o644)}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
+        std.debug.assert(entry[2].len <= 0o77777777777);
+        _ = std.fmt.bufPrint(header[124..136], "{o:0>11}\x00", .{entry[2].len}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         @memset(header[148..156], ' ');
         header[156] = entry[1];
         @memcpy(header[257..263], "ustar\x00");
         var checksum: usize = 0;
         for (header) |byte| checksum += byte;
-        _ = std.fmt.bufPrint(header[148..156], "{o:0>6}\x00 ", .{checksum}) catch unreachable;
+        std.debug.assert(checksum <= 0o777777);
+        _ = std.fmt.bufPrint(header[148..156], "{o:0>6}\x00 ", .{checksum}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         try output.appendSlice(allocator, &header);
         try output.appendSlice(allocator, entry[2]);
         try output.appendNTimes(allocator, 0, std.mem.alignForward(usize, entry[2].len, 512) - entry[2].len);

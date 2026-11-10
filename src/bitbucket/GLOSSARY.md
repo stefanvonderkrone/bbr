@@ -61,6 +61,14 @@ It holds no Credential and no PullRequest description.
 bbr rebuilds it after any parse error.
 _Avoid_: cache (alone), offline copy, database.
 
+**Default Reviewer**:
+An account that a Repository names as a reviewer of each new PullRequest. The Bitbucket web UI pre-fills the Default Reviewers on a new PullRequest. The API adds none, so `bbr api` sends them only on `--default-reviewers`, without the PullRequest Author.
+_Avoid_: default reviewer list entry, auto reviewer, code owner.
+
+**Effective Default Reviewer**:
+A Default Reviewer of the Repository or of the Bitbucket Project that holds the Repository. Its reviewer type, `repository` or `project`, names the list that holds it.
+_Avoid_: inherited reviewer, project reviewer.
+
 **SourceCommit**:
 The head commit hash of the PR's source branch at the moment we loaded it. Captured so we can detect that the PR "moved under us" before submitting.
 _Avoid_: head, tip, revision.

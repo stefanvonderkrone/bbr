@@ -91,7 +91,9 @@ pub const FuzzyList = struct {
     fn appendQuery(self: *FuzzyList, bytes: []const u8) void {
         var start: usize = 0;
         while (start < bytes.len) {
-            const len = std.unicode.utf8ByteSequenceLength(bytes[start]) catch 1;
+            const len = std.unicode.utf8ByteSequenceLength(bytes[start]) catch |err| switch (err) {
+                error.Utf8InvalidStartByte => 1,
+            };
             const end = @min(start + len, bytes.len);
             if (self.query_len + end - start > self.query_buf.len) break;
             @memcpy(self.query_buf[self.query_len..][0 .. end - start], bytes[start..end]);
@@ -270,7 +272,9 @@ const PullRequestHaystack = struct {
     fn score(self: PullRequestHaystack, index: usize, q: Query) ?f64 {
         const pr = self.prs[index];
         var id_buf: [32]u8 = undefined;
-        const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{pr.id}) catch return null;
+        const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{pr.id}) catch |err| switch (err) {
+            error.NoSpaceLeft => return null,
+        };
         if (q.text.len > 1 and q.text[0] == '#') return if (std.mem.eql(u8, q.text[1..], id_text)) 10000 else null;
         if (q.rank(pr.title)) |rank| return rank + 3000;
         if (q.rank(pr.source_branch)) |rank| return rank + 2000;
@@ -353,6 +357,7 @@ pub const CommandPalette = struct {
         .{ .action = .link_existing_comment, .title = "Link Existing Comment", .description = "Link an unknown-outcome Draft to a posted Comment" },
         .{ .action = .focus_next_pane, .title = "Switch Pane", .description = "Move focus between the Sidebar and the DiffPane" },
         .{ .action = .open_theme_overlay, .title = "Theme", .description = "Preview and choose the color Theme" },
+        .{ .action = .toggle_diagnostic_logging, .title = "Toggle diagnostic logging", .description = "Enable or disable private error records for this process" },
         .{ .action = .help, .title = "Keybindings", .description = "Show the keybinding help" },
         .{ .action = .quit, .title = "Quit", .description = "Quit bbr" },
     };
