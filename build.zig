@@ -219,6 +219,40 @@ pub fn build(b: *std.Build) void {
     stdio_writers.addFileArg(b.path("tools/check_stdio_writers.py"));
     stdio_writers.addDirectoryArg(b.path("."));
     const test_step = b.step("test", "Run tests");
+    // The core module is C-free. A macOS build links libc implicitly, so a libc call in
+    // core compiles there and fails only in the Linux CI jobs. Every host also compiles
+    // the core tests for Linux, so that mistake fails in a local `zig build test`.
+    const core_linux_tests = b.addTest(.{ .name = "core-linux-tests", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux }),
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&core_linux_tests.step);
+    const diagnostic_check = b.addSystemCommand(&.{"python3"});
+    diagnostic_check.addFileArg(b.path("tools/check_diagnostics.py"));
+    diagnostic_check.addDirectoryArg(b.path("."));
+    test_step.dependOn(&diagnostic_check.step);
+    const error_comparisons = b.addSystemCommand(&.{"python3"});
+    error_comparisons.addFileArg(b.path("tools/check_error_comparisons.py"));
+    error_comparisons.addDirectoryArg(b.path("."));
+    test_step.dependOn(&error_comparisons.step);
+    const task_spawns = b.addSystemCommand(&.{"python3"});
+    task_spawns.addFileArg(b.path("tools/check_task_spawns.py"));
+    task_spawns.addDirectoryArg(b.path("."));
+    test_step.dependOn(&task_spawns.step);
+    const diagnostic_tests = b.addTest(.{ .root_module = exe.root_module, .filters = &.{"diagnostics"} });
+    const diagnostic_core_tests = b.addTest(.{ .root_module = mod, .filters = &.{"diagnostics"} });
+    const diagnostic_step = b.step("test-diagnostics", "Run diagnostic logging checks");
+    diagnostic_step.dependOn(&diagnostic_check.step);
+    diagnostic_step.dependOn(&b.addRunArtifact(diagnostic_tests).step);
+    diagnostic_step.dependOn(&b.addRunArtifact(diagnostic_core_tests).step);
+    for ([_][]const u8{ "tests/check_diagnostics_test.py", "tests/diagnostic_types_test.py" }) |path| {
+        const run = b.addSystemCommand(&.{"python3"});
+        run.addFileArg(b.path(path));
+        run.setCwd(b.path("."));
+        run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+        diagnostic_step.dependOn(&run.step);
+    }
     const cli_test_step = b.step("test-cli", "Run hermetic Python CLI checks (requires python3)");
     addTestScripts(b, exe, test_step, cli_test_step);
 
@@ -452,6 +486,8 @@ fn addTestScripts(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.B
         run.addFileArg(b.path(path));
         run.setCwd(b.path("."));
         if (script != .cli) {
+            // A test that compiles Zig uses the compiler of this build, also when PATH has none.
+            run.setEnvironmentVariable("ZIG", b.graph.zig_exe);
             test_step.dependOn(&run.step);
             continue;
         }

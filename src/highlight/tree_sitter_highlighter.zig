@@ -8,6 +8,7 @@ const grammar_match = @import("grammar_match.zig");
 const user_grammar = @import("user_grammar.zig");
 const RuntimePackage = @import("runtime_package.zig").RuntimePackage;
 const c = predicate_mod.c;
+const diagnostics = bbr.diagnostics;
 
 extern fn tree_sitter_javascript() callconv(.c) ?*const c.TSLanguage;
 extern fn tree_sitter_typescript() callconv(.c) ?*const c.TSLanguage;
@@ -40,18 +41,22 @@ const GrammarSource = struct {
 
 pub const TreeSitterHighlighter = struct {
     registry: ?*user_grammar.Registry = null,
+    diagnostic_handle: diagnostics.Handle = .{},
     packages: [std.meta.tags(grammar_match.BuiltInGrammar).len]RuntimePackage = undefined,
     package_count: usize = 0,
 
-    pub fn init(allocator: Allocator, registry: ?*user_grammar.Registry) !TreeSitterHighlighter {
-        var self: TreeSitterHighlighter = .{ .registry = registry };
+    pub fn init(allocator: Allocator, registry: ?*user_grammar.Registry, diagnostic_handle: diagnostics.Handle) !TreeSitterHighlighter {
+        var self: TreeSitterHighlighter = .{ .registry = registry, .diagnostic_handle = diagnostic_handle };
         errdefer self.deinit();
         inline for (std.meta.tags(grammar_match.BuiltInGrammar)) |grammar| {
             const source = grammarSource(grammar) orelse return error.MissingBuiltInGrammar;
             var diagnostic: predicate_mod.Diagnostic = undefined;
-            self.packages[self.package_count] = RuntimePackage.init(allocator, source.language, source.query, source.locals_query, &diagnostic) catch |err| {
-                if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidPredicate) diagnostic.report();
-                return err;
+            self.packages[self.package_count] = RuntimePackage.init(allocator, source.language, source.query, source.locals_query, &diagnostic) catch |err| switch (err) {
+                error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidPredicate => {
+                    diagnostic.report();
+                    return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src());
+                },
+                else => return err,
             };
             self.package_count += 1;
         }
@@ -69,14 +74,29 @@ pub const TreeSitterHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlightImpl };
 
-    fn highlightImpl(ptr: *anyopaque, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlightImpl(ptr: *anyopaque, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8, request: diagnostics.Handle) anyerror!bbr.highlight.HighlightResult {
         const self: *TreeSitterHighlighter = @ptrCast(@alignCast(ptr));
+        const diagnostic = if (request.sink != null) request else self.diagnostic_handle;
         if (self.registry) |registry| {
             if (registry.matchName(path, content) != null) {
-                const grammar = registry.grammar(path, content) catch return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch .{ .spans = &.{} };
+                const grammar = registry.grammar(path, content) catch |err| {
+                    switch (err) {
+                        error.Reported => {},
+                        else => _ = diagnostic.failure(.prepare, .{ .zig = err }, @src()),
+                    }
+                    return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch |fallback_err| {
+                        recordHighlightFailure(diagnostic, fallback_err);
+                        return .{ .spans = &.{} };
+                    };
+                };
                 if (grammar) |selected| {
-                    return highlightWithPackage(result_allocator, scratch_allocator, selected.package, content, null) catch
-                        self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch .{ .spans = &.{} };
+                    return highlightWithPackage(result_allocator, scratch_allocator, selected.package, content, null) catch |err| {
+                        recordHighlightFailure(diagnostic, err);
+                        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch |fallback_err| {
+                            recordHighlightFailure(diagnostic, fallback_err);
+                            return .{ .spans = &.{} };
+                        };
+                    };
                 }
             }
         }
@@ -86,6 +106,13 @@ pub const TreeSitterHighlighter = struct {
     fn highlightBuiltIn(self: *TreeSitterHighlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
         const selected = grammar_match.selectBuiltIn(path, content) orelse return .{ .spans = &.{} };
         return highlightWithPackage(result_allocator, scratch_allocator, &self.packages[@intFromEnum(selected)], content, null);
+    }
+
+    fn recordHighlightFailure(diagnostic: diagnostics.Handle, err: anyerror) void {
+        switch (err) {
+            error.FileTooLarge, error.InvalidUtf8 => {},
+            else => _ = diagnostic.failure(.execute, .{ .zig = err }, @src()),
+        }
     }
 };
 
@@ -296,10 +323,14 @@ test "BuiltInGrammar selection covers JavaScript TypeScript and TSX" {
     try testing.expect(grammar_match.selectBuiltIn("scripts/release", "#!/usr/bin/env bash\n") != null);
 }
 
-test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
+test "diagnostics retain UserGrammar load and fallback allocation failures without changing fallback" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    var sink = try privateSink(tmp, &env);
+    defer sink.deinit();
     try tmp.dir.createDir(io, "fixture", .default_dir);
     try tmp.dir.writeFile(io, .{ .sub_path = "fixture/payload", .data = "not a library" });
     const payload_digest = digestHex("not a library");
@@ -323,7 +354,7 @@ test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
     try tmp.dir.writeFile(io, .{ .sub_path = "fixture/grammar.toml", .data = manifest });
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/fixture", .{&tmp.sub_path});
     defer testing.allocator.free(path);
-    var inspection = try user_grammar.inspect(testing.allocator, io, path);
+    var inspection = try user_grammar.inspect(testing.allocator, io, path, .{});
     const digest = inspection.report.digest;
     inspection.deinit();
     const entries = [_]user_grammar.RegistryEntry{.{
@@ -333,9 +364,10 @@ test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
         .trusted_digest = digest,
         .receipt = .{ .bundle_digest = digest, .bbr_identity = "test-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
     }};
-    var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build");
+    var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build", sink.handle(.grammar, .{}));
     defer registry.deinit();
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, &registry);
+    try testing.expect(sink.sequence > 0);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, &registry, sink.handle(.highlighting, .{}));
     defer highlighter.deinit();
 
     const built_in = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = 1;\n");
@@ -343,10 +375,135 @@ test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
     try testing.expect(built_in.spans.len > 0);
     const plain = try highlighter.highlighter().highlight(testing.allocator, "src/a.fixture", "content\n");
     try testing.expectEqual(@as(usize, 0), plain.spans.len);
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const fallback = try highlighter.highlighter().highlightWithScratch(testing.allocator, failing.allocator(), "private_path.js", "const private_source = 1;\n");
+    try testing.expectEqual(@as(usize, 0), fallback.spans.len);
+    const bytes = try diagnosticBytes(tmp);
+    defer testing.allocator.free(bytes);
+    for ([_][]const u8{ "error=OutOfMemory", "phase=open", "source=highlight/user_grammar.zig:" }) |needle|
+        try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
+    // The native library failure has one record: the leaf cause at the open, and no translated or repeated record.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "phase=open"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "error=OutOfMemory"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\n") - 1);
+    try testing.expect(std.mem.indexOf(u8, bytes, "error=NativeLibraryLoadFailed") == null);
+    for ([_][]const u8{ "private_path", "private_source", "not a library", path }) |secret|
+        try testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
+
+    const before_disable = sink.sequence;
+    const invalid = try highlighter.highlighter().highlight(testing.allocator, "private_path.js", "\xff");
+    try testing.expectEqual(@as(usize, 0), invalid.spans.len);
+    if (@sizeOf(usize) > @sizeOf(u32)) {
+        const oversized = @as([*]const u8, @ptrFromInt(1))[0 .. @as(usize, std.math.maxInt(u32)) + 1];
+        const too_large = try highlighter.highlighter().highlight(testing.allocator, "private_path.js", oversized);
+        try testing.expectEqual(@as(usize, 0), too_large.spans.len);
+    }
+    try testing.expectEqual(before_disable, sink.sequence);
+    try testing.expect(sink.setEnabled(false) == .off);
+    _ = try highlighter.highlighter().highlightWithScratch(testing.allocator, failing.allocator(), "private_path.js", "const private_source = 1;\n");
+    try testing.expectEqual(before_disable, sink.sequence);
+    try testing.expect(sink.setEnabled(true) == .on);
+    try testing.expectEqual(before_disable, sink.sequence);
+    _ = try highlighter.highlighter().highlightWithScratch(testing.allocator, failing.allocator(), "private_path.js", "const private_source = 1;\n");
+    try testing.expect(sink.sequence > before_disable);
+}
+
+test "diagnostics expected BuiltInGrammar content limits return their errors without a record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    var sink = try privateSink(tmp, &env);
+    defer sink.deinit();
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, sink.handle(.highlighting, .{}));
+    defer highlighter.deinit();
+    try testing.expectError(error.InvalidUtf8, highlighter.highlighter().highlight(testing.allocator, "private.js", "\xff"));
+    if (@sizeOf(usize) > @sizeOf(u32)) {
+        const oversized = @as([*]const u8, @ptrFromInt(1))[0 .. @as(usize, std.math.maxInt(u32)) + 1];
+        try testing.expectError(error.FileTooLarge, highlighter.highlighter().highlight(testing.allocator, "private.js", oversized));
+    }
+    const bytes = try diagnosticBytes(tmp);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n"));
+}
+
+test "diagnostics retain native query and regex codes without source or engine fragments" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    var sink = try privateSink(tmp, &env);
+    defer sink.deinit();
+    const handle = sink.handle(.grammar, .{});
+    var diagnostic: predicate_mod.Diagnostic = undefined;
+    try testing.expectError(error.InvalidHighlightQuery, RuntimePackage.init(
+        testing.allocator,
+        tree_sitter_javascript().?,
+        "(private_query_node_8f2b) @private_capture_9e",
+        "",
+        &diagnostic,
+    ));
+    try testing.expect(diagnostic.query_error.? != c.TSQueryErrorNone);
+    diagnostic.record(handle, @src());
+    var expected_buffer: [80]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buffer, "rule=query code={d} offset={d}", .{ diagnostic.query_error.?, diagnostic.source_offset });
+    const query_bytes = try diagnosticBytes(tmp);
+    defer testing.allocator.free(query_bytes);
+    try testing.expect(std.mem.indexOf(u8, query_bytes, expected) != null);
+
+    try testing.expectError(error.InvalidPredicate, RuntimePackage.init(
+        testing.allocator,
+        tree_sitter_javascript().?,
+        "((identifier) @private_capture_9e (#match? @private_capture_9e \"(?=private_regex_fragment_7c)\"))",
+        "",
+        &diagnostic,
+    ));
+    try testing.expect(diagnostic.regex_failure.?.fragment().len > 0);
+    diagnostic.record(handle, @src());
+    const bytes = try diagnosticBytes(tmp);
+    defer testing.allocator.free(bytes);
+    const expected_regex = try std.fmt.bufPrint(&expected_buffer, "rule=regex code={d} offset={d}", .{ @as(u32, @bitCast(diagnostic.regex_failure.?.engine_code)), diagnostic.source_offset });
+    try testing.expect(std.mem.indexOf(u8, bytes, expected_regex) != null);
+    for ([_][]const u8{ "private_query_node_8f2b", "private_capture_9e", "private_regex_fragment_7c", diagnostic.regex_failure.?.fragment() }) |secret|
+        try testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
+
+    try testing.expectError(error.InvalidPredicate, RuntimePackage.init(
+        testing.allocator,
+        tree_sitter_javascript().?,
+        "((identifier) @private_capture_9e (#private-operator-4d? @private_capture_9e))",
+        "",
+        &diagnostic,
+    ));
+    try testing.expectEqual(predicate_mod.Diagnostic.Kind.unknown_operator, diagnostic.kind);
+    diagnostic.record(handle, @src());
+    const predicate_bytes = try diagnosticBytes(tmp);
+    defer testing.allocator.free(predicate_bytes);
+    const expected_predicate = try std.fmt.bufPrint(&expected_buffer, "rule=unknown_operator code=0 offset={d}", .{diagnostic.source_offset});
+    try testing.expect(std.mem.indexOf(u8, predicate_bytes, expected_predicate) != null);
+    try testing.expect(std.mem.indexOf(u8, predicate_bytes, "private-operator-4d") == null);
+}
+
+fn privateSink(tmp: testing.TmpDir, env: *std.process.Environ.Map) !diagnostics.Sink {
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, env);
+    errdefer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    return sink;
+}
+
+fn diagnosticBytes(tmp: testing.TmpDir) ![]u8 {
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    return dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(64 * 1024));
 }
 
 test "JavaScript tracer produces ordered non-overlapping Captures" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = \"yes\";\n");
     defer {
@@ -360,7 +517,7 @@ test "JavaScript tracer produces ordered non-overlapping Captures" {
 }
 
 test "JavaScript BuiltInGrammar executes conditional Captures" {
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "Widget widget SCREAM console require other\n");
     defer freeResult(result);
@@ -380,7 +537,7 @@ test "JavaScript BuiltInGrammar rejects built-in Captures for local bindings" {
         \\require("x");
         \\function g(require) { require("y"); }
     ;
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
     defer freeResult(result);
@@ -410,7 +567,7 @@ test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed loc
         \\}
         \\console; require();
     ;
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for ([_][]const u8{ "src/a.js", "src/a.ts", "src/a.tsx" }) |path| {
         const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
@@ -432,7 +589,7 @@ test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed loc
 
 test "TypeScript BuiltInGrammars track optional parameter locals" {
     const source = "function f(console?: unknown) { console; }\nconsole;\n";
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for ([_][]const u8{ "src/a.ts", "src/a.tsx" }) |path| {
         const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
@@ -446,7 +603,7 @@ test "TypeScript BuiltInGrammars track optional parameter locals" {
 
 test "local filtering keeps UTF-8 byte offsets" {
     const source = "function f(console) { const π = 0; console; }\nconsole;\n";
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
     defer freeResult(result);
@@ -462,7 +619,7 @@ test "TypeScript and TSX BuiltInGrammars load their queries" {
         .{ .path = "src/a.ts", .source = "interface User { name: string }\n" },
         .{ .path = "src/a.tsx", .source = "const App = () => <main>Hello</main>;\n" },
     };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
@@ -481,7 +638,7 @@ test "remaining BuiltInGrammars load their queries and produce Captures" {
         .{ .path = "data.json", .source = "{\"ready\": true}\n" },
         .{ .path = "config.yaml", .source = "ready: true\n" },
     };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
@@ -506,7 +663,7 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "data.json", .source = "{\"nested\": {\"ready\": true}, \"items\": [1, 2]}\n" },
         .{ .path = "config.yaml", .source = "service:\n  enabled: true\n  ports: [80, 443]\n" },
     };
-    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     for (cases) |case| {
         const grammar = grammar_match.selectBuiltIn(case.path, case.source).?;
@@ -658,7 +815,9 @@ fn digestHex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     var result: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch unreachable;
+    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
     return result;
 }
 

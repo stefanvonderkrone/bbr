@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const diagnostics = @import("../diagnostics.zig");
 
 pub const CaptureRole = enum(u8) {
     unknown,
@@ -80,17 +81,25 @@ pub const FileHighlightStatus = struct {
 pub const Highlighter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// The request that asks for Highlighting. An adapter records its failures here.
+    diagnostic: diagnostics.Handle = .{},
 
     pub const VTable = struct {
-        highlight: *const fn (ptr: *anyopaque, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) anyerror!Result,
+        highlight: *const fn (ptr: *anyopaque, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8, diagnostic: diagnostics.Handle) anyerror!Result,
     };
+
+    pub fn withDiagnostics(self: Highlighter, diagnostic: diagnostics.Handle) Highlighter {
+        var bound = self;
+        bound.diagnostic = diagnostic;
+        return bound;
+    }
 
     pub fn highlight(self: Highlighter, allocator: Allocator, path: []const u8, content: []const u8) !Result {
         return self.highlightWithScratch(allocator, allocator, path, content);
     }
 
     pub fn highlightWithScratch(self: Highlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) !Result {
-        return self.vtable.highlight(self.ptr, result_allocator, scratch_allocator, path, content);
+        return self.vtable.highlight(self.ptr, result_allocator, scratch_allocator, path, content, self.diagnostic);
     }
 };
 
@@ -102,7 +111,7 @@ pub const PlainHighlighter = struct {
 
     const vtable: Highlighter.VTable = .{ .highlight = highlightImpl };
 
-    fn highlightImpl(_: *anyopaque, _: Allocator, _: Allocator, _: []const u8, _: []const u8) anyerror!Result {
+    fn highlightImpl(_: *anyopaque, _: Allocator, _: Allocator, _: []const u8, _: []const u8, _: diagnostics.Handle) anyerror!Result {
         return .{ .spans = &.{} };
     }
 };

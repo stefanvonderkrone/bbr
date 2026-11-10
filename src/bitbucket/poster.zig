@@ -65,7 +65,11 @@ pub const Poster = struct {
             error.MalformedResponse => return .{ .outcome = .{ .rejected = error.MalformedResponse } },
             // Any other error is a transport failure before a response arrived:
             // the POST may or may not have landed → ambiguous (dedupe on retry).
-            else => return .{ .outcome = .ambiguous },
+            // The ambiguous outcome carries no cause, so the cause gets its record here.
+            else => {
+                _ = self.client.diagnostic.failure(.execute, .{ .zig = err }, @src());
+                return .{ .outcome = .ambiguous };
+            },
         };
         return switch (attempt) {
             .posted => |id| .{ .outcome = .{ .posted = id } },
@@ -172,6 +176,36 @@ test "post maps a transport failure to .ambiguous" {
     var p = Poster{ .client = testClient(&fake), .allocator = a, .repo_slug = "myrepo", .pr_id = 7 };
     const outcome = try p.poster().post(.{ .local_id = 1, .kind = .comment, .body = "hi" }, null);
     try testing.expect(outcome.outcome == .ambiguous);
+}
+
+test "diagnostics an ambiguous POST keeps its transport cause in one record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = @import("../diagnostics.zig").Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var fake: FakeHttpClient = .{ .send_error = error.ConnectionResetByPeer };
+    var p = Poster{ .client = testClient(&fake).withDiagnostics(sink.handle(.submission, .{})), .allocator = testing.allocator, .repo_slug = "myrepo", .pr_id = 7 };
+    const outcome = try p.poster().post(.{ .local_id = 1, .kind = .comment, .body = "hi" }, null);
+    try testing.expect(outcome.outcome == .ambiguous);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, only, "source=bitbucket/poster.zig:") != null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=ConnectionResetByPeer"));
 }
 
 test "post maps a malformed 2xx response to a definite failure" {

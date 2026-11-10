@@ -779,7 +779,9 @@ const Writer = struct {
 
 const ValidMeasurement = struct { byte_len: usize, cell_width: usize, valid: bool };
 fn validMeasurement(metrics: CellMetrics, text: []const u8) ValidMeasurement {
-    const expected = std.unicode.utf8ByteSequenceLength(text[0]) catch return .{ .byte_len = 1, .cell_width = 1, .valid = false };
+    const expected = std.unicode.utf8ByteSequenceLength(text[0]) catch |err| switch (err) {
+        error.Utf8InvalidStartByte => return .{ .byte_len = 1, .cell_width = 1, .valid = false },
+    };
     const expected_len: usize = expected;
     if (expected_len > text.len or !std.unicode.utf8ValidateSlice(text[0..expected_len])) return .{ .byte_len = 1, .cell_width = 1, .valid = false };
     const measured = metrics.next(text);
@@ -1245,7 +1247,9 @@ const TestMetrics = struct {
     fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
         if (std.mem.startsWith(u8, text, "e\xcc\x81")) return .{ .byte_len = 3, .cell_width = 1 };
         if (std.mem.startsWith(u8, text, "界")) return .{ .byte_len = 3, .cell_width = 2 };
-        const len = std.unicode.utf8ByteSequenceLength(text[0]) catch 1;
+        const len = std.unicode.utf8ByteSequenceLength(text[0]) catch |err| switch (err) {
+            error.Utf8InvalidStartByte => 1,
+        };
         return .{ .byte_len = @min(@as(usize, len), text.len), .cell_width = 1 };
     }
     const context: u8 = 0;

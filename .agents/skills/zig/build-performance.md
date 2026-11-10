@@ -12,6 +12,12 @@ Commit `0164ee0` records these requirements.
 After dependency changes, run the native Linux RE2 and UserGrammar CI steps.
 A macOS build does not prove Linux behavior.
 
+The core `bbr` module links no libc, but a macOS build links libc implicitly.
+An `extern "c"` function or a `std.c` call in core compiles on macOS and fails on Linux with
+"dependency on libc must be explicitly specified".
+On Linux, call the kernel through `std.os.linux`, for example `std.os.linux.mknodat` for a test FIFO.
+`zig build test` compiles the core tests for `x86_64-linux` (`core-linux-tests`), so this mistake fails locally.
+
 Zig 0.16 cannot build bundled libc++ with a macOS 26 deployment minimum.
 Keep bbr's native deployment minimum at macOS 15 on newer hosts.
 Add the active SDK framework and library paths for that explicit target.

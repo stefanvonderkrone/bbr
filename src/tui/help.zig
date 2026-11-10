@@ -361,7 +361,9 @@ fn keyName(scratch: std.mem.Allocator, cp: u21) ![]const u8 {
         vaxis.Key.page_down => "pgdn",
         else => blk: {
             var b: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(cp, &b) catch break :blk "?";
+            const n = std.unicode.utf8Encode(cp, &b) catch |err| switch (err) {
+                error.CodepointTooLarge, error.Utf8CannotEncodeSurrogateHalf => break :blk "?",
+            };
             break :blk try scratch.dupe(u8, b[0..n]);
         },
     };
