@@ -131,22 +131,14 @@ pub fn loadSnapshot(allocator: std.mem.Allocator, snapshot: config_source.Snapsh
     };
 }
 
-pub const PersistThemeError = error{
-    /// `xdg.configFile` resolves no path: no absolute XDG_CONFIG_HOME and no HOME.
-    NoConfigLocation,
-    /// The file is over 64 KiB, or the rewritten file does not parse.
-    /// Nothing is written.
-    ConfigInvalid,
-    WriteFailed,
-    OutOfMemory,
-};
-
 /// Write `id` as the root `theme` of config.toml and keep every other byte.
 /// The rewritten file must parse before it replaces the old one. An existing
 /// file that already names `id` is not written. The write is atomic and
 /// durable, keeps the file's permissions, follows a symlinked config.toml to
 /// its target, and creates the `bbr` directory when it is absent.
-pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, id: ThemeId) PersistThemeError!void {
+/// A missing file is an empty source. A file over 64 KiB is `error.ConfigInvalid`.
+/// Every other read error, including `error.OutOfMemory`, keeps its name.
+pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, id: ThemeId) !void {
     const config_path = (try xdg.configFile(allocator, env)) orelse return error.NoConfigLocation;
     defer allocator.free(config_path);
     var exists = true;
@@ -156,8 +148,7 @@ pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.pr
             break :blk try allocator.dupe(u8, "");
         },
         error.StreamTooLong => return error.ConfigInvalid,
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.WriteFailed,
+        else => return err,
     };
     defer allocator.free(source);
     const next = try rewriteTheme(allocator, source, id.name());
@@ -168,6 +159,7 @@ pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.pr
     if (parsed == .invalid) return error.ConfigInvalid;
     writeAtomically(allocator, io, config_path, next) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
         else => error.WriteFailed,
     };
 }
@@ -230,7 +222,9 @@ fn rewriteTheme(allocator: std.mem.Allocator, source: []const u8, name: []const 
             if (!parser.take('=')) break :theme_line;
             parser.space();
             const value_start = line_start + parser.pos;
-            const value = parser.quoted() catch break :theme_line;
+            const value = parser.quoted() catch |err| switch (err) {
+                error.ExpectedQuote, error.UnsupportedEscape, error.UnterminatedString => break :theme_line,
+            };
             // `value` sits between the quotes that start at `value_start`.
             const start = value_start + 1;
             return std.mem.concat(allocator, u8, &.{ source[0..start], name, source[start + value.len ..] });
@@ -287,10 +281,12 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         parser.space();
         if (parser.done() or parser.peek() == '#') continue;
         if (parser.peek() == '[') {
-            const parsed_section = parser.section() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap], [highlight], [files.cache], [comments], [input.mouse], or [external_edit]" });
-                section = .unknown;
-                continue;
+            const parsed_section = parser.section() catch |err| switch (err) {
+                error.ExpectedClose, error.ExpectedSection => {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap], [highlight], [files.cache], [comments], [input.mouse], or [external_edit]" });
+                    section = .unknown;
+                    continue;
+                },
             };
             parser.space();
             if (!parser.trailing()) try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "unexpected text after table header" });
@@ -343,13 +339,17 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             const override: keymap.Override = .{ .action = key, .sequences = sequences };
             keymap.validateOverride(override) catch |err| {
                 allocator.free(sequences);
-                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = switch (err) {
-                    error.UnknownAction => "unknown Action name",
-                    error.UnknownKey => "unknown key name",
-                    error.SequenceTooLong => "key sequence exceeds eight chords",
-                    error.CountConflict => "key sequence cannot begin with a Count digit",
-                    else => "invalid key sequence",
-                }, .hint = if (err == error.UnknownAction) "use an Action name shown in the Keybindings Overlay" else null });
+                const diagnosed: struct { message: []const u8, hint: ?[]const u8 } = switch (err) {
+                    error.UnknownAction => .{
+                        .message = "unknown Action name",
+                        .hint = "use an Action name shown in the Keybindings Overlay",
+                    },
+                    error.UnknownKey => .{ .message = "unknown key name", .hint = null },
+                    error.SequenceTooLong => .{ .message = "key sequence exceeds eight chords", .hint = null },
+                    error.CountConflict => .{ .message = "key sequence cannot begin with a Count digit", .hint = null },
+                    error.EmptySequence, error.MissingKey => .{ .message = "invalid key sequence", .hint = null },
+                };
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = diagnosed.message, .hint = diagnosed.hint });
                 continue;
             };
             try overrides.append(allocator, override);
@@ -371,27 +371,39 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             continue;
         }
         const value: []const u8 = switch (section) {
-            .highlight, .comments, .external_edit => parser.unsigned() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
-                continue;
+            .highlight, .comments, .external_edit => parser.unsigned() catch |err| switch (err) {
+                error.ExpectedUnsigned => {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
+                    continue;
+                },
             },
-            .files_cache => if (std.mem.eql(u8, key, "enabled")) parser.boolean() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected true or false" });
-                continue;
-            } else parser.unsigned() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
-                continue;
+            .files_cache => if (std.mem.eql(u8, key, "enabled")) parser.boolean() catch |err| switch (err) {
+                error.ExpectedBoolean => {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected true or false" });
+                    continue;
+                },
+            } else parser.unsigned() catch |err| switch (err) {
+                error.ExpectedUnsigned => {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
+                    continue;
+                },
             },
-            .input_mouse => if (std.mem.eql(u8, key, "enabled")) parser.boolean() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected true or false" });
-                continue;
-            } else parser.unsigned() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a positive row count" });
-                continue;
+            .input_mouse => if (std.mem.eql(u8, key, "enabled")) parser.boolean() catch |err| switch (err) {
+                error.ExpectedBoolean => {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected true or false" });
+                    continue;
+                },
+            } else parser.unsigned() catch |err| switch (err) {
+                error.ExpectedUnsigned => {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a positive row count" });
+                    continue;
+                },
             },
-            else => parser.quoted() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a quoted string value" });
-                continue;
+            else => parser.quoted() catch |err| switch (err) {
+                error.ExpectedQuote, error.UnsupportedEscape, error.UnterminatedString => {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a quoted string value" });
+                    continue;
+                },
             },
         };
         parser.space();
@@ -415,10 +427,12 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             } else if (highlight_limit_seen) {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'max_file_bytes' key", .hint = "keep exactly one Highlighting limit" });
             } else {
-                highlight_max_file_bytes = std.fmt.parseInt(usize, value, 10) catch {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "Highlighting byte limit is too large" });
-                    highlight_limit_seen = true;
-                    continue;
+                highlight_max_file_bytes = std.fmt.parseInt(usize, value, 10) catch |err| switch (err) {
+                    error.InvalidCharacter, error.Overflow => {
+                        try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "Highlighting byte limit is too large" });
+                        highlight_limit_seen = true;
+                        continue;
+                    },
                 };
                 highlight_limit_seen = true;
             },
@@ -431,10 +445,12 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 if (file_cache_limit_seen) {
                     try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'max_bytes' key", .hint = "keep exactly one File cache budget" });
                 } else {
-                    inactive_file_cache_max_bytes = std.fmt.parseInt(usize, value, 10) catch {
-                        try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "File cache byte budget is too large" });
-                        file_cache_limit_seen = true;
-                        continue;
+                    inactive_file_cache_max_bytes = std.fmt.parseInt(usize, value, 10) catch |err| switch (err) {
+                        error.InvalidCharacter, error.Overflow => {
+                            try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "File cache byte budget is too large" });
+                            file_cache_limit_seen = true;
+                            continue;
+                        },
                     };
                 }
                 file_cache_limit_seen = true;
@@ -444,10 +460,12 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             } else if (comments_collapsed_seen) {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'collapsed_rows' key", .hint = "keep exactly one Comment row limit" });
             } else {
-                comments_collapsed_rows = std.fmt.parseInt(usize, value, 10) catch {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "Comment row limit is too large" });
-                    comments_collapsed_seen = true;
-                    continue;
+                comments_collapsed_rows = std.fmt.parseInt(usize, value, 10) catch |err| switch (err) {
+                    error.InvalidCharacter, error.Overflow => {
+                        try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "Comment row limit is too large" });
+                        comments_collapsed_seen = true;
+                        continue;
+                    },
                 };
                 comments_collapsed_seen = true;
             },
@@ -461,10 +479,12 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                     try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'vertical_scroll_rows' key", .hint = "keep exactly one mouse scroll row count" });
                 } else {
                     mouse_scroll_line = line_number;
-                    mouse_vertical_scroll_rows = std.fmt.parseInt(usize, value, 10) catch {
-                        try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "mouse scroll row count is too large" });
-                        mouse_scroll_seen = true;
-                        continue;
+                    mouse_vertical_scroll_rows = std.fmt.parseInt(usize, value, 10) catch |err| switch (err) {
+                        error.InvalidCharacter, error.Overflow => {
+                            try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "mouse scroll row count is too large" });
+                            mouse_scroll_seen = true;
+                            continue;
+                        },
                     };
                 }
                 mouse_scroll_seen = true;
@@ -475,10 +495,12 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'max_bytes' key", .hint = "keep exactly one External Edit limit" });
             } else {
                 external_edit_line = line_number;
-                external_edit_max_bytes = std.fmt.parseInt(usize, value, 10) catch {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "External Edit byte limit is too large" });
-                    external_edit_seen = true;
-                    continue;
+                external_edit_max_bytes = std.fmt.parseInt(usize, value, 10) catch |err| switch (err) {
+                    error.InvalidCharacter, error.Overflow => {
+                        try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "External Edit byte limit is too large" });
+                        external_edit_seen = true;
+                        continue;
+                    },
                 };
                 external_edit_seen = true;
             },
@@ -807,6 +829,19 @@ test "rewriteTheme replaces or adds only the root theme value" {
     try expectRewrite("# only a comment", "# only a comment\ntheme = \"solarized-dark\"\n");
     try expectRewrite("# only a comment\n", "# only a comment\ntheme = \"solarized-dark\"\n");
     try expectRewrite("", "theme = \"solarized-dark\"\n");
+}
+
+test "persistTheme reports a directory config.toml as a read failure" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+    try tmp.dir.createDirPath(io, "bbr/config.toml");
+    try testing.expectError(error.IsDir, persistTheme(testing.allocator, io, &env, .light));
 }
 
 test "persistTheme writes config.toml atomically through a symlink and refuses an invalid file" {

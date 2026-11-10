@@ -19,12 +19,56 @@ const CommentId = review.CommentId;
 const git_path = @import("../diff/path.zig");
 const diagnostics = @import("../diagnostics.zig");
 
-fn parseJson(diagnostic: diagnostics.Handle, comptime source: std.builtin.SourceLocation, comptime T: type, allocator: Allocator, body: []const u8, options: std.json.ParseOptions) !std.json.Parsed(T) {
-    errdefer |err| _ = diagnostic.failure(.decode, .{ .zig = err }, source);
-    return std.json.parseFromSlice(T, allocator, body, options);
+pub const base_url = "https://api.bitbucket.org/2.0";
+
+/// `std.json` reports allocation failure as `error.OutOfMemory` and every
+/// document problem as its own parse error. Callers see allocation failure
+/// unchanged. Every parse error is `error.MalformedResponse`, and the parse
+/// error goes to the boundary's record of it.
+fn jsonFailure(diagnostic: diagnostics.Handle, err: std.json.ParseError(std.json.Scanner)) error{ OutOfMemory, MalformedResponse } {
+    switch (err) {
+        error.OutOfMemory => return noted(diagnostic, error.OutOfMemory, .decode, null),
+        error.BufferUnderrun,
+        error.DuplicateField,
+        error.InvalidCharacter,
+        error.InvalidEnumTag,
+        error.InvalidNumber,
+        error.LengthMismatch,
+        error.MissingField,
+        error.Overflow,
+        error.SyntaxError,
+        error.UnexpectedEndOfInput,
+        error.UnexpectedToken,
+        error.UnknownField,
+        error.ValueTooLong,
+        => {
+            return noted(diagnostic, error.MalformedResponse, .decode, .{ .zig = err });
+        },
+    }
 }
 
-pub const base_url = "https://api.bitbucket.org/2.0";
+/// Notes the evidence of a client error and returns the error. Every client error return
+/// notes, so a boundary record of the error never takes the evidence of an earlier failure
+/// with the same name. `tools/check_diagnostics.py` rejects a plain return.
+fn noted(diagnostic: diagnostics.Handle, err: anytype, phase: diagnostics.Phase, cause: ?diagnostics.Cause) @TypeOf(err) {
+    diagnostic.note(.{ .err = err, .phase = phase, .cause = cause });
+    return err;
+}
+
+/// Decodes one list item. A decoder that can reject an item takes the page's handle first,
+/// so its rejection notes the page.
+fn decodeItem(comptime decode: anytype, diagnostic: diagnostics.Handle, args: anytype) @typeInfo(@TypeOf(decode)).@"fn".return_type.? {
+    if (@typeInfo(@TypeOf(decode)).@"fn".params[0].type == diagnostics.Handle) return @call(.auto, decode, .{diagnostic} ++ args);
+    return @call(.auto, decode, args);
+}
+
+fn parseResponse(comptime T: type, diagnostic: diagnostics.Handle, allocator: Allocator, body: []const u8) error{ OutOfMemory, MalformedResponse }!std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| return jsonFailure(diagnostic, err);
+}
+
+fn parseResponseLeaky(comptime T: type, diagnostic: diagnostics.Handle, allocator: Allocator, body: []const u8) error{ OutOfMemory, MalformedResponse }!T {
+    return std.json.parseFromSliceLeaky(T, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| return jsonFailure(diagnostic, err);
+}
 
 pub const Client = struct {
     diagnostic: diagnostics.Handle = .{},
@@ -38,14 +82,12 @@ pub const Client = struct {
         io: std.Io,
         mutex: std.Io.Mutex = .init,
         reason: ?ApiError = null,
-        reported_error: ?anyerror = null,
         message: ?[]u8 = null,
 
         pub fn deinit(self: *ErrorDetail) void {
             if (self.message) |message| self.allocator.free(message);
             self.message = null;
             self.reason = null;
-            self.reported_error = null;
         }
 
         fn copyFrom(self: *ErrorDetail, source: ?*const ErrorDetail) void {
@@ -54,8 +96,9 @@ pub const Client = struct {
             self.deinit();
             const detail = source orelse return;
             self.reason = detail.reason;
-            self.reported_error = detail.reported_error;
-            if (detail.message) |message| self.message = self.allocator.dupe(u8, message) catch null;
+            if (detail.message) |message| self.message = self.allocator.dupe(u8, message) catch |err| switch (err) {
+                error.OutOfMemory => null,
+            };
         }
 
         fn record(self: *ErrorDetail, reason: ApiError, body: []const u8, token: []const u8, headers: []const httpc.Header) void {
@@ -82,15 +125,21 @@ pub const Client = struct {
                     if (std.mem.startsWith(u8, remaining, value)) secret_len = @max(secret_len, value.len);
                 }
                 if (secret_len != 0) {
-                    redacted.appendSlice(self.allocator, "[redacted]") catch return;
+                    redacted.appendSlice(self.allocator, "[redacted]") catch |err| switch (err) {
+                        error.OutOfMemory => return,
+                    };
                     position += secret_len;
                 } else {
                     const byte = message[position];
-                    redacted.append(self.allocator, if (byte < 0x20 or byte == 0x7f) ' ' else byte) catch return;
+                    redacted.append(self.allocator, if (byte < 0x20 or byte == 0x7f) ' ' else byte) catch |err| switch (err) {
+                        error.OutOfMemory => return,
+                    };
                     position += 1;
                 }
             }
-            self.message = redacted.toOwnedSlice(self.allocator) catch return;
+            self.message = redacted.toOwnedSlice(self.allocator) catch |err| switch (err) {
+                error.OutOfMemory => return,
+            };
         }
     };
 
@@ -105,27 +154,17 @@ pub const Client = struct {
     }
 
     fn send(self: Client, allocator: Allocator, request: httpc.Request) !httpc.Response {
-        var bound = request;
-        bound.diagnostic = self.diagnostic;
-        const response = self.http.send(allocator, bound) catch |err| {
-            _ = self.diagnostic.failure(.execute, .{ .zig = err }, @src());
+        var phase: httpc.Phase = .prepare;
+        var traced = request;
+        traced.phase = &phase;
+        const response = self.http.send(allocator, traced) catch |err| {
+            self.diagnostic.note(.{ .err = err, .phase = phase });
             return err;
         };
         classify(response.status) catch |reason| {
-            _ = self.diagnostic.failure(.rejection, .{ .http = .{ .status = response.status, .classification = switch (reason) {
-                error.Unauthorized => .authentication,
-                error.Forbidden => .authorization,
-                error.RateLimited => .rate_limit,
-                error.ServerError => .server,
-                error.NotFound => .not_found,
-                error.BadRequest => .validation,
-                error.Conflict => .conflict,
-                else => .other,
-            } } }, @src());
+            self.diagnostic.note(.{ .err = reason, .phase = .rejection, .cause = .{ .http = .{ .status = response.status, .classification = httpClass(reason) } } });
+            if (self.error_detail) |detail| detail.record(reason, response.body, self.cred.token, request.headers);
         };
-        if (self.error_detail) |detail| {
-            classify(response.status) catch |reason| detail.record(reason, response.body, self.cred.token, request.headers);
-        }
         return response;
     }
 
@@ -158,22 +197,22 @@ pub const Client = struct {
         defer allocator.free(res.body);
 
         try classify(res.status);
-        return parsePullRequest(allocator, res.body, true, self.diagnostic);
+        return parsePullRequest(self.diagnostic, allocator, res.body, true);
     }
 
     pub fn createPullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, opts: types.PullRequestOptions) !PullRequest {
-        try opts.validate(true);
+        opts.validate(true) catch |err| return noted(self.diagnostic, err, .prepare, null);
         const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests");
         defer allocator.free(url);
         const body = try pullRequestBody(allocator, opts);
         defer allocator.free(body);
         const response = try self.requestJson(allocator, .POST, url, body);
         defer allocator.free(response);
-        return parsePullRequest(allocator, response, false, self.diagnostic);
+        return parsePullRequest(self.diagnostic, allocator, response, false);
     }
 
     pub fn updatePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64, opts: types.PullRequestOptions) !PullRequest {
-        try opts.validate(false);
+        opts.validate(false) catch |err| return noted(self.diagnostic, err, .prepare, null);
         const suffix = try std.fmt.allocPrint(allocator, "/pullrequests/{d}", .{id});
         defer allocator.free(suffix);
         const url = try self.repositoryEndpoint(allocator, repo_slug, suffix);
@@ -182,7 +221,7 @@ pub const Client = struct {
         defer allocator.free(body);
         const response = try self.requestJson(allocator, .PUT, url, body);
         defer allocator.free(response);
-        return parsePullRequest(allocator, response, false, self.diagnostic);
+        return parsePullRequest(self.diagnostic, allocator, response, false);
     }
 
     pub fn declinePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64) !PullRequest {
@@ -192,12 +231,12 @@ pub const Client = struct {
         defer allocator.free(url);
         const response = try self.requestJson(allocator, .POST, url, null);
         defer allocator.free(response);
-        return parsePullRequest(allocator, response, false, self.diagnostic);
+        return parsePullRequest(self.diagnostic, allocator, response, false);
     }
 
     /// Includes every returned lifecycle state. A pending index is not an empty result.
     pub fn listCommitPullRequests(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, opts: PageOptions) ![]PullRequestSummary {
-        if (commit.len == 0 or opts.query != null or opts.sort != null) return error.BadRequest;
+        if (commit.len == 0 or opts.query != null or opts.sort != null) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         var suffix: std.ArrayList(u8) = .empty;
         defer suffix.deinit(allocator);
         try suffix.appendSlice(allocator, "/commit/");
@@ -217,7 +256,7 @@ pub const Client = struct {
     }
 
     pub fn getBranch(self: Client, allocator: Allocator, repo_slug: []const u8, name: []const u8) !types.Branch {
-        try validateBranchName(name);
+        try validateBranchName(self.diagnostic, name);
         var suffix: std.ArrayList(u8) = .empty;
         defer suffix.deinit(allocator);
         try suffix.appendSlice(allocator, "/refs/branches/");
@@ -226,19 +265,19 @@ pub const Client = struct {
         defer allocator.free(url);
         const response = try self.requestJson(allocator, .GET, url, null);
         defer allocator.free(response);
-        return parseBranch(allocator, response, self.diagnostic);
+        return parseBranch(self.diagnostic, allocator, response);
     }
 
     pub fn createBranch(self: Client, allocator: Allocator, repo_slug: []const u8, name: []const u8, target: []const u8) !types.Branch {
-        try validateBranchName(name);
-        if (target.len == 0) return error.BadRequest;
+        try validateBranchName(self.diagnostic, name);
+        if (target.len == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches");
         defer allocator.free(url);
         const body = try std.json.Stringify.valueAlloc(allocator, .{ .name = name, .target = .{ .hash = target } }, .{});
         defer allocator.free(body);
         const response = try self.requestJson(allocator, .POST, url, body);
         defer allocator.free(response);
-        return parseBranch(allocator, response, self.diagnostic);
+        return parseBranch(self.diagnostic, allocator, response);
     }
 
     /// GET /repositories/{workspace}/{repo}/default-reviewers. With `effective`, GET
@@ -255,7 +294,7 @@ pub const Client = struct {
     }
 
     fn repositoryEndpoint(self: Client, allocator: Allocator, repo_slug: []const u8, suffix: []const u8) ![]u8 {
-        if (repo_slug.len == 0) return error.BadRequest;
+        if (repo_slug.len == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         var url: std.ArrayList(u8) = .empty;
         defer url.deinit(allocator);
         try url.appendSlice(allocator, base_url ++ "/repositories/");
@@ -402,25 +441,18 @@ pub const Client = struct {
             size: usize,
             attributes: []const []const u8,
         };
-        const parsed = parseJson(self.diagnostic, @src(), Wire, allocator, metadata_body, .{ .ignore_unknown_fields = true }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(Wire, self.diagnostic, allocator, metadata_body);
         defer parsed.deinit();
         const metadata = parsed.value;
-        if (!std.mem.eql(u8, metadata.type, "commit_file")) return self.invalidBlob(error.BlobTypeMismatch, @src());
-        if (!std.mem.eql(u8, metadata.path, path)) return self.invalidBlob(error.BlobPathMismatch, @src());
-        if (!hashMatches(metadata.commit.hash, commit)) return self.invalidBlob(error.BlobCommitMismatch, @src());
-        if (!stringSlicesEqual(metadata.attributes, expected_attributes)) return self.invalidBlob(error.BlobAttributesMismatch, @src());
+        if (!std.mem.eql(u8, metadata.type, "commit_file")) return noted(self.diagnostic, error.BlobTypeMismatch, .validate, null);
+        if (!std.mem.eql(u8, metadata.path, path)) return noted(self.diagnostic, error.BlobPathMismatch, .validate, null);
+        if (!hashMatches(metadata.commit.hash, commit)) return noted(self.diagnostic, error.BlobCommitMismatch, .validate, null);
+        if (!stringSlicesEqual(metadata.attributes, expected_attributes)) return noted(self.diagnostic, error.BlobAttributesMismatch, .validate, null);
 
         const raw = try self.getFileBlob(allocator, repo_slug, commit, path);
         defer allocator.free(raw);
-        if (metadata.size != raw.len) return self.invalidBlob(error.BlobSizeMismatch, @src());
+        if (metadata.size != raw.len) return noted(self.diagnostic, error.BlobSizeMismatch, .validate, null);
         return raw.len;
-    }
-
-    const BlobShapeError = error{ BlobTypeMismatch, BlobPathMismatch, BlobCommitMismatch, BlobAttributesMismatch, BlobSizeMismatch };
-
-    fn invalidBlob(self: Client, err: BlobShapeError, comptime source: std.builtin.SourceLocation) BlobShapeError {
-        _ = self.diagnostic.failure(.validate, .{ .zig = err }, source);
-        return err;
     }
 
     fn getSource(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, path: []const u8, metadata: bool) ![]u8 {
@@ -434,7 +466,7 @@ pub const Client = struct {
         var url_buf: std.ArrayList(u8) = .empty;
         defer url_buf.deinit(allocator);
         try url_buf.print(allocator, "{s}/repositories/{s}/{s}/src/{s}/", .{ base_url, self.cred.workspace, repo_slug, commit });
-        if (!git_path.isRepositoryRelative(path)) return error.InvalidPath;
+        if (!git_path.isRepositoryRelative(path)) return noted(self.diagnostic, error.InvalidPath, .prepare, null);
         try appendEncodedPath(allocator, &url_buf, path);
         if (metadata) try url_buf.appendSlice(allocator, "?format=meta");
         const url = try url_buf.toOwnedSlice(allocator);
@@ -549,14 +581,7 @@ pub const Client = struct {
             .reason = reason,
             .retry_after_ms = res.retry_after_ms,
         } };
-        const parsed = parseJson(
-            self.diagnostic,
-            @src(),
-            struct { id: u64 },
-            allocator,
-            res.body,
-            .{ .ignore_unknown_fields = true },
-        ) catch return error.MalformedResponse;
+        const parsed = try parseResponse(struct { id: u64 }, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return .{ .posted = parsed.value.id };
     }
@@ -564,25 +589,21 @@ pub const Client = struct {
     /// GET /users/{user_id}, using an Atlassian account ID or Bitbucket UUID.
     /// The result owns its strings. Release it with `deinitUser`.
     pub fn getUser(self: Client, allocator: Allocator, user_id: []const u8) !types.User {
-        if (user_id.len == 0) return error.BadRequest;
+        if (user_id.len == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         var url: std.ArrayList(u8) = .empty;
         defer url.deinit(allocator);
         try url.appendSlice(allocator, base_url ++ "/users/");
         try percentEncodeInto(allocator, &url, user_id);
         const body = try self.requestJson(allocator, .GET, url.items, null);
         defer allocator.free(body);
-        const parsed = parseJson(self.diagnostic, @src(), struct {
+        const parsed = try parseResponse(struct {
             uuid: []const u8,
             account_id: ?[]const u8 = null,
             display_name: ?[]const u8 = null,
             nickname: ?[]const u8 = null,
-        }, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.MalformedResponse,
-        };
+        }, self.diagnostic, allocator, body);
         defer parsed.deinit();
-        errdefer |err| _ = self.diagnostic.failure(.decode, .{ .zig = err }, @src());
-        if (parsed.value.uuid.len == 0) return error.MalformedResponse;
+        if (parsed.value.uuid.len == 0) return noted(self.diagnostic, error.MalformedResponse, .validate, null);
         const uuid = try allocator.dupe(u8, parsed.value.uuid);
         errdefer allocator.free(uuid);
         const account_id = try allocator.dupe(u8, parsed.value.account_id orelse "");
@@ -612,9 +633,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = parseJson(self.diagnostic, @src(), struct { uuid: []const u8 }, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(struct { uuid: []const u8 }, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return allocator.dupe(u8, parsed.value.uuid);
     }
@@ -650,13 +669,13 @@ pub const Client = struct {
         authenticated_account_uuid: []const u8,
         target: types.ReviewerVerdict,
     ) !types.ReviewerVerdictChangeResult {
-        const before = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
-            if (asApiError(err)) |api_error| return .{ .api_error = api_error };
-            return err;
-        };
+        // The caller records the error that this function returns and the cause that the
+        // result names. Each other cause drops out of the result, so it gets its record here.
+        const before = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err|
+            return .{ .api_error = asApiError(err) orelse return err };
         defer deinitPullRequest(allocator, before);
         if (!std.mem.eql(u8, before.source_commit, expected_source_commit)) return .stale_source_commit;
-        if (before.author_uuid.len != 0 and std.mem.eql(u8, before.author_uuid, authenticated_account_uuid)) return .{ .api_error = error.Forbidden };
+        if (before.author_uuid.len != 0 and std.mem.eql(u8, before.author_uuid, authenticated_account_uuid)) return .{ .api_error = noted(self.diagnostic, error.Forbidden, .validate, null) };
 
         const current = before.reviewerVerdict(authenticated_account_uuid);
         if (current == target) return .success;
@@ -680,22 +699,33 @@ pub const Client = struct {
         const mutation_auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(mutation_auth);
 
-        var uncertain = false;
-        var uncertain_reason: ?ApiError = null;
-        self.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
+        // The reconciliation read can fail with the same error name, so the mutation keeps its
+        // evidence in its own slot, and only a result that names the mutation's error moves it.
+        var mutation_leaf: ?diagnostics.Leaf = null;
+        const mutation = self.withDiagnostics(self.diagnostic.withLeaf(&mutation_leaf));
+        var uncertain: ?anyerror = null;
+        mutation.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
             if (asApiError(err)) |api_error| switch (api_error) {
-                error.RateLimited, error.ServerError => uncertain_reason = api_error,
-                else => return .{ .api_error = api_error },
+                error.RateLimited, error.ServerError => {},
+                else => {
+                    self.diagnostic.adopt(&mutation_leaf);
+                    return .{ .api_error = api_error };
+                },
             };
-            uncertain = true;
+            uncertain = err;
         };
 
         const after = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
-            return .{ .unresolved = asApiError(err) };
+            if (uncertain) |cause| _ = mutation.diagnostic.failure(.execute, .{ .zig = cause }, @src());
+            return .{ .unresolved = err };
         };
         defer deinitPullRequest(allocator, after);
-        if (after.reviewerVerdict(authenticated_account_uuid) != target) return .{ .unresolved = uncertain_reason };
-        if (uncertain or !std.mem.eql(u8, after.source_commit, expected_source_commit)) return .reconciled_success;
+        if (after.reviewerVerdict(authenticated_account_uuid) != target) {
+            self.diagnostic.adopt(&mutation_leaf);
+            return .{ .unresolved = uncertain };
+        }
+        if (uncertain) |cause| _ = mutation.diagnostic.failure(.execute, .{ .zig = cause }, @src());
+        if (uncertain != null or !std.mem.eql(u8, after.source_commit, expected_source_commit)) return .reconciled_success;
         return .success;
     }
 
@@ -918,14 +948,14 @@ pub const Client = struct {
 
     /// GET /workspaces/{workspace}/members. Free with `deinitWorkspaceMembers`.
     pub fn listWorkspaceMembers(self: Client, allocator: Allocator, opts: PageOptions) ![]types.WorkspaceMember {
-        if (self.cred.workspace.len == 0 or opts.query != null or opts.sort != null) return error.BadRequest;
+        if (self.cred.workspace.len == 0 or opts.query != null or opts.sort != null) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         const endpoint = try self.workspaceMembersEndpoint(allocator);
         defer allocator.free(endpoint);
         return self.listPages(allocator, types.WorkspaceMember, WorkspaceMembersPage, dupeWorkspaceMember, deinitWorkspaceMember, .{}, endpoint, largestPage(opts, max_pagelen.members), null, false);
     }
 
     fn workspaceMembersEndpoint(self: Client, allocator: Allocator) ![]u8 {
-        if (self.cred.workspace.len == 0) return error.BadRequest;
+        if (self.cred.workspace.len == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         var url: std.ArrayList(u8) = .empty;
         errdefer url.deinit(allocator);
         try url.appendSlice(allocator, base_url ++ "/workspaces/");
@@ -937,7 +967,7 @@ pub const Client = struct {
     /// Complete member acquisition with a caller-selected active-request bound.
     /// Free the result with `deinitWorkspaceMembers`.
     pub fn listWorkspaceMembersConcurrent(self: Client, io: std.Io, allocator: Allocator, pagelen: u32, concurrency: usize) ![]types.WorkspaceMember {
-        if (pagelen == 0 or pagelen > max_pagelen.members or concurrency == 0) return error.BadRequest;
+        if (pagelen == 0 or pagelen > max_pagelen.members or concurrency == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         const endpoint = try self.workspaceMembersEndpoint(allocator);
         defer allocator.free(endpoint);
         const first = try pageUrlWithBase(allocator, endpoint, .{ .pagelen = pagelen });
@@ -962,7 +992,7 @@ pub const Client = struct {
         firsts: []const []const u8,
         opts: PagedListOptions,
     ) ![]Item {
-        if (firsts.len == 0 or opts.pagelen == 0 or opts.concurrency == 0) return error.BadRequest;
+        if (firsts.len == 0 or opts.pagelen == 0 or opts.concurrency == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         if (opts.limit == 0) return allocator.alloc(Item, 0);
         const Lists = PagedLists(Item, Value, decode, deinit);
         var lists: Lists = .{ .allocator = allocator, .lists = try allocator.alloc(Lists.List, firsts.len), .options = opts, .diagnostic = self.diagnostic };
@@ -971,7 +1001,14 @@ pub const Client = struct {
         const slots = try allocator.alloc(Lists.Slot, opts.concurrency);
         for (slots) |*slot| slot.* = .{};
         defer {
-            for (slots) |*slot| slot.deinit(allocator);
+            for (slots) |*slot| {
+                if (slot.err) |err| {
+                    var diagnostic = self.diagnostic.withLeaf(&slot.leaf);
+                    diagnostic.context.page = slot.page_number;
+                    _ = diagnostic.failure(.read, .{ .zig = err }, @src());
+                }
+                slot.deinit(allocator);
+            }
             allocator.free(slots);
         }
         const completions = try allocator.alloc(PageCompletion, slots.len);
@@ -983,7 +1020,11 @@ pub const Client = struct {
         defer if (protection) |previous| {
             _ = io.swapCancelProtection(previous);
         };
-        defer select.group.await(io) catch {};
+        defer select.group.await(io) catch |err| switch (err) {
+            error.Canceled => io.recancel(),
+        };
+        // Each page task binds its page's slot, and `finish` adopts the slot of the returned failure.
+        const task_client = self.withDiagnostics(self.diagnostic.withLeaf(null));
         var concurrent = opts.concurrency > 1;
         var active: usize = 0;
         while (true) {
@@ -997,7 +1038,7 @@ pub const Client = struct {
                 slot.* = .{ .position = position, .page_number = lists.pageNumber(position.number), .url = try lists.pageUrl(position) };
                 try lists.lists[position.list].pages.append(allocator, .pending);
                 if (concurrent) {
-                    if (select.concurrent(.page, Lists.Slot.fetch, .{ self, slot, index })) |_| {
+                    if (diagnostics.selectConcurrent(&select, .page, Lists.Slot.fetch, .{ task_client, slot, index })) |_| {
                         if (protection == null) protection = io.swapCancelProtection(.blocked);
                         slot.busy = true;
                         active += 1;
@@ -1025,7 +1066,7 @@ pub const Client = struct {
     /// All pages share at most `opts.concurrency` active requests. `opts.limit` caps the result.
     /// Free the result with `deinitSummaries`.
     pub fn listWorkspacePullRequests(self: Client, io: std.Io, allocator: Allocator, filter: WorkspacePullRequestFilter, opts: WorkspacePullRequestOptions) ![]PullRequestSummary {
-        if (self.cred.workspace.len == 0 or filter.states.count() == 0) return error.BadRequest;
+        if (self.cred.workspace.len == 0 or filter.states.count() == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         var firsts: std.ArrayList([]u8) = .empty;
         defer {
             for (firsts.items) |url| allocator.free(url);
@@ -1034,7 +1075,7 @@ pub const Client = struct {
         var pagelen: u32 = max_pagelen.pull_requests;
         switch (filter.scope) {
             .workspace_author => |scope| {
-                if (scope.author.len == 0 or scope.reviewer != null and scope.reviewer.?.len == 0) return error.BadRequest;
+                if (scope.author.len == 0 or scope.reviewer != null and scope.reviewer.?.len == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
                 var endpoint: std.ArrayList(u8) = .empty;
                 defer endpoint.deinit(allocator);
                 try endpoint.appendSlice(allocator, base_url ++ "/workspaces/");
@@ -1052,8 +1093,8 @@ pub const Client = struct {
                     .reviewer => |uuid| .{ null, uuid },
                     .author_and_reviewer => |both| .{ both.author, both.reviewer },
                 };
-                if (scope.slugs.len == 0) return error.BadRequest;
-                for ([_]?[]const u8{ author, reviewer }) |value| if (value) |uuid| if (uuid.len == 0) return error.BadRequest;
+                if (scope.slugs.len == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
+                for ([_]?[]const u8{ author, reviewer }) |value| if (value) |uuid| if (uuid.len == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
                 try firsts.ensureTotalCapacityPrecise(allocator, scope.slugs.len);
                 for (scope.slugs) |slug| {
                     const endpoint = try self.repositoryEndpoint(allocator, slug, "/pullrequests");
@@ -1089,11 +1130,8 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = parseJson(self.diagnostic, @src(), WorkspaceJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(WorkspaceJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
-        errdefer |err| _ = self.diagnostic.failure(.decode, .{ .zig = err }, @src());
         return dupeWorkspaceJson(allocator, parsed.value);
     }
 
@@ -1165,11 +1203,8 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = parseJson(self.diagnostic, @src(), RepositoryJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(RepositoryJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
-        errdefer |err| _ = self.diagnostic.failure(.decode, .{ .zig = err }, @src());
         return dupeRepository(allocator, parsed.value);
     }
 
@@ -1219,7 +1254,7 @@ pub const Client = struct {
 
     /// Return commits reachable from `to`, excluding all commits reachable from `from`.
     pub fn listRepoCommitRange(self: Client, allocator: Allocator, repo_slug: []const u8, from: []const u8, to: []const u8, opts: PageOptions) ![]types.Commit {
-        if (from.len == 0 or to.len == 0) return error.BadRequest;
+        if (from.len == 0 or to.len == 0) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         var first: std.ArrayList(u8) = .empty;
         defer first.deinit(allocator);
         try first.print(allocator, "{s}/repositories/{s}/{s}/commits?include=", .{ base_url, self.cred.workspace, repo_slug });
@@ -1255,8 +1290,11 @@ pub const Client = struct {
         defer allocator.free(url);
         var followed: FollowedPages = .{};
         defer followed.deinit(allocator);
-        while (true) {
-            const res = try self.send(allocator, .{
+        // Bitbucket numbers the pages that `next` links to one by one.
+        var page = self;
+        page.diagnostic.context.page = opts.page orelse 1;
+        while (true) : (page.diagnostic.context.page.? += 1) {
+            const res = try page.send(allocator, .{
                 .method = .GET,
                 .url = url,
                 .headers = &.{
@@ -1265,21 +1303,18 @@ pub const Client = struct {
                 },
             });
             defer allocator.free(res.body);
-            if (commit_links and res.status == 202) return error.PullRequestLinksIndexing;
+            if (commit_links and res.status == 202) return noted(page.diagnostic, error.PullRequestLinksIndexing, .rejection, .{ .http = .{ .status = res.status, .classification = .other } });
             classify(res.status) catch |reason| {
                 if (rejection) |failure| failure.* = .{ .reason = reason, .retry_after_ms = res.retry_after_ms };
                 return reason;
             };
-            const parsed = parseJson(self.diagnostic, @src(), Page, allocator, res.body, .{
-                .ignore_unknown_fields = true,
-            }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+            const parsed = try parseResponse(Page, page.diagnostic, allocator, res.body);
             defer parsed.deinit();
-            errdefer |err| _ = self.diagnostic.failure(.decode, .{ .zig = err }, @src());
             for (parsed.value.values) |wire| {
                 if (opts.limit) |limit| {
                     if (out.items.len >= limit) break;
                 }
-                const item = try @call(.auto, decode, .{ allocator, wire } ++ decode_args);
+                const item = try decodeItem(decode, page.diagnostic, .{ allocator, wire } ++ decode_args);
                 if (Item == types.Task) {
                     if (opts.task_state) |state| {
                         if (item.state != state) {
@@ -1296,7 +1331,7 @@ pub const Client = struct {
                 if (out.items.len >= limit) break;
             }
             const next = parsed.value.next orelse break;
-            try followed.follow(allocator, url, next);
+            try followed.follow(page.diagnostic, allocator, url, next);
             const next_url = try allocator.dupe(u8, next);
             allocator.free(url);
             url = next_url;
@@ -1376,12 +1411,9 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = parseJson(self.diagnostic, @src(), CommentJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(CommentJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
-        errdefer |err| _ = self.diagnostic.failure(.decode, .{ .zig = err }, @src());
-        return dupeComment(allocator, parsed.value, .{});
+        return dupeComment(self.diagnostic, allocator, parsed.value, .{});
     }
 
     /// POST .../comments/{id}/resolve: resolve a comment thread.
@@ -1484,12 +1516,9 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = parseJson(self.diagnostic, @src(), TaskJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(TaskJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
-        errdefer |err| _ = self.diagnostic.failure(.decode, .{ .zig = err }, @src());
-        return dupeTask(allocator, parsed.value);
+        return dupeTask(self.diagnostic, allocator, parsed.value);
     }
 
     /// POST .../tasks: create a task. `comment_id` attaches it to a comment.
@@ -1532,14 +1561,7 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = parseJson(
-            self.diagnostic,
-            @src(),
-            struct { id: u64 },
-            allocator,
-            res.body,
-            .{ .ignore_unknown_fields = true },
-        ) catch return error.MalformedResponse;
+        const parsed = try parseResponse(struct { id: u64 }, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
         return parsed.value.id;
     }
@@ -1555,7 +1577,7 @@ pub const Client = struct {
         content: ?[]const u8,
         state: ?types.TaskState,
     ) !types.Task {
-        if (content == null and state == null) return error.BadRequest;
+        if (content == null and state == null) return noted(self.diagnostic, error.BadRequest, .prepare, null);
         const url = try std.fmt.allocPrint(
             allocator,
             "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks/{d}",
@@ -1586,12 +1608,9 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
         try classify(res.status);
-        const parsed = parseJson(self.diagnostic, @src(), TaskJson, allocator, res.body, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.MalformedResponse;
+        const parsed = try parseResponse(TaskJson, self.diagnostic, allocator, res.body);
         defer parsed.deinit();
-        errdefer |err| _ = self.diagnostic.failure(.decode, .{ .zig = err }, @src());
-        return dupeTask(allocator, parsed.value);
+        return dupeTask(self.diagnostic, allocator, parsed.value);
     }
 
     /// DELETE .../tasks/{task_id}.
@@ -1667,11 +1686,10 @@ pub const Client = struct {
             size: usize,
             attributes: []const []const u8 = &.{},
         };
-        const parsed = parseJson(self.diagnostic, @src(), Wire, allocator, metadata_body, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+        const parsed = try parseResponse(Wire, self.diagnostic, allocator, metadata_body);
         defer parsed.deinit();
-        errdefer |err| _ = self.diagnostic.failure(.decode, .{ .zig = err }, @src());
         const m = parsed.value;
-        if (!std.mem.eql(u8, m.type, "commit_file")) return error.BlobTypeMismatch;
+        if (!std.mem.eql(u8, m.type, "commit_file")) return noted(self.diagnostic, error.BlobTypeMismatch, .validate, null);
         const attrs = try allocator.alloc([]const u8, m.attributes.len);
         var copied: usize = 0;
         errdefer {
@@ -1820,8 +1838,8 @@ const FollowedPages = struct {
     }
 
     /// Records `url`, the page that links to `next`, and rejects a `next` that repeats a recorded page.
-    fn follow(self: *FollowedPages, allocator: Allocator, url: []const u8, next: []const u8) !void {
-        if (std.mem.eql(u8, url, next) or self.urls.contains(next)) return error.MalformedResponse;
+    fn follow(self: *FollowedPages, diagnostic: diagnostics.Handle, allocator: Allocator, url: []const u8, next: []const u8) !void {
+        if (std.mem.eql(u8, url, next) or self.urls.contains(next)) return noted(diagnostic, error.MalformedResponse, .validate, null);
         const owned = try allocator.dupe(u8, url);
         errdefer allocator.free(owned);
         try self.urls.putNoClobber(allocator, owned, {});
@@ -1842,7 +1860,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
         const PageState = union(enum) {
             pending,
             done: []Item,
-            failed: struct { reason: anyerror, detail: ?Client.ErrorDetail },
+            failed: struct { reason: anyerror, detail: ?Client.ErrorDetail, leaf: ?diagnostics.Leaf },
         };
 
         const List = struct {
@@ -1870,6 +1888,8 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             page: ?Page = null,
             err: ?anyerror = null,
             error_detail: ?Client.ErrorDetail = null,
+            /// The page's own evidence slot, because pages fetch concurrently.
+            leaf: ?diagnostics.Leaf = null,
 
             fn deinit(self: *Slot, a: Allocator) void {
                 self.arena.deinit();
@@ -1879,7 +1899,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             }
 
             fn fetch(bb: Client, slot: *Slot, index: usize) usize {
-                var scoped = bb;
+                var scoped = bb.withDiagnostics(bb.diagnostic.withLeaf(&slot.leaf));
                 scoped.diagnostic.context.page = slot.page_number;
                 if (bb.error_detail) |detail| {
                     slot.error_detail = .{ .allocator = std.heap.page_allocator, .io = detail.io };
@@ -1903,16 +1923,22 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                     },
                 });
                 try classify(response.status);
-                return std.json.parseFromSliceLeaky(Page, a, response.body, .{ .ignore_unknown_fields = true }) catch |err| {
-                    _ = bb.diagnostic.failure(.decode, .{ .zig = err }, @src());
-                    return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
-                };
+                return parseResponseLeaky(Page, bb.diagnostic, a, response.body);
             }
         };
 
+        /// The caller sees one failure at most, so each other failed page has its record here.
+        /// This runs on every exit, also when the coordinator fails before `finish`.
         fn deinit(self: *Self) void {
             for (self.lists) |*list| {
-                for (list.pages.items) |*page| self.release(page);
+                for (list.pages.items, 1..) |*page, number| {
+                    if (page.* == .failed) {
+                        var diagnostic = self.diagnostic.withLeaf(&page.failed.leaf);
+                        diagnostic.context.page = self.pageNumber(@intCast(number));
+                        _ = diagnostic.failure(.read, .{ .zig = page.failed.reason }, @src());
+                    }
+                    self.release(page);
+                }
                 list.pages.deinit(self.allocator);
                 if (list.link) |link| self.allocator.free(link);
                 list.followed.deinit(self.allocator);
@@ -1979,34 +2005,42 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
         }
 
         fn complete(self: *Self, slot: *Slot) !void {
+            defer slot.err = null;
             const state = &self.lists[slot.position.list].pages.items[slot.position.number - 1];
-            const items = self.accept(slot) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                state.* = .{ .failed = .{ .reason = err, .detail = slot.error_detail } };
-                slot.error_detail = null;
-                return;
+            const items = self.accept(slot) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    self.diagnostic.adopt(&slot.leaf);
+                    return err;
+                },
+                else => {
+                    state.* = .{ .failed = .{ .reason = err, .detail = slot.error_detail, .leaf = slot.leaf orelse .{ .err = err, .page = slot.page_number } } };
+                    slot.error_detail = null;
+                    return;
+                },
             };
             state.* = .{ .done = items };
         }
 
-        fn accept(self: *Self, slot: *const Slot) ![]Item {
+        /// A failure notes its evidence in the page's own slot.
+        fn accept(self: *Self, slot: *Slot) ![]Item {
             if (slot.err) |err| return err;
-            var diagnostic = self.diagnostic;
-            diagnostic.context.page = slot.page_number;
-            errdefer |err| _ = diagnostic.failure(.decode, .{ .zig = err }, @src());
             const page = slot.page.?;
             const list = &self.lists[slot.position.list];
             const number = slot.position.number;
             const page_number = self.pageNumber(number);
-            if (page.page orelse page_number != page_number) return error.MalformedResponse;
+            var diagnostic = self.diagnostic.withLeaf(&slot.leaf);
+            diagnostic.context.page = page_number;
+            if (page.page orelse page_number != page_number) return noted(diagnostic, error.MalformedResponse, .validate, null);
             if (number == 1) {
                 list.pagelen = page.pagelen orelse self.options.pagelen;
-                if (list.pagelen == 0 or list.pagelen > self.options.pagelen) return error.MalformedResponse;
+                if (list.pagelen == 0 or list.pagelen > self.options.pagelen) return noted(diagnostic, error.MalformedResponse, .validate, null);
                 if (page.next) |next| if (page.size) |size| if (numberedNext(next, list.first, page_number + 1)) {
-                    const total = std.math.cast(u32, std.math.divCeil(usize, size, list.pagelen) catch unreachable) orelse return error.MalformedResponse;
+                    const total = std.math.cast(u32, std.math.divCeil(usize, size, list.pagelen) catch |err| switch (err) {
+                        error.DivisionByZero => unreachable,
+                    }) orelse return noted(diagnostic, error.MalformedResponse, .validate, null);
                     list.known = @max(1, total -| (self.options.first_page - 1));
                 };
-            } else if (page.pagelen orelse list.pagelen != list.pagelen) return error.MalformedResponse;
+            } else if (page.pagelen orelse list.pagelen != list.pagelen) return noted(diagnostic, error.MalformedResponse, .validate, null);
             const items = try self.allocator.alloc(Item, page.values.len);
             var decoded: usize = 0;
             errdefer {
@@ -2014,14 +2048,14 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
                 self.allocator.free(items);
             }
             for (page.values, items) |value, *item| {
-                item.* = try decode(self.allocator, value);
+                item.* = try decodeItem(decode, diagnostic, .{ self.allocator, value });
                 decoded += 1;
             }
             if (page.next) |next| {
                 if (number < list.known) {
-                    if (!numberedNext(next, list.first, page_number + 1)) return error.MalformedResponse;
+                    if (!numberedNext(next, list.first, page_number + 1)) return noted(diagnostic, error.MalformedResponse, .validate, null);
                 } else {
-                    try list.followed.follow(self.allocator, slot.url, next);
+                    try list.followed.follow(diagnostic, self.allocator, slot.url, next);
                     list.link = try self.allocator.dupe(u8, next);
                     list.known = number + 1;
                 }
@@ -2059,14 +2093,17 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             return null;
         }
 
-        /// Moves the merged items to the caller, or returns the lowest needed failure.
+        /// Moves the merged items to the caller, or moves the lowest needed failure to the caller.
         fn finish(self: *Self, error_detail: ?*Client.ErrorDetail) ![]Item {
             const merged = self.prefix();
             if (merged.end != null) {
-                const position = self.firstFailure() orelse return error.MalformedResponse;
-                const failed = &self.lists[position.list].pages.items[position.number - 1].failed;
-                if (error_detail) |destination| destination.copyFrom(if (failed.detail) |*source| source else null);
-                return failed.reason;
+                const position = self.firstFailure() orelse return noted(self.diagnostic, error.MalformedResponse, .validate, null);
+                const page = &self.lists[position.list].pages.items[position.number - 1];
+                const reason = page.failed.reason;
+                if (error_detail) |destination| destination.copyFrom(if (page.failed.detail) |*source| source else null);
+                self.diagnostic.adopt(&page.failed.leaf);
+                self.release(page);
+                return reason;
             }
             const count = @min(merged.items, self.options.limit orelse merged.items);
             const out = try self.allocator.alloc(Item, count);
@@ -2093,14 +2130,16 @@ fn numberedNext(next: []const u8, first: []const u8, expected: u32) bool {
     if (!std.mem.startsWith(u8, next, path) or next.len <= path.len or next[path.len] != '?') return false;
     var query = std.mem.splitScalar(u8, next[path.len + 1 ..], '&');
     while (query.next()) |pair| {
-        if (std.mem.startsWith(u8, pair, "page=")) return (std.fmt.parseInt(u32, pair["page=".len..], 10) catch return false) == expected;
+        if (std.mem.startsWith(u8, pair, "page=")) return (std.fmt.parseInt(u32, pair["page=".len..], 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return false,
+        }) == expected;
     }
     return false;
 }
 
-fn dupeWorkspaceMember(allocator: Allocator, entry: WorkspaceMemberEntry) !types.WorkspaceMember {
+fn dupeWorkspaceMember(diagnostic: diagnostics.Handle, allocator: Allocator, entry: WorkspaceMemberEntry) !types.WorkspaceMember {
     const user = entry.user;
-    if (user.uuid.len == 0) return error.MalformedResponse;
+    if (user.uuid.len == 0) return noted(diagnostic, error.MalformedResponse, .validate, null);
     const uuid = try allocator.dupe(u8, user.uuid);
     errdefer allocator.free(uuid);
     const name = try allocator.dupe(u8, user.display_name);
@@ -2249,15 +2288,13 @@ const BranchJson = struct {
     default_merge_strategy: []const u8 = "",
 };
 
-fn validateBranchName(name: []const u8) !void {
-    if (name.len == 0 or std.mem.startsWith(u8, name, "refs/heads/")) return error.BadRequest;
+fn validateBranchName(diagnostic: diagnostics.Handle, name: []const u8) !void {
+    if (name.len == 0 or std.mem.startsWith(u8, name, "refs/heads/")) return noted(diagnostic, error.BadRequest, .prepare, null);
 }
 
-fn parseBranch(allocator: Allocator, body: []const u8, diagnostic: diagnostics.Handle) !types.Branch {
-    const parsed = parseJson(diagnostic, @src(), BranchJson, allocator, body, .{ .ignore_unknown_fields = true }) catch |err|
-        return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+fn parseBranch(diagnostic: diagnostics.Handle, allocator: Allocator, body: []const u8) !types.Branch {
+    const parsed = try parseResponse(BranchJson, diagnostic, allocator, body);
     defer parsed.deinit();
-    errdefer |err| _ = diagnostic.failure(.decode, .{ .zig = err }, @src());
     return dupeBranch(allocator, parsed.value);
 }
 
@@ -2306,16 +2343,16 @@ const EffectiveDefaultReviewerJson = struct {
     user: DefaultReviewerJson,
 };
 
-fn dupeDefaultReviewer(allocator: Allocator, wire: DefaultReviewerJson) !types.DefaultReviewer {
-    return dupeReviewerAccount(allocator, wire, .repository);
+fn dupeDefaultReviewer(diagnostic: diagnostics.Handle, allocator: Allocator, wire: DefaultReviewerJson) !types.DefaultReviewer {
+    return dupeReviewerAccount(diagnostic, allocator, wire, .repository);
 }
 
-fn dupeEffectiveDefaultReviewer(allocator: Allocator, wire: EffectiveDefaultReviewerJson) !types.DefaultReviewer {
-    return dupeReviewerAccount(allocator, wire.user, wire.reviewer_type);
+fn dupeEffectiveDefaultReviewer(diagnostic: diagnostics.Handle, allocator: Allocator, wire: EffectiveDefaultReviewerJson) !types.DefaultReviewer {
+    return dupeReviewerAccount(diagnostic, allocator, wire.user, wire.reviewer_type);
 }
 
-fn dupeReviewerAccount(allocator: Allocator, account: DefaultReviewerJson, reviewer_type: types.DefaultReviewerType) !types.DefaultReviewer {
-    if (account.uuid.len == 0) return error.MalformedResponse;
+fn dupeReviewerAccount(diagnostic: diagnostics.Handle, allocator: Allocator, account: DefaultReviewerJson, reviewer_type: types.DefaultReviewerType) !types.DefaultReviewer {
+    if (account.uuid.len == 0) return noted(diagnostic, error.MalformedResponse, .validate, null);
     const uuid = try allocator.dupe(u8, account.uuid);
     errdefer allocator.free(uuid);
     return .{ .uuid = uuid, .display_name = try allocator.dupe(u8, account.display_name), .reviewer_type = reviewer_type };
@@ -2385,10 +2422,10 @@ const TaskPage = struct {
     next: ?[]const u8 = null,
 };
 
-fn dupeTask(allocator: Allocator, tj: TaskJson) !types.Task {
+fn dupeTask(diagnostic: diagnostics.Handle, allocator: Allocator, tj: TaskJson) !types.Task {
     const raw = if (tj.content) |c| (c.raw orelse "") else "";
     const creator = if (tj.creator) |c| (c.uuid orelse "") else "";
-    const state: types.TaskState = if (std.mem.eql(u8, tj.state, "RESOLVED")) .resolved else if (std.mem.eql(u8, tj.state, "UNRESOLVED")) .unresolved else return error.MalformedResponse;
+    const state: types.TaskState = if (std.mem.eql(u8, tj.state, "RESOLVED")) .resolved else if (std.mem.eql(u8, tj.state, "UNRESOLVED")) .unresolved else return noted(diagnostic, error.MalformedResponse, .validate, null);
     const content = try allocator.dupe(u8, raw);
     errdefer allocator.free(content);
     return .{
@@ -2428,7 +2465,7 @@ pub fn deinitFileMeta(allocator: Allocator, m: Client.FileMeta) void {
 
 /// Map HTTP status to an `ApiError`; return normally on 2xx.
 fn classify(status: u16) ApiError!void {
-    return switch (status) {
+    const result: ApiError!void = switch (status) {
         200...299 => {},
         400 => error.BadRequest,
         401 => error.Unauthorized,
@@ -2439,19 +2476,34 @@ fn classify(status: u16) ApiError!void {
         500...599 => error.ServerError,
         else => error.UnexpectedStatus,
     };
+    return result;
 }
 
-fn asApiError(err: anyerror) ?ApiError {
+fn httpClass(reason: ApiError) diagnostics.HttpClass {
+    return switch (reason) {
+        error.Unauthorized => .authentication,
+        error.Forbidden => .authorization,
+        error.RateLimited => .rate_limit,
+        error.ServerError => .server,
+        error.NotFound => .not_found,
+        error.BadRequest => .validation,
+        error.Conflict => .conflict,
+        error.UnexpectedStatus, error.MalformedResponse => .other,
+    };
+}
+
+pub fn asApiError(err: anyerror) ?ApiError {
     return switch (err) {
-        error.Unauthorized => error.Unauthorized,
-        error.Forbidden => error.Forbidden,
-        error.BadRequest => error.BadRequest,
-        error.NotFound => error.NotFound,
-        error.RateLimited => error.RateLimited,
-        error.Conflict => error.Conflict,
-        error.ServerError => error.ServerError,
-        error.UnexpectedStatus => error.UnexpectedStatus,
-        error.MalformedResponse => error.MalformedResponse,
+        error.Unauthorized,
+        error.Forbidden,
+        error.BadRequest,
+        error.NotFound,
+        error.RateLimited,
+        error.Conflict,
+        error.ServerError,
+        error.UnexpectedStatus,
+        error.MalformedResponse,
+        => @errorCast(err),
         else => null,
     };
 }
@@ -2695,19 +2747,16 @@ const PrEndpointJson = struct {
     repository: ?struct { full_name: []const u8 = "" } = null,
 };
 
-fn parsePullRequest(allocator: Allocator, body: []const u8, comptime full_read: bool, diagnostic: diagnostics.Handle) !PullRequest {
-    const parsed = parseJson(diagnostic, @src(), PrJson, allocator, body, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+fn parsePullRequest(diagnostic: diagnostics.Handle, allocator: Allocator, body: []const u8, comptime full_read: bool) !PullRequest {
+    const parsed = try parseResponse(PrJson, diagnostic, allocator, body);
     defer parsed.deinit();
     const v = parsed.value;
-    errdefer |err| _ = diagnostic.failure(.decode, .{ .zig = err }, @src());
     // Preserve the full-read contract used by SourceCommit and Reviewer Verdict
     // guards. An explicit empty author UUID remains valid evidence.
     if (full_read) {
-        const author = v.author orelse return error.MalformedResponse;
+        const author = v.author orelse return noted(diagnostic, error.MalformedResponse, .validate, null);
         if (author.display_name == null or author.uuid == null or v.source.commit == null or
-            v.destination.commit == null or v.participants == null) return error.MalformedResponse;
+            v.destination.commit == null or v.participants == null) return noted(diagnostic, error.MalformedResponse, .validate, null);
     }
 
     var verdicts: std.ArrayList(types.ReviewerVerdictEntry) = .empty;
@@ -2718,11 +2767,11 @@ fn parsePullRequest(allocator: Allocator, body: []const u8, comptime full_read: 
     for (v.participants orelse &.{}) |participant| {
         const verdict: types.ReviewerVerdict = if (participant.approved) blk: {
             if (participant.state) |state| {
-                if (!std.mem.eql(u8, state, "approved")) return error.MalformedResponse;
+                if (!std.mem.eql(u8, state, "approved")) return noted(diagnostic, error.MalformedResponse, .validate, null);
             }
             break :blk .approved;
         } else if (participant.state) |state| blk: {
-            if (!std.mem.eql(u8, state, "changes_requested")) return error.MalformedResponse;
+            if (!std.mem.eql(u8, state, "changes_requested")) return noted(diagnostic, error.MalformedResponse, .validate, null);
             break :blk .changes_requested;
         } else .no_verdict;
         const account_uuid = try allocator.dupe(u8, participant.user.uuid);
@@ -2818,7 +2867,7 @@ const CommentsPage = struct {
 
 /// Copy one wire comment into a domain `Comment` owned by `allocator`. `head`
 /// is the PR's current revision, used to detect outdated inline comments.
-fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Comment {
+fn dupeComment(diagnostic: diagnostics.Handle, allocator: Allocator, cj: CommentJson, head: HeadCommits) !Comment {
     const author = if (cj.user) |u| (u.display_name orelse "") else "";
     const raw = if (cj.content) |c| (c.raw orelse "") else "";
 
@@ -2853,7 +2902,7 @@ fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Commen
                 };
                 scope = .{ .@"inline" = anchor.? };
             } else if (inl.start_from != null or inl.start_to != null) {
-                return error.MalformedResponse;
+                return noted(diagnostic, error.MalformedResponse, .validate, null);
             } else {
                 scope = .{ .file = .{
                     .path = path,
@@ -2999,7 +3048,7 @@ fn testCredential() Credential {
     return .{ .username = "u", .token = "t", .workspace = "check24" };
 }
 
-test "diagnostics Bitbucket keeps typed rejection original JSON and wire causes with context" {
+test "diagnostics Bitbucket leaves a rejection and a decode failure to the boundary" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
@@ -3013,9 +3062,12 @@ test "diagnostics Bitbucket keeps typed rejection original JSON and wire causes 
     var fake: FakeHttpClient = .{ .status = 429, .body = "private-server-body", .retry_after_ms = 1234 };
     const bb = Client.init(fake.httpClient(), .{ .username = "private-user", .token = "private-token", .workspace = "private-workspace" })
         .withDiagnostics(sink.handle(.submission, .{ .command_id = 71, .work_id = 72, .session_epoch = 3, .attempt = 2 }));
+    // The rejection reaches the caller as a value, and the caller that drops or shows it records it.
     const result = try bb.createCommentAttempt(testing.allocator, "private-repository", 7, .{ .body = "private-authored-body" });
     try testing.expectEqual(error.RateLimited, result.rejected.reason);
     try testing.expectEqual(@as(?u64, 1234), result.rejected.retry_after_ms);
+    try testing.expectError(error.RateLimited, bb.getPullRequest(testing.allocator, "private-repository", 7));
+    try testing.expectError(error.RateLimited, bb.listBranches(testing.io, testing.allocator, "private-repository", .{ .page = 4 }, 1));
     fake.status = 200;
     fake.body = "{";
     try testing.expectError(error.MalformedResponse, bb.getPullRequest(testing.allocator, "private-repository", 7));
@@ -3023,19 +3075,123 @@ test "diagnostics Bitbucket keeps typed rejection original JSON and wire causes 
     try testing.expectError(error.MalformedResponse, bb.getPullRequest(testing.allocator, "private-repository", 7));
     fake.body = "{";
     try testing.expectError(error.MalformedResponse, bb.listBranches(testing.io, testing.allocator, "private-repository", .{ .page = 4 }, 1));
-    try testing.expectEqual(@as(usize, 4), fake.call_count);
-    try testing.expectEqual(@as(u64, 4), sink.sequence);
+    try testing.expectEqual(@as(usize, 6), fake.call_count);
+    try testing.expectEqual(@as(u64, 0), sink.sequence);
+}
+
+/// The records that `sink` wrote, after the header line. The caller frees the bytes.
+fn sinkRecords(tmp: anytype, sink: *diagnostics.Sink) ![]u8 {
     _ = sink.setEnabled(false);
     var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
     defer dir.close(testing.io);
     var iterator = dir.iterate();
     const entry = (try iterator.next(testing.io)).?;
     const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    errdefer testing.allocator.free(bytes);
+    const start = (std.mem.indexOfScalar(u8, bytes, '\n') orelse return error.TestUnexpectedResult) + 1;
+    std.mem.copyForwards(u8, bytes, bytes[start..]);
+    return testing.allocator.realloc(bytes, bytes.len - start);
+}
+
+test "diagnostics PullRequest link indexing and a JSON allocation failure replace stale evidence" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    var fake: FakeHttpClient = .{ .status = 202, .body = "{\"values\":[]}" };
+    var leaf: ?diagnostics.Leaf = null;
+    const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+    const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+    boundary.note(.{ .err = error.PullRequestLinksIndexing, .phase = .connect });
+    try testing.expectError(error.PullRequestLinksIndexing, bb.listCommitPullRequests(testing.allocator, "myrepo", "abc123", .{ .follow = false }));
+    _ = boundary.failure(.execute, .{ .zig = error.PullRequestLinksIndexing }, @src());
+    boundary.note(.{ .err = error.OutOfMemory, .phase = .connect });
+    try testing.expectEqual(@as(error{ OutOfMemory, MalformedResponse }, error.OutOfMemory), jsonFailure(boundary, error.OutOfMemory));
+    _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+    const bytes = try sinkRecords(tmp, &sink);
     defer testing.allocator.free(bytes);
-    for ([_][]const u8{ "operation=submission", "phase=rejection", "status=429 classification=rate_limit", "error=UnexpectedEndOfInput", "error=MalformedResponse", "page=4", "command_id=71", "work_id=72", "session_epoch=3", "attempt=2", "source=bitbucket/client.zig:" }) |needle|
-        try testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
-    try testing.expect(std.mem.indexOf(u8, bytes, "private-") == null);
-    try testing.expect(std.mem.indexOf(u8, bytes, "api.bitbucket.org") == null);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    const indexing = lines.next().?;
+    const allocation = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, indexing, "operation=api phase=rejection ") != null);
+    try testing.expect(std.mem.indexOf(u8, indexing, "cause=http status=202 ") != null);
+    try testing.expect(std.mem.indexOf(u8, allocation, "operation=api phase=decode ") != null);
+    try testing.expect(std.mem.endsWith(u8, allocation, "error=OutOfMemory"));
+}
+
+test "diagnostics a client failure without a request replaces the evidence of an earlier failure" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = "{" },
+        .{ .body = "{\"uuid\":\"\"}" },
+        .{ .status = 400, .body = "{}" },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    var leaf: ?diagnostics.Leaf = null;
+    const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+    const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+    // Each first failure is an outcome to its caller, so it has no record.
+    try testing.expectError(error.MalformedResponse, bb.getUser(testing.allocator, "{account}"));
+    try testing.expectError(error.MalformedResponse, bb.getUser(testing.allocator, "{account}"));
+    _ = boundary.failure(.execute, .{ .zig = error.MalformedResponse }, @src());
+    try testing.expectError(error.BadRequest, bb.getUser(testing.allocator, "{account}"));
+    try testing.expectError(error.BadRequest, bb.getUser(testing.allocator, ""));
+    _ = boundary.failure(.execute, .{ .zig = error.BadRequest }, @src());
+    const bytes = try sinkRecords(tmp, &sink);
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    const structural = lines.next().?;
+    const input = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.indexOf(u8, structural, "operation=api phase=validate ") != null);
+    try testing.expect(std.mem.endsWith(u8, structural, "cause=zig error=MalformedResponse"));
+    try testing.expect(std.mem.indexOf(u8, input, "operation=api phase=prepare ") != null);
+    try testing.expect(std.mem.endsWith(u8, input, "cause=zig error=BadRequest"));
+}
+
+test "diagnostics an item decode failure on a sequential list page names its page" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[{\"id\":1,\"state\":\"RESOLVED\"}],\"next\":\"https://api.bitbucket.org/2.0/tasks?page=2\"}" },
+        .{ .body = "{\"values\":[{\"id\":2,\"state\":\"ABANDONED\"}]}" },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    var leaf: ?diagnostics.Leaf = null;
+    const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+    const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+    try testing.expectError(error.MalformedResponse, bb.listTasks(testing.allocator, "repo", 7, .{}));
+    _ = boundary.failure(.execute, .{ .zig = error.MalformedResponse }, @src());
+    const bytes = try sinkRecords(tmp, &sink);
+    defer testing.allocator.free(bytes);
+    const only = std.mem.trimEnd(u8, bytes, "\n");
+    try testing.expect(std.mem.indexOfScalar(u8, only, '\n') == null);
+    try testing.expect(std.mem.indexOf(u8, only, "operation=api phase=validate ") != null);
+    try testing.expect(std.mem.endsWith(u8, only, " page=2 cause=zig error=MalformedResponse"));
 }
 
 const lifecycle_branch =
@@ -3354,6 +3510,167 @@ test "getPullRequest translates PullRequest Author and Reviewer Verdicts" {
     try testing.expectEqual(types.ReviewerVerdict.no_verdict, pr.reviewerVerdict("{missing}"));
 }
 
+test "diagnostics a Reviewer Verdict change records each cause that its result drops" {
+    const Canned = @import("../http/fake_client.zig").Canned;
+    const before =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [] }
+    ;
+    const after =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [ { "user": { "uuid": "{me}" }, "approved": true, "state": "approved" } ] }
+    ;
+    const reset: Canned = .{ .send_error = error.ConnectionResetByPeer };
+    const cases = [_]struct {
+        responses: []const Canned,
+        result: types.ReviewerVerdictChangeResult,
+        records: []const []const u8,
+    }{
+        // The result names the read failure, so the mutation failure has its record here with
+        // the mutation's own evidence.
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, reset, reset },
+            .result = .{ .unresolved = error.ConnectionResetByPeer },
+            .records = &.{ "phase=prepare source=bitbucket/client.zig:", "cause=zig error=ConnectionResetByPeer" },
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, reset, .{ .status = 200, .body = before } },
+            .result = .{ .unresolved = error.ConnectionResetByPeer },
+            .records = &.{},
+        },
+        // The caller records a reason that the result names.
+        .{ .responses = &.{.{ .status = 401, .body = "{}" }}, .result = .{ .api_error = error.Unauthorized }, .records = &.{} },
+        .{ .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 403, .body = "{}" } }, .result = .{ .api_error = error.Forbidden }, .records = &.{} },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 200, .body = before } },
+            .result = .{ .unresolved = error.ServerError },
+            .records = &.{},
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 200, .body = after } },
+            .result = .reconciled_success,
+            .records = &.{ "phase=rejection source=bitbucket/client.zig:", "cause=http status=503 classification=server" },
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 429, .body = "{}" }, .{ .status = 401, .body = "{}" } },
+            .result = .{ .unresolved = error.Unauthorized },
+            .records = &.{ "phase=rejection source=bitbucket/client.zig:", "cause=http status=429 classification=rate_limit" },
+        },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        var fake: FakeHttpClient = .{ .responses = case.responses };
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(sink.handle(.verdict, .{}));
+        const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+        try testing.expectEqualDeep(case.result, result);
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        var index: usize = 0;
+        while (lines.next()) |line| : (index += 2) {
+            try testing.expect(index + 1 < case.records.len);
+            try testing.expect(std.mem.indexOf(u8, line, case.records[index]) != null);
+            try testing.expect(std.mem.endsWith(u8, line, case.records[index + 1]));
+        }
+        try testing.expectEqual(case.records.len, index);
+    }
+}
+
+test "diagnostics each Reviewer Verdict request keeps its own status in the record of its error" {
+    const Canned = @import("../http/fake_client.zig").Canned;
+    const before =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [] }
+    ;
+    const cases = [_]struct {
+        responses: []const Canned,
+        result: types.ReviewerVerdictChangeResult,
+        /// The end of each record, in record order.
+        records: []const []const u8,
+    }{
+        // The mutation and the reconciliation fail with the same error name and keep their own status.
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 502, .body = "{}" } },
+            .result = .{ .unresolved = error.ServerError },
+            .records = &.{ "cause=http status=503 classification=server", "cause=http status=502 classification=server" },
+        },
+        // The result names the mutation's error, so the boundary record holds the mutation's status.
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 503, .body = "{}" }, .{ .status = 200, .body = before } },
+            .result = .{ .unresolved = error.ServerError },
+            .records = &.{"cause=http status=503 classification=server"},
+        },
+        .{
+            .responses = &.{ .{ .status = 200, .body = before }, .{ .status = 403, .body = "{}" } },
+            .result = .{ .api_error = error.Forbidden },
+            .records = &.{"cause=http status=403 classification=authorization"},
+        },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        var fake: FakeHttpClient = .{ .responses = case.responses };
+        var leaf: ?diagnostics.Leaf = null;
+        const boundary = sink.handle(.verdict, .{}).withLeaf(&leaf);
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+        const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+        try testing.expectEqualDeep(case.result, result);
+        const returned: anyerror = switch (result) {
+            .unresolved => |err| err.?,
+            .api_error => |err| err,
+            else => unreachable,
+        };
+        _ = boundary.failure(.execute, .{ .zig = returned }, @src());
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        for (case.records) |record| {
+            const line = lines.next().?;
+            try testing.expect(std.mem.indexOf(u8, line, "operation=verdict phase=rejection source=bitbucket/client.zig:") != null);
+            try testing.expect(std.mem.endsWith(u8, line, record));
+        }
+        try testing.expect(lines.next() == null);
+    }
+}
+
 test "changeReviewerVerdict POSTs Approved after a fresh SourceCommit check" {
     const before =
         \\{ "id": 42, "title": "Review", "state": "OPEN",
@@ -3513,7 +3830,7 @@ test "changeReviewerVerdict reports unresolved reconciliation and malformed resp
     var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), testCredential());
     const unresolved = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
-    try testing.expect(unresolved.unresolved == null);
+    try testing.expectEqual(error.ConnectionResetByPeer, unresolved.unresolved.?);
 
     var malformed: FakeHttpClient = .{ .status = 200, .body = "not-json" };
     const malformed_bb = Client.init(malformed.httpClient(), testCredential());
@@ -3561,7 +3878,7 @@ test "changeReviewerVerdict reconciles response allocation failure once" {
     var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), testCredential());
     const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
-    try testing.expect(result.unresolved == null);
+    try testing.expectEqual(error.OutOfMemory, result.unresolved.?);
     try testing.expectEqual(@as(usize, 3), fake.call_count);
 }
 
@@ -3891,6 +4208,47 @@ test "checkFileBlob accepts nonempty equivalent commit prefixes and preserves va
     }
 }
 
+test "diagnostics blob validation replaces stale evidence with its own phase and cause" {
+    const cases = [_]struct { body: []const u8, err: anyerror }{
+        .{ .body = "{\"type\":\"directory\",\"path\":\"a\",\"commit\":{\"hash\":\"abc\"},\"size\":1,\"attributes\":[]}", .err = error.BlobTypeMismatch },
+        .{ .body = "{\"type\":\"commit_file\",\"path\":\"b\",\"commit\":{\"hash\":\"abc\"},\"size\":1,\"attributes\":[]}", .err = error.BlobPathMismatch },
+        .{ .body = "{\"type\":\"commit_file\",\"path\":\"a\",\"commit\":{\"hash\":\"def\"},\"size\":1,\"attributes\":[]}", .err = error.BlobCommitMismatch },
+        .{ .body = "{\"type\":\"commit_file\",\"path\":\"a\",\"commit\":{\"hash\":\"abc\"},\"size\":1,\"attributes\":[\"executable\"]}", .err = error.BlobAttributesMismatch },
+        .{ .body = "{\"type\":\"commit_file\",\"path\":\"a\",\"commit\":{\"hash\":\"abc\"},\"size\":2,\"attributes\":[]}", .err = error.BlobSizeMismatch },
+    };
+    for (cases) |case| {
+        const responses = [_]httpc_fixture.Canned{ .{ .body = case.body }, .{ .body = "x" } };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        var leaf: ?diagnostics.Leaf = null;
+        const boundary = (diagnostics.Handle{}).withLeaf(&leaf);
+        boundary.note(.{ .err = case.err, .phase = .rejection, .cause = .{ .http = .{ .status = 503, .classification = .server } } });
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+        try testing.expectError(case.err, bb.checkFileBlob(testing.allocator, "repo", "abc", "a", &.{}));
+        const failure = boundary.failure(.execute, .{ .zig = case.err }, @src());
+        try testing.expectEqual(diagnostics.Phase.validate, failure.phase);
+        try testing.expectEqual(case.err, failure.cause.zig);
+        if (case.err == error.BlobTypeMismatch) {
+            var metadata_fake: FakeHttpClient = .{ .body = case.body };
+            const metadata_bb = Client.init(metadata_fake.httpClient(), testCredential()).withDiagnostics(boundary);
+            boundary.note(.{ .err = case.err, .phase = .rejection });
+            try testing.expectError(case.err, metadata_bb.getFileMeta(testing.allocator, "repo", "abc", "a"));
+            const metadata_failure = boundary.failure(.execute, .{ .zig = case.err }, @src());
+            try testing.expectEqual(diagnostics.Phase.validate, metadata_failure.phase);
+            try testing.expectEqual(case.err, metadata_failure.cause.zig);
+        }
+    }
+    var fake: FakeHttpClient = .{};
+    var leaf: ?diagnostics.Leaf = null;
+    const boundary = (diagnostics.Handle{}).withLeaf(&leaf);
+    boundary.note(.{ .err = error.InvalidPath, .phase = .rejection });
+    const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+    try testing.expectError(error.InvalidPath, bb.getFileBlob(testing.allocator, "repo", "abc", "../a"));
+    const failure = boundary.failure(.execute, .{ .zig = error.InvalidPath }, @src());
+    try testing.expectEqual(diagnostics.Phase.prepare, failure.phase);
+    try testing.expectEqual(error.InvalidPath, failure.cause.zig);
+    try testing.expectEqual(@as(usize, 0), fake.call_count);
+}
+
 test "getFileBlob accepts empty bytes as a successful response" {
     var fake: FakeHttpClient = .{ .status = 200, .body = "" };
     const bb = Client.init(fake.httpClient(), testCredential());
@@ -4051,6 +4409,24 @@ test "getUser resolves account IDs and UUIDs without Workspace membership" {
     try testing.expectEqualStrings("", user.account_id);
     try testing.expectEqualStrings("", user.display_name);
     try testing.expectEqualStrings("", user.nickname);
+}
+
+test "an account lookup that cannot allocate reports out of memory" {
+    const body = "{\"uuid\":\"{account}\"}";
+    var index: usize = 0;
+    var saw_failure = false;
+    while (index < 32) : (index += 1) {
+        var fake: FakeHttpClient = .{ .body = body };
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = index });
+        const bb = Client.init(fake.httpClient(), testCredential());
+        if (bb.getAuthenticatedAccountUuid(failing.allocator())) |uuid| {
+            failing.allocator().free(uuid);
+        } else |err| {
+            saw_failure = true;
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    try testing.expect(saw_failure);
 }
 
 test "getUser rejects empty IDs and malformed profiles and classifies API failures" {
@@ -5059,6 +5435,108 @@ test "Repository PullRequests fail on a failed Repository request unless the lim
     }
 }
 
+test "diagnostics a failed page that the result does not need has one record" {
+    for ([_]usize{ 1, 3 }) |concurrency| {
+        for ([_]?usize{ null, 3 }) |limit| {
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+            defer testing.allocator.free(home);
+            var env = std.process.Environ.Map.init(testing.allocator);
+            defer env.deinit();
+            try env.put("XDG_STATE_HOME", home);
+            var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+            defer sink.deinit();
+            try testing.expect(sink.setEnabled(true) == .on);
+            const responses = repositoryResponses(.{ .status = 429, .body = "{}" }, null);
+            var fake: FakeHttpClient = .{ .responses = &responses };
+            var leaf: ?diagnostics.Leaf = null;
+            const boundary = sink.handle(.picker_list, .{}).withLeaf(&leaf);
+            const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+            var done: std.atomic.Value(bool) = .init(false);
+            const result = listRepositoryPullRequestsForTest(bb, .{ .reviewer = "{reviewer}" }, limit, concurrency, &done);
+            var source: []const u8 = "operation=picker_list phase=rejection source=bitbucket/client.zig:";
+            if (limit == null) {
+                // The caller receives the failure, so its boundary records it.
+                try testing.expectError(error.RateLimited, result);
+                try testing.expectEqual(@as(u64, 0), sink.sequence);
+                _ = boundary.failure(.execute, .{ .zig = error.RateLimited }, @src());
+                source = "operation=picker_list phase=rejection source=bitbucket/client.zig:";
+            } else {
+                const items = try result;
+                defer deinitSummaries(testing.allocator, items);
+                try testing.expectEqual(@as(usize, 3), items.len);
+            }
+            _ = sink.setEnabled(false);
+            var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+            defer dir.close(testing.io);
+            var iterator = dir.iterate();
+            const entry = (try iterator.next(testing.io)).?;
+            const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+            defer testing.allocator.free(bytes);
+            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+            _ = lines.next();
+            const only = lines.next().?;
+            try testing.expect(lines.next() == null);
+            try testing.expect(std.mem.indexOf(u8, only, source) != null);
+            try testing.expect(std.mem.endsWith(u8, only, " page=1 cause=http status=429 classification=rate_limit"));
+        }
+    }
+}
+
+test "diagnostics a failed page keeps its record when the coordinator fails before the result" {
+    var exits_early = false;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        try testing.expect(fail_index < 1000);
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        const responses = repositoryResponses(.{ .status = 429, .body = "{}" }, null);
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(sink.handle(.picker_list, .{}));
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const result = bb.listWorkspacePullRequests(testing.io, failing.allocator(), .{
+            .scope = .{ .repositories = .{ .slugs = &.{ "gamma", "alpha", "beta" }, .party = .{ .reviewer = "{reviewer}" } } },
+            .states = .initMany(&.{.OPEN}),
+        }, .{ .limit = 3, .concurrency = 1 });
+        const beta_failed = for (0..fake.call_count) |index| {
+            if (std.mem.indexOf(u8, fake.urlAt(index).?, "/beta/") != null) break true;
+        } else false;
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        var records: usize = 0;
+        while (lines.next()) |line| : (records += 1) {
+            try testing.expect(std.mem.indexOf(u8, line, " phase=rejection ") != null);
+            try testing.expect(std.mem.endsWith(u8, line, " page=1 cause=http status=429 classification=rate_limit"));
+        }
+        // The caller receives OutOfMemory, so its boundary records that. The failed page is not in the result.
+        try testing.expectEqual(@as(usize, @intFromBool(beta_failed)), records);
+        const items = result catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            if (beta_failed) exits_early = true;
+            continue;
+        };
+        deinitSummaries(testing.allocator, items);
+        break;
+    }
+    try testing.expect(exits_early);
+}
+
 const author_endpoint = base_url ++ "/workspaces/check24/pullrequests/%7Bauthor%7D";
 
 /// One body for each page of a list with two PullRequests a page. Page N holds the ids 2N-1 and 2N.
@@ -5244,22 +5722,98 @@ test "a list that ends early ignores a failed page past its end in any completio
     for (items, 1..) |item, id| try testing.expectEqual(@as(u64, id), item.id);
 }
 
-test "a failed PullRequest page fails the list and reports its detail" {
+test "diagnostics a failed PullRequest page fails the list and its one record names the page" {
     for ([_]usize{ 1, 3 }) |concurrency| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const responses = try pullRequestPages(arena.allocator(), author_endpoint, 4, true);
-        responses[2].status = 500;
-        responses[2].body = "{\"error\":{\"message\":\"Page 3 failed\"}}";
+        // The fixture holds page 1, then the pages from the last down.
+        responses[3].status = 500;
+        responses[3].body = "{\"error\":{\"message\":\"Page 2 failed\"}}";
+        responses[2].status = 503;
+        responses[2].body = "{}";
         var fake: FakeHttpClient = .{ .responses = responses };
         var detail: Client.ErrorDetail = .{ .allocator = testing.allocator, .io = testing.io };
         defer detail.deinit();
-        var bb = Client.init(fake.httpClient(), testCredential());
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        var leaf: ?diagnostics.Leaf = null;
+        const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+        var bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
         bb.error_detail = &detail;
         var done: std.atomic.Value(bool) = .init(false);
         try testing.expectError(error.ServerError, listPagedPullRequestsForTest(bb, author_scope, null, concurrency, &done));
-        try testing.expectEqualStrings("Page 3 failed", detail.message.?);
+        try testing.expectEqualStrings("Page 2 failed", detail.message.?);
         try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+        _ = boundary.failure(.execute, .{ .zig = error.ServerError }, @src());
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        // With one active request, page 3 never starts. Otherwise its failure has its own record.
+        if (concurrency > 1) {
+            const unneeded = lines.next().?;
+            try testing.expect(std.mem.indexOf(u8, unneeded, "operation=api phase=rejection source=bitbucket/client.zig:") != null);
+            try testing.expect(std.mem.endsWith(u8, unneeded, " page=3 cause=http status=503 classification=server"));
+        }
+        const returned = lines.next().?;
+        try testing.expect(lines.next() == null);
+        try testing.expect(std.mem.indexOf(u8, returned, "operation=api phase=rejection source=bitbucket/client.zig:") != null);
+        try testing.expect(std.mem.endsWith(u8, returned, " page=2 cause=http status=500 classification=server"));
+    }
+}
+
+test "diagnostics a transport OutOfMemory on a PullRequest page keeps its phase and page in the one record" {
+    for ([_]usize{ 1, 3 }) |concurrency| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const responses = try pullRequestPages(arena.allocator(), author_endpoint, 4, true);
+        // The fixture holds page 1, then the pages from the last down.
+        responses[3].send_error = error.OutOfMemory;
+        responses[3].send_phase = .receive_head;
+        var fake: FakeHttpClient = .{ .responses = responses };
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        var leaf: ?diagnostics.Leaf = null;
+        const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+        const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+        var done: std.atomic.Value(bool) = .init(false);
+        try testing.expectError(error.OutOfMemory, listPagedPullRequestsForTest(bb, author_scope, null, concurrency, &done));
+        _ = boundary.failure(.execute, .{ .zig = error.OutOfMemory }, @src());
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next().?;
+        try testing.expect(lines.next() == null);
+        try testing.expect(std.mem.indexOf(u8, only, "operation=api phase=receive_head source=bitbucket/client.zig:") != null);
+        try testing.expect(std.mem.endsWith(u8, only, " page=2 cause=zig error=OutOfMemory"));
     }
 }
 
@@ -5456,6 +6010,38 @@ test "Default Reviewer lists reject an empty UUID and an unknown reviewer type" 
             var fake: FakeHttpClient = .{ .body = case.body };
             const bb = Client.init(fake.httpClient(), testCredential());
             try testing.expectError(error.MalformedResponse, bb.listDefaultReviewers(testing.io, testing.allocator, "repo", case.effective, .{ .follow = follow }, 2));
+        }
+    }
+}
+
+test "diagnostics a Default Reviewer with an empty UUID notes its validate phase and page in the one record" {
+    for ([_]struct { effective: bool, body: []const u8 }{
+        .{ .effective = false, .body = "{\"values\":[{\"uuid\":\"\",\"display_name\":\"Ada\"}]}" },
+        .{ .effective = true, .body = "{\"values\":[{\"reviewer_type\":\"repository\",\"user\":{\"uuid\":\"\",\"display_name\":\"Ada\"}}]}" },
+    }) |case| {
+        for ([_]bool{ true, false }) |follow| {
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+            defer testing.allocator.free(home);
+            var env = std.process.Environ.Map.init(testing.allocator);
+            defer env.deinit();
+            try env.put("XDG_STATE_HOME", home);
+            var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+            defer sink.deinit();
+            try testing.expect(sink.setEnabled(true) == .on);
+            var fake: FakeHttpClient = .{ .body = case.body };
+            var leaf: ?diagnostics.Leaf = null;
+            const boundary = sink.handle(.api, .{}).withLeaf(&leaf);
+            const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+            try testing.expectError(error.MalformedResponse, bb.listDefaultReviewers(testing.io, testing.allocator, "repo", case.effective, .{ .follow = follow }, 2));
+            _ = boundary.failure(.execute, .{ .zig = error.MalformedResponse }, @src());
+            const bytes = try sinkRecords(tmp, &sink);
+            defer testing.allocator.free(bytes);
+            const only = std.mem.trimEnd(u8, bytes, "\n");
+            try testing.expect(std.mem.indexOfScalar(u8, only, '\n') == null);
+            try testing.expect(std.mem.indexOf(u8, only, "operation=api phase=validate ") != null);
+            try testing.expect(std.mem.endsWith(u8, only, " page=1 cause=zig error=MalformedResponse"));
         }
     }
 }
@@ -5987,4 +6573,64 @@ test "partial responses request exactly the decoded PullRequest and Repository f
         partialFields(PrListPage),
     );
     try testing.expectEqualStrings("values.slug,values.full_name,values.name,values.uuid,values.is_private,next,page,pagelen,size", partialFields(RepositoryPage));
+}
+
+test "diagnostics coordinator allocation failures keep every joined page failure record" {
+    for ([_]usize{ 1, 3 }) |concurrency| {
+        var failed_with_requests = false;
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            try testing.expect(fail_index < 100);
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+            defer testing.allocator.free(home);
+            var env = std.process.Environ.Map.init(testing.allocator);
+            defer env.deinit();
+            try env.put("XDG_STATE_HOME", home);
+            var sink = diagnostics.Sink.init(testing.allocator, testing.io, &env);
+            defer sink.deinit();
+            try testing.expect(sink.setEnabled(true) == .on);
+            var leaf: ?diagnostics.Leaf = null;
+            const boundary = sink.handle(.picker_list, .{}).withLeaf(&leaf);
+            var fake: FakeHttpClient = .{ .status = 429, .body = "{}" };
+            const bb = Client.init(fake.httpClient(), testCredential()).withDiagnostics(boundary);
+            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            const items = bb.listWorkspacePullRequests(testing.io, failing.allocator(), .{
+                .scope = .{ .repositories = .{ .slugs = &.{ "gamma", "alpha", "beta" }, .party = .{ .reviewer = "{reviewer}" } } },
+            }, .{ .concurrency = concurrency }) catch |err| {
+                switch (err) {
+                    error.OutOfMemory => if (fake.call_count > 0) {
+                        failed_with_requests = true;
+                    },
+                    error.RateLimited => {},
+                    else => return err,
+                }
+                _ = boundary.failure(.execute, .{ .zig = err }, @src());
+                const bytes = try sinkRecords(tmp, &sink);
+                defer testing.allocator.free(bytes);
+                var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+                var page_records: usize = 0;
+                var coordinator_records: usize = 0;
+                while (lines.next()) |line| {
+                    if (std.mem.endsWith(u8, line, " cause=http status=429 classification=rate_limit")) {
+                        try testing.expect(std.mem.indexOf(u8, line, "operation=picker_list phase=rejection ") != null);
+                        try testing.expect(std.mem.indexOf(u8, line, " page=1 ") != null);
+                        page_records += 1;
+                    } else {
+                        try testing.expect(std.mem.endsWith(u8, line, " cause=zig error=OutOfMemory"));
+                        coordinator_records += 1;
+                    }
+                }
+                try testing.expectEqual(fake.call_count, page_records);
+                try testing.expectEqual(@as(usize, @intFromBool(err == error.OutOfMemory)), coordinator_records);
+                try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+                if (!failing.has_induced_failure) break;
+                continue;
+            };
+            defer deinitSummaries(failing.allocator(), items);
+            return error.TestUnexpectedResult;
+        }
+        if (concurrency > 1) try testing.expect(failed_with_requests);
+    }
 }

@@ -2,6 +2,8 @@
 //! Bitbucket adapter). The executable (`src/main.zig`) imports this and adds
 //! the TUI. Tests for every file run via the aggregating `test` block below.
 
+pub const cli_failure = @import("cli_failure.zig");
+
 pub const http = struct {
     pub const client = @import("http/client.zig");
     pub const HttpClient = client.HttpClient;
@@ -143,6 +145,7 @@ pub const bitbucket = struct {
     pub const Client = client_mod.Client;
     pub const NewComment = client_mod.NewComment;
     pub const Poster = @import("bitbucket/poster.zig").Poster;
+    pub const asApiError = client_mod.asApiError;
     pub const deinitPullRequest = client_mod.deinitPullRequest;
     pub const deinitComments = client_mod.deinitComments;
     pub const deinitSummaries = client_mod.deinitSummaries;

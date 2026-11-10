@@ -25,7 +25,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn run(writer: *std.Io.Writer, init: std.process.Init) !void {
-    errdefer writer.flush() catch {};
+    errdefer writer.flush() catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
 
     var arguments = init.minimal.args.iterate();
     _ = arguments.next();

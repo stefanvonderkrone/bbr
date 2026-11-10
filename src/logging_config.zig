@@ -16,7 +16,9 @@ pub fn parse(text: []const u8) Result {
         parser.space();
         if (parser.done() or parser.peek() == '#') continue;
         if (parser.peek() == '[') {
-            const section = parser.section() catch return .{ .invalid = line };
+            const section = parser.section() catch |err| switch (err) {
+                error.ExpectedClose, error.ExpectedSection => return .{ .invalid = line },
+            };
             parser.space();
             if (!parser.trailing()) return .{ .invalid = line };
             in_logging = std.mem.eql(u8, section, "logging");
@@ -31,7 +33,9 @@ pub fn parse(text: []const u8) Result {
             parser.space();
             if (!parser.take('=')) return .{ .invalid = line };
             parser.space();
-            const value = parser.boolean() catch return .{ .invalid = line };
+            const value = parser.boolean() catch |err| switch (err) {
+                error.ExpectedBoolean => return .{ .invalid = line },
+            };
             parser.space();
             if (!parser.trailing()) return .{ .invalid = line };
             enabled_value = std.mem.eql(u8, value, "true");

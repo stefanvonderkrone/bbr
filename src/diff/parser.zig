@@ -156,7 +156,9 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
                 (std.mem.startsWith(u8, line, "literal ") or std.mem.startsWith(u8, line, "delta ")))
             {
                 if (std.mem.startsWith(u8, line, "literal ")) {
-                    const size = std.fmt.parseInt(usize, line["literal ".len..], 10) catch null;
+                    const size = std.fmt.parseInt(usize, line["literal ".len..], 10) catch |err| switch (err) {
+                        error.InvalidCharacter, error.Overflow => null,
+                    };
                     if (binary_block_count == 0) binary_new_size = size;
                     if (binary_block_count == 1) binary_old_size = size;
                 }
@@ -372,12 +374,18 @@ const Range = struct { start: u32, count: u32 };
 fn parseRange(s: []const u8) ParseError!Range {
     if (std.mem.indexOfScalar(u8, s, ',')) |c| {
         return .{
-            .start = std.fmt.parseInt(u32, s[0..c], 10) catch return ParseError.MalformedHunkHeader,
-            .count = std.fmt.parseInt(u32, s[c + 1 ..], 10) catch return ParseError.MalformedHunkHeader,
+            .start = std.fmt.parseInt(u32, s[0..c], 10) catch |err| switch (err) {
+                error.InvalidCharacter, error.Overflow => return ParseError.MalformedHunkHeader,
+            },
+            .count = std.fmt.parseInt(u32, s[c + 1 ..], 10) catch |err| switch (err) {
+                error.InvalidCharacter, error.Overflow => return ParseError.MalformedHunkHeader,
+            },
         };
     }
     return .{
-        .start = std.fmt.parseInt(u32, s, 10) catch return ParseError.MalformedHunkHeader,
+        .start = std.fmt.parseInt(u32, s, 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return ParseError.MalformedHunkHeader,
+        },
         .count = 1,
     };
 }

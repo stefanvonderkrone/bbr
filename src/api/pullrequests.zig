@@ -647,9 +647,9 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
         .success, .reconciled_success => {},
         .api_error => |err| return err,
         .stale_source_commit => return error.ReviewerVerdictChangeFailed,
-        .unresolved => {
-            if (bb.error_detail) |detail| detail.reported_error = error.ReviewerVerdictChangeFailed;
-            return error.ReviewerVerdictChangeFailed;
+        .unresolved => |unresolved| {
+            const cause = unresolved orelse return error.ReviewerVerdictChangeFailed;
+            return bbr.cli_failure.fail(init.io, bb.diagnostic, .execute, .{ .zig = cause }, @src(), writeVerdictFailure, .{ bb.error_detail, cause });
         },
     }
     const name: []const u8 = switch (result) {
@@ -664,6 +664,18 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
     } else {
         try out.printLine(init, "ok: {s} (verdict {s})", .{ name, vs });
     }
+}
+
+fn writeVerdictFailure(writer: *std.Io.Writer, detail: ?*const bbr.bitbucket.Client.ErrorDetail, cause: anyerror) !void {
+    try writer.writeAll("bbr api set-verdict: ReviewerVerdictChangeFailed");
+    const rejection = if (detail) |value| value.reason else null;
+    if (bbr.bitbucket.asApiError(cause) == null) {
+        try writer.print(": {s}", .{@errorName(cause)});
+    } else if (rejection) |reason| {
+        try writer.print(": Bitbucket rejected request ({s})", .{@errorName(reason)});
+        if (detail.?.message) |message| try writer.print(": {s}", .{message});
+    }
+    try writer.writeByte('\n');
 }
 
 test "list-pull-requests parses interleaved filters and page controls in both value forms" {

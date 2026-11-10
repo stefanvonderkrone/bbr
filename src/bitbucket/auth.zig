@@ -454,7 +454,10 @@ pub fn load(allocator: Allocator, io: std.Io, env: *const EnvMap) !?Loaded {
     }
     var location: ParseLocation = .{};
     const file = parseWithLocation(allocator, source, &location) catch |err| {
-        if (err == error.InvalidAuthFile) reportParseDiagnostic(io, path, location);
+        switch (err) {
+            error.InvalidAuthFile => reportParseDiagnostic(io, path, location),
+            else => {},
+        }
         return err;
     };
     return .{ .path = path, .file = file };
@@ -467,8 +470,12 @@ fn writeParseDiagnostic(writer: *std.Io.Writer, path: []const u8, location: Pars
 fn reportParseDiagnostic(io: std.Io, path: []const u8, location: ParseLocation) void {
     var buffer: [256]u8 = undefined;
     var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
-    writeParseDiagnostic(&writer.interface, path, location) catch return;
-    writer.interface.flush() catch {};
+    writeParseDiagnostic(&writer.interface, path, location) catch |err| switch (err) {
+        error.WriteFailed => return,
+    };
+    writer.interface.flush() catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
 }
 
 const file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
@@ -477,8 +484,12 @@ const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
 fn warnStorage(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buffer: [256]u8 = undefined;
     var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
-    writer.interface.print("warning: " ++ fmt ++ "\n", args) catch return;
-    writer.interface.flush() catch {};
+    writer.interface.print("warning: " ++ fmt ++ "\n", args) catch |err| switch (err) {
+        error.WriteFailed => return,
+    };
+    writer.interface.flush() catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
 }
 
 /// Ensure the `bbr` data directory exists and is private (`0700`).
@@ -493,8 +504,9 @@ pub fn ensureAuthDir(allocator: Allocator, io: std.Io, env: *const EnvMap) !void
         error.FileNotFound => {
             var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{ .open_options = .{ .iterate = true } });
             defer dir.close(io);
-            dir.setPermissions(io, dir_permissions) catch {
-                warnStorage(io, "could not secure {s}; continuing", .{dir_path});
+            dir.setPermissions(io, dir_permissions) catch |permission_error| switch (permission_error) {
+                error.Canceled => return error.Canceled,
+                else => warnStorage(io, "could not secure {s}; continuing", .{dir_path}),
             };
             return;
         },
@@ -503,8 +515,9 @@ pub fn ensureAuthDir(allocator: Allocator, io: std.Io, env: *const EnvMap) !void
     if (st.kind != .directory) return error.UnsafeAuthTarget;
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| return err;
     defer dir.close(io);
-    dir.setPermissions(io, dir_permissions) catch {
-        warnStorage(io, "could not secure {s}; continuing", .{dir_path});
+    dir.setPermissions(io, dir_permissions) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => warnStorage(io, "could not secure {s}; continuing", .{dir_path}),
     };
 }
 
@@ -560,8 +573,9 @@ pub fn save(
     atomic.replace(io) catch |err| return err;
     // Enforce `0600` even when the atomic fallback preserved old modes.
     // Failed enforcement warns visibly and keeps the file.
-    dir.setFilePermissions(io, basename, file_permissions, .{}) catch {
-        warnStorage(io, "could not secure {s}; continuing", .{path});
+    dir.setFilePermissions(io, basename, file_permissions, .{}) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => warnStorage(io, "could not secure {s}; continuing", .{path}),
     };
     return path;
 }
@@ -925,7 +939,10 @@ fn checkParseAllocations(allocator: Allocator, source: []const u8, invalid: bool
     var no_remap = testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
     const checked = no_remap.allocator();
     var file = parse(checked, source) catch |err| {
-        if (invalid and err == error.InvalidAuthFile) return;
+        switch (err) {
+            error.InvalidAuthFile => if (invalid) return,
+            else => {},
+        }
         return err;
     };
     defer file.deinit(checked);
@@ -1501,6 +1518,51 @@ test "Profile updates preserve file symlinks and replace the private target" {
         try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(st.permissions)) & 0o777);
         try dir.deleteFile(io, "auth.toml");
     }
+}
+
+test "diagnostics auth directory permission cancellation propagates for new and existing directories" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpPath(testing.allocator, &tmp, "");
+    defer testing.allocator.free(base);
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    var vtable = testing.io.vtable.*;
+    vtable.dirSetPermissions = struct {
+        fn canceled(_: ?*anyopaque, _: std.Io.Dir, _: std.Io.Dir.Permissions) std.Io.Dir.SetPermissionsError!void {
+            return error.Canceled;
+        }
+    }.canceled;
+    const io: std.Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    try testing.expectError(error.Canceled, ensureAuthDir(testing.allocator, io, &env));
+    try testing.expectError(error.Canceled, ensureAuthDir(testing.allocator, io, &env));
+}
+
+test "diagnostics auth file permission cancellation propagates after the atomic write" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpPath(testing.allocator, &tmp, "");
+    defer testing.allocator.free(base);
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    var vtable = testing.io.vtable.*;
+    vtable.dirSetFilePermissions = struct {
+        fn canceled(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.File.Permissions, _: std.Io.Dir.SetFilePermissionsOptions) std.Io.Dir.SetFilePermissionsError!void {
+            return error.Canceled;
+        }
+    }.canceled;
+    const io: std.Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    const result = save(testing.allocator, io, &env, "default", &.{.{ .name = "default", .username = "u", .token = "t", .workspace = "ws" }});
+    if (result) |path| {
+        testing.allocator.free(path);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectError(error.Canceled, result);
+    var loaded = (try load(testing.allocator, testing.io, &env)).?;
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqualStrings("u", loaded.file.find("default").?.username);
 }
 
 test "resolve surfaces file errors only when env is incomplete" {

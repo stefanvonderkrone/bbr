@@ -219,46 +219,45 @@ fn writeHelp(writer: *std.Io.Writer, name: ?[]const u8) !void {
 }
 
 fn isOptionError(err: anyerror) bool {
-    return err == error.UnknownFlag or err == error.MissingRequired or
-        err == error.MissingValue or err == error.InvalidNumber or err == error.BadRequest or
-        err == error.InvalidProfileName;
+    return switch (err) {
+        error.UnknownFlag,
+        error.MissingRequired,
+        error.MissingValue,
+        error.InvalidNumber,
+        error.BadRequest,
+        error.InvalidProfileName,
+        => true,
+        else => false,
+    };
 }
 
 fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*const bbr.bitbucket.Client.ErrorDetail) !void {
     try writer.writeAll("bbr api");
     if (verb) |v| try writer.print(" {s}", .{v.name});
     const api_error = if (detail) |d| d.reason else null;
-    const reported_error = if (detail) |d| d.reported_error else null;
-    if (api_error != null and (api_error.? == err or (reported_error != null and reported_error.? == err))) {
-        if (api_error.? != err) try writer.print(": {s}", .{@errorName(err)});
+    if (api_error != null and api_error.? == err) {
         try writer.print(": Bitbucket rejected request ({s})", .{@errorName(api_error.?)});
         if (detail.?.message) |message| try writer.print(": {s}", .{message});
         try writer.writeAll("\n");
     } else if (isOptionError(err)) {
         try writer.print(": bad options ({s})\n", .{@errorName(err)});
         try writeHelp(writer, if (verb) |v| v.name else null);
-    } else {
-        try writer.print(": {s}\n", .{@errorName(err)});
-        if (err == error.MissingCredential) {
-            try writer.writeAll("Run `bbr auth login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n");
-        }
+    } else switch (err) {
+        error.MissingUsername, error.MissingToken, error.MissingWorkspace => try writer.print(
+            ": MissingCredential ({s})\nRun `bbr auth login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n",
+            .{@errorName(err)},
+        ),
+        else => try writer.print(": {s}\n", .{@errorName(err)}),
     }
     if (verb) |v| {
         if (std.mem.eql(u8, v.name, "list-commit-pull-requests")) {
-            if (err == error.PullRequestLinksIndexing) {
-                try writer.writeAll("Bitbucket still indexes PullRequest links. Run the command again after indexing completes.\n");
-            } else if (err == error.NotFound) {
-                try writer.writeAll("The Repository or commit links were not found. Links can lack an index. Select 'Go to pull request' on the commit's details page to install the Pull Request Commit Links app.\n");
+            switch (err) {
+                error.PullRequestLinksIndexing => try writer.writeAll("Bitbucket still indexes PullRequest links. Run the command again after indexing completes.\n"),
+                error.NotFound => try writer.writeAll("The Repository or commit links were not found. Links can lack an index. Select 'Go to pull request' on the commit's details page to install the Pull Request Commit Links app.\n"),
+                else => {},
             }
         }
     }
-}
-
-fn printError(init: std.process.Init, verb: ?Verb, err: anyerror, detail: ?*const bbr.bitbucket.Client.ErrorDetail) !void {
-    var buf: [8192]u8 = undefined;
-    var stderr = std.Io.File.stderr().writerStreaming(init.io, &buf);
-    try writeError(&stderr.interface, verb, err, detail);
-    try stderr.interface.flush();
 }
 
 /// Only report a registered verb in a positional slot. Never report a flag value.
@@ -313,18 +312,20 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, profile:
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     while (it.next()) |a| argv.append(gpa, a) catch |err| {
-        _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
-        try printError(init, diagnosticVerb(argv.items), err, null);
-        return err;
+        return bbr.cli_failure.fail(init.io, diagnostic, .prepare, .{ .zig = err }, @src(), writeError, .{ diagnosticVerb(argv.items), err, null });
     };
     var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = gpa, .io = init.io };
     defer detail.deinit();
-    runArgs(init, gpa, argv.items, profile, &detail, diagnostic) catch |err| {
-        if (err == error.StdoutClosed) return err;
-        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
-        try printError(init, diagnosticVerb(argv.items), err, &detail);
-        return err;
-    };
+    runArgs(init, gpa, argv.items, profile, &detail, diagnostic) catch |err|
+        return reportFailure(init, diagnosticVerb(argv.items), err, &detail, diagnostic);
+}
+
+/// The api boundary. It shows each failure that a verb returns and records it once.
+fn reportFailure(init: std.process.Init, verb: ?Verb, err: anyerror, detail: *const bbr.bitbucket.Client.ErrorDetail, diagnostic: bbr.diagnostics.Handle) anyerror {
+    switch (err) {
+        error.StdoutClosed, error.Reported => return err,
+        else => return bbr.cli_failure.fail(init.io, diagnostic, .execute, .{ .zig = err }, @src(), writeError, .{ verb, err, detail }),
+    }
 }
 
 fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const u8, profile: ?[]const u8, detail: *bbr.bitbucket.Client.ErrorDetail, diagnostic: bbr.diagnostics.Handle) !void {
@@ -337,17 +338,10 @@ fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const
 
     const entry = findVerb(verb) orelse return error.UnknownFlag;
 
-    var owned = cliCredential(gpa, init.io, init.environ_map, parsed.workspace, parsed.profile orelse profile) catch |err| {
-        _ = diagnostic.failure(.read, .{ .zig = err }, @src());
-        return switch (err) {
-            error.MissingUsername, error.MissingToken, error.MissingWorkspace => error.MissingCredential,
-            else => err,
-        };
-    };
+    var owned = try cliCredential(gpa, init.io, init.environ_map, parsed.workspace, parsed.profile orelse profile);
     defer owned.deinit(gpa);
 
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
-    transport.diagnostic = diagnostic;
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
     var bb = bbr.bitbucket.Client.init(transport.httpClient(), owned.credential());
@@ -633,8 +627,7 @@ test "global parse errors use stderr and name only a safely supplied verb" {
     for (cases) |case| {
         var output: TestOutput = .{};
         var args: arg.Cursor = .{ .args = case.args };
-        const expected: anyerror = if (case.args.len == 1) error.UnknownFlag else error.MissingValue;
-        try std.testing.expectError(expected, run(output.init(&env, &arena), a, &args, null, .{}));
+        try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &args, null, .{}));
         try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), case.prefix));
         try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), case.hidden) == null);
@@ -649,8 +642,8 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     defer arena.deinit();
     var output: TestOutput = .{};
     var missing: arg.Cursor = .{ .args = &.{ "whoami", "--json" } };
-    try std.testing.expectError(error.MissingCredential, run(output.init(&env, &arena), a, &missing, null, .{}));
-    try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: MissingCredential\n"));
+    try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &missing, null, .{}));
+    try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: MissingCredential (MissingUsername)\nRun `bbr auth login`"));
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
 
     try env.put("BITBUCKET_USERNAME", "private-username");
@@ -658,7 +651,7 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     try env.put("BITBUCKET_WORKSPACE", "private-workspace");
     output = .{};
     var invalid: arg.Cursor = .{ .args = &.{ "whoami", "--json", "--uuid=private-value" } };
-    try std.testing.expectError(error.UnknownFlag, run(output.init(&env, &arena), a, &invalid, null, .{}));
+    try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &invalid, null, .{}));
     try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: bad options (UnknownFlag)\n"));
     try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), "Example:\n  bbr api whoami --json\n") != null);
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
@@ -667,9 +660,157 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     try env.put("https_proxy", "socks5://private-proxy.invalid");
     output = .{};
     var proxy: arg.Cursor = .{ .args = &.{ "whoami", "--json" } };
-    try std.testing.expectError(error.InvalidProxyConfiguration, run(output.init(&env, &arena), a, &proxy, null, .{}));
+    try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &proxy, null, .{}));
     try std.testing.expectEqualStrings("bbr api whoami: InvalidProxyConfiguration\n", output.stderrBytes());
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+}
+
+test "diagnostics failed api stderr keeps the cause and write failure once across boundaries" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |argv_oom| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(home);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &env);
+        defer sink.deinit();
+        try std.testing.expect(sink.setEnabled(true) == .on);
+        const handle = sink.handle(.api, .{});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var output: TestOutput = .{ .stderr_fails = true };
+        var args: arg.Cursor = .{ .args = &.{"private-invalid-verb"} };
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const allocator = if (argv_oom) failing.allocator() else a;
+        const failure = if (run(output.init(&env, &arena), allocator, &args, null, handle)) |_| error.TestUnexpectedResult else |err| err;
+        try std.testing.expectEqual(error.Reported, failure);
+        _ = handle.failure(.execute, .{ .zig = failure }, @src());
+        try std.testing.expectEqual(@as(usize, 1), output.stderr_writes);
+        try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(std.testing.io)).?;
+        const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+        defer a.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        try std.testing.expect(std.mem.endsWith(u8, lines.next().?, if (argv_oom) "error=OutOfMemory" else "error=UnknownFlag"));
+        const write_failure = lines.next().?;
+        try std.testing.expect(std.mem.indexOf(u8, write_failure, "phase=write ") != null);
+        try std.testing.expect(std.mem.endsWith(u8, write_failure, "error=NoSpaceLeft"));
+        try std.testing.expect(lines.next() == null);
+    }
+}
+
+test "diagnostics the api boundary shows each failure and records it once" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { args: []const []const u8, message: []const u8, cause: []const u8 }{
+        .{ .args = &.{ "whoami", "--json" }, .message = "bbr api whoami: MissingCredential (MissingUsername)\n", .cause = "error=MissingUsername" },
+        .{ .args = &.{"private-invalid-verb"}, .message = "bbr api: bad options (UnknownFlag)\n", .cause = "error=UnknownFlag" },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(home);
+        var sink_env = std.process.Environ.Map.init(a);
+        defer sink_env.deinit();
+        try sink_env.put("XDG_STATE_HOME", home);
+        var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &sink_env);
+        defer sink.deinit();
+        try std.testing.expect(sink.setEnabled(true) == .on);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var output: TestOutput = .{};
+        var args: arg.Cursor = .{ .args = case.args };
+        try std.testing.expectError(error.Reported, run(output.init(&env, &arena), a, &args, null, sink.handle(.api, .{})));
+        try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), case.message));
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(std.testing.io)).?;
+        const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+        defer a.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next().?;
+        try std.testing.expect(lines.next() == null);
+        try std.testing.expect(std.mem.indexOf(u8, only, "operation=api ") != null);
+        try std.testing.expect(std.mem.endsWith(u8, only, case.cause));
+    }
+}
+
+/// Runs `whoami` against `fake` and returns the one record that the api boundary writes.
+fn leafEvidenceRecord(a: std.mem.Allocator, fake: *bbr.http.FakeHttpClient, message: []const u8) ![]u8 {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(home);
+    var sink_env = std.process.Environ.Map.init(a);
+    defer sink_env.deinit();
+    try sink_env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &sink_env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const diagnostic = sink.handle(.api, .{}).withLeaf(&leaf);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var output: TestOutput = .{};
+    const init = output.init(&env, &arena);
+    var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+    defer detail.deinit();
+    var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "user", .token = "token", .workspace = "workspace" });
+    bb.diagnostic = diagnostic;
+    bb.error_detail = &detail;
+    const verb = findVerb("whoami").?;
+    const err = if (verb.handler(init, bb, &.{}, true)) |_| return error.TestUnexpectedResult else |err| err;
+    try std.testing.expectEqual(error.Reported, reportFailure(init, verb, err, &detail, diagnostic));
+    try std.testing.expectEqualStrings(message, output.stderrBytes());
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+    defer a.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    return a.dupe(u8, only);
+}
+
+test "diagnostics the api boundary record holds the leaf evidence of a Bitbucket failure" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { fake: bbr.http.FakeHttpClient, message: []const u8, phase: []const u8, cause: []const u8 }{
+        .{ .fake = .{ .status = 503, .body = "{}" }, .message = "bbr api whoami: Bitbucket rejected request (ServerError)\n", .phase = "rejection", .cause = "cause=http status=503 classification=server" },
+        .{ .fake = .{ .status = 418, .body = "{}" }, .message = "bbr api whoami: Bitbucket rejected request (UnexpectedStatus)\n", .phase = "rejection", .cause = "cause=http status=418 classification=other" },
+        .{ .fake = .{ .body = "{" }, .message = "bbr api whoami: MalformedResponse\n", .phase = "decode", .cause = "cause=zig error=UnexpectedEndOfInput" },
+        .{ .fake = .{ .body = "{\"uuid\":7}" }, .message = "bbr api whoami: MalformedResponse\n", .phase = "decode", .cause = "cause=zig error=UnexpectedToken" },
+    };
+    for (cases) |case| {
+        var fake = case.fake;
+        const record = try leafEvidenceRecord(a, &fake, case.message);
+        defer a.free(record);
+        const prefix = try std.fmt.allocPrint(a, "operation=api phase={s} source=api/cli.zig:", .{case.phase});
+        defer a.free(prefix);
+        try std.testing.expect(std.mem.indexOf(u8, record, prefix) != null);
+        try std.testing.expect(std.mem.endsWith(u8, record, case.cause));
+        if (std.mem.eql(u8, case.phase, "decode")) {
+            try std.testing.expect(std.mem.indexOf(u8, record, " boundary_error=MalformedResponse ") != null);
+        }
+    }
 }
 
 test "error writer formats option help and runtime errors without user values" {
@@ -725,7 +866,7 @@ test "Bitbucket rejection messages survive response cleanup and stay on stderr" 
         bb.error_detail = &detail;
         const init = output.init(&env, &arena);
         try std.testing.expectError(case.err, comments.runList(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--query=resolution=null", "--no-head" }, true));
-        try printError(init, findVerb("list-comments"), case.err, &detail);
+        try std.testing.expectEqual(error.Reported, reportFailure(init, findVerb("list-comments"), case.err, &detail, .{}));
         try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
         try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         try std.testing.expectEqual(@as(usize, 1), fake.call_count);
@@ -787,11 +928,110 @@ test "unresolved verdict changes keep the domain error and the relevant API mess
             var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" });
             bb.error_detail = &detail;
             const init = output.init(&env, &arena);
-            try std.testing.expectError(error.ReviewerVerdictChangeFailed, pullrequests.runSetVerdict(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit=abc123" }, json));
-            try printError(init, findVerb("set-verdict"), error.ReviewerVerdictChangeFailed, &detail);
+            try std.testing.expectError(error.Reported, pullrequests.runSetVerdict(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit=abc123" }, json));
             try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
             try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
             try std.testing.expectEqual(@as(usize, 4), fake.call_count);
+        }
+    }
+}
+
+test "diagnostics a refused set-verdict shows its message and has one record" {
+    const a = std.testing.allocator;
+    const pr =
+        "{\"id\":42,\"title\":\"Review\",\"state\":\"OPEN\",\"author\":{\"display_name\":\"Ada\",\"uuid\":\"{author}\"}," ++
+        "\"source\":{\"branch\":{\"name\":\"feature\"},\"commit\":{\"hash\":\"abc123\"}}," ++
+        "\"destination\":{\"branch\":{\"name\":\"main\"},\"commit\":{\"hash\":\"def456\"}},\"participants\":[]}";
+    const account: bbr.http.Canned = .{ .body = "{\"uuid\":\"{account}\"}" };
+    const cases = [_]struct { responses: []const bbr.http.Canned, expected_commit: []const u8 = "abc123", message: []const u8, phase: []const u8 = "", cause: []const u8 }{
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{ .send_error = error.ConnectionResetByPeer }, .{ .body = pr } },
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: ConnectionResetByPeer\n",
+            .cause = "error=ConnectionResetByPeer",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr } },
+            .expected_commit = "old",
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed\n",
+            .cause = "error=ReviewerVerdictChangeFailed",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{ .status = 403, .body = "{\"error\":{\"message\":\"Read denied\"}}" } },
+            .message = "bbr api set-verdict: Bitbucket rejected request (Forbidden): Read denied\n",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=403 classification=authorization",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{ .status = 429, .body = "{\"error\":{\"message\":\"Slow down\"}}" }, .{ .body = pr } },
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (RateLimited): Slow down\n",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=429 classification=rate_limit",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{ .status = 429, .body = "{\"error\":{\"message\":\"" ++ "x" ** 9000 ++ "\"}}" }, .{ .body = pr } },
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (RateLimited): " ++ "x" ** 9000 ++ "\n",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=429 classification=rate_limit",
+        },
+        .{
+            .responses = &.{ account, .{ .body = pr }, .{}, .{ .status = 403, .body = "{\"error\":{\"message\":\"Read denied\"}}" } },
+            .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (Forbidden): Read denied\n",
+            .phase = "phase=rejection",
+            .cause = "cause=http status=403 classification=authorization",
+        },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |stderr_fails| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+            defer a.free(home);
+            var env = std.process.Environ.Map.init(a);
+            defer env.deinit();
+            try env.put("XDG_STATE_HOME", home);
+            var sink = bbr.diagnostics.Sink.init(a, std.testing.io, &env);
+            defer sink.deinit();
+            try std.testing.expect(sink.setEnabled(true) == .on);
+            var leaf: ?bbr.diagnostic.Leaf = null;
+            const handle = sink.handle(.api, .{}).withLeaf(&leaf);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var output: TestOutput = .{ .stderr_fails = stderr_fails };
+            const init = output.init(&env, &arena);
+            var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
+            var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+            defer detail.deinit();
+            var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" }).withDiagnostics(handle);
+            bb.error_detail = &detail;
+            const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
+            const failure = if (pullrequests.runSetVerdict(init, bb, args, false)) |_| error.TestUnexpectedResult else |err| reportFailure(init, findVerb("set-verdict"), err, &detail, handle);
+            try std.testing.expectEqual(error.Reported, failure);
+            _ = handle.failure(.execute, .{ .zig = failure }, @src());
+            try std.testing.expect(leaf == null);
+            _ = sink.setEnabled(false);
+            var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+            defer dir.close(std.testing.io);
+            var iterator = dir.iterate();
+            const entry = (try iterator.next(std.testing.io)).?;
+            const bytes = try dir.readFileAlloc(std.testing.io, entry.name, a, .limited(8192));
+            defer a.free(bytes);
+            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+            _ = lines.next();
+            var records: usize = 0;
+            while (lines.next()) |line| : (records += 1) {
+                try std.testing.expect(std.mem.indexOf(u8, line, "operation=api ") != null);
+                if (records == 0) {
+                    try std.testing.expect(std.mem.indexOf(u8, line, case.phase) != null);
+                    try std.testing.expect(std.mem.endsWith(u8, line, case.cause));
+                } else {
+                    try std.testing.expect(std.mem.indexOf(u8, line, "phase=write ") != null);
+                    try std.testing.expect(std.mem.endsWith(u8, line, "error=NoSpaceLeft"));
+                }
+            }
+            try std.testing.expectEqual(@as(usize, if (stderr_fails) 2 else 1), records);
+            if (stderr_fails) try std.testing.expectEqual(@as(usize, 1), output.stderr_writes);
+            try std.testing.expectEqualStrings(if (stderr_fails) "" else case.message, output.stderrBytes());
+            try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         }
     }
 }
@@ -1413,9 +1653,11 @@ test "list-workspace-pull-requests prints the named Repositories once in the giv
 
 const TestOutput = struct {
     stdout_buffer: [8192]u8 = undefined,
-    stderr_buffer: [8192]u8 = undefined,
+    stderr_buffer: [16384]u8 = undefined,
     stdout_len: usize = 0,
     stderr_len: usize = 0,
+    stderr_fails: bool = false,
+    stderr_writes: usize = 0,
 
     const vtable: std.Io.VTable = blk: {
         var table = std.Io.failing.vtable.*;
@@ -1444,13 +1686,21 @@ const TestOutput = struct {
 
     fn capture(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize) error{NoSpaceLeft}!usize {
         const self: *TestOutput = @ptrCast(@alignCast(userdata.?));
+        if (file.handle == std.Io.File.stderr().handle) {
+            self.stderr_writes += 1;
+            if (self.stderr_fails) return error.NoSpaceLeft;
+        }
         const buffer: []u8 = if (file.handle == std.Io.File.stdout().handle) &self.stdout_buffer else &self.stderr_buffer;
         const len: *usize = if (file.handle == std.Io.File.stdout().handle) &self.stdout_len else &self.stderr_len;
         var writer = std.Io.Writer.fixed(buffer[len.*..]);
-        writer.writeAll(header) catch return error.NoSpaceLeft;
+        writer.writeAll(header) catch |err| switch (err) {
+            error.WriteFailed => return error.NoSpaceLeft,
+        };
         for (data, 0..) |part, index| {
             const repetitions = if (index + 1 == data.len) splat else 1;
-            for (0..repetitions) |_| writer.writeAll(part) catch return error.NoSpaceLeft;
+            for (0..repetitions) |_| writer.writeAll(part) catch |err| switch (err) {
+                error.WriteFailed => return error.NoSpaceLeft,
+            };
         }
         const written = writer.buffered().len;
         len.* += written;
