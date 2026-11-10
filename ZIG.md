@@ -53,8 +53,16 @@ Implications for us:
 - Formatting goes through `writer.print(...)`; there is no more `anytype`-generic stream.
 - `File.writer(io, buf)` starts in `.positional` mode at offset 0 (`std/Io/File/Writer.zig`
   `init`). On stdout or stderr redirected to a file, it overwrites earlier text, and later
-  writers overwrite its text. Use `File.writerStreaming` for stdout and stderr.
-  `tools/check_stdio_writers.py` enforces it.
+  writers overwrite its text. Use `File.writerStreaming` for stderr. Write stdout through
+  `bbr.stdout` in `src/stdout.zig`, the only file that makes a stdout writer.
+  `tools/check_stdio_writers.py` enforces both.
+- A `File.Writer` returns the generic `error.WriteFailed` and keeps the cause in its `err`
+  field. `bbr.stdout` returns that cause, and a closed pipe becomes `error.StdoutClosed`.
+- `bbr.cli_failure.fail` records the native stderr cause without converting `BrokenPipe` to `StdoutClosed`.
+  `File.Writer.drainStreaming` retains buffered bytes after a failed write (`std/Io/File/Writer.zig:123-131`).
+  A second flush retries those bytes, so the helper stops after the first failed write.
+- `std.debug.lockStderr(buffer)` returns `Io.LockedStderr` with a `file_writer` field (`std/debug.zig:282`, `std/Io.zig:2404`).
+  `std.debug.unlockStderr()` flushes that writer. The Grammar `Diagnostic.report` uses this pair.
 - Anything wrapping I/O (our diff parser reading a `RawDiff`, JSON decoding) targets these
   interfaces. Prefer taking a `*std.Io.Reader` over a concrete stream.
 
@@ -190,6 +198,26 @@ the main thread; the Epoch token still guards against stale results.
   The caller initializes a new value and owns any referenced strings (`std/hash_map.zig:1094-1104`).
   Session mention labels use this map to keep one result per account ID.
 
+## 4.5 Dropping an error
+
+The one sanctioned way to drop an error is a `catch` that switches on the capture and names each dropped error.
+The switch has no `else` prong.
+
+```zig
+catch |err| switch (err) { error.OutOfMemory => fallback }
+```
+
+The compiler rejects that site when the callee gains a new error.
+The compiler also rejects a name the callee cannot return.
+`dumpErrorReturnTrace` uses this form (`std/debug.zig:887-892`).
+TigerBeetle `array_print` uses it (`src/stdx/stdx.zig:1021-1022` at `68958eb7`).
+
+`tools/check_diagnostics.py` counts two other captured forms as drops.
+A handler that discards the capture with `_ = err;` is a drop.
+An `else` drop is one where the handler neither records nor returns the cause.
+The `switch (err)` subject is not a use of the cause.
+A reference to the capture elsewhere in the handler means the cause flows.
+
 ## 5. Build system (`build.zig` / `build.zig.zon`)
 
 - `b.standardTargetOptions(.{})` / `b.standardOptimizeOption(.{})`.
@@ -229,6 +257,21 @@ the main thread; the Epoch token still guards against stale results.
 For an inclusive byte limit, pass `.limited(max_bytes + 1)`.
 The API text-file helper uses this rule to accept exactly 1 MiB and reject larger files.
 Verified in `std/Io/Dir.zig:1326-1338` and `std/Io/Reader.zig:367-386`.
+
+`std.Io.Dir.openFile` sets `O_NONBLOCK` only for a lock with `lock_nonblocking`
+(`std/Io/Dir.zig:547`, `std/Io/Threaded.zig:4821-4832`). A plain open of a FIFO blocks until a writer appears.
+To refuse a FIFO without a race, call `std.posix.openat(AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0)`
+(`std/posix.zig:441`), wrap the descriptor as `std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }`,
+and check `file.stat(io).kind` before the read.
+`O_NONBLOCK` has no effect on reads of a regular file.
+
+A `std.Io.File.Reader` stores the real read error in its `err` field (`std/Io/File/Reader.zig:19`).
+Its interface returns only `error.ReadFailed`, so map `ReadFailed` to `reader.err.?`.
+
+`std.Io.CancelProtection` (`std/Io.zig:1322-1343`): in the `.blocked` state, no `Io` function returns
+`error.Canceled`. Wrap a write that must finish in `io.swapCancelProtection(.blocked)` and restore the old state.
+
+`std.os.linux.mknodat` (`std/os/linux.zig:990`) creates a FIFO on Linux without libc.
 
 ## 6. Testing
 
@@ -383,6 +426,13 @@ To preserve a file symlink, create the atomic file in the resolved target direct
 - [ ] Directory handles still need `.iterate = true` for `setPermissions` on Linux?
 - [ ] `Dir.readLink`, `realPathFileAlloc`, and `File.Atomic.replace` still preserve the documented path and rename behavior?
 - [ ] `std.posix.tcgetattr`, `tcsetattr`, and the `ECHO` and `ECHONL` fields unchanged?
+- [ ] `Dir.openFile` still sets `O_NONBLOCK` only with a lock? If it gains a nonblocking option, use it in `Snapshot.readRegular`.
+- [ ] `File.Reader.err` still holds the cause behind `error.ReadFailed`?
+- [ ] `File.Writer.err` still holds the native write cause, and a failed streaming write still retains buffered bytes?
+- [ ] `std.debug.lockStderr` still returns `LockedStderr.file_writer`, and `unlockStderr` still flushes it?
+- [ ] `dumpErrorReturnTrace` still ignores a write error with `catch |err| switch (err) { error.WriteFailed => {} }` and no `else` prong?
+- [ ] `io.swapCancelProtection(.blocked)` still suppresses `error.Canceled` in every `Io` call?
+- [ ] `std.os.linux.mknodat` signature unchanged?
 - [ ] libvaxis still builds against the new toolchain; re-pin its commit.
 - [ ] libvaxis `Vaxis.copyToSystemClipboard` signature and OSC 52 behavior unchanged?
 - [ ] `Io.Clock.awake` / `Timestamp.untilNow` / `Duration.toNanoseconds` unchanged?

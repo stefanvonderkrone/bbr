@@ -15,7 +15,7 @@ The integrated hermetic suite passes with every M27 test.
 - Measure the values from the "Binary size measurement" section of the spec.
   Write them to `.scratch/m27-zig-builtin-grammar/binary-size.md` and link that file under `## Completion`.
 - Apply the glossary changes from the "Glossary changes" section of the spec to `src/highlight/GLOSSARY.md`.
-- Add `docs/adr/0014-builtin-grammar-queries-come-from-nvim-treesitter.md` with the decisions from the "ADRs" section of the spec.
+- Add `docs/adr/0017-builtin-grammar-queries-come-from-nvim-treesitter.md` with the decisions from the "ADRs" section of the spec.
 - Add the six M27 rules from the "AGENTS.md rules" section of the spec to the table in `AGENTS.md`.
   Make sure that each named test and check exists with that exact name.
 - Name the vendoring tools and Injection in `docs/code-navigation.md`.
@@ -30,7 +30,7 @@ The integrated hermetic suite passes with every M27 test.
 - [x] `binary-size.md` records the host, the toolchain, both commits, both build modes, the `size` output, the build time, the `TreeSitterHighlighter.init` time, and the bench results.
 - [x] No Grammar is dropped for size.
 - [x] The glossary entries match the spec and use the glossary terms exactly.
-- [x] ADR-0014 exists and states its relation to ADR-0009.
+- [x] ADR-0017 exists and states its relation to ADR-0009.
 - [x] `AGENTS.md` has the six M27 rules, and each named test and check exists.
 - [x] `README.md` lists every BuiltInGrammar with its GrammarMatch rules.
 - [x] `vendors/tree-sitter/README.md` describes the procedure, the generated Swift parser, and the licences.
@@ -83,7 +83,7 @@ The SPEC puts lazy query preparation out of scope, so this ticket records the co
 ### Change summary
 
 - `src/highlight/GLOSSARY.md`: the BuiltInGrammar set after M27, `markdown_inline`, the new term Injection, and the Capture and GrammarMatch additions from the SPEC.
-- `docs/adr/0014-builtin-grammar-queries-come-from-nvim-treesitter.md` (new): the SPEC decisions, stated as a refinement of ADR-0009.
+- `docs/adr/0017-builtin-grammar-queries-come-from-nvim-treesitter.md` (new): the SPEC decisions, stated as a refinement of ADR-0009.
 - `AGENTS.md`: seven new rules.
   These are the six SPEC rules and one rule for the vendoring direction.
   The rule for a new BuiltInGrammar names the manifest entry and the tag, as ticket 03 shipped it.
@@ -139,7 +139,7 @@ The `WorkerLaunchFailed` warnings in the test output also appear on green runs.
   The `init` time uses ReleaseSafe, as the SPEC asks.
 - The new AGENTS rule for the build never generating or downloading a source is a convention (no check) for that half.
   No check builds offline. Ticket 07 proved one offline build.
-- ADR-0014 keeps its number, although another unmerged branch also plans an ADR-0014.
+- This ADR first had the number 0014. Main merged its own ADR-0014 first, so the merge of main on 2026-11-10 gave this ADR the number 0017.
 - The spec stays `claimed`, because ticket 13 is `ready-for-human`.
 
 ### Changed paths
@@ -149,7 +149,7 @@ The `WorkerLaunchFailed` warnings in the test output also appear on green runs.
 - `README.md`
 - `TODO.md`
 - `build.zig`
-- `docs/adr/0014-builtin-grammar-queries-come-from-nvim-treesitter.md` (new)
+- `docs/adr/0017-builtin-grammar-queries-come-from-nvim-treesitter.md` (new)
 - `docs/code-navigation.md`
 - `src/highlight/GLOSSARY.md`
 - `tests/check_vendored_grammars_test.py`

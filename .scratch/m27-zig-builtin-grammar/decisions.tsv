@@ -22,7 +22,7 @@ ts	phase	decision	why	evidence	result
 2026-10-30T23:04:19Z	integrate	correction to the union merge row: I did not abort, I re-resolved the same cherry-pick with merge3.py from the branch commits	the earlier row says aborted, which is wrong	$TMPDIR/m27/resolve.sh	superseded
 2026-10-30T23:48:28Z	batches	ran tickets 10 and 11 in parallel worktrees from 1f5fa9c, then cherry-picked both with merge3.py	both depend only on 09, which had landed	342e1bd, c65a2f9	done
 2026-10-30T23:48:28Z	integrate	full suite after tickets 10 and 11, every branch test name present	verify the merged artifact	1465/1465 tests, 27/27 steps, Markdown 1 MiB median 434 ms in ticket 10	tests green
-2026-10-31T00:43:47Z	t12	committed docs, ADR-0014, seven AGENTS rules, test-python step, and binary-size.md after a runner rerun of the full suite	verify before commit	0af57c0, 31/31 steps, 1465/1465 tests	tests green
+2026-10-31T00:43:47Z	t12	committed docs, ADR-0017, seven AGENTS rules, test-python step, and binary-size.md after a runner rerun of the full suite	verify before commit	0af57c0, 31/31 steps, 1465/1465 tests	tests green
 2026-10-31T00:43:47Z	t12	did not add lazy query preparation although init grows from 28 ms to 422 ms	the SPEC puts lazy preparation out of scope, so the operator decides	.scratch/m27-zig-builtin-grammar/binary-size.md	open
 2026-10-31T00:43:47Z	t13	wrote exact human steps into ticket 13 and left it ready-for-human	it needs a human eye and Neovim	4d9704b	done
 2026-10-31T00:43:47Z	review	skipped the cross-model trail review	this runner cannot choose another model family, the Subagent tool forbids a model choice the operator did not ask for	none	skipped

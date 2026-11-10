@@ -181,9 +181,9 @@ fn probe(init: std.process.Init, path: []const u8, expectation: []const u8) !voi
     const entries = try store.registryEntries(init.arena.allocator());
     const overrides = try grammar_cli.loadOverrides(init.arena.allocator(), init.io, init.environ_map);
     try store.validateOverrideNames(overrides);
-    var registry = try user_grammar.Registry.init(init.gpa, init.io, entries, overrides, grammar_cli.bbr_identity);
+    var registry = try user_grammar.Registry.init(init.gpa, init.io, entries, overrides, grammar_cli.bbr_identity, .{});
     defer registry.deinit();
-    var tree_sitter = TreeSitterHighlighter.init(init.gpa, init.io, &registry);
+    var tree_sitter = TreeSitterHighlighter.init(init.gpa, init.io, &registry, .{});
     defer tree_sitter.deinit();
     const result = try tree_sitter.highlighter().highlight(init.arena.allocator(), path, "identifier\n");
     const highlighted = result.spans.len != 0;

@@ -629,7 +629,7 @@ Ticket 12 adds these rules to the table in `AGENTS.md`:
 ADR-0009 holds.
 M27 keeps the hermetic delivery: pinned, vendored, checksummed, and compiled into the executable.
 
-Ticket 12 adds ADR-0014 "BuiltInGrammar queries come from nvim-treesitter".
+Ticket 12 adds ADR-0017 "BuiltInGrammar queries come from nvim-treesitter".
 It records these decisions:
 
 - New BuiltInGrammars use nvim-treesitter queries, and the M13 Grammars keep their upstream queries.
@@ -639,7 +639,7 @@ It records these decisions:
 
 ADR-0009 says that sources are copied.
 A generated Swift `parser.c` is not a plain copy.
-ADR-0014 states this as a refinement of ADR-0009, not a reversal.
+ADR-0017 states this as a refinement of ADR-0009, not a reversal.
 
 ADR-0003 holds.
 The `Highlighter` seam and the core `bbr` module stay C-free.

@@ -114,7 +114,9 @@ pub fn selectInjection(name: []const u8) ?BuiltInGrammar {
     const base = lower[if (std.mem.lastIndexOfScalar(u8, lower, '/')) |slash| slash + 1 else 0..];
     if (std.meta.stringToEnum(BuiltInGrammar, base)) |grammar| return grammar;
     var path_buffer: [lower_buffer.len + "injection.".len]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "injection.{s}", .{grammar_name.extension(base) orelse base}) catch unreachable;
+    const path = std.fmt.bufPrint(&path_buffer, "injection.{s}", .{grammar_name.extension(base) orelse base}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+    };
     return selectBuiltIn(path, "");
 }
 
