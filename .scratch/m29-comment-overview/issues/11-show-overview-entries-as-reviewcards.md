@@ -1,6 +1,6 @@
 # 11: Show Overview Entries as ReviewCards
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: none
 Spec: [M29 spec](../SPEC.md)
 
@@ -27,9 +27,6 @@ The operator answered on 2026-11-10.
 3. A context entry, the dim parent that the Comment Overview shows above a matching Reply, shows as a full card in a dim style.
 4. Enter on the `[...] (enter to expand)` row or on the bottom border below it expands the card in the Comment Overview. Enter on every other row of the entry opens the DiffPane at the ReviewCard.
 5. The query highlights its matches in the card body, as Buffer Search does.
-
-## Open questions
-
-1. Does the expanded state of a card in the Comment Overview stay separate from the DiffPane disclosure state? The runner proposes yes.
+6. The expanded state of a card in the Comment Overview stays separate from the DiffPane disclosure state.
 
 ## Comments
