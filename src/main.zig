@@ -36,6 +36,34 @@ const ArgSlice = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    var snapshot = bbr.config_source.Snapshot.load(init.gpa, init.io, init.environ_map);
+    defer snapshot.deinit(init.gpa);
+    var sink = bbr.diagnostics.Sink.init(init.gpa, init.io, init.environ_map);
+    defer sink.deinit();
+    switch (sink.setEnabled(bbr.logging_config.enabled(snapshot))) {
+        .unavailable => |failure| std.debug.print("bbr: diagnostic logging unavailable: {s}\n", .{switch (failure.cause) {
+            .zig => |err| @errorName(err),
+            else => @tagName(failure.cause),
+        }}),
+        .off, .on => {},
+    }
+    // The CLI runs one command at a time, so its boundaries share one evidence slot.
+    // The TUI gives each worker its own.
+    var leaf: ?bbr.diagnostic.Leaf = null;
+    const diagnostic = sink.handle(.startup, .{}).withLeaf(&leaf);
+    runMain(init, snapshot, diagnostic) catch |err| switch (err) {
+        error.StdoutClosed => {},
+        error.Reported => exitFailure(diagnostic, err, @src()),
+        else => {
+            // The Zig start code printed this line and the trace when main returned the error.
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            exitFailure(diagnostic, err, @src());
+        },
+    };
+}
+
+fn runMain(init: std.process.Init, snapshot: bbr.config_source.Snapshot, diagnostic: bbr.diagnostics.Handle) !void {
     const gpa = init.gpa;
     const auth = bbr.bitbucket.auth;
 
@@ -54,19 +82,19 @@ pub fn main(init: std.process.Init) !void {
         const a = argv.items[arg_idx];
         if (filtered.items.len == 0 and std.mem.eql(u8, a, "api")) {
             var api_args = ArgSlice{ .args = argv.items[arg_idx + 1 ..] };
-            return api_cli.run(init, gpa, &api_args, flag_profile);
+            return api_cli.run(init, gpa, &api_args, flag_profile, diagnostic.forContext(.api, .{}));
         } else if (std.mem.eql(u8, a, "--profile")) {
             arg_idx += 1;
             if (arg_idx >= argv.items.len) {
                 std.debug.print("bbr: --profile needs a value\n", .{});
-                std.process.exit(1);
+                exitFailure(diagnostic.forContext(.arguments, .{}), error.MissingValue, @src());
             }
             flag_profile = argv.items[arg_idx];
         } else if (std.mem.startsWith(u8, a, "--profile=")) {
             flag_profile = a["--profile=".len..];
             if (flag_profile.?.len == 0) {
                 std.debug.print("bbr: --profile needs a value\n", .{});
-                std.process.exit(1);
+                exitFailure(diagnostic.forContext(.arguments, .{}), error.MissingValue, @src());
             }
         } else {
             try filtered.append(gpa, a);
@@ -75,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
     if (flag_profile) |p| {
         if (!auth.isValidProfileName(p)) {
             std.debug.print("bbr: invalid profile name '{s}'\n", .{p});
-            std.process.exit(1);
+            exitFailure(diagnostic.forContext(.arguments, .{}), error.InvalidProfileName, @src());
         }
     }
 
@@ -84,27 +112,22 @@ pub fn main(init: std.process.Init) !void {
     var rest = ArgSlice{ .args = rest_args };
 
     if (first) |argument| {
-        if (std.mem.eql(u8, argument, "--version")) {
-            var output_buffer: [128]u8 = undefined;
-            var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-            try stdout.interface.print("bbr {s}\n", .{build_options.version});
-            return stdout.interface.flush();
-        }
+        if (std.mem.eql(u8, argument, "--version")) return bbr.stdout.print(init.io, "bbr {s}\n", .{build_options.version});
     }
 
     // `demo` needs no credentials: it feeds synthetic data through the real
     // buffer/renderer so the comment UI can be exercised entirely offline.
     if (first) |f| {
-        if (std.mem.eql(u8, f, "grammar")) return grammarRun(init, gpa, &rest);
+        if (std.mem.eql(u8, f, "grammar")) return grammarRun(init, gpa, &rest, diagnostic.forContext(.grammar, .{}));
         if (std.mem.eql(u8, f, "demo")) {
-            var loaded = try config.load(gpa, init.io, init.environ_map);
+            var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(init.io, diagnostic, err, @src());
             defer loaded.deinit(gpa);
             return switch (loaded) {
-                .ok => |*configuration| demoRun(init.io, gpa, init.environ_map, configuration),
-                .invalid => |failure| failure.report(),
+                .ok => |*configuration| demoRun(init.io, gpa, init.environ_map, configuration, diagnostic),
+                .invalid => |failure| reportConfigFailure(diagnostic, failure),
             };
         }
-        if (std.mem.eql(u8, f, "local")) return localRun(init, gpa, &rest);
+        if (std.mem.eql(u8, f, "local")) return localRun(init, gpa, &rest, snapshot, diagnostic.forContext(.session_load, .{}));
         if (std.mem.eql(u8, f, "external-edit-smoke")) {
             if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_PTY_SMOKE") orelse "", "1")) {
                 std.debug.print("bbr: refusing PTY smoke without BBR_ALLOW_PTY_SMOKE=1\n", .{});
@@ -114,48 +137,58 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("ok: External Edit PTY handoff, redraw, and recreated input verified\n", .{});
             return;
         }
-        if (std.mem.eql(u8, f, "auth")) return authRun(init, gpa, &rest, flag_profile);
+        if (std.mem.eql(u8, f, "auth")) return authRun(init, gpa, &rest, flag_profile, diagnostic.forContext(.auth, .{}));
         if (std.mem.eql(u8, f, "login")) {
             std.debug.print("bbr: use `bbr auth login` (login lives under the auth group)\n", .{});
-            std.process.exit(1);
+            exitFailure(diagnostic.forContext(.arguments, .{}), error.UnknownCommand, @src());
         }
         if (std.mem.eql(u8, f, "logout")) {
             std.debug.print("bbr: use `bbr auth logout` (logout lives under the auth group)\n", .{});
-            std.process.exit(1);
+            exitFailure(diagnostic.forContext(.arguments, .{}), error.UnknownCommand, @src());
         }
-        if (std.mem.eql(u8, f, "completion")) return completion_cli.run(init, gpa, &rest);
+        if (std.mem.eql(u8, f, "completion")) return completion_cli.run(init, gpa, &rest, diagnostic.forContext(.completion, .{}));
         if (std.mem.eql(u8, f, "check-blobs")) {
             var blob_owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
-                if (err == error.InvalidAuthFile) return;
-                std.debug.print("skipped: blob checker needs a login (`bbr auth login`) or BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
-                return;
+                _ = diagnostic.forContext(.auth, .{}).failure(.read, .{ .zig = err }, @src());
+                switch (err) {
+                    error.InvalidAuthFile => return,
+                    else => {
+                        std.debug.print("skipped: blob checker needs a login (`bbr auth login`) or BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
+                        return;
+                    },
+                }
             };
             defer blob_owned.deinit(gpa);
-            return checkBlobsRun(init, gpa, blob_owned.credential(), &rest);
+            return checkBlobsRun(init, gpa, blob_owned.credential(), &rest, diagnostic);
         }
     }
 
     var owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
-        if (err == error.InvalidAuthFile) return;
-        std.debug.print("bbr: missing credential: {s}\nRun `bbr auth login` to save credentials, or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.\n", .{
-            @errorName(err),
-        });
-        return;
+        _ = diagnostic.forContext(.auth, .{}).failure(.read, .{ .zig = err }, @src());
+        switch (err) {
+            error.InvalidAuthFile => return,
+            else => {
+                std.debug.print("bbr: missing credential: {s}\nRun `bbr auth login` to save credentials, or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.\n", .{
+                    @errorName(err),
+                });
+                return;
+            },
+        }
     };
     defer owned.deinit(gpa);
     const cred = owned.credential();
 
     if (first) |f| {
         // Debug aids: dump raw comment JSON (no parsing).
-        if (std.mem.eql(u8, f, "raw-comments")) return rawComments(init, gpa, cred, &rest);
-        if (std.mem.eql(u8, f, "raw-comment")) return rawComment(init, gpa, cred, &rest);
+        if (std.mem.eql(u8, f, "raw-comments")) return rawComments(init, gpa, cred, &rest, diagnostic);
+        if (std.mem.eql(u8, f, "raw-comment")) return rawComment(init, gpa, cred, &rest, diagnostic);
         // Live smoke test: fetch + print, no TUI (scriptable, exits non-zero on failure).
-        if (std.mem.eql(u8, f, "check")) return checkRun(init, gpa, cred, &rest);
-        if (std.mem.eql(u8, f, "check-acquisition")) return checkAcquisitionRun(init, gpa, cred);
-        if (std.mem.eql(u8, f, "check-mutation")) return checkMutationRun(init, gpa, cred, &rest);
-        if (std.mem.eql(u8, f, "check-verdict")) return checkVerdictRun(init, gpa, cred, &rest);
+        if (std.mem.eql(u8, f, "check")) return checkRun(init, gpa, cred, &rest, diagnostic);
+        if (std.mem.eql(u8, f, "check-acquisition")) return checkAcquisitionRun(init, gpa, cred, diagnostic);
+        if (std.mem.eql(u8, f, "check-mutation")) return checkMutationRun(init, gpa, cred, &rest, diagnostic);
+        if (std.mem.eql(u8, f, "check-verdict")) return checkVerdictRun(init, gpa, cred, &rest, diagnostic);
         // Print startup resolution (branch/remote/PR list) without the TUI.
-        if (std.mem.eql(u8, f, "detect")) return detectRun(init, gpa, cred, &rest);
+        if (std.mem.eql(u8, f, "detect")) return detectRun(init, gpa, cred, &rest, diagnostic);
     }
 
     // Build the startup input from the remaining args: a URL, an explicit
@@ -165,21 +198,29 @@ pub fn main(init: std.process.Init) !void {
         if (looksLikeUrl(f)) {
             input = .{ .url = f };
         } else if (rest.next()) |second| {
-            input = .{ .repo_slug = f, .id = std.fmt.parseInt(u64, second, 10) catch return usage() };
+            input = .{ .repo_slug = f, .id = std.fmt.parseInt(u64, second, 10) catch |err| return invalidUsage(diagnostic, err, @src()) };
         } else {
             input = .{ .repo_slug = f };
         }
     }
 
-    var loaded = try config.load(gpa, init.io, init.environ_map);
+    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(init.io, diagnostic, err, @src());
     defer loaded.deinit(gpa);
     switch (loaded) {
-        .ok => |*configuration| try openTui(init, gpa, cred, input, configuration),
-        .invalid => |failure| failure.report(),
+        .ok => |*configuration| try openTui(init, gpa, cred, input, configuration, diagnostic),
+        .invalid => |failure| reportConfigFailure(diagnostic, failure),
     }
 }
 
-fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
+/// The boundary of `bbr grammar`: it prints and records each failure of the command once.
+fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
+    grammarCommand(init, gpa, it, diagnostic) catch |err| switch (err) {
+        error.StdoutClosed, error.Reported => return err,
+        else => return bbr.cli_failure.fail(init.io, diagnostic, .execute, .{ .zig = err }, @src(), std.Io.Writer.print, .{ "bbr grammar: {s}\n", .{@errorName(err)} }),
+    };
+}
+
+fn grammarCommand(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(gpa);
     while (it.next()) |arg| try args.append(gpa, arg);
@@ -190,12 +231,9 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void
     var interactive_digest: ?[32]u8 = null;
     if (needs_confirmation) {
         const path_index: usize = if (std.mem.eql(u8, args.items[0], "update")) 2 else 1;
-        if (args.items.len <= path_index) return usage();
-        var output_buffer: [4096]u8 = undefined;
-        var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-        const previewed_digest = try grammar_cli.writeCandidateReport(gpa, init.io, args.items[path_index], &stdout.interface);
-        try stdout.interface.writeAll("Trust this exact bundle? [y/N] ");
-        try stdout.interface.flush();
+        if (args.items.len <= path_index) return invalidUsage(diagnostic, error.MissingRequired, @src());
+        var previewed_digest: [32]u8 = undefined;
+        try bbr.stdout.write(init.io, writeTrustQuestion, .{ gpa, init.io, args.items[path_index], &previewed_digest, diagnostic });
         var buffer: [16]u8 = undefined;
         var stdin = std.Io.File.stdin().reader(init.io, &buffer);
         const answer = (try stdin.interface.takeDelimiter('\n')) orelse "";
@@ -203,13 +241,16 @@ fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer, " \t\r"), "yes");
         if (approved) interactive_digest = previewed_digest;
     }
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    grammar_cli.run(gpa, init.io, init.environ_map, args.items, interactive_digest, &stdout.interface) catch |err| {
-        std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
-        return err;
-    };
-    try stdout.interface.flush();
+    try bbr.stdout.write(init.io, runGrammar, .{ gpa, init.io, init.environ_map, args.items, interactive_digest, diagnostic });
+}
+
+fn writeTrustQuestion(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, path: []const u8, digest: *[32]u8, diagnostic: bbr.diagnostics.Handle) !void {
+    digest.* = try grammar_cli.writeCandidateReport(gpa, io, path, writer, diagnostic);
+    try writer.writeAll("Trust this exact bundle? [y/N] ");
+}
+
+fn runGrammar(writer: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, args: []const []const u8, interactive_digest: ?[32]u8, diagnostic: bbr.diagnostics.Handle) !void {
+    return grammar_cli.run(gpa, io, env, args, interactive_digest, writer, diagnostic);
 }
 
 fn containsTrustArgument(args: []const []const u8) bool {
@@ -219,19 +260,21 @@ fn containsTrustArgument(args: []const []const u8) bool {
 
 /// Resolve the startup entry and hand off to the TUI. One StdHttpClient serves
 /// startup and every remote worker so its connection pool lives for the TUI.
-fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, input: bbr.startup.Input, configuration: *const config.Configuration) !void {
+fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, input: bbr.startup.Input, configuration: *const config.Configuration, diagnostic: bbr.diagnostics.Handle) anyerror!void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    git.diagnostic = diagnostic;
 
     var client = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
     defer client.deinit();
     try client.initDefaultProxies(a, init.environ_map);
-    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
 
     const entry = bbr.startup.resolve(a, git.gitClient(), bb, input) catch |err| {
+        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
         std.debug.print("bbr: could not resolve a PR to open: {s}\n", .{@errorName(err)});
         return;
     };
@@ -263,7 +306,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     @memcpy(repo_buf[0..repo_len], target.repo[0..repo_len]);
 
     // Global-tier pending-review store (design §11): opened once, lives until exit.
-    var store = openStore(gpa, init.io, init.environ_map);
+    var store = openStore(gpa, init.io, init.environ_map, diagnostic);
     defer store.deinit();
     var lock_dir = try openSubmissionLockDir(gpa, init.io, init.environ_map);
     defer lock_dir.close(init.io);
@@ -274,18 +317,20 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         else => return err,
     };
     defer if (grammar_store) |*grammar_data_store| grammar_data_store.deinit();
+    if (grammar_store) |*grammar_data_store| grammar_data_store.diagnostic_handle = diagnostic.forContext(.grammar, .{});
     var grammar_registry: ?@import("highlight/user_grammar.zig").Registry = null;
     defer if (grammar_registry) |*registry| registry.deinit();
     if (grammar_store) |*grammar_data_store| {
         const grammar_entries = try grammar_data_store.registryEntries(a);
         const grammar_overrides = try grammar_cli.loadOverrides(a, init.io, init.environ_map);
         try grammar_data_store.validateOverrideNames(grammar_overrides);
-        grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity);
+        grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity, diagnostic.forContext(.grammar, .{}));
     }
-    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null);
+    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null, diagnostic.forContext(.highlighting, .{}));
     defer tree_sitter_highlighter.deinit();
 
-    app.run(.{
+    try app.run(.{
+        .diagnostic = diagnostic,
         .io = init.io,
         .gpa = gpa,
         .env_map = init.environ_map,
@@ -303,54 +348,54 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .submission_locks = os_locks.locks(),
-    }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id)) catch |err| {
-        if (tuiFatalMessage(err)) |message| {
-            std.debug.print("{s}\n", .{message});
-            return;
-        }
-        return err;
-    };
+    }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id));
 }
 
-fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
+fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, snapshot: bbr.config_source.Snapshot, diagnostic: bbr.diagnostics.Handle) anyerror!void {
     const base_input = it.next();
     const source_input = it.next();
-    if (it.next() != null) return usage();
+    if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
-    var loaded = try config.load(gpa, init.io, init.environ_map);
+    var loaded = config.loadSnapshot(gpa, snapshot) catch |err| return configLoadFailed(init.io, diagnostic, err, @src());
     defer loaded.deinit(gpa);
     const configuration = switch (loaded) {
         .ok => |*value| value,
-        .invalid => |failure| return failure.report(),
+        .invalid => |failure| return reportConfigFailure(diagnostic, failure),
     };
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    git.diagnostic = diagnostic;
     const client = git.gitClient();
     const source_name = if (source_input) |value| value else client.currentBranch(a) catch |err| {
+        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
         std.debug.print("bbr local: cannot determine SourceRef: {s}\n", .{@errorName(err)});
         return;
     };
     const source = client.resolveRef(a, source_name) catch |err| {
+        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
         std.debug.print("bbr local: cannot resolve SourceRef '{s}': {s}\n", .{ source_name, @errorName(err) });
         return;
     };
     const base_name = if (base_input) |value| value else client.defaultBaseRef(a, source.canonical) catch |err| {
+        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
         std.debug.print("bbr local: no default BaseRef ({s}); pass one explicitly\n", .{@errorName(err)});
         return;
     };
     const base = client.resolveRef(a, base_name) catch |err| {
+        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
         std.debug.print("bbr local: cannot resolve BaseRef '{s}': {s}\n", .{ base_name, @errorName(err) });
         return;
     };
     const common_dir = client.commonDir(a) catch |err| {
+        _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
         std.debug.print("bbr local: cannot identify repository: {s}\n", .{@errorName(err)});
         return;
     };
 
-    var store = openStore(gpa, init.io, init.environ_map);
+    var store = openStore(gpa, init.io, init.environ_map, diagnostic);
     defer store.deinit();
     const common_alias = try std.fmt.allocPrint(a, "common:{s}", .{common_dir});
     var aliases: [2][]const u8 = undefined;
@@ -358,34 +403,47 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
     if (client.repositoryRemote(a, source.canonical)) |remote| {
         aliases[alias_count] = try std.fmt.allocPrint(a, "remote:{s}", .{remote});
         alias_count += 1;
-    } else |_| {}
+    } else |err| switch (err) {
+        error.NoRemote => {},
+        else => _ = diagnostic.forContext(.git, .{}).failure(.read, .{ .zig = err }, @src()),
+    }
     aliases[alias_count] = common_alias;
     alias_count += 1;
-    const repository_id = store.store().resolveRepository(aliases[0..alias_count]) catch |err| {
-        std.debug.print("bbr local: cannot resolve repository identity: {s}\n", .{@errorName(err)});
-        return;
+    const repository_id = store.store().resolveRepository(aliases[0..alias_count]) catch |err| switch (err) {
+        error.Reported => {
+            std.debug.print("bbr local: cannot resolve repository identity\n", .{});
+            return;
+        },
+        else => {
+            _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
+            std.debug.print("bbr local: cannot resolve repository identity: {s}\n", .{@errorName(err)});
+            return;
+        },
     };
-    const key = presentation.OwnedReviewIdentity.initLocal(repository_id, base.canonical, source.canonical) catch {
+    const key = presentation.OwnedReviewIdentity.initLocal(repository_id, base.canonical, source.canonical) catch |err| {
+        _ = diagnostic.failure(.prepare, .{ .zig = err }, @src());
         std.debug.print("bbr local: Ref name is too long\n", .{});
         return;
     };
 
     var grammar_store: ?grammar_cli.Store = grammar_cli.Store.open(gpa, init.io, init.environ_map) catch |err| switch (err) {
         error.NoDataHome => null,
-        else => return err,
+        else => return @as(anyerror!void, err),
     };
     defer if (grammar_store) |*grammar_data_store| grammar_data_store.deinit();
+    if (grammar_store) |*grammar_data_store| grammar_data_store.diagnostic_handle = diagnostic.forContext(.grammar, .{});
     var grammar_registry: ?@import("highlight/user_grammar.zig").Registry = null;
     defer if (grammar_registry) |*registry| registry.deinit();
     if (grammar_store) |*grammar_data_store| {
         const grammar_entries = try grammar_data_store.registryEntries(a);
         const grammar_overrides = try grammar_cli.loadOverrides(a, init.io, init.environ_map);
         try grammar_data_store.validateOverrideNames(grammar_overrides);
-        grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity);
+        grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity, diagnostic.forContext(.grammar, .{}));
     }
-    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null);
+    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null, diagnostic.forContext(.highlighting, .{}));
     defer tree_sitter_highlighter.deinit();
     try app.run(.{
+        .diagnostic = diagnostic,
         .io = init.io,
         .gpa = gpa,
         .env_map = init.environ_map,
@@ -405,26 +463,34 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
     }, null, key);
 }
 
-fn tuiFatalMessage(err: anyerror) ?[]const u8 {
-    return switch (err) {
-        error.FileEnrichmentOutOfMemory => "bbr: file enrichment ran out of memory; the review was not modified",
-        else => null,
-    };
-}
-
 /// Open the pending-review store at `<state home>/bbr/pending.db`, creating the
 /// directory. Falls back to an in-memory (non-durable) store when no state home
 /// resolves or the file can't be prepared, so the reviewer can still author this session.
-fn openStore(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map) persist.SqliteStore {
+fn openStore(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, diagnostic: bbr.diagnostics.Handle) persist.SqliteStore {
     if (statePath(gpa, io, env_map)) |path| {
         defer gpa.free(path);
-        if (persist.SqliteStore.open(path)) |s| {
+        if (persist.SqliteStore.openDiagnostic(path, diagnostic.forContext(.persistence, .{}))) |s| {
             return s;
-        } else |err| {
-            std.debug.print("bbr: could not open {s} ({s}); drafts won't persist this session\n", .{ path, @errorName(err) });
+        } else |err| switch (err) {
+            // The SQLite seam recorded the result code. The error name says nothing more.
+            error.Reported => std.debug.print("bbr: could not open {s}; drafts won't persist this session\n", .{path}),
+            else => {
+                _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
+                std.debug.print("bbr: could not open {s} ({s}); drafts won't persist this session\n", .{ path, @errorName(err) });
+            },
         }
-    } else |_| {}
-    return persist.SqliteStore.open(":memory:") catch @panic("sqlite :memory: open failed");
+    } else |err| switch (err) {
+        error.NoStateHome => {},
+        else => _ = diagnostic.forContext(.persistence, .{}).failure(.prepare, .{ .zig = err }, @src()),
+    }
+    return memoryStore(diagnostic);
+}
+
+fn memoryStore(diagnostic: bbr.diagnostics.Handle) persist.SqliteStore {
+    return persist.SqliteStore.openDiagnostic(":memory:", diagnostic.forContext(.persistence, .{})) catch |err| {
+        _ = diagnostic.forContext(.persistence, .{}).failure(.open, .{ .zig = err }, @src());
+        @panic("sqlite :memory: open failed");
+    };
 }
 
 /// Build the state DB path, creating `<state home>/bbr`. Caller frees.
@@ -452,43 +518,43 @@ fn looksLikeUrl(s: []const u8) bool {
         std.mem.indexOf(u8, s, "bitbucket.org") != null;
 }
 
-fn rawComments(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
-    const repo = it.next() orelse return usage();
-    const pr_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+fn rawComments(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
+    const repo = it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src());
+    const pr_id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
 
     const raw = try bb.getCommentsRaw(gpa, repo, pr_id);
     defer gpa.free(raw);
     std.debug.print("{s}\n", .{raw});
 }
 
-fn rawComment(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
-    const repo = it.next() orelse return usage();
-    const pr_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
-    const cid = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+fn rawComment(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
+    const repo = it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src());
+    const pr_id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
+    const cid = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
 
     const raw = try bb.getCommentRaw(gpa, repo, pr_id, cid);
     defer gpa.free(raw);
     std.debug.print("{s}\n", .{raw});
 }
 
-fn checkRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
-    const repo = it.next() orelse return usage();
-    const id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+fn checkRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
+    const repo = it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src());
+    const id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
 
     const pr = try bb.getPullRequest(gpa, repo, id);
     defer bbr.bitbucket.deinitPullRequest(gpa, pr);
@@ -529,7 +595,7 @@ fn checkRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.
     }
 }
 
-fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential) !void {
+fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, diagnostic: bbr.diagnostics.Handle) !void {
     if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_ACQUISITION_GATE") orelse "", "1")) {
         std.debug.print("bbr: refusing live acquisition gate without BBR_ALLOW_LIVE_ACQUISITION_GATE=1\n", .{});
         return;
@@ -542,8 +608,8 @@ fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr
         var rate_limited: usize = 0;
         var max_connections: usize = 0;
         for (0..10) |sample_index| {
-            sequential[sample_index] = runAcquisitionSample(init, gpa, cred, id, false, &failures, &rate_limited, &max_connections) catch 0;
-            bounded[sample_index] = runAcquisitionSample(init, gpa, cred, id, true, &failures, &rate_limited, &max_connections) catch 0;
+            sequential[sample_index] = acquisitionSample(init, gpa, cred, id, false, &failures, &rate_limited, &max_connections, diagnostic);
+            bounded[sample_index] = acquisitionSample(init, gpa, cred, id, true, &failures, &rate_limited, &max_connections, diagnostic);
         }
         std.mem.sort(u64, &sequential, {}, std.sort.asc(u64));
         std.mem.sort(u64, &bounded, {}, std.sort.asc(u64));
@@ -557,23 +623,21 @@ fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr
     }
 }
 
-fn runAcquisitionSample(
-    init: std.process.Init,
-    gpa: std.mem.Allocator,
-    cred: bbr.bitbucket.Credential,
-    id: u64,
-    bounded: bool,
-    failures: *usize,
-    rate_limited: *usize,
-    max_connections: *usize,
-) !u64 {
+fn acquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, id: u64, bounded: bool, failures: *usize, rate_limited: *usize, max_connections: *usize, diagnostic: bbr.diagnostics.Handle) u64 {
+    return runAcquisitionSample(init, gpa, cred, id, bounded, failures, rate_limited, max_connections, diagnostic) catch |err| {
+        _ = diagnostic.forContext(.session_load, .{}).failure(.execute, .{ .zig = err }, @src());
+        return 0;
+    };
+}
+
+fn runAcquisitionSample(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, id: u64, bounded: bool, failures: *usize, rate_limited: *usize, max_connections: *usize, diagnostic: bbr.diagnostics.Handle) !u64 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
     defer transport.deinit();
     transport.enableConnectionCountTracking();
     try transport.initDefaultProxies(arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred);
+    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred).withDiagnostics(diagnostic);
     const start = std.Io.Clock.awake.now(init.io);
     const loaded = if (bounded)
         session.loadWith(init.io, std.heap.page_allocator, bb, "pr-webapp", id)
@@ -581,27 +645,30 @@ fn runAcquisitionSample(
         session.loadSequentialWith(std.heap.page_allocator, bb, "pr-webapp", id);
     const candidate = loaded catch |err| {
         failures.* += 1;
-        if (err == error.RateLimited) rate_limited.* += 1;
-        return err;
+        switch (err) {
+            error.RateLimited => rate_limited.* += 1,
+            else => {},
+        }
+        return @as(anyerror!u64, err);
     };
     defer candidate.destroy();
     max_connections.* = @max(max_connections.*, transport.maxConnectionCount());
     return @intCast(@divFloor(start.untilNow(init.io, .awake).toNanoseconds(), std.time.ns_per_ms));
 }
 
-fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
+fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
     if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_MUTATION") orelse "", "1")) {
         std.debug.print("bbr: refusing destructive check without BBR_ALLOW_LIVE_MUTATION=1\n", .{});
         return;
     }
-    const repo = it.next() orelse return usage();
-    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
-    if (it.next() != null) return usage();
+    const repo = it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src());
+    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
+    if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
     const author_uuid = try bb.getAuthenticatedAccountUuid(gpa);
     defer gpa.free(author_uuid);
 
@@ -615,7 +682,9 @@ fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bi
 
     const comment_id = try bb.createComment(gpa, repo, pull_request_id, .{ .body = created_body, .scope = .review });
     var cleanup_needed = true;
-    defer if (cleanup_needed) bb.deleteComment(gpa, repo, pull_request_id, comment_id) catch {};
+    defer if (cleanup_needed) bb.deleteComment(gpa, repo, pull_request_id, comment_id) catch |err| {
+        _ = diagnostic.forContext(.mutation, .{}).failure(.cleanup, .{ .zig = err }, @src());
+    };
 
     try verifyLiveComment(gpa, bb, repo, pull_request_id, comment_id, author_uuid, created_body);
     try bb.updateComment(gpa, repo, pull_request_id, comment_id, updated_body);
@@ -626,19 +695,22 @@ fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bi
     std.debug.print("ok: created, fetched, body-updated, and deleted disposable Comment #{d}\n", .{comment_id});
 }
 
-fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
+fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
     if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_MUTATION") orelse "", "1")) {
         std.debug.print("bbr: refusing destructive check without BBR_ALLOW_LIVE_MUTATION=1\n", .{});
         return;
     }
-    const repo = it.next() orelse return usage();
-    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
-    if (it.next() != null) return usage();
+    const repo = it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src());
+    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
+    if (it.next() != null) return invalidUsage(diagnostic, error.UnexpectedArgument, @src());
 
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred);
+    try checkVerdict(init.io, gpa, bbr.bitbucket.Client.init(transport.httpClient(), cred).withDiagnostics(diagnostic), repo, pull_request_id, diagnostic);
+}
+
+fn checkVerdict(io: std.Io, gpa: std.mem.Allocator, bb: bbr.bitbucket.Client, repo: []const u8, pull_request_id: u64, diagnostic: bbr.diagnostics.Handle) !void {
     const account_uuid = try bb.getAuthenticatedAccountUuid(gpa);
     defer gpa.free(account_uuid);
     const initial_pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
@@ -649,13 +721,17 @@ fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bit
     const target: bbr.bitbucket.ReviewerVerdict = if (initial == .approved) .changes_requested else .approved;
     var restored = false;
     defer if (!restored) {
-        _ = restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial) catch {};
+        if (restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial)) |result| {
+            if (!verdictChangeSucceeded(result)) _ = diagnostic.forContext(.verdict, .{}).failure(.cleanup, .{ .zig = verdictChangeCause(result, error.ReviewerVerdictRestoreFailed) }, @src());
+        } else |err| {
+            _ = diagnostic.forContext(.verdict, .{}).failure(.cleanup, .{ .zig = err }, @src());
+        }
     };
 
     const changed = try bb.changeReviewerVerdict(gpa, repo, pull_request_id, initial_pull_request.source_commit, account_uuid, target);
-    if (!verdictChangeSucceeded(changed)) return error.ReviewerVerdictChangeFailed;
+    if (!verdictChangeSucceeded(changed)) return verdictChangeFailed(io, diagnostic, changed, error.ReviewerVerdictChangeFailed, @src());
     const restore_result = try restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial);
-    if (!verdictChangeSucceeded(restore_result)) return error.ReviewerVerdictRestoreFailed;
+    if (!verdictChangeSucceeded(restore_result)) return verdictChangeFailed(io, diagnostic, restore_result, error.ReviewerVerdictRestoreFailed, @src());
     restored = true;
     std.debug.print("ok: changed Reviewer Verdict from {s} to {s} and restored it\n", .{ @tagName(initial), @tagName(target) });
 }
@@ -673,6 +749,21 @@ fn restoreReviewerVerdict(
     return bb.changeReviewerVerdict(gpa, repo, pull_request_id, current.source_commit, account_uuid, target);
 }
 
+/// The cause that a failed change result names, else `failure`.
+fn verdictChangeCause(result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror) anyerror {
+    return switch (result) {
+        .api_error => |err| err,
+        .unresolved => |err| err orelse failure,
+        .success, .reconciled_success, .stale_source_commit => failure,
+    };
+}
+
+/// Shows a failed change with the cause that its result names, and records that cause once.
+fn verdictChangeFailed(io: std.Io, diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    const cause = verdictChangeCause(result, failure);
+    return bbr.cli_failure.fail(io, diagnostic.forContext(.verdict, .{}), .execute, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) } });
+}
+
 fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) bool {
     return switch (result) {
         .success, .reconciled_success => true,
@@ -680,23 +771,23 @@ fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) boo
     };
 }
 
-fn checkBlobsRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
-    const repo = it.next() orelse return usage();
-    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+fn checkBlobsRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
+    const repo = it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src());
+    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src()), 10) catch |err| return invalidUsage(diagnostic, err, @src());
     const fixture_classes = [_][]const u8{ "text", "empty", "binary", "path-special", "executable", "link" };
     var checked: [fixture_classes.len]bool = @splat(false);
 
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
     const pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
     defer bbr.bitbucket.deinitPullRequest(gpa, pull_request);
 
     while (it.next()) |class| {
-        const side = it.next() orelse return usage();
-        const path = it.next() orelse return usage();
-        const expected_attributes = it.next() orelse return usage();
+        const side = it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src());
+        const path = it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src());
+        const expected_attributes = it.next() orelse return invalidUsage(diagnostic, error.MissingRequired, @src());
         const class_index = for (fixture_classes, 0..) |known, index| {
             if (std.mem.eql(u8, known, class)) break index;
         } else return error.UnknownBlobFixtureClass;
@@ -773,7 +864,7 @@ fn verifyLiveCommentDeleted(
 
 /// `detect [<repo>]`: run startup resolution and print the outcome, no TUI. A
 /// scriptable way to verify the GitClient + list pipeline against live data.
-fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
+fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype, diagnostic: bbr.diagnostics.Handle) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -782,6 +873,7 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
     if (it.next()) |repo| input = .{ .repo_slug = repo };
 
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    git.diagnostic = diagnostic;
 
     // Report what the GitClient sees, so a failed detect is diagnosable.
     if (git.gitClient().currentBranch(a)) |b| {
@@ -794,7 +886,7 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
     var client = bbr.http.StdHttpClient.init(gpa, init.io);
     defer client.deinit();
     try client.initDefaultProxies(a, init.environ_map);
-    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
 
     const entry = try bbr.startup.resolve(a, git.gitClient(), bb, input);
     switch (entry) {
@@ -820,7 +912,7 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
 /// `error.EmptyInput` when the line is blank (the caller re-prompts).
 /// `stdin` is one reader held for the whole login so piped input is not lost
 /// between prompts (each reader buffers its fill).
-fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt: []const u8, hide_input: bool) ![]u8 {
+fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt: []const u8, hide_input: bool, diagnostic: bbr.diagnostics.Handle) ![]u8 {
     const fd = std.Io.File.stdin().handle;
     const original: ?std.posix.termios = if (hide_input) std.posix.tcgetattr(fd) catch |err| switch (err) {
         error.NotATerminal => null,
@@ -832,15 +924,13 @@ fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt
         hidden.lflag.ECHONL = false;
         try std.posix.tcsetattr(fd, .NOW, hidden);
     }
-    defer if (original) |term| std.posix.tcsetattr(fd, .NOW, term) catch {};
+    defer if (original) |term| std.posix.tcsetattr(fd, .NOW, term) catch |err| {
+        _ = diagnostic.failure(.cleanup, .{ .zig = err }, @src());
+    };
 
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(io, &output_buffer);
-    try stdout.interface.writeAll(prompt);
-    try stdout.interface.flush();
-    defer if (original != null) {
-        stdout.interface.writeAll("\n") catch {};
-        stdout.interface.flush() catch {};
+    try bbr.stdout.writeAll(io, prompt);
+    defer if (original != null) bbr.stdout.writeAll(io, "\n") catch |err| {
+        _ = diagnostic.failure(.write, .{ .zig = err }, @src());
     };
     const line = (try stdin.takeDelimiter('\n')) orelse return error.LoginAborted;
     const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -850,10 +940,10 @@ fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt
 }
 
 /// Prompt up to three times for a non-empty value.
-fn promptField(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt: []const u8, hide_input: bool) ![]u8 {
+fn promptField(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt: []const u8, hide_input: bool, diagnostic: bbr.diagnostics.Handle) ![]u8 {
     var attempts: usize = 0;
     while (attempts < 3) : (attempts += 1) {
-        return promptInput(gpa, io, stdin, prompt, hide_input) catch |err| switch (err) {
+        return promptInput(gpa, io, stdin, prompt, hide_input, diagnostic) catch |err| switch (err) {
             error.EmptyInput => continue,
             else => return err,
         };
@@ -888,7 +978,7 @@ fn warnEnvOverride(env_map: *std.process.Environ.Map) void {
 /// Prompts for each missing field in Email, Token, Workspace order, proves
 /// the Credential live, then saves it as the Active Profile.
 /// Exit 0 only when the Credential validates and saves, else exit 1.
-fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8) !void {
+fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8, diagnostic: bbr.diagnostics.Handle) !void {
     const auth = bbr.bitbucket.auth;
     var positional: ?[]const u8 = null;
     var flag_email: ?[]const u8 = null;
@@ -900,46 +990,46 @@ fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fla
         } else if (std.mem.eql(u8, a, "--email")) {
             flag_email = rest.next() orelse {
                 std.debug.print("bbr: --email needs a value; the token never rides as a CLI argument\n", .{});
-                std.process.exit(1);
+                exitFailure(diagnostic, error.MissingValue, @src());
             };
         } else if (std.mem.startsWith(u8, a, "--email=")) {
             flag_email = a["--email=".len..];
         } else if (std.mem.eql(u8, a, "--workspace")) {
             flag_workspace = rest.next() orelse {
                 std.debug.print("bbr: --workspace needs a value; the token never rides as a CLI argument\n", .{});
-                std.process.exit(1);
+                exitFailure(diagnostic, error.MissingValue, @src());
             };
         } else if (std.mem.startsWith(u8, a, "--workspace=")) {
             flag_workspace = a["--workspace=".len..];
         } else if (std.mem.startsWith(u8, a, "-")) {
             std.debug.print("bbr: unknown login option '{s}'; the token never rides as a CLI argument (use the hidden prompt or --stdin)\n", .{a});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.UnknownFlag, @src());
         } else if (positional == null) {
             positional = a;
         } else {
             std.debug.print("bbr: unexpected argument '{s}'; the token never rides as a CLI argument\n", .{a});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.UnexpectedArgument, @src());
         }
     }
     if (positional) |p| {
         if (!auth.isValidProfileName(p)) {
             std.debug.print("bbr: invalid profile name '{s}'\n", .{p});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.InvalidProfileName, @src());
         }
     }
     if (positional != null and flag_profile != null and !std.mem.eql(u8, positional.?, flag_profile.?)) {
         std.debug.print("bbr: profile given twice (`{s}` vs `--profile {s}`); use one\n", .{ positional.?, flag_profile.? });
-        std.process.exit(1);
+        exitFailure(diagnostic, error.DuplicateProfile, @src());
     }
     const profile_name = auth.selectedProfileName(gpa, init.environ_map, null, positional orelse flag_profile) catch |err| {
         std.debug.print("bbr: could not select profile: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        exitFailure(diagnostic, err, @src());
     };
     defer gpa.free(profile_name);
 
     const auth_path = (try auth.authFilePath(gpa, init.environ_map)) orelse {
         std.debug.print("bbr: cannot save credentials: set HOME or an absolute XDG_DATA_HOME\n", .{});
-        std.process.exit(1);
+        exitFailure(diagnostic, error.NoDataHome, @src());
     };
     defer gpa.free(auth_path);
 
@@ -952,94 +1042,98 @@ fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fla
     if (want_stdin) {
         const email = email_arg orelse {
             std.debug.print("bbr: --stdin needs --email and --workspace; missing email; nothing saved\n", .{});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.MissingUsername, @src());
         };
         const workspace = workspace_arg orelse {
             std.debug.print("bbr: --stdin needs --email and --workspace; missing workspace; nothing saved\n", .{});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.MissingWorkspace, @src());
         };
         const token = readStdinToken(gpa, &stdin.interface) catch |err| {
-            if (err == error.OutOfMemory) {
-                std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
-            } else {
-                std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
+            switch (err) {
+                error.OutOfMemory => std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{}),
+                else => std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{}),
             }
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         };
         defer gpa.free(token);
-        return loginValidateAndSave(init, gpa, profile_name, email, token, workspace);
+        return loginValidateAndSave(init, gpa, profile_name, email, token, workspace, diagnostic);
     }
 
-    const stdin_is_tty = std.Io.File.stdin().isTty(init.io) catch false;
+    const stdin_is_tty = std.Io.File.stdin().isTty(init.io) catch |err| blk: {
+        _ = diagnostic.failure(.read, .{ .zig = err }, @src());
+        break :blk false;
+    };
     if (!stdin_is_tty) {
         std.debug.print("bbr: piped input needs --stdin with --email and --workspace, or run in a terminal\n", .{});
-        std.process.exit(1);
+        exitFailure(diagnostic, error.StdinRequiresFlag, @src());
     }
     var email_owned: ?[]u8 = null;
     defer if (email_owned) |e| gpa.free(e);
     var workspace_owned: ?[]u8 = null;
     defer if (workspace_owned) |w| gpa.free(w);
     if (email_arg) |e| {
-        email_owned = gpa.dupe(u8, e) catch {
+        email_owned = gpa.dupe(u8, e) catch |err| {
             std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         };
     } else {
-        email_owned = promptField(gpa, init.io, &stdin.interface, "Email: ", false) catch |err| {
+        email_owned = promptField(gpa, init.io, &stdin.interface, "Email: ", false, diagnostic) catch |err| {
             std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         };
     }
-    const token = promptField(gpa, init.io, &stdin.interface, "Token: ", true) catch |err| {
+    const token = promptField(gpa, init.io, &stdin.interface, "Token: ", true, diagnostic) catch |err| {
         std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
-        std.process.exit(1);
+        exitFailure(diagnostic, err, @src());
     };
     defer gpa.free(token);
     if (workspace_arg) |w| {
-        workspace_owned = gpa.dupe(u8, w) catch {
+        workspace_owned = gpa.dupe(u8, w) catch |err| {
             std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         };
     } else {
-        workspace_owned = promptField(gpa, init.io, &stdin.interface, "Workspace: ", false) catch |err| {
+        workspace_owned = promptField(gpa, init.io, &stdin.interface, "Workspace: ", false, diagnostic) catch |err| {
             std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         };
     }
-    return loginValidateAndSave(init, gpa, profile_name, email_owned.?, token, workspace_owned.?);
+    return loginValidateAndSave(init, gpa, profile_name, email_owned.?, token, workspace_owned.?, diagnostic);
 }
 
 /// Prove the candidate live (account + Workspace probes) before any save.
 /// Preserves the prior stored Credential on any failure. Exit 1 on failure.
-fn loginValidateAndSave(init: std.process.Init, gpa: std.mem.Allocator, profile_name: []const u8, email: []const u8, token: []const u8, workspace: []const u8) !void {
+fn loginValidateAndSave(init: std.process.Init, gpa: std.mem.Allocator, profile_name: []const u8, email: []const u8, token: []const u8, workspace: []const u8, diagnostic: bbr.diagnostics.Handle) !void {
     const auth = bbr.bitbucket.auth;
     const candidate: bbr.bitbucket.Credential = .{ .username = email, .token = token, .workspace = workspace };
     var http_client = bbr.http.StdHttpClient.init(gpa, init.io);
     defer http_client.deinit();
     http_client.initDefaultProxies(init.arena.allocator(), init.environ_map) catch |err| {
         std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
-        std.process.exit(1);
+        exitFailure(diagnostic, err, @src());
     };
-    const bb = bbr.bitbucket.Client.init(http_client.httpClient(), candidate);
+    const bb = bbr.bitbucket.Client.init(http_client.httpClient(), candidate).withDiagnostics(diagnostic);
 
     const uuid = bb.getAuthenticatedAccountUuid(gpa) catch |err| {
-        if (err == error.Unauthorized) std.debug.print("bbr: login failed: bad email/token (401); nothing saved\n", .{}) else std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
-        std.process.exit(1);
+        switch (err) {
+            error.Unauthorized => std.debug.print("bbr: login failed: bad email/token (401); nothing saved\n", .{}),
+            else => std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)}),
+        }
+        exitFailure(diagnostic, err, @src());
     };
     defer gpa.free(uuid);
     bb.checkWorkspace(gpa, workspace) catch |err| {
-        if (err == error.NotFound or err == error.Forbidden) {
-            std.debug.print("bbr: login failed: workspace not found or not visible; nothing saved\n", .{});
-        } else {
-            std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
+        switch (err) {
+            error.NotFound, error.Forbidden => std.debug.print("bbr: login failed: workspace not found or not visible; nothing saved\n", .{}),
+            else => std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)}),
         }
-        std.process.exit(1);
+        exitFailure(diagnostic, err, @src());
     };
 
     const path = auth.upsertProfile(gpa, init.io, init.environ_map, profile_name, candidate) catch |err| switch (err) {
         error.UnsafeAuthTarget, error.InvalidAuthFile, error.NoDataHome, error.InvalidProfileName, error.MissingUsername, error.MissingToken, error.MissingWorkspace => {
             std.debug.print("bbr: could not save credentials: {s}; nothing saved\n", .{@errorName(err)});
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         },
         else => return err,
     };
@@ -1051,7 +1145,7 @@ fn loginValidateAndSave(init: std.process.Init, gpa: std.mem.Allocator, profile_
 /// `bbr auth logout [profile|--all]` removes one Profile or the whole file.
 /// Idempotent: absent files succeed. States that logout neither revokes the
 /// API token nor removes environment overrides.
-fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8) !void {
+fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8, diagnostic: bbr.diagnostics.Handle) !void {
     const auth = bbr.bitbucket.auth;
     var positional: ?[]const u8 = null;
     var want_all = false;
@@ -1060,30 +1154,30 @@ fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
             want_all = true;
         } else if (std.mem.startsWith(u8, a, "-")) {
             std.debug.print("bbr: unknown logout option '{s}'\n", .{a});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.UnknownFlag, @src());
         } else if (positional == null) {
             positional = a;
         } else {
             std.debug.print("bbr: unexpected argument '{s}'\n", .{a});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.UnexpectedArgument, @src());
         }
     }
     if (positional) |p| {
         if (!auth.isValidProfileName(p)) {
             std.debug.print("bbr: invalid profile name '{s}'\n", .{p});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.InvalidProfileName, @src());
         }
     }
     if (!want_all and positional != null and flag_profile != null and !std.mem.eql(u8, positional.?, flag_profile.?)) {
         std.debug.print("bbr: profile given twice (`{s}` vs `--profile {s}`); use one\n", .{ positional.?, flag_profile.? });
-        std.process.exit(1);
+        exitFailure(diagnostic, error.DuplicateProfile, @src());
     }
 
     if (want_all) {
         const removed = auth.deleteAuthFile(gpa, init.io, init.environ_map) catch |err| switch (err) {
             error.UnsafeAuthTarget, error.NoDataHome => {
                 std.debug.print("bbr: logout failed: {s}\n", .{@errorName(err)});
-                std.process.exit(1);
+                exitFailure(diagnostic, err, @src());
             },
             else => return err,
         };
@@ -1100,7 +1194,7 @@ fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     var loaded = auth.load(gpa, init.io, init.environ_map) catch |err| switch (err) {
         error.InvalidAuthFile, error.UnsafeAuthTarget => {
             std.debug.print("bbr: logout failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         },
         else => return err,
     };
@@ -1108,13 +1202,13 @@ fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     const file_active: ?[]const u8 = if (loaded) |*l| l.file.active_profile else null;
     const name = auth.selectedProfileName(gpa, init.environ_map, file_active, positional orelse flag_profile) catch |err| {
         std.debug.print("bbr: could not select profile: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        exitFailure(diagnostic, err, @src());
     };
     defer gpa.free(name);
     const removed = auth.removeProfile(gpa, init.io, init.environ_map, name) catch |err| switch (err) {
         error.InvalidAuthFile, error.UnsafeAuthTarget, error.NoDataHome => {
             std.debug.print("bbr: logout failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         },
         else => return err,
     };
@@ -1142,36 +1236,36 @@ fn statusFailureMessage(err: anyerror, workspace_probe: bool) []const u8 {
 /// `bbr auth status [profile]`: always validates live with both probes and
 /// reports per-field source, the proven account UUID, and distinct failures.
 /// Never writes storage. Exit 0 only when both probes pass.
-fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8) !void {
+fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8, diagnostic: bbr.diagnostics.Handle) !void {
     const auth = bbr.bitbucket.auth;
     const positional = rest.next();
     if (rest.next() != null) {
         std.debug.print("bbr: `auth status` takes at most one profile\n", .{});
-        std.process.exit(1);
+        exitFailure(diagnostic, error.UnexpectedArgument, @src());
     }
     if (positional) |p| {
         if (std.mem.startsWith(u8, p, "-")) {
             std.debug.print("bbr: unknown status option '{s}'\n", .{p});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.UnknownFlag, @src());
         }
         if (!auth.isValidProfileName(p)) {
             std.debug.print("bbr: invalid profile name '{s}'\n", .{p});
-            std.process.exit(1);
+            exitFailure(diagnostic, error.InvalidProfileName, @src());
         }
     }
     if (positional != null and flag_profile != null and !std.mem.eql(u8, positional.?, flag_profile.?)) {
         std.debug.print("bbr: profile given twice (`{s}` vs `--profile {s}`); use one\n", .{ positional.?, flag_profile.? });
-        std.process.exit(1);
+        exitFailure(diagnostic, error.DuplicateProfile, @src());
     }
 
     var owned = auth.resolve(gpa, init.io, init.environ_map, positional orelse flag_profile) catch |err| switch (err) {
         error.MissingUsername, error.MissingToken, error.MissingWorkspace => {
             std.debug.print("bbr: no credential for profile; run `bbr auth login` ({s})\n", .{@errorName(err)});
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         },
         error.InvalidAuthFile, error.UnsafeAuthTarget, error.InvalidProfileName => {
             std.debug.print("bbr: stored credential is unusable ({s}); run `bbr auth login`\n", .{@errorName(err)});
-            std.process.exit(1);
+            exitFailure(diagnostic, err, @src());
         },
         else => return err,
     };
@@ -1181,57 +1275,75 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     defer http_client.deinit();
     http_client.initDefaultProxies(init.arena.allocator(), init.environ_map) catch |err| {
         std.debug.print("bbr: status failed: transport ({s})\n", .{@errorName(err)});
-        std.process.exit(1);
+        exitFailure(diagnostic, err, @src());
     };
-    const bb = bbr.bitbucket.Client.init(http_client.httpClient(), owned.credential());
+    const bb = bbr.bitbucket.Client.init(http_client.httpClient(), owned.credential()).withDiagnostics(diagnostic);
 
     const uuid = bb.getAuthenticatedAccountUuid(gpa) catch |err| {
         std.debug.print("bbr: status failed: {s} ({s})\n", .{ statusFailureMessage(err, false), @errorName(err) });
-        std.process.exit(1);
+        exitFailure(diagnostic, err, @src());
     };
     defer gpa.free(uuid);
     bb.checkWorkspace(gpa, owned.workspace) catch |err| {
-        if (err == error.NotFound or err == error.Forbidden) {
-            std.debug.print("bbr: status failed: workspace '{s}' not found or not visible\n", .{owned.workspace});
-        } else {
-            std.debug.print("bbr: status failed: {s} ({s})\n", .{ statusFailureMessage(err, true), @errorName(err) });
+        switch (err) {
+            error.NotFound, error.Forbidden => std.debug.print("bbr: status failed: workspace '{s}' not found or not visible\n", .{owned.workspace}),
+            else => std.debug.print("bbr: status failed: {s} ({s})\n", .{ statusFailureMessage(err, true), @errorName(err) }),
         }
-        std.process.exit(1);
+        exitFailure(diagnostic, err, @src());
     };
 
     const email_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_USERNAME") != null) "env" else "file";
     const token_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_TOKEN") != null) "env" else "file";
     const workspace_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_WORKSPACE") != null) "env" else "file";
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    stdout.interface.print("profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
+    bbr.stdout.print(init.io, "profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
         owned.profile, owned.username, email_src, token_src, owned.workspace, workspace_src, uuid,
-    }) catch {
-        std.debug.print("bbr: status failed: output error\n", .{});
-        std.process.exit(1);
-    };
-    stdout.interface.flush() catch {
-        std.debug.print("bbr: status failed: output error\n", .{});
-        std.process.exit(1);
+    }) catch |err| switch (err) {
+        error.StdoutClosed => return err,
+        else => {
+            std.debug.print("bbr: status failed: output error\n", .{});
+            exitFailure(diagnostic, err, @src());
+        },
     };
 }
 
 /// `bbr auth login|status|logout` dispatcher. Credential management lives
 /// outside the TUI under this one group; there are no top-level aliases.
-fn authRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8) !void {
+fn authRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8, diagnostic: bbr.diagnostics.Handle) !void {
     const sub = rest.next() orelse {
         std.debug.print("usage: bbr auth (login|status|logout) [...]\n", .{});
-        std.process.exit(1);
+        exitFailure(diagnostic, error.MissingRequired, @src());
     };
-    if (std.mem.eql(u8, sub, "login")) return loginRun(init, gpa, rest, flag_profile);
-    if (std.mem.eql(u8, sub, "status")) return statusRun(init, gpa, rest, flag_profile);
-    if (std.mem.eql(u8, sub, "logout")) return logoutRun(init, gpa, rest, flag_profile);
+    if (std.mem.eql(u8, sub, "login")) return loginRun(init, gpa, rest, flag_profile, diagnostic);
+    if (std.mem.eql(u8, sub, "status")) return statusRun(init, gpa, rest, flag_profile, diagnostic);
+    if (std.mem.eql(u8, sub, "logout")) return logoutRun(init, gpa, rest, flag_profile, diagnostic);
     if (std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h") or std.mem.eql(u8, sub, "help")) {
         std.debug.print("usage:\n  bbr auth login [profile] [--email E] [--workspace W] [--stdin]\n  bbr auth status [profile]\n  bbr auth logout [profile|--all]\n", .{});
         return;
     }
     std.debug.print("bbr: unknown auth command '{s}' (login, status, logout)\n", .{sub});
+    exitFailure(diagnostic, error.UnknownCommand, @src());
+}
+
+fn exitFailure(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) noreturn {
+    switch (cause) {
+        error.Reported, error.LoginAborted => {},
+        else => _ = diagnostic.failure(.execute, .{ .zig = cause }, source),
+    }
     std.process.exit(1);
+}
+
+fn invalidUsage(diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) void {
+    _ = diagnostic.forContext(.arguments, .{}).failure(.decode, .{ .zig = cause }, source);
+    usage();
+}
+
+fn configLoadFailed(io: std.Io, diagnostic: bbr.diagnostics.Handle, cause: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
+    return bbr.cli_failure.fail(io, diagnostic.forContext(.configuration, .{}), .read, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr: could not load configuration: {s}\n", .{@errorName(cause)} });
+}
+
+fn reportConfigFailure(diagnostic: bbr.diagnostics.Handle, failure: config.Failure) void {
+    _ = diagnostic.forContext(.configuration, .{}).failure(.read, .{ .zig = failure.read_error orelse error.ConfigInvalid }, @src());
+    failure.report();
 }
 
 fn usage() void {
@@ -1299,7 +1411,7 @@ const demo_diff =
 /// a PR-level comment, an inline root + reply, a suggestion, a resolved thread
 /// (hidden until `R`), and an outdated thread (in the per-file section). The
 /// Picker is disabled (`online = false`): there is no repo to list.
-fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map, configuration: *const config.Configuration) !void {
+fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map, configuration: *const config.Configuration, diagnostic: bbr.diagnostics.Handle) !void {
     // Build the session on the page allocator so app.run can destroy it uniformly.
     const s = try session.create(std.heap.page_allocator);
     const a = s.arena.allocator();
@@ -1343,10 +1455,11 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
     };
 
     // Ephemeral in-memory store: the demo authors drafts but persists nothing.
-    var store = persist.SqliteStore.open(":memory:") catch @panic("sqlite :memory: open failed");
+    var store = memoryStore(diagnostic);
     defer store.deinit();
     var plain_highlighter: bbr.highlight.PlainHighlighter = .{};
     try app.run(.{
+        .diagnostic = diagnostic,
         .io = io,
         .gpa = gpa,
         .env_map = env_map,
@@ -1411,6 +1524,7 @@ test {
     _ = @import("api/branches.zig");
     _ = @import("api/users.zig");
     _ = @import("highlight/tree_sitter_highlighter.zig");
+    _ = @import("highlight_record_once_test.zig");
     _ = @import("highlight/query_regex.zig");
     _ = @import("highlight/user_grammar.zig");
     _ = @import("highlight/grammar_cli.zig");
@@ -1457,35 +1571,113 @@ test "pending.db and submission locks live under an absolute XDG_STATE_HOME, els
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, "relative/state", .{}));
 }
 
-test "File Enrichment OOM has a distinct fatal message" {
-    try std.testing.expectEqualStrings(
-        "bbr: file enrichment ran out of memory; the review was not modified",
-        tuiFatalMessage(error.FileEnrichmentOutOfMemory).?,
-    );
-    try std.testing.expect(tuiFatalMessage(error.NotFound) == null);
+test "diagnostics pending store fallback records preparation failure but not absent state home" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", root);
+    var sink = bbr.diagnostics.Sink.init(allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+
+    const blocked_file = try tmp.dir.createFile(testing.io, "blocked", .{});
+    blocked_file.close(testing.io);
+    const blocked = try std.fs.path.join(allocator, &.{ root, "blocked" });
+    defer allocator.free(blocked);
+    try env.put("XDG_STATE_HOME", blocked);
+    const cause = if (statePath(allocator, testing.io, &env)) |path| blk: {
+        allocator.free(path);
+        break :blk error.TestUnexpectedResult;
+    } else |err| err;
+    var fallback = openStore(allocator, testing.io, &env, sink.handle(.startup, .{}));
+    defer fallback.deinit();
+    try testing.expectEqual(@as(u64, 1), sink.sequence);
+    try env.put("XDG_STATE_HOME", "");
+    try testing.expectError(error.NoStateHome, statePath(allocator, testing.io, &env));
+    var ephemeral = openStore(allocator, testing.io, &env, sink.handle(.startup, .{}));
+    defer ephemeral.deinit();
+    try testing.expectEqual(@as(u64, 1), sink.sequence);
+    _ = sink.setEnabled(false);
+    var log_dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer log_dir.close(testing.io);
+    var iterator = log_dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const text = try log_dir.readFileAlloc(testing.io, entry.name, allocator, .limited(8192));
+    defer allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "operation=persistence phase=prepare") != null);
+    try testing.expect(std.mem.indexOf(u8, text, @errorName(cause)) != null);
+}
+
+test "diagnostics an unresolved check-verdict change has one record and reaches exitFailure as Reported" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer sink.deinit();
+    try testing.expect(sink.setEnabled(true) == .on);
+    const pr =
+        "{\"id\":42,\"title\":\"Review\",\"state\":\"OPEN\",\"author\":{\"display_name\":\"Ada\",\"uuid\":\"{author}\"}," ++
+        "\"source\":{\"branch\":{\"name\":\"feature\"},\"commit\":{\"hash\":\"abc123\"}}," ++
+        "\"destination\":{\"branch\":{\"name\":\"main\"},\"commit\":{\"hash\":\"def456\"}},\"participants\":[]}";
+    const responses = [_]bbr.http.Canned{
+        .{ .body = "{\"uuid\":\"{account}\"}" },
+        .{ .body = pr },
+        .{ .body = pr },
+        .{ .send_error = error.ConnectionResetByPeer },
+        .{ .body = pr },
+        .{ .body = pr },
+        .{ .body = pr },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const handle = sink.handle(.verdict, .{});
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "w" }).withDiagnostics(handle);
+    try testing.expectError(error.Reported, checkVerdict(testing.io, testing.allocator, bb, "repo", 42, handle));
+    try testing.expectEqual(responses.len, fake.call_count);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.endsWith(u8, only, "error=ConnectionResetByPeer"));
 }
 
 test "login reader trims lines and preserves empty input and EOF errors" {
     const testing = std.testing;
     var reader = std.Io.Reader.fixed(" \t first \r\n \t\r\nsecond");
-    const first = try promptInput(testing.allocator, testing.io, &reader, "", false);
+    const first = try promptInput(testing.allocator, testing.io, &reader, "", false, .{});
     defer testing.allocator.free(first);
     try testing.expectEqualStrings("first", first);
-    try testing.expectError(error.EmptyInput, promptInput(testing.allocator, testing.io, &reader, "", false));
-    const second = try promptInput(testing.allocator, testing.io, &reader, "", false);
+    try testing.expectError(error.EmptyInput, promptInput(testing.allocator, testing.io, &reader, "", false, .{}));
+    const second = try promptInput(testing.allocator, testing.io, &reader, "", false, .{});
     defer testing.allocator.free(second);
     try testing.expectEqualStrings("second", second);
-    try testing.expectError(error.LoginAborted, promptInput(testing.allocator, testing.io, &reader, "", false));
+    try testing.expectError(error.LoginAborted, promptInput(testing.allocator, testing.io, &reader, "", false, .{}));
 }
 
 test "login field retries blank lines at most three times" {
     const testing = std.testing;
     var reader = std.Io.Reader.fixed("\n \r\n value \n\n\n\nignored\n");
-    const value = try promptField(testing.allocator, testing.io, &reader, "", false);
+    const value = try promptField(testing.allocator, testing.io, &reader, "", false, .{});
     defer testing.allocator.free(value);
     try testing.expectEqualStrings("value", value);
-    try testing.expectError(error.LoginAborted, promptField(testing.allocator, testing.io, &reader, "", false));
-    const remaining = try promptInput(testing.allocator, testing.io, &reader, "", false);
+    try testing.expectError(error.LoginAborted, promptField(testing.allocator, testing.io, &reader, "", false, .{}));
+    const remaining = try promptInput(testing.allocator, testing.io, &reader, "", false, .{});
     defer testing.allocator.free(remaining);
     try testing.expectEqualStrings("ignored", remaining);
 }
@@ -1495,7 +1687,7 @@ test "login reader rejects input longer than 1024 bytes" {
     @memset(&input, 'x');
     input[input.len - 1] = '\n';
     var reader = std.Io.Reader.fixed(&input);
-    try std.testing.expectError(error.InputTooLong, promptInput(std.testing.allocator, std.testing.io, &reader, "", false));
+    try std.testing.expectError(error.InputTooLong, promptInput(std.testing.allocator, std.testing.io, &reader, "", false, .{}));
 }
 
 test "stdin login accepts one token and rejects trailing content" {

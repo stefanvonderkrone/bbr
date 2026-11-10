@@ -31,6 +31,7 @@ pub const Action = enum {
     open_pull_request_picker,
     open_command_palette,
     open_theme_overlay,
+    toggle_diagnostic_logging,
     refresh,
     inline_comment,
     file_comment,

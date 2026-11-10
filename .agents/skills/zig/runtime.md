@@ -10,6 +10,12 @@ A slice copies only its header. Pass owned data or keep its backing storage aliv
 The call returns `std.Io.Future(R)`. Reclaim the future with `future.await(io)`.
 Await every future before destroying state that a worker can still access.
 
+Each `Io` call with `error.Canceled` in its error set is a cancelation point.
+A write that must finish, such as a diagnostic record, runs between
+`const old = io.swapCancelProtection(.blocked);` and `defer _ = io.swapCancelProtection(old);`.
+Otherwise a canceled worker gets `error.Canceled` from the write, and the writer can treat its file as broken.
+`Sink.record` in `src/diagnostics.zig` shows the pattern.
+
 This toolchain has no `std.heap.ThreadSafeAllocator`.
 Give workers `std.heap.page_allocator`, keep `gpa` on the main thread, and transfer ownership through events.
 

@@ -42,8 +42,7 @@ pub const search_members_help =
     \\Results have one group per name in input order, including repeated names.
     \\JSON is an array of groups, including for one name. Human output labels each name.
     \\Search always follows all pages. --limit caps ranked results per name, not requests.
-++ "\n" ++ pagelenHelp(bbr.bitbucket.max_pagelen.members) ++
-    \\Concurrency defaults to 8. --concurrency accepts a positive integer, capped by logical CPUs.
+++ "\n" ++ pagelenHelp(bbr.bitbucket.max_pagelen.members) ++ concurrencyHelp(default_concurrency) ++
     \\Page 1 gives the page count. The other pages load in parallel. Without a count, pages load in order.
     \\A failed page fails the complete search. HTTP 429 is not retried.
     \\Each JSON group contains name and matches with UUID, display name, and nickname.
@@ -81,25 +80,28 @@ fn searchOptions(allocator: std.mem.Allocator, args: []const []const u8) !Search
 
 pub const default_concurrency: usize = 8;
 
-/// The help of a command that pages with `--concurrency`.
-pub const concurrency_help = std.fmt.comptimePrint(
-    \\--concurrency bounds the parallel page requests of the whole command.
-    \\It defaults to {d} and accepts a positive integer, capped by logical CPUs.
-    \\
-, .{default_concurrency});
+/// The help of a command that pages with `--concurrency`. `default` is the value that its parser uses without the flag.
+pub fn concurrencyHelp(comptime default: usize) []const u8 {
+    return std.fmt.comptimePrint(
+        \\--concurrency bounds the parallel page requests of the whole command.
+        \\It defaults to {d} and accepts a positive integer, capped by logical CPUs.
+        \\
+    , .{default});
+}
 
 /// The `--pagelen` help of a list command. `max` is the largest page of its endpoint.
 pub fn pagelenHelp(comptime max: u32) []const u8 {
     return std.fmt.comptimePrint("--pagelen accepts 1 to {d} and defaults to {d}, the maximum.\n", .{ max, max });
 }
 
-/// The paging help of a list command with `--concurrency`. `max` is its largest page.
-pub fn pagingHelp(comptime max: u32) []const u8 {
+/// The paging help of a list command with `--concurrency`. `max` is its largest page,
+/// and `concurrency` is the `--concurrency` default of its parser.
+pub fn pagingHelp(comptime max: u32, comptime concurrency: usize) []const u8 {
     return
     \\Follow pages by default. --no-follow returns one page. --page N starts at page N.
     \\--limit caps the total.
     \\
-    ++ pagelenHelp(max) ++ concurrency_help ++
+    ++ pagelenHelp(max) ++ concurrencyHelp(concurrency) ++
         \\A failed request fails the complete list. HTTP 429 is not retried.
         \\
     ;
@@ -133,6 +135,13 @@ test "member search concurrency accepts positive values and caps them by logical
         try std.testing.expectError(error.InvalidNumber, searchOptions(std.testing.allocator, &.{ "--name=Ada", "--concurrency", value }));
     try std.testing.expectError(error.MissingValue, searchOptions(std.testing.allocator, &.{ "--name=Ada", "--concurrency" }));
     try std.testing.expectError(error.BadRequest, searchOptions(std.testing.allocator, &.{ "--name=Ada", "--concurrency=1", "--concurrency=2" }));
+}
+
+test "member search help states the concurrency default of its parser" {
+    var opts = try searchOptions(std.testing.allocator, &.{"--name=Ada"});
+    defer opts.names.deinit(std.testing.allocator);
+    try std.testing.expectEqual(default_concurrency, opts.concurrency);
+    try std.testing.expect(std.mem.indexOf(u8, search_members_help, concurrencyHelp(default_concurrency)) != null);
 }
 
 const SearchGroup = struct {
