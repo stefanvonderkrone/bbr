@@ -2,6 +2,8 @@
 //! Bitbucket adapter). The executable (`src/main.zig`) imports this and adds
 //! the TUI. Tests for every file run via the aggregating `test` block below.
 
+pub const cli_failure = @import("cli_failure.zig");
+
 pub const http = struct {
     pub const client = @import("http/client.zig");
     pub const HttpClient = client.HttpClient;
@@ -143,6 +145,7 @@ pub const bitbucket = struct {
     pub const Client = client_mod.Client;
     pub const NewComment = client_mod.NewComment;
     pub const Poster = @import("bitbucket/poster.zig").Poster;
+    pub const asApiError = client_mod.asApiError;
     pub const deinitPullRequest = client_mod.deinitPullRequest;
     pub const deinitComments = client_mod.deinitComments;
     pub const deinitSummaries = client_mod.deinitSummaries;
@@ -179,15 +182,26 @@ pub const bitbucket = struct {
     pub const PullRequestOptions = types.PullRequestOptions;
     pub const deinitBranch = client_mod.deinitBranch;
     pub const deinitBranches = client_mod.deinitBranches;
+    pub const DefaultReviewer = types.DefaultReviewer;
+    pub const DefaultReviewerType = types.DefaultReviewerType;
+    pub const deinitDefaultReviewers = client_mod.deinitDefaultReviewers;
     pub const ReviewerVerdict = types.ReviewerVerdict;
     pub const ReviewerVerdictChangeResult = types.ReviewerVerdictChangeResult;
     pub const url = @import("bitbucket/url.zig");
 };
 
 pub const startup = @import("startup.zig");
+pub const diagnostic = @import("diagnostic.zig");
+pub const diagnostics = @import("diagnostics.zig");
+pub const config_source = @import("config_source.zig");
+pub const logging_config = @import("logging_config.zig");
 pub const xdg = @import("xdg.zig");
+pub const stdout = @import("stdout.zig");
 
 test {
+    _ = @import("diagnostics.zig");
+    _ = @import("logging_config.zig");
+    _ = @import("config_source.zig");
     _ = @import("http/client.zig");
     _ = @import("http/fake_client.zig");
     _ = @import("http/std_client.zig");
@@ -215,4 +229,5 @@ test {
     _ = @import("bitbucket/url.zig");
     _ = @import("startup.zig");
     _ = @import("xdg.zig");
+    _ = @import("stdout.zig");
 }

@@ -44,7 +44,9 @@ fn fillRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
 
 fn drawGutter(win: vaxis.Window, row: u16, no: u32) void {
     var text: [32]u8 = undefined;
-    const gutter = std.fmt.bufPrint(&text, "{d: >4} {d: >4} ", .{ no, no }) catch return;
+    const gutter = std.fmt.bufPrint(&text, "{d: >4} {d: >4} ", .{ no, no }) catch |err| switch (err) {
+        error.NoSpaceLeft => return,
+    };
     for (gutter, 0..) |byte, column| {
         win.writeCell(@intCast(column), row, .{
             .char = .{ .grapheme = digitGlyph(byte), .width = 1 },

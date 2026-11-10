@@ -39,6 +39,7 @@ pub const StatusSlot = enum {
     verdict,
     refs,
     position,
+    diagnostics,
     layout,
     scope,
     isolate,

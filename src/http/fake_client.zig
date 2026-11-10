@@ -10,6 +10,7 @@ const client = @import("client.zig");
 const HttpClient = client.HttpClient;
 const Request = client.Request;
 const Response = client.Response;
+const Phase = client.Phase;
 
 /// One canned response in a scripted sequence.
 pub const Canned = struct {
@@ -19,6 +20,8 @@ pub const Canned = struct {
     body: []const u8 = "",
     retry_after_ms: ?u64 = null,
     send_error: ?anyerror = null,
+    /// The transport phase that `send_error` reports, as `StdHttpClient` does.
+    send_phase: ?Phase = null,
     /// A request waits until this flag becomes true. Tests use it to choose
     /// completion order without coupling responses to start order.
     released: ?*std.atomic.Value(bool) = null,
@@ -38,6 +41,7 @@ pub const FakeHttpClient = struct {
     /// transport failure (connection reset, timeout) so callers can exercise the
     /// "did it post or not?" ambiguous path.
     send_error: ?anyerror = null,
+    send_phase: ?Phase = null,
     /// A `send` after this many calls fails with `error.TestUnexpectedResult`, so a
     /// caller that never stops requesting fails its test instead of hanging it.
     max_calls: ?usize = null,
@@ -105,6 +109,7 @@ pub const FakeHttpClient = struct {
         const self: *FakeHttpClient = @ptrCast(@alignCast(ptr));
         var canned: Canned = undefined;
         var send_error: ?anyerror = null;
+        var send_phase: ?Phase = null;
         {
             self.lock();
             defer self.mutex.unlock();
@@ -127,6 +132,7 @@ pub const FakeHttpClient = struct {
             self.max_active_requests = @max(self.max_active_requests, self.active_requests);
             canned = self.responseFor(req.url, call_index);
             send_error = if (call_index >= self.max_calls orelse std.math.maxInt(usize)) error.TestUnexpectedResult else canned.send_error orelse self.send_error;
+            send_phase = canned.send_phase orelse self.send_phase;
         }
         defer {
             self.lock();
@@ -136,7 +142,12 @@ pub const FakeHttpClient = struct {
 
         if (canned.released) |released|
             while (!released.load(.acquire)) std.atomic.spinLoopHint();
-        if (send_error) |e| return e;
+        if (send_error) |e| {
+            if (req.phase) |phase| if (send_phase) |reported| {
+                phase.* = reported;
+            };
+            return e;
+        }
         return .{
             .status = canned.status,
             .body = try allocator.dupe(u8, canned.body),

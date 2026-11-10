@@ -811,7 +811,9 @@ fn systemTestLuminance(color: Color, palette: [16]u24) f64 {
         .rgb => |channels| channels,
         .index => |index| if (index < palette.len) rgb(palette[index]).rgb else blk: {
             // The system Theme uses xterm orange for bold Markdown.
-            testing.expect(index == 208) catch unreachable;
+            testing.expect(index == 208) catch |err| switch (err) {
+                error.TestUnexpectedResult => unreachable,
+            };
             break :blk rgb(0xff8700).rgb;
         },
     };

@@ -753,7 +753,9 @@ fn itemPrefix(text: []const u8) ?ItemPrefix {
     } else {
         while (end < text.len and text[end] >= '0' and text[end] <= '9') end += 1;
         if (end == spaces or end >= text.len or text[end] != '.') return null;
-        marker = .{ .number = std.fmt.parseInt(usize, text[spaces..end], 10) catch return null };
+        marker = .{ .number = std.fmt.parseInt(usize, text[spaces..end], 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return null,
+        } };
         end += 1;
     }
     if (end >= text.len or text[end] != ' ') return null;
@@ -1355,9 +1357,11 @@ const ReferenceDefinitions = struct {
     const NameContext = struct {
         pub fn hash(_: @This(), name: []const u8) u64 {
             var hasher = std.hash.Wyhash.init(0);
-            const view = std.unicode.Utf8View.init(name) catch {
-                hasher.update(name);
-                return hasher.final();
+            const view = std.unicode.Utf8View.init(name) catch |err| switch (err) {
+                error.InvalidUtf8 => {
+                    hasher.update(name);
+                    return hasher.final();
+                },
             };
             var iterator = view.iterator();
             while (iterator.nextCodepoint()) |scalar| {
