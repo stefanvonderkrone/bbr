@@ -57,7 +57,9 @@ pub fn parse(url: []const u8) ParseError!PrRef {
     } else return error.NotABitbucketPrUrl;
 
     if (marker < 2 or marker + 1 >= n) return error.MalformedUrl;
-    const id = std.fmt.parseInt(u64, segs[marker + 1], 10) catch return error.MalformedUrl;
+    const id = std.fmt.parseInt(u64, segs[marker + 1], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return error.MalformedUrl,
+    };
     return .{
         .workspace = segs[marker - 2],
         .repo_slug = segs[marker - 1],

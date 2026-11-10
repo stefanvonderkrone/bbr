@@ -551,7 +551,9 @@ fn wrapEnd(text: []const u8, start: usize, width: usize, metrics: CellMetrics) u
 }
 
 fn isUnicodeWhitespace(grapheme: []const u8) bool {
-    const first_len = std.unicode.utf8ByteSequenceLength(grapheme[0]) catch return false;
+    const first_len = std.unicode.utf8ByteSequenceLength(grapheme[0]) catch |err| switch (err) {
+        error.Utf8InvalidStartByte => return false,
+    };
     if (first_len > grapheme.len) return false;
     const cp = std.unicode.utf8Decode(grapheme[0..first_len]) catch return false;
     return (cp >= 0x09 and cp <= 0x0d) or cp == 0x20 or cp == 0x85 or cp == 0xa0 or

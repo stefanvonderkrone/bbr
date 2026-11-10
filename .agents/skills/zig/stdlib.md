@@ -30,6 +30,16 @@ Format through `writer.print(...)`.
 For an inclusive maximum, pass `.limited(max_bytes + 1)`.
 The API text-file tests cover exactly 1 MiB and one byte more.
 
+A blocking open of a FIFO waits until a writer appears.
+`std.Io.Dir.openFile` and `readFileAlloc` set `O_NONBLOCK` only with a lock and `lock_nonblocking`.
+A separate `statFile` before the open leaves a race.
+To read a path that a user controls, open it with `std.posix.openat` and `.NONBLOCK = true`.
+Wrap the descriptor as `std.Io.File`, then check `file.stat(io)` for `.kind == .file` before the read.
+`src/config_source.zig` (`Snapshot.readRegular`) shows the pattern.
+
+`error.ReadFailed` from a `std.Io.File.Reader` interface hides the cause.
+The cause is in the `err` field of the `File.Reader`. Return `reader.err.?`, not `ReadFailed`.
+
 `std.Io.Dir` has no `realpathAlloc` in Zig 0.16.
 `std.testing.tmpDir(.{})` exposes `dir`, `parent_dir`, and `sub_path`.
 For a C API path, build `.zig-cache/tmp/{s}/pending.db` from `tmp.sub_path`.

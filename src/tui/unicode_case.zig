@@ -16,8 +16,12 @@ pub fn fold(scalar: u21) u21 {
 }
 
 pub fn eqlIgnoreCase(left: []const u8, right: []const u8) bool {
-    const left_view = std.unicode.Utf8View.init(left) catch return std.mem.eql(u8, left, right);
-    const right_view = std.unicode.Utf8View.init(right) catch return false;
+    const left_view = std.unicode.Utf8View.init(left) catch |err| switch (err) {
+        error.InvalidUtf8 => return std.mem.eql(u8, left, right),
+    };
+    const right_view = std.unicode.Utf8View.init(right) catch |err| switch (err) {
+        error.InvalidUtf8 => return false,
+    };
     var a = left_view.iterator();
     var b = right_view.iterator();
     while (a.nextCodepoint()) |scalar| {

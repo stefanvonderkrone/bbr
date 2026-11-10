@@ -20,6 +20,7 @@ pub const PreparedQuery = struct {
         var error_type: c.TSQueryError = undefined;
         const query = c.ts_query_new(language, source.ptr, @intCast(source.len), &error_offset, &error_type) orelse {
             predicate_mod.setInvalidQueryDiagnostic(source, diagnostic, error_offset, kind);
+            diagnostic.query_error = error_type;
             return switch (kind) {
                 .highlight => error.InvalidHighlightQuery,
                 .locals => error.InvalidLocalsQuery,

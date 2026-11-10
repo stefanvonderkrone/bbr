@@ -6,6 +6,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// The step of a request that failed, such as `connect`. A failed `send` leaves it at the last step it began.
+pub const Phase = @import("../diagnostic.zig").Phase;
+
 pub const Method = enum { GET, POST, PUT, DELETE };
 
 pub const Header = struct {
@@ -19,6 +22,8 @@ pub const Request = struct {
     url: []const u8,
     headers: []const Header = &.{},
     body: ?[]const u8 = null,
+    /// When set, `send` writes each step here before it begins it.
+    phase: ?*Phase = null,
 };
 
 pub const Response = struct {
