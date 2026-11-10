@@ -12,6 +12,7 @@ const Io = std.Io;
 const remote_mod = @import("remote.zig");
 const Remote = remote_mod.Remote;
 const Rewrite = remote_mod.Rewrite;
+const diagnostics = @import("../diagnostics.zig");
 
 pub const GitError = error{
     /// The working directory is not inside a git worktree.
@@ -54,8 +55,10 @@ pub const GitClient = struct {
         default_base_ref: *const fn (ptr: *anyopaque, allocator: Allocator, source_ref: []const u8) anyerror![]u8,
         common_dir: *const fn (ptr: *anyopaque, allocator: Allocator) anyerror![]u8,
         worktrees: *const fn (ptr: *anyopaque, allocator: Allocator) anyerror![]Worktree,
-        diff: *const fn (ptr: *anyopaque, allocator: Allocator, base_commit: []const u8, source_commit: []const u8) anyerror![]u8,
-        blob: *const fn (ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8,
+        /// `diagnostic` receives the termination of a failed read. Each caller passes the
+        /// slot of its own failure, because one client can serve concurrent reads.
+        diff: *const fn (ptr: *anyopaque, allocator: Allocator, base_commit: []const u8, source_commit: []const u8, diagnostic: diagnostics.Handle) anyerror![]u8,
+        blob: *const fn (ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: diagnostics.Handle) anyerror![]u8,
         repository_remote: *const fn (ptr: *anyopaque, allocator: Allocator, source_ref: []const u8) anyerror![]u8,
     };
 
@@ -83,12 +86,12 @@ pub const GitClient = struct {
         return self.vtable.worktrees(self.ptr, allocator);
     }
 
-    pub fn diff(self: GitClient, allocator: Allocator, base_commit: []const u8, source_commit: []const u8) ![]u8 {
-        return self.vtable.diff(self.ptr, allocator, base_commit, source_commit);
+    pub fn diff(self: GitClient, allocator: Allocator, base_commit: []const u8, source_commit: []const u8, diagnostic: diagnostics.Handle) ![]u8 {
+        return self.vtable.diff(self.ptr, allocator, base_commit, source_commit, diagnostic);
     }
 
-    pub fn blob(self: GitClient, allocator: Allocator, commit: []const u8, path: []const u8) ![]u8 {
-        return self.vtable.blob(self.ptr, allocator, commit, path);
+    pub fn blob(self: GitClient, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: diagnostics.Handle) ![]u8 {
+        return self.vtable.blob(self.ptr, allocator, commit, path, diagnostic);
     }
 
     pub fn repositoryRemote(self: GitClient, allocator: Allocator, source_ref: []const u8) ![]u8 {
@@ -101,6 +104,9 @@ pub const ShellGitClient = struct {
     gpa: Allocator,
     io: Io,
     cwd: std.process.Child.Cwd = .inherit,
+    /// Receives the termination or launch error behind each failure of a command other than
+    /// `diff` and `blob`, which take the handle of their caller. The client records nothing.
+    diagnostic: diagnostics.Handle = .{},
 
     pub fn init(gpa: Allocator, io: Io) ShellGitClient {
         return .{ .gpa = gpa, .io = io };
@@ -125,8 +131,13 @@ pub const ShellGitClient = struct {
     /// Run `git <args>` and return trimmed stdout owned by `allocator`. A
     /// non-zero exit maps to `on_fail` (so the caller distinguishes "not a repo"
     /// from "no remote"). Stderr is discarded.
-    fn run(self: *ShellGitClient, allocator: Allocator, args: []const []const u8, on_fail: anyerror) ![]u8 {
-        const stdout = try self.runRaw(allocator, args, on_fail);
+    fn run(
+        self: *ShellGitClient,
+        allocator: Allocator,
+        args: []const []const u8,
+        on_fail: anyerror,
+    ) ![]u8 {
+        const stdout = try self.runRaw(allocator, args, on_fail, self.diagnostic);
         errdefer allocator.free(stdout);
         const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
         // Shrink to the trimmed extent so the caller owns exactly what it sees.
@@ -140,35 +151,34 @@ pub const ShellGitClient = struct {
 
     /// Run Git while preserving stdout byte-for-byte. Diff and blob content use
     /// this path; metadata commands use `run`, which trims line endings.
-    fn runRaw(self: *ShellGitClient, allocator: Allocator, args: []const []const u8, on_fail: anyerror) ![]u8 {
+    /// A launch failure, such as a missing git binary, keeps its own error.
+    /// `on_fail` is only a finished Git process that exits non-zero.
+    fn runRaw(self: *ShellGitClient, allocator: Allocator, args: []const []const u8, on_fail: anyerror, diagnostic: diagnostics.Handle) ![]u8 {
         const res = std.process.run(allocator, self.io, .{
             .argv = args,
             .cwd = self.cwd,
-        }) catch return on_fail;
+        }) catch |err| {
+            diagnostic.note(.{ .err = err, .phase = .launch });
+            return err;
+        };
         defer allocator.free(res.stderr);
         errdefer allocator.free(res.stdout);
 
-        switch (res.term) {
-            .exited => |code| if (code != 0) {
-                allocator.free(res.stdout);
-                return on_fail;
-            },
-            else => {
-                allocator.free(res.stdout);
-                return on_fail;
-            },
-        }
-
-        return res.stdout;
+        const termination: @FieldType(diagnostics.Cause, "git") = switch (res.term) {
+            .exited => |code| if (code == 0) return res.stdout else .{ .kind = .exited, .code = code },
+            .signal => |signal| .{ .kind = .signal, .code = @intFromEnum(signal) },
+            .stopped => |signal| .{ .kind = .stopped, .code = @intFromEnum(signal) },
+            .unknown => |code| .{ .kind = .unknown, .code = code },
+        };
+        var cause = termination;
+        cause.err = on_fail;
+        diagnostic.note(.{ .err = on_fail, .phase = .execute, .cause = .{ .git = cause } });
+        return on_fail;
     }
 
     fn currentBranch(ptr: *anyopaque, allocator: Allocator) anyerror![]u8 {
         const self: *ShellGitClient = @ptrCast(@alignCast(ptr));
-        const branch = try self.run(
-            allocator,
-            &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
-            error.NotAGitRepo,
-        );
+        const branch = try self.run(allocator, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }, error.NotAGitRepo);
         errdefer allocator.free(branch);
         // `rev-parse --abbrev-ref HEAD` prints "HEAD" verbatim when detached.
         if (std.mem.eql(u8, branch, "HEAD")) {
@@ -222,7 +232,20 @@ pub const ShellGitClient = struct {
         if (std.mem.startsWith(u8, source_ref, heads)) {
             const branch = source_ref[heads.len..];
             const key = try std.fmt.allocPrint(sa, "branch.{s}.remote", .{branch});
-            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch "origin";
+            var leaf: ?diagnostics.Leaf = null;
+            var lookup = self.*;
+            lookup.diagnostic = self.diagnostic.withLeaf(&leaf);
+            remote_name = lookup.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch |err| switch (err) {
+                error.Canceled => {
+                    self.diagnostic.adopt(&leaf);
+                    return error.Canceled;
+                },
+                error.OutOfMemory => {
+                    self.diagnostic.adopt(&leaf);
+                    return error.OutOfMemory;
+                },
+                else => "origin",
+            };
             if (std.mem.eql(u8, remote_name, ".")) return error.NoDefaultBaseRef;
         }
         const remote_head = try std.fmt.allocPrint(sa, "refs/remotes/{s}/HEAD", .{remote_name});
@@ -284,17 +307,17 @@ pub const ShellGitClient = struct {
         return result.toOwnedSlice(allocator);
     }
 
-    fn diff(ptr: *anyopaque, allocator: Allocator, base_commit: []const u8, source_commit: []const u8) anyerror![]u8 {
+    fn diff(ptr: *anyopaque, allocator: Allocator, base_commit: []const u8, source_commit: []const u8, diagnostic: diagnostics.Handle) anyerror![]u8 {
         const self: *ShellGitClient = @ptrCast(@alignCast(ptr));
-        return self.runRaw(allocator, &.{ "git", "diff", "--find-renames", "--full-index", "--no-ext-diff", "--no-color", base_commit, source_commit }, error.UnknownRef);
+        return self.runRaw(allocator, &.{ "git", "diff", "--find-renames", "--full-index", "--no-ext-diff", "--no-color", base_commit, source_commit }, error.UnknownRef, diagnostic);
     }
 
-    fn blob(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+    fn blob(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, diagnostic: diagnostics.Handle) anyerror![]u8 {
         const self: *ShellGitClient = @ptrCast(@alignCast(ptr));
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const spec = try std.fmt.allocPrint(scratch.allocator(), "{s}:{s}", .{ commit, path });
-        const contents = try self.runRaw(scratch.allocator(), &.{ "git", "show", spec }, error.BlobNotFound);
+        const contents = try self.runRaw(scratch.allocator(), &.{ "git", "show", spec }, error.BlobNotFound, diagnostic);
         return allocator.dupe(u8, contents);
     }
 
@@ -308,7 +331,20 @@ pub const ShellGitClient = struct {
         if (std.mem.startsWith(u8, source_ref, heads)) {
             const branch = source_ref[heads.len..];
             const key = try std.fmt.allocPrint(sa, "branch.{s}.remote", .{branch});
-            remote_name = self.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch "origin";
+            var leaf: ?diagnostics.Leaf = null;
+            var lookup = self.*;
+            lookup.diagnostic = self.diagnostic.withLeaf(&leaf);
+            remote_name = lookup.run(sa, &.{ "git", "config", "--get", key }, error.NoRemote) catch |err| switch (err) {
+                error.Canceled => {
+                    self.diagnostic.adopt(&leaf);
+                    return error.Canceled;
+                },
+                error.OutOfMemory => {
+                    self.diagnostic.adopt(&leaf);
+                    return error.OutOfMemory;
+                },
+                else => "origin",
+            };
             if (std.mem.eql(u8, remote_name, ".")) return error.NoRemote;
         }
         const url = try self.run(sa, &.{ "git", "remote", "get-url", remote_name }, error.NoRemote);
@@ -320,8 +356,20 @@ pub const ShellGitClient = struct {
     /// Returns an empty slice when none are configured. All memory is `sa`-owned.
     fn readInsteadOf(self: *ShellGitClient, sa: Allocator) ![]Rewrite {
         // A missing key makes git exit 1; treat that as "no rewrites".
-        const out = self.run(sa, &.{ "git", "config", "--get-regexp", "url\\..*\\.insteadof" }, error.NoRemote) catch
-            return &.{};
+        var leaf: ?diagnostics.Leaf = null;
+        var lookup = self.*;
+        lookup.diagnostic = self.diagnostic.withLeaf(&leaf);
+        const out = lookup.run(sa, &.{ "git", "config", "--get-regexp", "url\\..*\\.insteadof" }, error.NoRemote) catch |err| switch (err) {
+            error.Canceled => {
+                self.diagnostic.adopt(&leaf);
+                return error.Canceled;
+            },
+            error.OutOfMemory => {
+                self.diagnostic.adopt(&leaf);
+                return error.OutOfMemory;
+            },
+            else => return &.{},
+        };
 
         var list: std.ArrayList(Rewrite) = .empty;
         var lines = std.mem.splitScalar(u8, out, '\n');
@@ -341,6 +389,82 @@ pub const ShellGitClient = struct {
         return list.toOwnedSlice(sa);
     }
 };
+
+test "diagnostics Git metadata fallbacks leave no evidence for a later failure" {
+    const Isolated = struct {
+        var env: *std.process.Environ.Map = undefined;
+
+        fn spawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+            var isolated = options;
+            isolated.environ_map = env;
+            return testing.io.vtable.processSpawn(userdata, isolated);
+        }
+    };
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("GIT_CONFIG_NOSYSTEM", "1");
+    try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    Isolated.env = &env;
+    var vtable = testing.io.vtable.*;
+    vtable.processSpawn = Isolated.spawn;
+    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    try runTestProcess(path, &.{ "git", "init", "-b", "main" });
+    try runTestProcess(path, &.{ "git", "remote", "add", "origin", "https://bitbucket.org/team/repo.git" });
+    try runTestProcess(path, &.{ "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main" });
+    var shell = ShellGitClient.init(testing.allocator, io);
+    shell.cwd = .{ .path = path };
+    var leaf: ?diagnostics.Leaf = null;
+    shell.diagnostic = (diagnostics.Handle{}).withLeaf(&leaf);
+    const client = shell.gitClient();
+
+    const base = try client.defaultBaseRef(testing.allocator, "refs/heads/main");
+    defer testing.allocator.free(base);
+    try testing.expectEqualStrings("refs/remotes/origin/main", base);
+    try testing.expect(shell.diagnostic.failure(.validate, .{ .zig = error.NoRemote }, @src()).cause == .zig);
+
+    const remote_name = try client.repositoryRemote(testing.allocator, "refs/heads/main");
+    defer testing.allocator.free(remote_name);
+    try testing.expectEqualStrings("bitbucket.org/team/repo", remote_name);
+    try testing.expect(shell.diagnostic.failure(.validate, .{ .zig = error.NoRemote }, @src()).cause == .zig);
+
+    const remote_value = try client.remote(testing.allocator);
+    defer testing.allocator.free(remote_value.workspace);
+    defer testing.allocator.free(remote_value.repo_slug);
+    try testing.expectEqualStrings("team", remote_value.workspace);
+    try testing.expect(shell.diagnostic.failure(.validate, .{ .zig = error.NoRemote }, @src()).cause == .zig);
+}
+
+test "diagnostics Git metadata fallbacks propagate cancellation and allocation failure" {
+    const Failure = struct {
+        var err: std.process.SpawnError = error.Canceled;
+        var calls: usize = 0;
+
+        fn spawn(_: ?*anyopaque, _: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+            calls += 1;
+            return err;
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.processSpawn = Failure.spawn;
+    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    for ([_]std.process.SpawnError{ error.Canceled, error.OutOfMemory }) |err| {
+        Failure.err = err;
+        var shell = ShellGitClient.init(testing.allocator, io);
+        Failure.calls = 0;
+        try testing.expectError(err, shell.gitClient().defaultBaseRef(testing.allocator, "refs/heads/main"));
+        try testing.expectEqual(@as(usize, 1), Failure.calls);
+        Failure.calls = 0;
+        try testing.expectError(err, shell.gitClient().repositoryRemote(testing.allocator, "refs/heads/main"));
+        try testing.expectEqual(@as(usize, 1), Failure.calls);
+        Failure.calls = 0;
+        try testing.expectError(err, shell.readInsteadOf(testing.allocator));
+        try testing.expectEqual(@as(usize, 1), Failure.calls);
+    }
+}
 
 /// Test double: returns canned values (or errors) for each seam call.
 pub const FakeGitClient = struct {
@@ -424,13 +548,13 @@ pub const FakeGitClient = struct {
         return copy;
     }
 
-    fn diff(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8) anyerror![]u8 {
+    fn diff(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, _: diagnostics.Handle) anyerror![]u8 {
         const self: *FakeGitClient = @ptrCast(@alignCast(ptr));
         self.diff_calls += 1;
         return allocator.dupe(u8, try self.diff_result);
     }
 
-    fn blob(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+    fn blob(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8, _: diagnostics.Handle) anyerror![]u8 {
         const self: *FakeGitClient = @ptrCast(@alignCast(ptr));
         if (self.blob_fixtures.len > 0) {
             const fixture_index = self.blob_calls;
@@ -455,6 +579,20 @@ pub const FakeGitClient = struct {
 };
 
 const testing = std.testing;
+
+test "Git failures return their typed error and leave the record to the boundary" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    try runTestProcess(home, &.{ "git", "init", "-b", "main" });
+    var shell = ShellGitClient.init(testing.allocator, testing.io);
+    shell.cwd = .{ .path = home };
+    try testing.expectError(error.UnknownRef, shell.gitClient().resolveRef(testing.allocator, "missing-ref"));
+    try testing.expectError(error.UnknownRef, shell.gitClient().diff(testing.allocator, "missing-base", "missing-source", .{}));
+    try testing.expectError(error.NoRemote, shell.run(testing.allocator, &.{ "git", "config", "--file", "/dev/null", "--get", "bbr.missing" }, error.NoRemote));
+    try testing.expectError(error.FileNotFound, shell.runRaw(testing.allocator, &.{"/bbr-no-such-executable"}, error.NotAGitRepo, .{}));
+}
 
 test "fake reports the current branch" {
     var fake: FakeGitClient = .{ .branch = "feature/timeout" };
@@ -524,12 +662,12 @@ test "shell client resolves refs and acquires committed review material" {
     defer testing.allocator.free(base.canonical);
     defer testing.allocator.free(base.commit);
 
-    const raw = try client.diff(testing.allocator, base.commit, source.commit);
+    const raw = try client.diff(testing.allocator, base.commit, source.commit, .{});
     defer testing.allocator.free(raw);
     try testing.expect(std.mem.indexOf(u8, raw, "-old") != null);
     try testing.expect(std.mem.indexOf(u8, raw, "+new") != null);
 
-    const contents = try client.blob(testing.allocator, source.commit, "f.zig");
+    const contents = try client.blob(testing.allocator, source.commit, "f.zig", .{});
     defer testing.allocator.free(contents);
     try testing.expectEqualStrings("new\n", contents);
 

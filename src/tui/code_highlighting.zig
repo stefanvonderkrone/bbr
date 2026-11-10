@@ -57,6 +57,7 @@ pub const Identity = struct {
 };
 
 pub const Completed = struct {
+    evidence: ?bbr.diagnostic.Failure = null,
     command_id: u64,
     identity: Identity,
     result: ?*Result = null,
@@ -107,6 +108,7 @@ pub const Analyze = struct {
         defer self.destroy();
         var completed: Completed = .{ .command_id = self.command_id, .identity = self.identity };
         completed.result = self.analyze(highlighter) catch |err| {
+            completed.evidence = bbr.diagnostic.Failure.capture(.highlighting, .execute, .{ .command_id = self.command_id, .session_epoch = self.identity.session_epoch }, .{ .zig = err }, @src());
             completed.failure = err;
             return completed;
         };

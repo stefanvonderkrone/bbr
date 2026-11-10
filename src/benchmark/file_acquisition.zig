@@ -41,7 +41,7 @@ const CountingSource = struct {
         return .{ .ptr = self, .read_fn = read };
     }
 
-    fn read(ptr: *anyopaque, allocator: std.mem.Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+    fn read(ptr: *anyopaque, allocator: std.mem.Allocator, commit: []const u8, path: []const u8, diagnostic: bbr.diagnostics.Handle) anyerror![]u8 {
         const self: *CountingSource = @ptrCast(@alignCast(ptr));
         const active = self.active.fetchAdd(1, .acq_rel) + 1;
         defer _ = self.active.fetchSub(1, .acq_rel);
@@ -49,7 +49,7 @@ const CountingSource = struct {
         while (active > previous) {
             previous = self.max_active.cmpxchgWeak(previous, active, .release, .monotonic) orelse break;
         }
-        return self.inner.read(allocator, commit, path);
+        return self.inner.read(allocator, commit, path, diagnostic);
     }
 };
 
@@ -64,9 +64,15 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, kind, "remote")) {
         const repo = arguments.next() orelse return usage();
-        const id = std.fmt.parseInt(u64, arguments.next() orelse return usage(), 10) catch return usage();
+        const id = std.fmt.parseInt(u64, arguments.next() orelse return usage(), 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return usage(),
+        };
         if (arguments.next() != null) return usage();
-        var owned = bbr.bitbucket.auth.resolve(allocator, init.io, init.environ_map, null) catch return error.MissingCredential;
+        var owned = bbr.bitbucket.auth.resolve(allocator, init.io, init.environ_map, null) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MissingCredential,
+        };
         defer owned.deinit(allocator);
         const credential = owned.credential();
         var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
@@ -97,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
         var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, init.io);
         const base = try git.gitClient().resolveRef(allocator, base_ref);
         const source = try git.gitClient().resolveRef(allocator, source_ref);
-        const raw_diff = try git.gitClient().diff(allocator, base.commit, source.commit);
+        const raw_diff = try git.gitClient().diff(allocator, base.commit, source.commit, .{});
         const diff = try bbr.diff.parse(allocator, raw_diff);
         var git_source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
         const name = try std.fmt.allocPrint(allocator, "LocalReview {s}..{s}", .{ base_ref, source_ref });
@@ -129,7 +135,9 @@ fn runFixture(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture) !void 
             samples[limit_index][sample_index] = try runSample(io, allocator, fixture, order, limits[limit_index]);
             run_count += 1;
             if (fixture.remote and run_count < samples_per_limit * limits.len)
-                io.sleep(std.Io.Duration.fromSeconds(10), .awake) catch return error.SleepFailed;
+                io.sleep(std.Io.Duration.fromSeconds(10), .awake) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                };
         }
     }
 
@@ -161,7 +169,15 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
     const Selected = union(enum) { file: Completion };
     var completion_buffer: [limits[limits.len - 1]]Selected = undefined;
     var select = std.Io.Select(Selected).init(io, &completion_buffer);
-    defer select.group.await(io) catch {};
+    defer while (select.cancel()) |completion| {
+        switch (completion.file.outcome) {
+            .completed => |value| {
+                var result = value;
+                result.deinit();
+            },
+            .failed => {},
+        }
+    };
     const start = std.Io.Clock.awake.now(io);
     var first_file_ms: u64 = 0;
     var next: usize = 0;
@@ -172,7 +188,7 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
 
     while (active < limit and next < order.len) : (next += 1) {
         const file_index = order[next];
-        try select.concurrent(.file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
+        try bbr.diagnostics.selectConcurrent(&select, .file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
         active += 1;
     }
     while (active > 0) {
@@ -190,14 +206,21 @@ fn runSample(io: std.Io, allocator: std.mem.Allocator, fixture: Fixture, order: 
                 countFailure(view.new, &failures, &rate_limited);
             },
             .failed => |err| {
+                switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => {},
+                }
                 failures += 1;
-                if (err == error.RateLimited) rate_limited += 1;
+                switch (err) {
+                    error.RateLimited => rate_limited += 1,
+                    else => {},
+                }
             },
         }
         if (next < order.len) {
             const file_index = order[next];
             next += 1;
-            try select.concurrent(.file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
+            try bbr.diagnostics.selectConcurrent(&select, .file, enrichFile, .{ io, fixture, counting_source.source(), plain.highlighter(), file_index });
             active += 1;
         }
     }
@@ -241,7 +264,10 @@ fn lessThanFilePath(files: []const bbr.diff.File, lhs: usize, rhs: usize) bool {
 fn countFailure(side: file_enrichment.SideView, failures: *usize, rate_limited: *usize) void {
     if (side == .fetch_failed) {
         failures.* += 1;
-        if (side.fetch_failed == error.RateLimited) rate_limited.* += 1;
+        switch (side.fetch_failed) {
+            error.RateLimited => rate_limited.* += 1,
+            else => {},
+        }
     }
 }
 

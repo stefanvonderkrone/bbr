@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const model = @import("model.zig");
 const parser = @import("parser.zig");
 const git_mod = @import("../git/client.zig");
+const diagnostics = @import("../diagnostics.zig");
 
 pub const DiffSource = struct {
     ptr: *anyopaque,
@@ -40,6 +41,7 @@ pub const GitSource = struct {
     git: git_mod.GitClient,
     base_commit: []const u8,
     source_commit: []const u8,
+    diagnostic: diagnostics.Handle,
 
     pub fn source(self: *GitSource) DiffSource {
         return .{ .ptr = self, .read_fn = read };
@@ -47,7 +49,7 @@ pub const GitSource = struct {
 
     fn read(ptr: *anyopaque, allocator: Allocator) anyerror![]u8 {
         const self: *GitSource = @ptrCast(@alignCast(ptr));
-        return self.git.diff(allocator, self.base_commit, self.source_commit);
+        return self.git.diff(allocator, self.base_commit, self.source_commit, self.diagnostic);
     }
 };
 
@@ -72,6 +74,7 @@ test "remote text and local Git sources produce the same Diff" {
         .git = fake_git.gitClient(),
         .base_commit = "base",
         .source_commit = "source",
+        .diagnostic = .{},
     };
     var local_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer local_arena.deinit();

@@ -184,6 +184,7 @@ pub fn helpSection(a: Action) HelpSection {
         .open_pull_request_picker,
         .open_command_palette,
         .open_theme_overlay,
+        .toggle_diagnostic_logging,
         .confirm_picker,
         => .general,
     };
@@ -430,7 +431,9 @@ fn keyCode(name: []const u8) ?u21 {
     };
     inline for (names) |entry| if (std.mem.eql(u8, name, entry[0])) return entry[1];
     if (name.len >= 2 and name[0] == 'f') {
-        const n = std.fmt.parseInt(u8, name[1..], 10) catch return null;
+        const n = std.fmt.parseInt(u8, name[1..], 10) catch |err| switch (err) {
+            error.InvalidCharacter, error.Overflow => return null,
+        };
         if (n >= 1 and n <= 35) return vaxis.Key.f1 + n - 1;
     }
     return null;
@@ -482,6 +485,10 @@ fn validateBindings(bindings: []const Binding) !void {
 }
 
 pub fn supportsContext(action: Action, context: InteractionContext) bool {
+    if (action == .toggle_diagnostic_logging) return switch (context) {
+        .diff, .diff_source, .diff_disclosure, .diff_review_card, .sidebar, .sidebar_directory, .sidebar_file => true,
+        else => false,
+    };
     return switch (context) {
         .composer => action == .external_edit,
         .help, .unknown_resolution, .delete_confirmation, .buffer_search_input => false,

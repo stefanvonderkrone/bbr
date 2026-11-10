@@ -18,10 +18,16 @@ const tui = @import("benchmark_tui");
 const TreeSitterHighlighter = @import("benchmark_highlight").TreeSitterHighlighter;
 
 pub fn main(init: std.process.Init) !void {
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    const writer = &stdout.interface;
-    errdefer writer.flush() catch {};
+    bbr.stdout.write(init.io, run, .{init}) catch |err| switch (err) {
+        error.StdoutClosed => {},
+        else => return err,
+    };
+}
+
+fn run(writer: *std.Io.Writer, init: std.process.Init) !void {
+    errdefer writer.flush() catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
 
     var arguments = init.minimal.args.iterate();
     _ = arguments.next();
@@ -116,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(search_unicode);
     var frame_paint_context = try frame_paint.Context.init(init.gpa);
     defer frame_paint_context.deinit(init.gpa);
-    var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null);
+    var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null, .{});
     defer tree_sitter_highlighter.deinit();
     const highlight_benchmarks = [_]struct { name: []const u8, context: highlight.Context }{
         .{ .name = "highlight_javascript_4k", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.js", .content = highlight_javascript_4k } },
@@ -436,7 +442,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (!matched) return error.UnknownBenchmark;
-    try writer.flush();
 }
 
 fn sourceFixture(allocator: std.mem.Allocator, minimum_bytes: usize, line: []const u8) ![]u8 {

@@ -32,6 +32,7 @@ const frame_arena_retained_limit = 4 * 1024 * 1024;
 /// offline `demo`, which disables the network-backed Picker. `store` persists
 /// the reviewer's pending Drafts (SQLite in production, `:memory:` for demo).
 pub const RunCtx = struct {
+    diagnostic: bbr.diagnostics.Handle = .{},
     io: std.Io,
     gpa: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
@@ -97,11 +98,16 @@ const PickerTickTransition = union(enum) {
 
 const picker_tick_interval_ms = 250;
 
-fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
+fn runPresentation(shared: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
+    // Workers note client evidence concurrently, so the CLI evidence slot stays out of the
+    // TUI, and each worker owns its own slot in its PresentationSinkContext.
+    var ctx = shared;
+    ctx.diagnostic = ctx.diagnostic.withLeaf(null);
+    if (ctx.bitbucket) |client| ctx.bitbucket = client.withDiagnostics(ctx.diagnostic);
     var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
-    var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient());
+    var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient(), ctx.diagnostic.forContext(.git, .{}));
     defer git_anchor_resolver.deinit();
-    var state = try presentation.Presentation.init(ctx.gpa, .{
+    var state = presentation.Presentation.init(ctx.gpa, .{
         .reviews = ctx.store,
         .file_reads = ctx.file_reads,
         .anchor_resolver = git_anchor_resolver.resolver(),
@@ -121,12 +127,23 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         .configured_theme = ctx.theme,
         .persist_theme = ctx.persist_theme,
     }, .{
+        .diagnostic_state = if (ctx.diagnostic.sink) |sink| sink.state() else .off,
         .initial = if (initial) |loaded| .{
             .key = initial_key,
             .session = loaded,
         } else null,
         .viewport_rows = 1,
-    });
+    }) catch |err| switch (err) {
+        // The store recorded the failure. The terminal is not in raw mode yet.
+        error.Reported => {
+            var buf: [128]u8 = undefined;
+            var stderr = std.Io.File.stderr().writerStreaming(ctx.io, &buf);
+            try stderr.interface.writeAll("bbr: could not load the pending review drafts\n");
+            try stderr.interface.flush();
+            return error.Reported;
+        },
+        else => return err,
+    };
     defer state.deinit();
     if (initial == null) try state.dispatch(.{ .choose_pull_request = initial_key });
 
@@ -188,6 +205,11 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
         }
         try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
+        if (ctx.diagnostic.sink) |sink| {
+            const actual = sink.state();
+            if (!std.meta.eql(actual, state.projection().diagnostic_state))
+                try state.dispatch(.{ .diagnostics_changed = .{ .state = actual } });
+        }
         if (try syncContentGeometry(&state, &frame_arena, vx.window(), &sent_geometry)) {
             // A taller DiffPane can expose Files outside the old Enrichment Range.
             if (state.projection().review != null) try state.dispatch(.ensure_focused_enrichment);
@@ -238,8 +260,15 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
 }
 
 fn pickerTickWorker(loop: *Loop, future_id: u64, scope: presentation.WorkId, io: std.Io) void {
-    io.sleep(std.Io.Duration.fromMilliseconds(picker_tick_interval_ms), .awake) catch return;
-    loop.postEvent(.{ .picker_tick = .{ .future_id = future_id, .scope = scope } }) catch {};
+    io.sleep(std.Io.Duration.fromMilliseconds(picker_tick_interval_ms), .awake) catch |err| switch (err) {
+        error.Canceled => {
+            io.recancel();
+            return;
+        },
+    };
+    loop.postEvent(.{ .picker_tick = .{ .future_id = future_id, .scope = scope } }) catch |err| switch (err) {
+        error.Canceled => io.recancel(),
+    };
 }
 
 fn pickerTickTransition(scope: ?presentation.WorkId, active: ?PickerTickWork) PickerTickTransition {
@@ -276,7 +305,7 @@ fn syncPickerTick(
     try futures.ensureUnusedCapacity(ctx.gpa, 1);
     const id = next_work_id.*;
     next_work_id.* +%= 1;
-    const future = try ctx.io.concurrent(pickerTickWorker, .{ loop, id, start_scope.?, ctx.io });
+    const future = try bbr.diagnostics.concurrent(ctx.io, pickerTickWorker, .{ loop, id, start_scope.?, ctx.io });
     futures.appendAssumeCapacity(.{ .id = id, .future = future });
     active.* = .{ .id = id, .scope = start_scope.? };
 }
@@ -341,13 +370,16 @@ fn presentationStatus(
     };
     if (projection.buffer_search) |search_projection| return bufferSearchStatus(frame, projection, search_projection);
     if (projection.action_error) |err| return actionErrorText(err);
+    if (projection.diagnostic_pending) return "changing diagnostic logging";
     if (projection.clipboard_status) |status| return switch (status) {
         .copied => "copied text",
         .failed => "could not copy text",
     };
     if (projection.shutting_down) {
         if (projection.submission) |submission|
-            return std.fmt.allocPrint(frame, "finishing Submission for {s}#{d}", .{ submission.key.repository(), submission.key.pull_request_id }) catch "finishing Submission";
+            return std.fmt.allocPrint(frame, "finishing Submission for {s}#{d}", .{ submission.key.repository(), submission.key.pull_request_id }) catch |err| switch (err) {
+                error.OutOfMemory => "finishing Submission",
+            };
         return "shutting down…";
     }
     if (projection.submission) |submission| {
@@ -357,7 +389,9 @@ fn presentationStatus(
                 submission.key.pull_request_id,
                 submission.completed,
                 submission.total,
-            }) catch "submitting another pull request…";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "submitting another pull request…",
+            };
     }
     if (projection.submission_result) |result| {
         if (visible_key == null or !presentation.OwnedReviewIdentity.eql(result.key, visible_key.?))
@@ -367,7 +401,9 @@ fn presentationStatus(
                 result.posted,
                 result.failed + result.outcome_unknown,
                 result.skipped,
-            }) catch "submission finished for another pull request";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "submission finished for another pull request",
+            };
     }
     if (projection.reviewer_verdict_result) |result| {
         if (visible_key == null or !presentation.OwnedReviewIdentity.eql(result.key, visible_key.?))
@@ -375,7 +411,9 @@ fn presentationStatus(
                 result.key.repository(),
                 result.key.pull_request_id,
                 reviewerVerdictOutcomeLabel(result.outcome),
-            }) catch "Reviewer Verdict changed for another pull request";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "Reviewer Verdict changed for another pull request",
+            };
         return switch (result.outcome) {
             .completed => |completed| switch (completed) {
                 .success, .reconciled_success => "Reviewer Verdict changed",
@@ -394,7 +432,9 @@ fn presentationStatus(
                 result.key.pull_request_id,
                 result.comment_id,
                 @tagName(result.outcome),
-            }) catch "Comment edit finished for another pull request";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "Comment edit finished for another pull request",
+            };
         return switch (result.outcome) {
             .updated => "Bitbucket Comment updated",
             .failed => "Bitbucket Comment edit failed",
@@ -409,7 +449,9 @@ fn presentationStatus(
                 result.key.pull_request_id,
                 result.comment_id,
                 @tagName(result.outcome),
-            }) catch "Comment deletion finished for another pull request";
+            }) catch |err| switch (err) {
+                error.OutOfMemory => "Comment deletion finished for another pull request",
+            };
         return switch (result.outcome) {
             .deleted => "Bitbucket Comment deleted",
             .failed => "Bitbucket Comment deletion failed",
@@ -421,11 +463,15 @@ fn presentationStatus(
         .recoverable => std.fmt.allocPrint(frame, "interrupted Submission for {s}#{d} · Y resume", .{
             recovery.key.repository(),
             recovery.key.pull_request_id,
-        }) catch "interrupted Submission · Y resume",
+        }) catch |err| switch (err) {
+            error.OutOfMemory => "interrupted Submission · Y resume",
+        },
         .running_elsewhere => std.fmt.allocPrint(frame, "{s}#{d} is submitting in another bbr instance", .{
             recovery.key.repository(),
             recovery.key.pull_request_id,
-        }) catch "Submission owned by another bbr instance",
+        }) catch |err| switch (err) {
+            error.OutOfMemory => "Submission owned by another bbr instance",
+        },
     };
     if (projection.replacement_error) |err| return @tagName(err);
     return null;
@@ -451,12 +497,20 @@ fn formatBufferSearchStatus(frame: std.mem.Allocator, width: u16, action_error: 
         else => "",
     };
     const count = if (search_projection.total == 0)
-        (std.fmt.allocPrint(frame, " 0/0", .{}) catch "")
+        (std.fmt.allocPrint(frame, " 0/0", .{}) catch |err| switch (err) {
+            error.OutOfMemory => "",
+        })
     else if (search_projection.active) |active|
-        (std.fmt.allocPrint(frame, " {d}/{d}", .{ active, search_projection.total }) catch "")
+        (std.fmt.allocPrint(frame, " {d}/{d}", .{ active, search_projection.total }) catch |err| switch (err) {
+            error.OutOfMemory => "",
+        })
     else
-        (std.fmt.allocPrint(frame, " -/{d}", .{search_projection.total}) catch "");
-    const verbose_suffix = std.fmt.allocPrint(frame, "{s}{s}", .{ count, message }) catch count;
+        (std.fmt.allocPrint(frame, " -/{d}", .{search_projection.total}) catch |err| switch (err) {
+            error.OutOfMemory => "",
+        });
+    const verbose_suffix = std.fmt.allocPrint(frame, "{s}{s}", .{ count, message }) catch |err| switch (err) {
+        error.OutOfMemory => count,
+    };
     const suffix = if (vaxis.gwidth.gwidth(verbose_suffix, .unicode) + 2 <= width)
         verbose_suffix
     else
@@ -465,10 +519,14 @@ fn formatBufferSearchStatus(frame: std.mem.Allocator, width: u16, action_error: 
     const available = @as(usize, width) -| fixed_width;
     var query_start: usize = 0;
     while (query_start < search_projection.query.len and vaxis.gwidth.gwidth(search_projection.query[query_start..], .unicode) > available) {
-        const length = std.unicode.utf8ByteSequenceLength(search_projection.query[query_start]) catch 1;
+        const length = std.unicode.utf8ByteSequenceLength(search_projection.query[query_start]) catch |err| switch (err) {
+            error.Utf8InvalidStartByte => 1,
+        };
         query_start += length;
     }
-    return std.fmt.allocPrint(frame, "/{s}{s}", .{ search_projection.query[query_start..], suffix }) catch "/";
+    return std.fmt.allocPrint(frame, "/{s}{s}", .{ search_projection.query[query_start..], suffix }) catch |err| switch (err) {
+        error.OutOfMemory => "/",
+    };
 }
 
 fn reviewerVerdictOutcomeLabel(outcome: presentation.ReviewerVerdictCommandOutcome) []const u8 {
@@ -490,6 +548,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
         .theme_not_saved => "Theme applied, but config.toml could not be written",
         .theme_not_saved_invalid_config => "Theme applied, but config.toml is invalid and was not changed",
+        .theme_not_saved_unreadable => "Theme applied, but config.toml could not be read",
         .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
         .local_review_remote_action_unavailable => "This action is unavailable for a local review",
         .source_action_unavailable => "This action requires a source line or Selection",
@@ -534,6 +593,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .draft_descendant_locked => "a Reply below this Draft cannot be deleted yet",
         .anchor_candidate_ambiguous => "that source range is ambiguous; select one side of one File",
         .anchor_range_too_long => "an Anchor covers at most 30 lines",
+        .anchor_range_descending => "an Anchor range must run forward",
         .suggestion_anchor_not_new_side => "a Suggestion cannot anchor to removed lines",
         .replacement_pending => "the Review is reloading; try again when it finishes",
         .buffer_search_selection_active => "Clear Selection before Buffer Search",
@@ -558,16 +618,34 @@ fn deleteConfirmationText(
 ) []const u8 {
     if (confirmation.comment_id) |comment_id| {
         if (confirmation.root_has_replies)
-            return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d}? Bitbucket removes its body, retains a Deleted Comment tombstone, and keeps {d} Reply/Replies.", .{ comment_id, confirmation.descendant_count }) catch "Delete this Bitbucket Comment remotely?";
-        return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d} from Bitbucket?", .{comment_id}) catch "Delete this Bitbucket Comment remotely?";
+            return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d}? Bitbucket removes its body, retains a Deleted Comment tombstone, and keeps {d} Reply/Replies.", .{ comment_id, confirmation.descendant_count }) catch |err| switch (err) {
+                error.OutOfMemory => "Delete this Bitbucket Comment remotely?",
+            };
+        return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d} from Bitbucket?", .{comment_id}) catch |err| switch (err) {
+            error.OutOfMemory => "Delete this Bitbucket Comment remotely?",
+        };
     }
     const fallback = "Delete this local Draft and every Reply below it?";
     if (confirmation.descendant_count == 0)
-        return std.fmt.allocPrint(frame, "Delete local Draft #{d}? It has no Replies.", .{confirmation.temp_id}) catch fallback;
+        return std.fmt.allocPrint(frame, "Delete local Draft #{d}? It has no Replies.", .{confirmation.temp_id}) catch |err| switch (err) {
+            error.OutOfMemory => fallback,
+        };
     return std.fmt.allocPrint(frame, "Delete local Draft #{d} and its {d} Reply Draft(s)?", .{
         confirmation.temp_id,
         confirmation.descendant_count,
-    }) catch fallback;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => fallback,
+    };
+}
+
+/// Maps a Theme save error to the status outcome. The diagnostic record keeps `err`.
+fn themeSaveOutcome(err: anyerror) presentation.ThemePersisted.Outcome {
+    return switch (err) {
+        error.NoConfigLocation => .no_config_location,
+        error.ConfigInvalid => .config_invalid,
+        error.OutOfMemory, error.WriteFailed, error.Canceled => .write_failed,
+        else => .read_failed,
+    };
 }
 
 /// `Re-anchor local Draft #7 → src/f.zig new 12-14 · Enter accept · Esc cancel`
@@ -582,11 +660,15 @@ fn reanchorStatus(
         @tagName(candidate.side),
         candidate.top,
         candidate.bottom,
-    }) catch return fallback else actionErrorText(reanchor.refusal orelse projection.action_error orelse .action_refused);
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return fallback,
+    } else actionErrorText(reanchor.refusal orelse projection.action_error orelse .action_refused);
     return std.fmt.allocPrint(frame, "Re-anchor local Draft #{d} → {s} · Enter accept · Esc cancel", .{
         reanchor.temp_id,
         detail,
-    }) catch fallback;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => fallback,
+    };
 }
 
 fn portableKey(key: vaxis.Key) keymap.KeyStroke {
@@ -724,10 +806,22 @@ fn createSmokeExternalEdit(allocator: std.mem.Allocator) !*presentation.External
 const PresentationSinkContext = struct {
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle = .{},
+    /// The worker's evidence slot. The worker's boundary record of a client error carries
+    /// the evidence that the client noted here.
+    leaf: ?bbr.diagnostic.Leaf = null,
+
+    fn handle(self: *PresentationSinkContext) bbr.diagnostics.Handle {
+        return self.diagnostic.withLeaf(&self.leaf);
+    }
+
+    fn bitbucket(self: *PresentationSinkContext, client: bbr.bitbucket.Client) bbr.bitbucket.Client {
+        return client.withDiagnostics(self.handle());
+    }
 };
 
 fn presentationSink(context: *PresentationSinkContext) presentation_runtime.CompletionSink {
-    return .{ .ptr = context, .post_fn = postPresentationInput };
+    return .{ .ptr = context, .post_fn = postPresentationInput, .diagnostic = context.handle() };
 }
 
 fn postPresentationInput(ptr: *anyopaque, input: presentation.OwnedInput) anyerror!void {
@@ -741,14 +835,15 @@ fn postPresentationInput(ptr: *anyopaque, input: presentation.OwnedInput) anyerr
 fn presentationPostWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: *presentation.PostDraft,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     var poster = bbr.bitbucket.Poster{
-        .client = client,
+        .client = sink_context.bitbucket(client),
         .allocator = scratch.allocator(),
         .repo_slug = command.identity.repository(),
         .pr_id = command.identity.pullRequestId(),
@@ -759,52 +854,61 @@ fn presentationPostWorker(
 fn presentationCommentEditWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: *presentation.UpdateComment,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, client);
+    presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, sink_context.bitbucket(client));
 }
 
 fn presentationCommentDeleteWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: *presentation.DeleteComment,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, client);
+    presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, sink_context.bitbucket(client));
 }
 
 fn presentationReviewerVerdictWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: presentation.ChangeReviewerVerdict,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.executeReviewerVerdict(scratch.allocator(), command, client));
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.executeReviewerVerdict(scratch.allocator(), command, sink_context.bitbucket(client)));
 }
 
 fn presentationLoadWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     io: std.Io,
     client: ?bbr.bitbucket.Client,
     command: presentation.LoadSession,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
-    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, client, command })) |loaded|
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
+    // The load runs on its own task, so it notes into its own slot, and a failure moves it here.
+    var load_slot: ?bbr.diagnostic.Leaf = null;
+    const outcome: presentation.SessionLoadOutcome = if (loadSessionWithin(io, session_load_timeout, loadSession, .{ io, client, diagnostic, &load_slot, command })) |loaded|
         .{ .loaded = loaded }
-    else |err|
-        .{ .failed = err };
+    else |err| failed: {
+        sink_context.handle().adopt(&load_slot);
+        break :failed .{ .failed = err };
+    };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_loaded = .{
+        .evidence = if (outcome == .failed) bbr.diagnostic.Failure.capture(.session_load, .execute, diagnostic.context, .{ .zig = outcome.failed }, @src()) else null,
         .command_id = command.command_id,
         .intent = command.intent,
         .outcome = outcome,
@@ -815,22 +919,25 @@ fn presentationLoadWorker(
 /// replacement suspends Session-specific Actions until it completes.
 const session_load_timeout = std.Io.Duration.fromSeconds(60);
 
-fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, command: presentation.LoadSession) anyerror!*Session {
+fn loadSession(io: std.Io, client: ?bbr.bitbucket.Client, spawn_diagnostic: bbr.diagnostics.Handle, task_slot: *?bbr.diagnostic.Leaf, command: presentation.LoadSession) anyerror!*Session {
+    const diagnostic = spawn_diagnostic.withLeaf(task_slot);
     return switch (command.key.kind) {
         .remote => session.loadWith(
             io,
             std.heap.page_allocator,
-            client.?,
+            client.?.withDiagnostics(diagnostic),
             command.key.repository(),
             command.key.pull_request_id,
         ),
         .local => blk: {
             var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
+            git.diagnostic = diagnostic;
             break :blk session.loadLocalWith(
                 std.heap.page_allocator,
                 git.gitClient(),
                 command.key.baseRef(),
                 command.key.sourceRef(),
+                diagnostic,
             );
         },
     };
@@ -848,8 +955,8 @@ fn loadSessionWithin(io: std.Io, timeout: std.Io.Duration, load: anytype, args: 
     var buffer: [2]LoadRace = undefined;
     var race = std.Io.Select(LoadRace).init(io, &buffer);
     defer discardLoadRace(&race);
-    try race.concurrent(.loaded, load, args);
-    try race.concurrent(.expired, std.Io.sleep, .{ io, timeout, .awake });
+    try bbr.diagnostics.selectConcurrent(&race, .loaded, load, args);
+    try bbr.diagnostics.selectConcurrent(&race, .expired, std.Io.sleep, .{ io, timeout, .awake });
     return switch (try race.await()) {
         .loaded => |result| result,
         .expired => error.Timeout,
@@ -866,114 +973,150 @@ fn discardLoadRace(race: *std.Io.Select(LoadRace)) void {
 fn presentationEnrichmentWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     io: std.Io,
     client: ?bbr.bitbucket.Client,
     highlighter: bbr.highlight.Highlighter,
     command: presentation.EnrichFile,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer scratch.deinit();
-    const outcome: presentation.FileEnrichmentOutcome = switch (command.source) {
-        .remote => blk: {
-            break :blk if (file_enrichment.enrichConcurrent(
-                io,
-                std.heap.page_allocator,
-                client.?,
-                highlighter,
-                command.request(),
-            )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
+    const input = enrichFileInput(&sink_context, io, client, highlighter, command) catch |err| switch (err) {
+        error.Canceled => {
+            io.recancel();
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            presentation_runtime.deliver(presentationSink(&sink_context), .{ .file_enrichment_completed = .{
+                .command_id = command.command_id,
+                .work_id = command.work_id,
+                .session_epoch = command.session_epoch,
+                .file_index = command.file_index,
+                .outcome = .{ .failed = .launch_failed },
+            } });
+            return;
         },
+    };
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    presentation_runtime.deliver(presentationSink(&sink_context), input);
+}
+
+/// The worker's File Enrichment. The request and the client note into the worker's slot, so
+/// the worker's one record of a failure holds the evidence.
+fn enrichFileInput(
+    sink_context: *PresentationSinkContext,
+    io: std.Io,
+    client: ?bbr.bitbucket.Client,
+    highlighter: bbr.highlight.Highlighter,
+    command: presentation.EnrichFile,
+) error{Canceled}!presentation.OwnedInput {
+    var request = command.request();
+    request.diagnostic = sink_context.handle();
+    const enriched = switch (command.source) {
+        .remote => file_enrichment.enrichConcurrent(io, std.heap.page_allocator, sink_context.bitbucket(client.?), highlighter, request),
         .local => blk: {
             var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
             var source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
-            break :blk if (file_enrichment.enrichFrom(
-                std.heap.page_allocator,
-                source.source(),
-                highlighter,
-                command.request(),
-            )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+            break :blk file_enrichment.enrichFrom(std.heap.page_allocator, source.source(), highlighter, request);
         },
     };
-    presentation_runtime.deliver(presentationSink(&sink_context), .{ .file_enrichment_completed = .{
+    var evidence: ?bbr.diagnostic.Failure = null;
+    const outcome: presentation.FileEnrichmentOutcome = if (enriched) |result| .{ .completed = result } else |err| failed: {
+        switch (err) {
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory => {},
+        }
+        evidence = bbr.diagnostic.Failure.capture(.file_enrichment, .execute, sink_context.diagnostic.context, .{ .zig = err }, @src());
+        break :failed .{ .failed = .out_of_memory };
+    };
+    return .{ .file_enrichment_completed = .{
+        .evidence = evidence,
         .command_id = command.command_id,
         .work_id = command.work_id,
         .session_epoch = command.session_epoch,
         .file_index = command.file_index,
         .outcome = outcome,
-    } });
+    } };
 }
 
 fn presentationBufferSearchWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     command_value: presentation.ScanBufferSearch,
 ) void {
     var command = command_value;
     defer command.deinit();
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     presentation_runtime.deliver(
         presentationSink(&sink_context),
         .{ .buffer_search_scanned = presentation.executeBufferSearchScan(std.heap.page_allocator, &command) },
     );
 }
 
-fn presentationDisclosureWorker(loop: *Loop, work_id: u64, job: *presentation.DisclosureBuild) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+fn presentationDisclosureWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, job: *presentation.DisclosureBuild) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     job.build();
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .buffer_disclosure_built = job });
 }
 
-fn presentationPrepareSessionWorker(loop: *Loop, work_id: u64, job: *presentation.PrepareSession) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+fn presentationPrepareSessionWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, job: *presentation.PrepareSession) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     job.build();
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_prepared = job });
 }
 
-fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, command_value: presentation.ScanReviewSource) void {
+fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, command_value: presentation.ScanReviewSource) void {
     var command = command_value;
     defer command.deinit();
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .review_source_scanned = presentation.executeReviewSourceScan(std.heap.page_allocator, &command) });
 }
 
-fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentation.WaitSubmission) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
-    io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_launch_failed = wait });
-        return;
+fn presentationWaitWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, io: std.Io, wait: presentation.WaitSubmission) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
+    io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch |err| switch (err) {
+        error.Canceled => {
+            io.recancel();
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_launch_failed = wait });
+            return;
+        },
     };
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_completed = wait });
 }
 
 fn presentationRecoveryCheckWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     check: presentation.CheckRecovery,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    const input = if (client.getPullRequest(scratch.allocator(), check.identity.repository(), check.identity.pullRequestId())) |pr|
-        presentation.recoveryCheckSucceeded(check.command_id, check.operation_id, check.identity, pr.source_commit)
-    else |_|
-        presentation.OwnedInput{ .recovery_checked = .{ .command_id = check.command_id, .operation_id = check.operation_id, .identity = check.identity, .outcome = .failed } };
+    const input = presentation_adapter.checkRecovery(scratch.allocator(), sink_context.bitbucket(client), check);
     presentation_runtime.deliver(presentationSink(&sink_context), input);
 }
 
 fn presentationDuplicateCheckWorker(
     loop: *Loop,
     work_id: u64,
-    client: bbr.bitbucket.Client,
+    diagnostic: bbr.diagnostics.Handle,
+    unbound: bbr.bitbucket.Client,
     command: *presentation.PostDraft,
 ) void {
     defer command.destroy();
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
+    const client = sink_context.bitbucket(unbound);
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch {
+    const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch |err| {
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
+            .evidence = bbr.diagnostic.Failure.capture(.duplicate_check, .execute, diagnostic.context, .{ .zig = err }, @src()),
             .command_id = command.command_id,
             .operation_id = command.operation_id,
             .identity = command.identity,
@@ -990,11 +1133,17 @@ fn presentationDuplicateCheckWorker(
         .author_uuid = author_uuid,
         .require_author_match = true,
     };
-    const checked = poster.poster().findExisting(command.draft, command.parent) catch bbr.review.CheckResult{ .outcome = .ambiguous };
+    const checked = poster.poster().findExisting(command.draft, command.parent) catch |err| blk: {
+        _ = client.diagnostic.failure(.execute, .{ .zig = err }, @src());
+        break :blk bbr.review.CheckResult{ .outcome = .ambiguous };
+    };
     const outcome: presentation.DuplicateCheckOutcome = switch (checked.outcome) {
         .found => |id| .{ .found = id },
         .missing => .missing,
-        .rejected => |err| .{ .rejected = err },
+        .rejected => |err| rejected: {
+            _ = client.diagnostic.failure(.rejection, .{ .zig = err }, @src());
+            break :rejected .{ .rejected = err };
+        },
         .ambiguous => .failed,
     };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
@@ -1010,45 +1159,17 @@ fn presentationDuplicateCheckWorker(
 fn presentationListPullRequestsWorker(
     loop: *Loop,
     work_id: u64,
+    diagnostic: bbr.diagnostics.Handle,
     client: bbr.bitbucket.Client,
     command: presentation.ListPullRequests,
 ) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
-    const summaries = presentation.PullRequestSummaries.create(std.heap.page_allocator) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
-            .command_id = command.command_id,
-            .work_id = command.work_id,
-            .outcome = .failed,
-        } });
-        return;
-    };
-    loadPullRequestSummaries(client, command.repositoryName(), summaries) catch {
-        summaries.destroy();
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
-            .command_id = command.command_id,
-            .work_id = command.work_id,
-            .outcome = .failed,
-        } });
-        return;
-    };
-    presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
-        .command_id = command.command_id,
-        .work_id = command.work_id,
-        .outcome = .{ .loaded = summaries },
-    } });
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.listPullRequests(std.heap.page_allocator, sink_context.bitbucket(client), command));
 }
 
-fn loadPullRequestSummaries(
-    client: bbr.bitbucket.Client,
-    repository: []const u8,
-    summaries: *presentation.PullRequestSummaries,
-) !void {
-    summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
-}
-
-fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {
-    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
-    presentation_runtime.deliver(presentationSink(&sink_context), .{ .code_highlight_completed = command.execute(highlighter) });
+fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .code_highlight_completed = command.execute(highlighter.withDiagnostics(diagnostic)) });
 }
 
 fn drainPresentationCommands(
@@ -1064,25 +1185,41 @@ fn drainPresentationCommands(
 ) !void {
     while (state.takeCommand()) |command_value| {
         var command = command_value;
+        if (command == .report_diagnostic) {
+            ctx.diagnostic.record(command.report_diagnostic);
+            continue;
+        }
+        if (command == .set_diagnostics) {
+            const actual = if (ctx.diagnostic.sink) |sink| sink.setEnabled(command.set_diagnostics.enabled) else .off;
+            try state.dispatch(.{ .diagnostics_changed = .{ .command_id = command.set_diagnostics.command_id, .state = actual } });
+            continue;
+        }
         if (command == .copy_clipboard) {
+            const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, null);
             const input = presentation_adapter.copyToClipboard(vx.*, tty.writer(), command.copy_clipboard);
             command = undefined;
+            presentation_runtime.recordFailures(diagnostic, input);
             try state.dispatch(input);
             continue;
         }
         // config.toml is at most 64 KiB, so the write runs on the terminal
         // thread and completes before the next event.
         if (command == .persist_theme) {
+            const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, null);
             const persist = command.persist_theme;
-            const outcome: presentation.ThemePersisted.Outcome = if (config.persistTheme(ctx.gpa, ctx.io, ctx.env_map, persist.theme)) |_| .saved else |err| switch (err) {
-                error.NoConfigLocation => .no_config_location,
-                error.ConfigInvalid => .config_invalid,
-                error.WriteFailed, error.OutOfMemory => .write_failed,
+            const outcome: presentation.ThemePersisted.Outcome = if (config.persistTheme(ctx.gpa, ctx.io, ctx.env_map, persist.theme)) |_| .saved else |err| blk: {
+                _ = diagnostic.failure(.write, .{ .zig = err }, @src());
+                switch (err) {
+                    error.Canceled => ctx.io.recancel(),
+                    else => {},
+                }
+                break :blk themeSaveOutcome(err);
             };
             try state.dispatch(.{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = outcome } });
             continue;
         }
         if (command == .external_edit) {
+            const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, null);
             var handoff_context: TerminalHandoffContext = .{
                 .ctx = ctx,
                 .loop = loop,
@@ -1091,11 +1228,12 @@ fn drainPresentationCommands(
                 .vx = vx,
                 .write_buf = write_buf,
             };
-            const completed = presentation_adapter.externalEdit(ctx.io, ctx.env_map, handoff_context.handoff(), command.external_edit) catch {
+            const completed = presentation_adapter.externalEdit(ctx.io, ctx.env_map, handoff_context.handoff(), command.external_edit) catch |err| {
                 command = undefined;
-                return error.OutOfMemory;
+                return err;
             };
             command = undefined;
+            presentation_runtime.recordFailures(diagnostic, .{ .external_edit_completed = completed });
             const restoration_failed = completed.outcome == .restoration_failed;
             const retained_path = if (restoration_failed) completed.outcome.restoration_failed else null;
             if (retained_path) |path| {
@@ -1105,32 +1243,39 @@ fn drainPresentationCommands(
             try state.dispatch(.{ .external_edit_completed = completed });
             continue;
         }
-        futures.ensureUnusedCapacity(ctx.gpa, 1) catch {
-            try state.dispatch(try command.launchFailed());
+        futures.ensureUnusedCapacity(ctx.gpa, 1) catch |err| {
+            const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, null);
+            const input = try command.launchFailed(err);
+            presentation_runtime.recordFailures(diagnostic, input);
+            try state.dispatch(input);
             continue;
         };
         const work_id = next_work_id.*;
         next_work_id.* +%= 1;
+        const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, work_id);
+        const client = if (ctx.bitbucket) |value| value.withDiagnostics(diagnostic) else null;
         const future = switch (command) {
-            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, workerBitbucketForReviewKind(ctx.bitbucket, load.key.kind), load }),
-            .prepare_session => |job| ctx.io.concurrent(presentationPrepareSessionWorker, .{ loop, work_id, job }),
-            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, workerBitbucketForEnrichment(ctx.bitbucket, enrich.source), ctx.highlighter, enrich }),
-            .highlight_code => |job| ctx.io.concurrent(presentationCodeHighlightWorker, .{ loop, work_id, ctx.highlighter, job }),
-            .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.bitbucket.?, post }),
-            .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.bitbucket.?, update }),
-            .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.bitbucket.?, delete }),
-            .change_reviewer_verdict => |verdict| ctx.io.concurrent(presentationReviewerVerdictWorker, .{ loop, work_id, ctx.bitbucket.?, verdict }),
-            .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, ctx.io, wait }),
-            .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
-            .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
-            .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
-            .copy_clipboard, .persist_theme => unreachable,
+            .load_session => |load| bbr.diagnostics.concurrent(ctx.io, presentationLoadWorker, .{ loop, work_id, diagnostic, ctx.io, workerBitbucketForReviewKind(client, load.key.kind), load }),
+            .prepare_session => |job| bbr.diagnostics.concurrent(ctx.io, presentationPrepareSessionWorker, .{ loop, work_id, diagnostic, job }),
+            .enrich_file => |enrich| bbr.diagnostics.concurrent(ctx.io, presentationEnrichmentWorker, .{ loop, work_id, diagnostic, ctx.io, workerBitbucketForEnrichment(client, enrich.source), ctx.highlighter, enrich }),
+            .highlight_code => |job| bbr.diagnostics.concurrent(ctx.io, presentationCodeHighlightWorker, .{ loop, work_id, diagnostic, ctx.highlighter, job }),
+            .post_draft => |post| bbr.diagnostics.concurrent(ctx.io, presentationPostWorker, .{ loop, work_id, diagnostic, client.?, post }),
+            .update_comment => |update| bbr.diagnostics.concurrent(ctx.io, presentationCommentEditWorker, .{ loop, work_id, diagnostic, client.?, update }),
+            .delete_comment => |delete| bbr.diagnostics.concurrent(ctx.io, presentationCommentDeleteWorker, .{ loop, work_id, diagnostic, client.?, delete }),
+            .change_reviewer_verdict => |verdict| bbr.diagnostics.concurrent(ctx.io, presentationReviewerVerdictWorker, .{ loop, work_id, diagnostic, client.?, verdict }),
+            .wait_submission => |wait| bbr.diagnostics.concurrent(ctx.io, presentationWaitWorker, .{ loop, work_id, diagnostic, ctx.io, wait }),
+            .check_recovery => |check| bbr.diagnostics.concurrent(ctx.io, presentationRecoveryCheckWorker, .{ loop, work_id, diagnostic, client.?, check }),
+            .find_duplicate => |check| bbr.diagnostics.concurrent(ctx.io, presentationDuplicateCheckWorker, .{ loop, work_id, diagnostic, client.?, check }),
+            .list_pull_requests => |list| bbr.diagnostics.concurrent(ctx.io, presentationListPullRequestsWorker, .{ loop, work_id, diagnostic, client.?, list }),
+            .copy_clipboard, .persist_theme, .set_diagnostics, .report_diagnostic => unreachable,
             .external_edit => unreachable,
-            .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),
-            .build_buffer_disclosure => |job| ctx.io.concurrent(presentationDisclosureWorker, .{ loop, work_id, job }),
-            .scan_review_source => |scan| ctx.io.concurrent(presentationReviewSourceWorker, .{ loop, work_id, scan }),
-        } catch {
-            try state.dispatch(try command.launchFailed());
+            .scan_buffer_search => |scan| bbr.diagnostics.concurrent(ctx.io, presentationBufferSearchWorker, .{ loop, work_id, diagnostic, scan }),
+            .build_buffer_disclosure => |job| bbr.diagnostics.concurrent(ctx.io, presentationDisclosureWorker, .{ loop, work_id, diagnostic, job }),
+            .scan_review_source => |scan| bbr.diagnostics.concurrent(ctx.io, presentationReviewSourceWorker, .{ loop, work_id, diagnostic, scan }),
+        } catch |err| {
+            const input = try command.launchFailed(err);
+            presentation_runtime.recordFailures(diagnostic, input);
+            try state.dispatch(input);
             continue;
         };
         futures.appendAssumeCapacity(.{ .id = work_id, .future = future });
@@ -1249,13 +1394,24 @@ const StatusFacts = struct {
     submitting: bool = false,
     draft_count: usize = 0,
     status_msg: ?[]const u8 = null,
+    diagnostic_state: bbr.diagnostic.State = .off,
     searching: bool = false,
     search_has_no_matches: bool = false,
 };
 
+/// Diagnostic logging state is its own meta item, so it never hides an
+/// operation status or the key hints.
+fn diagnosticStatus(state: bbr.diagnostic.State) ?[]const u8 {
+    return switch (state) {
+        .on => "diagnostic logging enabled",
+        .unavailable => "diagnostic logging unavailable",
+        .off => null,
+    };
+}
+
 fn projectionStatusItems(frame: std.mem.Allocator, projection: presentation.Projection) StatusItems {
     const active_theme = theme.value(projection.theme);
-    const review = projection.review orelse return loadingStatusItems(active_theme, presentationStatus(frame, projection, null));
+    const review = projection.review orelse return loadingStatusItems(active_theme, presentationStatus(frame, projection, null), projection.diagnostic_state);
     const visual_cursor = review.navigation.cursor;
     return statusItems(frame, active_theme, .{
         .header = review.header,
@@ -1273,6 +1429,7 @@ fn projectionStatusItems(frame: std.mem.Allocator, projection: presentation.Proj
         .submitting = projection.submission != null,
         .draft_count = review.drafts.len,
         .status_msg = presentationStatus(frame, projection, review.key),
+        .diagnostic_state = projection.diagnostic_state,
         .searching = projection.buffer_search != null,
         .search_has_no_matches = if (projection.buffer_search) |search| search.query.len > 0 and search.total == 0 else false,
     });
@@ -1286,7 +1443,9 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
         if (facts.status_msg) |message| items.add(.search, message, if (facts.search_has_no_matches) .no_match else .message);
     } else {
         if (facts.header.pull_request_id) |id| {
-            items.add(.title, std.fmt.allocPrint(frame, "#{d}", .{id}) catch "#", .pull_request);
+            items.add(.title, std.fmt.allocPrint(frame, "#{d}", .{id}) catch |err| switch (err) {
+                error.OutOfMemory => "#",
+            }, .pull_request);
             items.add(.title, " ", .bar);
             items.add(.verdict, reviewerVerdictLabel(facts.reviewer_verdict), if (facts.reviewer_verdict) |verdict| switch (verdict) {
                 .approved => .verdict_approved,
@@ -1298,8 +1457,11 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
         items.add(.refs, facts.header.source_ref, .ref);
         items.add(.refs, " → ", .separator);
         items.add(.refs, facts.header.base_ref, .ref);
-        items.add(.position, std.fmt.allocPrint(frame, "{d}/{d}", .{ facts.position, facts.total }) catch "", .position);
+        items.add(.position, std.fmt.allocPrint(frame, "{d}/{d}", .{ facts.position, facts.total }) catch |err| switch (err) {
+            error.OutOfMemory => "",
+        }, .position);
         items.position_width = @intCast(std.fmt.count("{d}/{d}", .{ facts.total, facts.total }));
+        if (diagnosticStatus(facts.diagnostic_state)) |text| items.add(.diagnostics, text, .message);
     }
     items.hint(.layout, "s", if (facts.layout == .unified) " split" else " unified");
     // Names the *current* scope; `f` cycles Changes → fetched → whole.
@@ -1321,7 +1483,9 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
     } else {
         if (facts.draft_count > 0) {
             items.add(.submit, "X", .key);
-            items.add(.submit, std.fmt.allocPrint(frame, " submit {d}", .{facts.draft_count}) catch " submit", .drafts);
+            items.add(.submit, std.fmt.allocPrint(frame, " submit {d}", .{facts.draft_count}) catch |err| switch (err) {
+                error.OutOfMemory => " submit",
+            }, .drafts);
         }
         items.hint(.comment, "c/i", " comment");
         items.hint(.file, "[ ]", " file");
@@ -1333,8 +1497,9 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
 }
 
 /// Before a review exists, the hint part holds the loading message alone.
-fn loadingStatusItems(active_theme: theme.Theme, status_msg: ?[]const u8) StatusItems {
+fn loadingStatusItems(active_theme: theme.Theme, status_msg: ?[]const u8, diagnostic_state: bbr.diagnostic.State) StatusItems {
     var items: StatusItems = .init(active_theme);
+    if (diagnosticStatus(diagnostic_state)) |text| items.add(.diagnostics, text, .message);
     if (status_msg) |message| items.add(.message, message, .message) else items.add(.message, "loading…", .busy);
     return items;
 }
@@ -1450,6 +1615,15 @@ test {
     _ = @import("presentation_runtime.zig");
 }
 
+test "a directory config.toml is a read failure on the Theme status" {
+    try std.testing.expectEqual(presentation.ThemePersisted.Outcome.read_failed, themeSaveOutcome(error.IsDir));
+    try std.testing.expectEqual(presentation.ThemePersisted.Outcome.write_failed, themeSaveOutcome(error.WriteFailed));
+    try std.testing.expectEqual(presentation.ThemePersisted.Outcome.write_failed, themeSaveOutcome(error.Canceled));
+    try std.testing.expectEqualStrings("Theme applied, but config.toml could not be read", actionErrorText(.theme_not_saved_unreadable));
+    try std.testing.expectEqualStrings("Theme applied, but config.toml could not be written", actionErrorText(.theme_not_saved));
+    try std.testing.expectEqualStrings("an Anchor range must run forward", actionErrorText(.anchor_range_descending));
+}
+
 test "whole-text vaxis width matches grapheme measurement" {
     for ([_][]const u8{ "plain", "\x00", "\t", "\x7f", "e\xcc\x81", "\xe7\x95\x8c", "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb", "\xff" }) |text| {
         var scalar_width: usize = 0;
@@ -1485,6 +1659,245 @@ test "M22 read the receipt load failure status names the unread fallback" {
     try std.testing.expectEqualStrings("File read state unavailable, all Files show unread", actionErrorText(.file_read_load_failed));
 }
 
+var test_store_diagnostic: bbr.diagnostics.Handle = .{};
+
+fn failTestLoad(_: *anyopaque, _: std.mem.Allocator, _: bbr.review.RemoteReviewIdentity) anyerror![]bbr.review.Draft {
+    return test_store_diagnostic.fail(.step, .{ .sqlite = .{ .result = 7, .extended = 7 } }, @src());
+}
+
+/// An Io that captures stderr writes and fails every other operation.
+const TestStderr = struct {
+    buffer: [512]u8 = undefined,
+    len: usize = 0,
+
+    const vtable: std.Io.VTable = blk: {
+        var table = std.Io.failing.vtable.*;
+        table.operate = operate;
+        break :blk table;
+    };
+
+    fn io(self: *TestStderr) std.Io {
+        return .{ .userdata = self, .vtable = &vtable };
+    }
+
+    fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        const self: *TestStderr = @ptrCast(@alignCast(userdata.?));
+        const write = switch (operation) {
+            .file_write_streaming => |write| write,
+            else => unreachable,
+        };
+        std.debug.assert(write.file.handle == std.Io.File.stderr().handle);
+        var writer = std.Io.Writer.fixed(self.buffer[self.len..]);
+        writer.writeAll(write.header) catch |err| switch (err) {
+            error.WriteFailed => return .{ .file_write_streaming = error.NoSpaceLeft },
+        };
+        for (write.data, 0..) |part, index| for (0..if (index + 1 == write.data.len) write.splat else 1) |_| writer.writeAll(part) catch |err| switch (err) {
+            error.WriteFailed => return .{ .file_write_streaming = error.NoSpaceLeft },
+        };
+        self.len += writer.buffered().len;
+        return .{ .file_write_streaming = writer.buffered().len };
+    }
+};
+
+fn testBoundedText(comptime T: type, value: []const u8) T {
+    var text: T = .{ .len = value.len };
+    @memcpy(text.bytes[0..value.len], value);
+    return text;
+}
+
+test "diagnostics a canceled File Enrichment worker keeps its retirement completion and rearms cancellation" {
+    const Rearmed = struct {
+        var count: usize = 0;
+
+        fn recancel(_: ?*anyopaque) void {
+            count += 1;
+        }
+    };
+    Rearmed.count = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.recancel = Rearmed.recancel;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var fake: bbr.http.FakeHttpClient = .{ .send_error = error.Canceled };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    const Command = presentation.EnrichFile;
+    presentationEnrichmentWorker(&loop, 9, .{}, io, client, plain.highlighter(), .{
+        .work_id = 9,
+        .session_epoch = 1,
+        .file_index = 0,
+        .source = .{ .remote = testBoundedText(@FieldType(@FieldType(Command, "source"), "remote"), "repo") },
+        .source_commit = testBoundedText(@FieldType(Command, "source_commit"), "source"),
+        .destination_commit = testBoundedText(@FieldType(Command, "destination_commit"), "destination"),
+        .old_path = testBoundedText(@FieldType(Command, "old_path"), "file.zig"),
+        .new_path = testBoundedText(@FieldType(Command, "new_path"), "file.zig"),
+        .status = .modified,
+        .max_file_bytes = 0,
+    });
+    var done = (try loop.tryEvent()).?.presentation_done;
+    defer done.input.deinit();
+    try std.testing.expectEqual(@as(u64, 9), done.work_id);
+    try std.testing.expect(done.input.file_enrichment_completed.evidence == null);
+    try std.testing.expectEqual(presentation.FileEnrichmentOutcome{ .failed = .launch_failed }, done.input.file_enrichment_completed.outcome);
+    try std.testing.expectEqual(@as(usize, 1), Rearmed.count);
+    try std.testing.expect((try loop.tryEvent()) == null);
+}
+
+test "diagnostics a transport OutOfMemory on one File side keeps its phase in the worker record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(std.testing.allocator, std.testing.io, &env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/destination/", .send_error = error.OutOfMemory, .send_phase = .receive_body },
+        .{ .request_key = "/source/", .status = 200, .body = "new" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    // The worker gets the spawn handle and client, which have no slot, as `drainPresentationCommands` passes them.
+    const spawn_handle = sink.handle(.file_enrichment, .{ .work_id = 9 });
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(spawn_handle);
+    var sink_context: PresentationSinkContext = .{ .loop = undefined, .work_id = 9, .diagnostic = spawn_handle };
+    const Command = presentation.EnrichFile;
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var input = try enrichFileInput(&sink_context, std.testing.io, client, plain.highlighter(), .{
+        .work_id = 9,
+        .session_epoch = 1,
+        .file_index = 0,
+        .source = .{ .remote = testBoundedText(@FieldType(@FieldType(Command, "source"), "remote"), "repo") },
+        .source_commit = testBoundedText(@FieldType(Command, "source_commit"), "source"),
+        .destination_commit = testBoundedText(@FieldType(Command, "destination_commit"), "destination"),
+        .old_path = testBoundedText(@FieldType(Command, "old_path"), "file.zig"),
+        .new_path = testBoundedText(@FieldType(Command, "new_path"), "file.zig"),
+        .status = .modified,
+        .max_file_bytes = 0,
+    });
+    defer input.deinit();
+    try std.testing.expect(input.file_enrichment_completed.outcome == .failed);
+    presentation_runtime.recordFailures(sink_context.handle(), input);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "operation=file_enrichment phase=receive_body source=tui/app.zig:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "work_id=9") != null);
+    try std.testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
+}
+
+test "diagnostics the worker Session load spawns with its own slot and its one record keeps the status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(std.testing.allocator, std.testing.io, &env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    const responses = [_]bbr.http.Canned{
+        .{ .request_key = "/2.0/user", .body = "{\"uuid\":\"{account}\"}" },
+        .{ .request_key = "/pullrequests/7/diff", .body = "" },
+        .{ .request_key = "/pullrequests/7", .status = 404, .body = "{}" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    // The worker gets the spawn handle and client, which have no slot, as `drainPresentationCommands` passes them.
+    // A Debug build panics when the worker spawns its load with a handle that has a slot.
+    const spawn_handle = sink.handle(.session_load, .{ .work_id = 4 });
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" }).withDiagnostics(spawn_handle);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    presentationLoadWorker(&loop, 4, spawn_handle, std.testing.io, client, .{
+        .command_id = 8,
+        .intent = 3,
+        .key = try presentation.OwnedReviewIdentity.init("ws", "repo", 7),
+    });
+    var event = (try loop.tryEvent()) orelse return error.TestUnexpectedResult;
+    defer event.presentation_done.input.deinit();
+    const loaded = event.presentation_done.input.session_loaded;
+    try std.testing.expectEqual(error.NotFound, loaded.outcome.failed);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "operation=session_load phase=rejection source=tui/app.zig:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, only, "work_id=4") != null);
+    try std.testing.expect(std.mem.endsWith(u8, only, "cause=http status=404 classification=not_found"));
+}
+
+test "diagnostics an initial load that the store reported shows its message and keeps one record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var sink = bbr.diagnostics.Sink.init(std.testing.allocator, std.testing.io, &env);
+    defer sink.deinit();
+    try std.testing.expect(sink.setEnabled(true) == .on);
+    test_store_diagnostic = sink.handle(.persistence, .{});
+    defer test_store_diagnostic = .{};
+
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    var vtable = store.store().vtable.*;
+    vtable.load = failTestLoad;
+    var reviews = store.store();
+    reviews.vtable = &vtable;
+    const initial = try session.create(std.testing.allocator);
+    initial.diff = .{ .files = &.{} };
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var output: TestStderr = .{};
+    try std.testing.expectError(error.Reported, run(.{
+        .diagnostic = sink.handle(.session_load, .{}),
+        .io = output.io(),
+        .gpa = std.testing.allocator,
+        .env_map = &env,
+        .repo = "",
+        .store = reviews,
+        .theme = .dark,
+        .keymap = keymap.Keymap.default,
+        .highlighter = plain.highlighter(),
+        .highlight_max_file_bytes = 0,
+        .file_cache_enabled = false,
+        .inactive_file_cache_max_bytes = 0,
+        .comments_collapsed_rows = 0,
+        .online = false,
+    }, initial, try presentation.OwnedReviewIdentity.init("workspace", "repo", 1)));
+    try std.testing.expectEqualStrings("bbr: could not load the pending review drafts\n", output.buffer[0..output.len]);
+    _ = sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(std.testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(std.testing.io)).?;
+    const bytes = try dir.readFileAlloc(std.testing.io, entry.name, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.endsWith(u8, only, "cause=sqlite result=7 extended=7"));
+}
+
 test "status labels project every Reviewer Verdict" {
     try std.testing.expectEqualStrings("Approved", reviewerVerdictLabel(.approved));
     try std.testing.expectEqualStrings("Changes requested", reviewerVerdictLabel(.changes_requested));
@@ -1505,6 +1918,7 @@ const TestStatus = struct {
     total: usize = 1,
     loading: bool = false,
     status_msg: ?[]const u8 = null,
+    diagnostic_state: bbr.diagnostic.State = .off,
     searching: bool = false,
     search_has_no_matches: bool = false,
 };
@@ -1521,6 +1935,7 @@ fn testStatusItems(arena: std.mem.Allocator, active_theme: theme.Theme, case: Te
         .loading = case.loading,
         .draft_count = 2,
         .status_msg = case.status_msg,
+        .diagnostic_state = case.diagnostic_state,
         .searching = case.searching,
         .search_has_no_matches = case.search_has_no_matches,
     });
@@ -1580,6 +1995,18 @@ test "the status puts the meta items above the hint items and separates items on
         for (narrow) |row| rows_with_item += @intFromBool(std.mem.indexOf(u8, row, item) != null);
         try std.testing.expectEqual(@as(usize, 1), rows_with_item);
     }
+}
+
+test "diagnostic logging state is a meta item that hides no status message or key hint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const enabled = try testStatusRows(a, try testDrawStatus(a, theme.dark, .{ .diagnostic_state = .on }));
+    try std.testing.expectEqualStrings("#7 Fix parser  ·  Approved  ·  review → main  ·  1/1  ·  diagnostic logging enabled", enabled[0]);
+    try std.testing.expect(std.mem.indexOf(u8, enabled[1], "? help") != null);
+    const copied = try testStatusRows(a, try testDrawStatus(a, theme.dark, .{ .diagnostic_state = .on, .status_msg = "copied text" }));
+    try std.testing.expect(std.mem.indexOf(u8, copied[0], "diagnostic logging enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copied[1], "copied text") != null);
 }
 
 test "the status height does not change when only the cursor moves" {
@@ -1737,7 +2164,9 @@ test "Picker tick scheduler starts only while loading and stops on every scope e
 }
 
 fn testSleepingPickerTick(io: std.Io) void {
-    io.sleep(std.Io.Duration.fromSeconds(60), .awake) catch return;
+    io.sleep(std.Io.Duration.fromSeconds(60), .awake) catch |err| switch (err) {
+        error.Canceled => return,
+    };
 }
 
 test "stopping a Picker tick cancels and reaps its sleeping future" {
@@ -1750,6 +2179,131 @@ test "stopping a Picker tick cancels and reaps its sleeping future" {
     cancelPresentationWork(&work, io, 19);
 
     try std.testing.expectEqual(@as(usize, 0), work.items.len);
+}
+
+/// Set when a test Picker tick reaches its wait, so the test cancels it there.
+var test_picker_tick_waits: std.Io.Event = .unset;
+
+/// A Picker tick wait that only a cancel ends.
+fn testSleepUntilCanceled(userdata: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+    const io: std.Io = .{ .userdata = userdata, .vtable = std.testing.io.vtable };
+    test_picker_tick_waits.set(io);
+    var never: std.Io.Event = .unset;
+    return never.wait(io);
+}
+
+/// A Picker tick wait that ends at once.
+fn testSleepNotAtAll(userdata: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+    test_picker_tick_waits.set(.{ .userdata = userdata, .vtable = std.testing.io.vtable });
+}
+
+fn testPickerTickIo(vtable: *std.Io.VTable, sleep: @FieldType(std.Io.VTable, "sleep")) std.Io {
+    vtable.* = std.testing.io.vtable.*;
+    vtable.sleep = sleep;
+    test_picker_tick_waits = .unset;
+    return .{ .userdata = std.testing.io.userdata, .vtable = vtable };
+}
+
+test "a Picker tick canceled in its wait posts no tick" {
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, testSleepUntilCanceled);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var future = try std.testing.io.concurrent(pickerTickWorker, .{ &loop, 3, 7, worker_io });
+    try test_picker_tick_waits.wait(std.testing.io);
+    future.cancel(std.testing.io);
+    try std.testing.expect((try loop.tryEvent()) == null);
+}
+
+test "diagnostics a canceled Submission wait retires its worker without failure evidence" {
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, testSleepUntilCanceled);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var futures: std.ArrayList(PresentationWork) = .empty;
+    defer futures.deinit(std.testing.allocator);
+    var future = try std.testing.io.concurrent(presentationWaitWorker, .{ &loop, 3, bbr.diagnostics.Handle{}, worker_io, presentation.WaitSubmission{
+        .operation_id = 1,
+        .temp_id = 1,
+        .ms = 60000,
+    } });
+    try test_picker_tick_waits.wait(std.testing.io);
+    future.cancel(std.testing.io);
+    try futures.append(std.testing.allocator, .{ .id = 3, .future = future });
+    const done = (try loop.tryEvent()).?.presentation_done;
+    try std.testing.expectEqual(@as(u64, 3), done.work_id);
+    try std.testing.expect(done.input.submission_wait_launch_failed.evidence == null);
+    reapPresentationWork(&futures, std.testing.io, done.work_id);
+    try std.testing.expectEqual(@as(usize, 0), futures.items.len);
+    try std.testing.expect((try loop.tryEvent()) == null);
+}
+
+test "a Picker tick canceled while the event queue is full ends without its tick" {
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, testSleepNotAtAll);
+    var loop: Loop = .init(std.testing.io, undefined, undefined);
+    var capacity: usize = 0;
+    while (try loop.tryPostEvent(.{ .picker_tick = .{ .future_id = 1, .scope = 1 } })) capacity += 1;
+    var future = try std.testing.io.concurrent(pickerTickWorker, .{ &loop, 3, 7, worker_io });
+    try test_picker_tick_waits.wait(std.testing.io);
+    future.cancel(std.testing.io);
+    var queued: usize = 0;
+    while (try loop.tryEvent()) |event| : (queued += 1) try std.testing.expectEqual(@as(u64, 1), event.picker_tick.future_id);
+    try std.testing.expectEqual(capacity, queued);
+}
+
+test "diagnostics a completed Submission wait canceled with a full event queue still retires its worker" {
+    const Race = struct {
+        var delivery: std.Io.Event = .unset;
+
+        fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const io: std.Io = .{ .userdata = userdata, .vtable = std.testing.io.vtable };
+            testSleepUntilCanceled(userdata, timeout) catch |err| switch (err) {
+                error.Canceled => io.recancel(),
+            };
+        }
+
+        fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const io: std.Io = .{ .userdata = userdata, .vtable = std.testing.io.vtable };
+            try io.checkCancel();
+            delivery.set(io);
+            return io.vtable.futexWait(userdata, ptr, expected, timeout);
+        }
+
+        fn run(loop: *Loop, io: std.Io, wait: presentation.WaitSubmission) void {
+            presentationWaitWorker(loop, 3, .{}, io, wait);
+            delivery.set(std.testing.io);
+        }
+
+        fn drain(loop: *Loop, count: usize) !void {
+            try delivery.wait(std.testing.io);
+            for (0..count) |_| try std.testing.expectEqual(@as(u64, 1), (try loop.nextEvent()).picker_tick.future_id);
+        }
+    };
+    Race.delivery = .unset;
+    var vtable: std.Io.VTable = undefined;
+    const worker_io = testPickerTickIo(&vtable, Race.sleep);
+    var queue_vtable = std.testing.io.vtable.*;
+    queue_vtable.futexWait = Race.futexWait;
+    var loop: Loop = .init(.{ .userdata = std.testing.io.userdata, .vtable = &queue_vtable }, undefined, undefined);
+    var capacity: usize = 0;
+    while (try loop.tryPostEvent(.{ .picker_tick = .{ .future_id = 1, .scope = 1 } })) capacity += 1;
+    var futures: std.ArrayList(PresentationWork) = .empty;
+    defer futures.deinit(std.testing.allocator);
+    const wait: presentation.WaitSubmission = .{ .operation_id = 1, .temp_id = 1, .ms = 1 };
+    var future = try std.testing.io.concurrent(Race.run, .{ &loop, worker_io, wait });
+    try test_picker_tick_waits.wait(std.testing.io);
+    var drain = try std.testing.io.concurrent(Race.drain, .{ &loop, capacity });
+    defer drain.await(std.testing.io) catch unreachable;
+    future.cancel(std.testing.io);
+    try drain.await(std.testing.io);
+    try futures.append(std.testing.allocator, .{ .id = 3, .future = future });
+    const event = (try loop.tryEvent()) orelse return error.TestUnexpectedResult;
+    const done = event.presentation_done;
+    try std.testing.expectEqual(@as(u64, 3), done.work_id);
+    try std.testing.expectEqualDeep(wait, done.input.submission_wait_completed);
+    try std.testing.expect(done.input.submission_wait_completed.evidence == null);
+    reapPresentationWork(&futures, std.testing.io, done.work_id);
+    try std.testing.expectEqual(@as(usize, 0), futures.items.len);
+    try std.testing.expect((try loop.tryEvent()) == null);
 }
 
 fn testStalledLoad(io: std.Io) anyerror!*Session {
