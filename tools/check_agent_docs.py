@@ -16,6 +16,7 @@ LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 REFERENCE = re.compile(r"^\s{0,3}\[(?!\^)[^\]\n]+\]:\s*(<[^>]+>|\S+)")
 QUOTED = re.compile(r'(?<!step )"([^"\n]+)"')
 ZIG_FILE = re.compile(r"in `([^`\n]+\.zig)`")
+CODE_SPAN = re.compile(r"`[^`\n]*`")
 
 
 def prose(text):
@@ -93,7 +94,8 @@ def check(root):
             if not line.startswith("| "):
                 continue
             enforcement = line.rstrip().rstrip("|").rsplit(" | ", 1)[-1]
-            for match in QUOTED.finditer(enforcement):
+            prose_only = CODE_SPAN.sub(lambda span: " " * len(span[0]), enforcement)
+            for match in QUOTED.finditer(prose_only):
                 name = match[1]
                 file = ZIG_FILE.search(enforcement, match.end()) or (
                     list(ZIG_FILE.finditer(enforcement, 0, match.start())) or [None])[-1]
