@@ -305,11 +305,15 @@ pub const SqliteStore = struct {
     /// step reads the version again inside its transaction.
     fn migrateStep(self: *SqliteStore, version: i64, sql: [:0]const u8) SqliteError!void {
         try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
+        errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
+            error.Exec, error.Open, error.Prepare, error.Step, error.Reported => {},
+        };
         if (try self.userVersion() < version) {
             try self.exec(sql);
             var buf: [40]u8 = undefined;
-            try self.exec(std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{version}) catch unreachable);
+            try self.exec(std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{version}) catch |err| switch (err) {
+                error.NoSpaceLeft => unreachable,
+            });
         }
         try self.exec("COMMIT;");
     }
