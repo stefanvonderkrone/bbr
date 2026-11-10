@@ -557,6 +557,30 @@ fn testDeleteCommand() !*presentation.DeleteComment {
     return command;
 }
 
+test "Review recovery Picker list failures surface once without a retry" {
+    const cases = [_]struct { response: bbr.http.Canned, expected: anyerror }{
+        .{ .response = .{ .status = 503 }, .expected = error.ServerError },
+        .{ .response = .{ .status = 429, .retry_after_ms = 5000 }, .expected = error.RateLimited },
+        .{ .response = .{ .body = "invalid JSON" }, .expected = error.MalformedResponse },
+        .{ .response = .{ .send_error = error.ConnectionResetByPeer }, .expected = error.ConnectionResetByPeer },
+    };
+    var repository: [256]u8 = undefined;
+    @memcpy(repository[0..4], "repo");
+    const command: presentation.ListPullRequests = .{ .command_id = 31, .work_id = 41, .repository = .{ .bytes = repository, .len = 4 } };
+    for (cases) |case| {
+        const responses = [_]bbr.http.Canned{ case.response, .{ .body = "{\"values\":[]}" } };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test", .token = "test", .workspace = "workspace" });
+        const failed = listPullRequests(testing.allocator, client, command).pull_requests_loaded.outcome.failed;
+        try testing.expectEqual(bbr.diagnostic.Phase.execute, failed.phase);
+        try testing.expectEqual(case.expected, failed.cause.zig);
+        try testing.expectEqual(@as(usize, 1), fake.call_count);
+        const loaded = listPullRequests(testing.allocator, client, command).pull_requests_loaded.outcome.loaded;
+        loaded.destroy();
+        try testing.expectEqual(@as(usize, 2), fake.call_count);
+    }
+}
+
 test "Comment deletion adapter distinguishes not-found, definitive, and unknown outcomes" {
     const cases = [_]struct { status: u16, send_error: ?anyerror, expected: std.meta.Tag(presentation.CommentDeleteOutcome) }{
         .{ .status = 204, .send_error = null, .expected = .deleted },
