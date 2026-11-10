@@ -57,8 +57,9 @@ Live checks on Workspace `check24` and Repository `pr-webapp` on 31 October 2026
 | `.../pullrequests/{id}/tasks` | 100 | `pagelen=1000` returned HTTP 200 with `pagelen` 1000. |
 | `.../commit/{commit}/pullrequests` | 100 | `pagelen=1000` returned HTTP 200 with `pagelen` 1000. |
 | `/user/workspaces` | 100 | `pagelen=1000` returned HTTP 200 with `pagelen` 1000. |
+| `.../default-reviewers` and `.../effective-default-reviewers` | 100 | `pagelen=101` returned HTTP 400 "Invalid pagelen" on both endpoints. `pagelen=1000` also returned HTTP 400 on the plain endpoint. |
 
-The last three endpoints accepted every size, and the test lists were too short to show a clamp.
+The PullRequest tasks, commit PullRequests, and user Workspaces endpoints accepted every size, and the test lists were too short to show a clamp.
 They use 100, the maximum that the Bitbucket API reference states for most lists.
 A clamp would not break a list, because the commands follow the `next` links.
 
@@ -75,7 +76,9 @@ A `next` link that repeats a page that the list already followed fails the list 
 The first page without a `next` link ends the list, also when `size` claims more pages and a later page completes after it.
 The Workspace members endpoint behaves the same way. It reported `size` 4278 for `check24`.
 The Repository and branch lists also report `size`, `page`, and `pagelen` and have numbered `next` links.
-`list-repositories`, `list-branches`, and `list-pull-requests` use the same pager.
+`list-repositories`, `list-branches`, `list-pull-requests`, and `list-default-reviewers` use the same pager.
+The effective Default Reviewer list reports `size` and has numbered `next` links, so the pager requests its pages in parallel.
+The plain Default Reviewer list has no `size`, and its `next` link carries an opaque `page` value, so the pager follows it one page at a time.
 With `--page N`, the pager reads page N first and numbers the remaining pages from there.
 With a limit, a failed page fails the result unless the pages before it in the merged order already hold the limit.
 So the result does not depend on the request timing. Only a later list can hold such a page, because page 1 of every list goes first.

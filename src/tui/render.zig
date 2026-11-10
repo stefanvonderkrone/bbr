@@ -265,7 +265,7 @@ fn drawDiffPaneTitle(scratch: std.mem.Allocator, win: vaxis.Window, frame: @impo
     const control_x = (if (frame.version_title_targets.old) |old| old.x else if (frame.version_title_targets.new) |new| new.x else frame.panes.diff.x +| frame.panes.diff.width -| 1) -| 1;
     const title_width = control_x -| title_x -| 1;
     if (title_width > 0) {
-        const title = std.fmt.allocPrint(scratch, "{s} · {s}", .{ path, scopeLabel(scope) }) catch path;
+        const title = formatLabel(scratch, "{s} · {s}", .{ path, scopeLabel(scope) }, path);
         const style = if (focused) theme.pane_border_focused else theme.pane_border;
         view_paint.titleText(win, .{ .x = title_x, .y = frame.panes.diff.y, .width = title_width, .height = 1 }, title, style);
     }
@@ -277,6 +277,13 @@ fn drawDiffPaneTitle(scratch: std.mem.Allocator, win: vaxis.Window, frame: @impo
     const x = @min(old.x, new.x);
     const end = @max(old.x + old.width, new.x + new.width);
     view_paint.titleGaps(win, .{ .x = x, .y = old.y, .width = end - x, .height = 1 }, if (focused) theme.pane_border_focused else theme.pane_border);
+}
+
+/// A frame paints even when the per-frame arena is exhausted, so a label it cannot format draws `fallback`.
+fn formatLabel(scratch: std.mem.Allocator, comptime format: []const u8, args: anytype, fallback: []const u8) []const u8 {
+    return std.fmt.allocPrint(scratch, format, args) catch |err| switch (err) {
+        error.OutOfMemory => fallback,
+    };
 }
 
 fn scopeLabel(scope: presentation.Scope) []const u8 {
@@ -380,13 +387,13 @@ fn drawSidebar(scratch: std.mem.Allocator, win: vaxis.Window, diff: bbr.diff.Dif
         const comments = fileAnchoredCount(Thread, threads, file);
         if (comments > 0) {
             const s: vaxis.Style = .{ .fg = theme.comment.fg, .bg = style.bg };
-            const t = std.fmt.allocPrint(scratch, " 🗨 {d}", .{comments}) catch " 🗨";
+            const t = formatLabel(scratch, " 🗨 {d}", .{comments}, " 🗨");
             res = win.printSegment(.{ .text = t, .style = s }, .{ .row_offset = row, .col_offset = res.col, .wrap = .none });
         }
         const draft_n = fileAnchoredCount(Draft, drafts, file);
         if (draft_n > 0) {
             const s: vaxis.Style = .{ .fg = theme.draft.fg, .bg = style.bg };
-            const t = std.fmt.allocPrint(scratch, " ✎ {d}", .{draft_n}) catch " ✎";
+            const t = formatLabel(scratch, " ✎ {d}", .{draft_n}, " ✎");
             _ = win.printSegment(.{ .text = t, .style = s }, .{ .row_offset = row, .col_offset = res.col, .wrap = .none });
         }
         row += 1;
@@ -419,7 +426,9 @@ fn drawVisualPane(
     nav: Nav,
 ) void {
     const sel = nav.selection() orelse .{ nav.cursor, nav.cursor };
-    const path = if (nav.cursor < visual_rows.len) buf.activePath(scratch, visual_rows[nav.cursor].buffer_index) catch buffer_mod.ActivePath{} else buffer_mod.ActivePath{};
+    const path = if (nav.cursor < visual_rows.len) buf.activePath(scratch, visual_rows[nav.cursor].buffer_index) catch |err| switch (err) {
+        error.OutOfMemory => buffer_mod.ActivePath{},
+    } else buffer_mod.ActivePath{};
     const ancestry_theme = ancestryRowTheme(theme);
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
@@ -562,7 +571,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
                 drawSideFileHeader(scratch, win, r, header, selected, theme);
             } else {
                 fillRuleRow(win, r, theme.section_rule);
-                const text = std.fmt.allocPrint(scratch, "─ {s} {s} ", .{ statusChar(header.file.status), header.path }) catch header.path;
+                const text = formatLabel(scratch, "─ {s} {s} ", .{ statusChar(header.file.status), header.path }, header.path);
                 _ = win.printSegment(.{ .text = text, .style = theme.file_header }, .{ .row_offset = r, .wrap = .none });
             }
         },
@@ -602,8 +611,8 @@ fn drawSideFileHeader(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, h
         new_style.fg = theme.accent;
         new_style.bold = true;
     }
-    const old = std.fmt.allocPrint(scratch, "OLD {s}", .{header.file.old_path}) catch "OLD";
-    const new = std.fmt.allocPrint(scratch, "NEW {s}", .{header.file.new_path}) catch "NEW";
+    const old = formatLabel(scratch, "OLD {s}", .{header.file.old_path}, "OLD");
+    const new = formatLabel(scratch, "NEW {s}", .{header.file.new_path}, "NEW");
     if (half > 0) _ = win.child(.{ .x_off = anchor_cols, .y_off = row, .width = half - anchor_cols, .height = 1 }).printSegment(.{ .text = old, .style = theme.resolveStyle(old_style) }, .{ .wrap = .none });
     if (right_x < win.width) _ = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 }).printSegment(.{ .text = new, .style = theme.resolveStyle(new_style) }, .{ .wrap = .none });
 }
@@ -695,14 +704,14 @@ fn statusPlaceholderText(scratch: std.mem.Allocator, side: Side, state: buffer_m
     const side_name = if (side == .old) "Old" else "New";
     return switch (state) {
         .loading => |bytes| statusPlaceholderDetail(scratch, side_name, "loading", bytes),
-        .absent => std.fmt.allocPrint(scratch, "{s} content absent", .{side_name}) catch "Content absent",
-        .empty => std.fmt.allocPrint(scratch, "{s} Empty file", .{side_name}) catch "Empty file",
+        .absent => formatLabel(scratch, "{s} content absent", .{side_name}, "Content absent"),
+        .empty => formatLabel(scratch, "{s} Empty file", .{side_name}, "Empty file"),
         .binary => |bytes| statusPlaceholderDetail(scratch, side_name, "binary", bytes),
         .unavailable => |status| switch (status.unavailable.reason) {
             .invalid_utf8 => statusPlaceholderDetail(scratch, side_name, "unavailable: invalid UTF-8", status.byteSize()),
             .invalid_path => statusPlaceholderDetail(scratch, side_name, "unavailable: invalid path", status.byteSize()),
             .acquisition_failed => |err| blk: {
-                const reason = std.fmt.allocPrint(scratch, "unavailable: acquisition failed ({s})", .{@errorName(err)}) catch "unavailable: acquisition failed";
+                const reason = formatLabel(scratch, "unavailable: acquisition failed ({s})", .{@errorName(err)}, "unavailable: acquisition failed");
                 break :blk statusPlaceholderDetail(scratch, side_name, reason, status.byteSize());
             },
         },
@@ -710,8 +719,8 @@ fn statusPlaceholderText(scratch: std.mem.Allocator, side: Side, state: buffer_m
 }
 
 fn statusPlaceholderDetail(scratch: std.mem.Allocator, side: []const u8, state: []const u8, bytes: ?usize) []const u8 {
-    if (bytes) |size| return std.fmt.allocPrint(scratch, "{s} content {s}, {d} bytes", .{ side, state, size }) catch "Content unavailable";
-    return std.fmt.allocPrint(scratch, "{s} content {s}, size unavailable", .{ side, state }) catch "Content unavailable";
+    if (bytes) |size| return formatLabel(scratch, "{s} content {s}, {d} bytes", .{ side, state, size }, "Content unavailable");
+    return formatLabel(scratch, "{s} content {s}, size unavailable", .{ side, state }, "Content unavailable");
 }
 
 fn fillRuleRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
@@ -821,9 +830,11 @@ fn drawLineBodyText(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_
         if (offset < source_end and run_end > source_start) count += 1;
         offset = run_end;
     }
-    const segs = scratch.alloc(vaxis.Segment, count) catch {
-        _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
-        return;
+    const segs = scratch.alloc(vaxis.Segment, count) catch |err| switch (err) {
+        error.OutOfMemory => {
+            _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
+            return;
+        },
     };
     offset = 0;
     var index: usize = 0;
@@ -887,7 +898,9 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
         view_paint.rail(win, rail.column, r, if (target) |path_card| theme.reviewCardStyle(path_card.role, .body, .{}) else dim);
     }
     if (card.part.isBorder() or card.segments.len == 0) return;
-    const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch return;
+    const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
     var links: TerminalLinks = .{ .scratch = scratch, .owner = card.owner };
     var column: usize = 0;
     for (card.segments, 0..) |segment, index| {
@@ -942,7 +955,9 @@ const TerminalLinks = struct {
             .comment => |value| value,
             .draft => |value| value,
         };
-        const params = std.fmt.allocPrint(self.scratch, "id=bbr-{s}-{d}-{d}", .{ @tagName(self.owner), id, link.start }) catch return .{};
+        const params = std.fmt.allocPrint(self.scratch, "id=bbr-{s}-{d}-{d}", .{ @tagName(self.owner), id, link.start }) catch |err| switch (err) {
+            error.OutOfMemory => return .{},
+        };
         self.link = .{ .uri = link.destination, .params = params };
         return self.link;
     }
@@ -957,13 +972,13 @@ fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: 
     fillRow(win, r, style);
     const glyph: []const u8 = if (value.expanded) "▾" else "▸";
     const text = switch (value.kind) {
-        .resolved_thread => std.fmt.allocPrint(scratch, "{s} ✓ Resolved · {s} · {d} replies", .{ glyph, value.author, value.count }) catch glyph,
-        .fold => std.fmt.allocPrint(scratch, "{s} ⋯ {d} unchanged lines", .{ glyph, value.count }) catch glyph,
+        .resolved_thread => formatLabel(scratch, "{s} ✓ Resolved · {s} · {d} replies", .{ glyph, value.author, value.count }, glyph),
+        .fold => formatLabel(scratch, "{s} ⋯ {d} unchanged lines", .{ glyph, value.count }, glyph),
         .outdated => if (value.path.len > 0)
-            std.fmt.allocPrint(scratch, "{s} Outdated · {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph
+            formatLabel(scratch, "{s} Outdated · {s} · {d} threads", .{ glyph, value.path, value.count }, glyph)
         else
-            std.fmt.allocPrint(scratch, "{s} Outdated · {d} threads", .{ glyph, value.count }) catch glyph,
-        .opposite_version => std.fmt.allocPrint(scratch, "{s} {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph,
+            formatLabel(scratch, "{s} Outdated · {d} threads", .{ glyph, value.count }, glyph),
+        .opposite_version => formatLabel(scratch, "{s} {s} · {d} threads", .{ glyph, value.path, value.count }, glyph),
         .review_card => unreachable,
     };
     if (value.kind == .resolved_thread) {
@@ -977,13 +992,13 @@ fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: 
 fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Section, theme: Theme) void {
     fillRuleRow(win, r, theme.section_rule);
     const text = switch (sec.kind) {
-        .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ", .{sec.count}) catch "── PR comments ",
-        .pending => std.fmt.allocPrint(scratch, "── Pending ({d}) ", .{sec.count}) catch "── Pending ",
+        .pr_comments => formatLabel(scratch, "── PR comments ({d}) ", .{sec.count}, "── PR comments "),
+        .pending => formatLabel(scratch, "── Pending ({d}) ", .{sec.count}, "── Pending "),
         .outdated => if (sec.path.len > 0)
-            std.fmt.allocPrint(scratch, "── Outdated · {s} ({d}) ", .{ sec.path, sec.count }) catch "── Outdated "
+            formatLabel(scratch, "── Outdated · {s} ({d}) ", .{ sec.path, sec.count }, "── Outdated ")
         else
-            std.fmt.allocPrint(scratch, "── Outdated ({d}) ", .{sec.count}) catch "── Outdated ",
-        .unavailable => std.fmt.allocPrint(scratch, "── Anchor unavailable ({d}) ", .{sec.count}) catch "── Anchor unavailable ",
+            formatLabel(scratch, "── Outdated ({d}) ", .{sec.count}, "── Outdated "),
+        .unavailable => formatLabel(scratch, "── Anchor unavailable ({d}) ", .{sec.count}, "── Anchor unavailable "),
     };
     const style = if (sec.kind == .pr_comments) theme.file_header else theme.section;
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .wrap = .none });
@@ -1008,7 +1023,7 @@ pub fn drawListOverlay(
     const entries = childRect(win, rects.get(.entries).content);
     const list = overlay.list();
 
-    const prompt = std.fmt.allocPrint(scratch, "› {s}", .{list.query()}) catch "›";
+    const prompt = formatLabel(scratch, "› {s}", .{list.query()}, "›");
     _ = query.printSegment(.{ .text = prompt, .style = theme.picker }, .{ .wrap = .none });
 
     if (listPlaceholder(scratch, overlay, files)) |message| {
@@ -1033,7 +1048,7 @@ pub fn drawListOverlay(
 fn listPlaceholder(scratch: std.mem.Allocator, overlay: *const ListOverlay, files: []const bbr.diff.File) ?[]const u8 {
     return switch (overlay.*) {
         .pull_request_picker => |*picker| if (picker.loading())
-            std.fmt.allocPrint(scratch, "{s} Loading pull requests…", .{picker.spinnerGlyph()}) catch "  Loading pull requests…"
+            formatLabel(scratch, "{s} Loading pull requests…", .{picker.spinnerGlyph()}, "  Loading pull requests…")
         else if (picker.prs().len == 0) "  no open pull requests" else null,
         .file_finder => |*finder| if (finder.list.matches().len > 0) null else if (files.len == 0) "  no changed files" else "  no matching files",
         .command_palette => |*palette| if (palette.list.matches().len > 0) null else "  no matching commands",
@@ -1063,10 +1078,12 @@ fn listRow(
             row_style.bold = false;
             const reason = sourceRefusalLabel(availability, command.action);
             const description = if (reason) |label|
-                std.fmt.allocPrint(scratch, "  {s} ({s})", .{ command.description, label }) catch command.description
+                formatLabel(scratch, "  {s} ({s})", .{ command.description, label }, command.description)
             else
-                std.fmt.allocPrint(scratch, "  {s}", .{command.description}) catch command.description;
-            const segments = scratch.alloc(vaxis.Segment, 3) catch return &.{};
+                formatLabel(scratch, "  {s}", .{command.description}, command.description);
+            const segments = scratch.alloc(vaxis.Segment, 3) catch |err| switch (err) {
+                error.OutOfMemory => return &.{},
+            };
             segments[0] = .{ .text = marker, .style = row_style };
             segments[1] = .{ .text = command.title, .style = title_style };
             segments[2] = .{ .text = description, .style = row_style };
@@ -1074,19 +1091,21 @@ fn listRow(
         },
         .pull_request_picker => |*picker| blk: {
             const pr = picker.prs()[item];
-            break :blk std.fmt.allocPrint(scratch, "{s}#{d}  {s}  ({s})", .{ marker, pr.id, pr.title, pr.source_branch }) catch pr.title;
+            break :blk formatLabel(scratch, "{s}#{d}  {s}  ({s})", .{ marker, pr.id, pr.title, pr.source_branch }, pr.title);
         },
         .file_finder => blk: {
             const path = files[item].displayPath();
-            break :blk std.fmt.allocPrint(scratch, "{s}{s}", .{ marker, path }) catch path;
+            break :blk formatLabel(scratch, "{s}{s}", .{ marker, path }, path);
         },
         .theme => blk: {
             const id = ThemeId.at(item);
             const suffix: []const u8 = if (id == configured_theme) "  (configured)" else "";
-            break :blk std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ marker, id.name(), suffix }) catch id.name();
+            break :blk formatLabel(scratch, "{s}{s}{s}", .{ marker, id.name(), suffix }, id.name());
         },
     };
-    const segments = scratch.alloc(vaxis.Segment, 1) catch return &.{};
+    const segments = scratch.alloc(vaxis.Segment, 1) catch |err| switch (err) {
+        error.OutOfMemory => return &.{},
+    };
     segments[0] = .{ .text = text, .style = style };
     return segments;
 }
@@ -1098,12 +1117,12 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
     // A terminal shrink can precede publication of the replacement geometry.
     // Keep the shared paint and pointer geometry intact until it fits again.
     if (geometry.rect.width > win.width -| geometry.rect.x or geometry.rect.height > win.height -| geometry.rect.y) return;
-    const full_status = std.fmt.allocPrint(scratch, "{d}/{d} matches · {d} candidates{s}", .{
+    const full_status = formatLabel(scratch, "{d}/{d} matches · {d} candidates{s}", .{
         if (projection.selected) |index| index + 1 else @as(usize, 0), projection.results.len, projection.candidate_count,
         if (projection.pending) " · searching" else "",
-    }) catch "";
-    const short_status = std.fmt.allocPrint(scratch, "{d} matches · {d} candidates", .{ projection.results.len, projection.candidate_count }) catch "";
-    const tiny_status = std.fmt.allocPrint(scratch, "{d}/{d}", .{ projection.results.len, projection.candidate_count }) catch "";
+    }, "");
+    const short_status = formatLabel(scratch, "{d} matches · {d} candidates", .{ projection.results.len, projection.candidate_count }, "");
+    const tiny_status = formatLabel(scratch, "{d}/{d}", .{ projection.results.len, projection.candidate_count }, "");
     const box_width = geometry.rect.width;
     const status_label = if (searchCellWidth(full_status) + 6 <= box_width) full_status else if (searchCellWidth(short_status) + 6 <= box_width) short_status else if (searchCellWidth(tiny_status) + 6 <= box_width) tiny_status else "";
     const results_span = if (geometry.landscape) geometry.divider - geometry.body.x else geometry.body.width;
@@ -1114,7 +1133,7 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         .list_scroll = .{ .total = list_total, .offset = projection.list_scroll },
     }, win, theme);
     const input = childRect(win, rects.get(.query).content);
-    const query = std.fmt.allocPrint(scratch, "> {s}", .{projection.query}) catch "> ";
+    const query = formatLabel(scratch, "> {s}", .{projection.query}, "> ");
     _ = input.printSegment(.{ .text = query, .style = theme.picker }, .{ .wrap = .none });
     const list = childRect(win, rects.get(.list).content);
     const preview = childRect(win, rects.get(.preview).content);
@@ -1126,11 +1145,11 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
             const file = projection.files[index];
             const content = projection.content_statuses[index];
             const status = projection.highlight_statuses[index];
-            const label = std.fmt.allocPrint(scratch, "{s}  old {s} · new {s}", .{
+            const label = formatLabel(scratch, "{s}  old {s} · new {s}", .{
                 shortSearchPath(scratch, file.displayPath(), @max(list.width / 2, 1)),
                 sourceContentLabel(scratch, content.old, status.old),
                 sourceContentLabel(scratch, content.new, status.new),
-            }) catch file.displayPath();
+            }, file.displayPath());
             _ = list.printSegment(.{ .text = label, .style = theme.picker }, .{ .row_offset = @intCast(row), .wrap = .none });
         }
         if (projection.files.len == 0)
@@ -1144,15 +1163,15 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         const style = if (selected) theme.picker_selected else theme.picker;
         fillRow(list, @intCast(row_index), style);
         const position = switch (result.occurrence.location) {
-            .review_body => |owner| std.fmt.allocPrint(scratch, " L{d}:C{d}", .{ owner.logical_line, result.occurrence.column }) catch "",
-            .source => |source| std.fmt.allocPrint(scratch, " {s} L{d}:C{d}", .{ @tagName(source.relation), source.new_line orelse source.old_line orelse 0, result.occurrence.column }) catch "",
+            .review_body => |owner| formatLabel(scratch, " L{d}:C{d}", .{ owner.logical_line, result.occurrence.column }, ""),
+            .source => |source| formatLabel(scratch, " {s} L{d}:C{d}", .{ @tagName(source.relation), source.new_line orelse source.old_line orelse 0, result.occurrence.column }, ""),
         };
         const path = switch (result.occurrence.location) {
             .source => |source| if (source.relation == .old) source.old_path else source.new_path,
             .review_body => switch (result.scope) {
                 .review => "Review",
                 .file => |file| file.path,
-                .@"inline" => |anchor| std.fmt.allocPrint(scratch, "{s}:{d}", .{ anchor.path, anchor.line() orelse 0 }) catch anchor.path,
+                .@"inline" => |anchor| formatLabel(scratch, "{s}:{d}", .{ anchor.path, anchor.line() orelse 0 }, anchor.path),
             },
         };
         const available = list.width -| 2;
@@ -1160,7 +1179,7 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         const show_position = available > position.len + 2 and searchCellWidth(filename) <= available - position.len;
         const location = shortSearchPath(scratch, path, available -| (if (show_position) position.len else @as(usize, 0)));
         const suffix = if (show_position) position else "";
-        const row_text = std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ if (selected) "▸ " else "  ", location, suffix }) catch location;
+        const row_text = formatLabel(scratch, "{s}{s}{s}", .{ if (selected) "▸ " else "  ", location, suffix }, location);
         _ = list.printSegment(.{ .text = row_text, .style = style }, .{ .row_offset = @intCast(row_index), .wrap = .none });
     }
     const selected = projection.selected orelse {
@@ -1168,8 +1187,8 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
             if (projection.list_scroll < projection.files.len) {
                 const path = projection.files[projection.list_scroll].displayPath();
                 if (header.height > 0) _ = header.printSegment(.{ .text = path, .style = theme.picker }, .{ .wrap = .none });
-                const old = std.fmt.allocPrint(scratch, "old: {s}", .{sourceSideState(scratch, view.old)}) catch "old";
-                const new = std.fmt.allocPrint(scratch, "new: {s}", .{sourceSideState(scratch, view.new)}) catch "new";
+                const old = formatLabel(scratch, "old: {s}", .{sourceSideState(scratch, view.old)}, "old");
+                const new = formatLabel(scratch, "new: {s}", .{sourceSideState(scratch, view.new)}, "new");
                 if (preview.height > 0) _ = preview.printSegment(.{ .text = old, .style = theme.picker }, .{ .wrap = .none });
                 if (preview.height > 1) _ = preview.printSegment(.{ .text = new, .style = theme.picker }, .{ .row_offset = 1, .wrap = .none });
             }
@@ -1192,10 +1211,10 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
 fn sourceContentLabel(scratch: std.mem.Allocator, content: ?@import("bbr").diff.FileContentStatus, state: @import("bbr").highlight.SideState) []const u8 {
     const value = content orelse return "absent";
     return switch (value) {
-        .text => |size| if (size) |bytes| std.fmt.allocPrint(scratch, "text ({d} bytes)", .{bytes}) catch "text" else if (state == .pending or state == .loading) "loading" else "unavailable",
-        .binary => |size| if (size) |bytes| std.fmt.allocPrint(scratch, "binary ({d} bytes)", .{bytes}) catch "binary" else "binary",
+        .text => |size| if (size) |bytes| formatLabel(scratch, "text ({d} bytes)", .{bytes}, "text") else if (state == .pending or state == .loading) "loading" else "unavailable",
+        .binary => |size| if (size) |bytes| formatLabel(scratch, "binary ({d} bytes)", .{bytes}, "binary") else "binary",
         .unavailable => |unavailable| switch (unavailable.reason) {
-            .invalid_utf8 => if (unavailable.byte_size) |bytes| std.fmt.allocPrint(scratch, "invalid UTF-8 ({d} bytes)", .{bytes}) catch "invalid UTF-8" else "invalid UTF-8",
+            .invalid_utf8 => if (unavailable.byte_size) |bytes| formatLabel(scratch, "invalid UTF-8 ({d} bytes)", .{bytes}, "invalid UTF-8") else "invalid UTF-8",
             .acquisition_failed => "acquisition failure",
             .invalid_path => "unavailable",
         },
@@ -1210,7 +1229,7 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
         fillRow(header, 0, theme.picker);
         const old_state = if (file_view) |view| sourceSideState(scratch, view.old) else "loading";
         const new_state = if (file_view) |view| sourceSideState(scratch, view.new) else "loading";
-        const label = std.fmt.allocPrint(scratch, "{s} · {s} · L{d}:C{d} · old {s} · new {s}", .{ path, version, source.new_line orelse source.old_line orelse 0, result.occurrence.column, old_state, new_state }) catch path;
+        const label = formatLabel(scratch, "{s} · {s} · L{d}:C{d} · old {s} · new {s}", .{ path, version, source.new_line orelse source.old_line orelse 0, result.occurrence.column, old_state, new_state }, path);
         _ = header.printSegment(.{ .text = label, .style = theme.picker }, .{ .wrap = .none });
     }
     if (preview.height == 0) return;
@@ -1237,7 +1256,9 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
             var offset: usize = 0;
             var skipped: usize = 0;
             while (offset < line.len and skipped < horizontal) {
-                const scalar_length = std.unicode.utf8ByteSequenceLength(line[offset]) catch 1;
+                const scalar_length = std.unicode.utf8ByteSequenceLength(line[offset]) catch |err| switch (err) {
+                    error.Utf8InvalidStartByte => 1,
+                };
                 offset += @min(scalar_length, line.len - offset);
                 skipped += 1;
             }
@@ -1245,8 +1266,9 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
             while (span_cursor < spans.len and spans[span_cursor].line < line_number) span_cursor += 1;
             const first_span = span_cursor;
             while (span_cursor < spans.len and spans[span_cursor].line == line_number) span_cursor += 1;
-            const decorated = bbr.highlight.decoration.decorate(scratch, line, spans[first_span..span_cursor], &.{}) catch
-                bbr.highlight.LineDecoration{ .runs = &.{.{ .text = line }} };
+            const decorated = bbr.highlight.decoration.decorate(scratch, line, spans[first_span..span_cursor], &.{}) catch |err| switch (err) {
+                error.InvalidEmphasis, error.InvalidSpan, error.OutOfMemory => bbr.highlight.LineDecoration{ .runs = &.{.{ .text = line }} },
+            };
             var segments: std.ArrayList(vaxis.Segment) = .empty;
             var run_start: usize = 0;
             for (decorated.runs) |run| {
@@ -1276,12 +1298,16 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
                         segment_style.bg = theme.search_active;
                         segment_style.bold = true;
                     }
-                    segments.append(scratch, .{ .text = line[cursor..segment_end], .style = theme.resolveStyle(segment_style) }) catch return;
+                    segments.append(scratch, .{ .text = line[cursor..segment_end], .style = theme.resolveStyle(segment_style) }) catch |err| switch (err) {
+                        error.OutOfMemory => return,
+                    };
                     cursor = segment_end;
                 }
                 run_start = run_end;
             }
-            if (segments.items.len == 0) segments.append(scratch, .{ .text = "", .style = style }) catch return;
+            if (segments.items.len == 0) segments.append(scratch, .{ .text = "", .style = style }) catch |err| switch (err) {
+                error.OutOfMemory => return,
+            };
             _ = preview.print(segments.items, .{ .row_offset = row, .wrap = .none });
             if (line_number == matched_line) tintReviewSearchPreviewRow(preview, row, theme);
             row += 1;
@@ -1304,10 +1330,10 @@ fn sourceSideState(scratch: std.mem.Allocator, side: @import("file_enrichment.zi
     return switch (side) {
         .pending => "loading",
         .absent => "absent",
-        .binary => |size| if (size) |bytes| std.fmt.allocPrint(scratch, "binary ({d} bytes)", .{bytes}) catch "binary" else "binary",
+        .binary => |size| if (size) |bytes| formatLabel(scratch, "binary ({d} bytes)", .{bytes}, "binary") else "binary",
         .unavailable => |status| switch (status) {
             .unavailable => |unavailable| switch (unavailable.reason) {
-                .invalid_utf8 => if (unavailable.byte_size) |bytes| std.fmt.allocPrint(scratch, "invalid UTF-8 ({d} bytes)", .{bytes}) catch "invalid UTF-8" else "invalid UTF-8",
+                .invalid_utf8 => if (unavailable.byte_size) |bytes| formatLabel(scratch, "invalid UTF-8 ({d} bytes)", .{bytes}, "invalid UTF-8") else "invalid UTF-8",
                 .acquisition_failed => "acquisition failure",
                 .invalid_path => "unavailable",
             },
@@ -1331,17 +1357,25 @@ fn shortSearchPath(scratch: std.mem.Allocator, path: []const u8, width: usize) [
         var dirs = std.mem.splitScalar(u8, path[0..last_slash.?], '/');
         while (dirs.next()) |dir| {
             if (dir.len > 0) {
-                const length = std.unicode.utf8ByteSequenceLength(dir[0]) catch 1;
-                compact.appendSlice(scratch, dir[0..@min(dir.len, length)]) catch return filename;
+                const length = std.unicode.utf8ByteSequenceLength(dir[0]) catch |err| switch (err) {
+                    error.Utf8InvalidStartByte => 1,
+                };
+                compact.appendSlice(scratch, dir[0..@min(dir.len, length)]) catch |err| switch (err) {
+                    error.OutOfMemory => return filename,
+                };
             }
-            compact.append(scratch, '/') catch return filename;
+            compact.append(scratch, '/') catch |err| switch (err) {
+                error.OutOfMemory => return filename,
+            };
         }
-        compact.appendSlice(scratch, filename) catch return filename;
+        compact.appendSlice(scratch, filename) catch |err| switch (err) {
+            error.OutOfMemory => return filename,
+        };
         if (searchCellWidth(compact.items) <= width) return compact.items;
         var remaining: []const u8 = compact.items;
         while (std.mem.indexOfScalar(u8, remaining, '/')) |slash| {
             remaining = remaining[slash + 1 ..];
-            if (searchCellWidth(remaining) + 2 <= width) return std.fmt.allocPrint(scratch, "…/{s}", .{remaining}) catch remaining;
+            if (searchCellWidth(remaining) + 2 <= width) return formatLabel(scratch, "…/{s}", .{remaining}, remaining);
         }
     }
     if (searchCellWidth(filename) <= width) return filename;
@@ -1349,9 +1383,11 @@ fn shortSearchPath(scratch: std.mem.Allocator, path: []const u8, width: usize) [
     if (width == 1) return "…";
     var start: usize = 0;
     while (start < filename.len and searchCellWidth(filename[start..]) + 1 > width) {
-        start += @min(filename.len - start, std.unicode.utf8ByteSequenceLength(filename[start]) catch 1);
+        start += @min(filename.len - start, std.unicode.utf8ByteSequenceLength(filename[start]) catch |err| switch (err) {
+            error.Utf8InvalidStartByte => 1,
+        });
     }
-    return std.fmt.allocPrint(scratch, "…{s}", .{filename[start..]}) catch filename[start..];
+    return formatLabel(scratch, "…{s}", .{filename[start..]}, filename[start..]);
 }
 
 fn drawReviewSearchHeader(scratch: std.mem.Allocator, win: vaxis.Window, result: presentation.ReviewSearchResult, theme: Theme) void {
@@ -1361,13 +1397,13 @@ fn drawReviewSearchHeader(scratch: std.mem.Allocator, win: vaxis.Window, result:
         .comment => |value| value,
         .draft => |value| value,
     };
-    const prefix = std.fmt.allocPrint(scratch, "{s} · {s} #{d} · ", .{ result.kind, result.source, id }) catch "";
+    const prefix = formatLabel(scratch, "{s} · {s} #{d} · ", .{ result.kind, result.source, id }, "");
     const scope = switch (result.scope) {
         .review => "Review",
-        .file => |file| std.fmt.allocPrint(scratch, "File {s}", .{shortSearchPath(scratch, file.path, win.width -| searchCellWidth(prefix) -| 5)}) catch "File",
-        .@"inline" => |anchor| std.fmt.allocPrint(scratch, "Inline {s}", .{shortSearchPath(scratch, anchor.path, win.width -| searchCellWidth(prefix) -| 7)}) catch "Inline",
+        .file => |file| formatLabel(scratch, "File {s}", .{shortSearchPath(scratch, file.path, win.width -| searchCellWidth(prefix) -| 5)}, "File"),
+        .@"inline" => |anchor| formatLabel(scratch, "Inline {s}", .{shortSearchPath(scratch, anchor.path, win.width -| searchCellWidth(prefix) -| 7)}, "Inline"),
     };
-    const label = std.fmt.allocPrint(scratch, "{s}{s} · L{d}:C{d}", .{ prefix, scope, owner.logical_line, result.occurrence.column }) catch prefix;
+    const label = formatLabel(scratch, "{s}{s} · L{d}:C{d}", .{ prefix, scope, owner.logical_line, result.occurrence.column }, prefix);
     fillRow(win, 0, theme.picker);
     _ = win.printSegment(.{ .text = label, .style = theme.picker }, .{ .wrap = .none });
 }
@@ -1412,7 +1448,9 @@ test "mention labels and filtered emoji paint in Review Search previews" {
 fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result: presentation.ReviewSearchResult, scroll: usize, theme: Theme, metrics: @import("cell_metrics.zig").CellMetrics) void {
     const owner = result.occurrence.location.review_body;
     const card_mod = @import("review_card.zig");
-    const body = card_mod.ReviewBody.parseWithMentions(scratch, result.body, result.mention_names) catch return;
+    const body = card_mod.ReviewBody.parseWithMentions(scratch, result.body, result.mention_names) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
     const comment: bbr.review.Comment = .{ .id = if (owner.owner == .comment) owner.owner.comment else 0, .author = result.source, .body = result.body };
     const draft: bbr.review.Draft = .{ .local_id = if (owner.owner == .draft) owner.owner.draft else 0, .kind = .comment, .body = result.body };
     const rows = card_mod.projectPreview(scratch, body, .{
@@ -1423,12 +1461,16 @@ fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result
         .content_width = win.width,
         .metrics = metrics,
         .collapsed_rows = 0,
-    }, scroll, win.height) catch return;
+    }, scroll, win.height) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
     var row: u16 = 0;
     for (rows) |card| {
         const code = card.part == .code_body or card.part == .suggestion_body or card.part == .suggestion_label;
         fillReviewCardBackground(win, row, card, 0, if (code and card.code_area == null) theme.reviewCardStyle(card.role, card.part, .{}) else theme.picker, theme.reviewCardStyle(card.role, card.part, .{}));
-        const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch return;
+        const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch |err| switch (err) {
+            error.OutOfMemory => return,
+        };
         var links: TerminalLinks = .{ .scratch = scratch, .owner = card.owner };
         var column: usize = 0;
         var matched_row = false;
@@ -2008,7 +2050,7 @@ pub fn drawComposerProjection(scratch: std.mem.Allocator, win: vaxis.Window, com
 fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []const u8, body: []const u8, footer: ?[]const u8, pending: bool, theme: Theme) void {
     const rects = view_paint.paint(layouts.DialogSlot, layouts.dialog, layouts.composer, win, theme);
     if (rects.get(.surface).border.isEmpty()) return;
-    const header = std.fmt.allocPrint(scratch, "✎ {s}", .{label}) catch "✎ compose";
+    const header = formatLabel(scratch, "✎ {s}", .{label}, "✎ compose");
     _ = childRect(win, rects.get(.header).content).printSegment(.{ .text = header, .style = theme.picker_query }, .{ .wrap = .none });
     _ = childRect(win, rects.get(.hint).content).printSegment(
         .{ .text = footer orelse if (pending) "External Edit in progress…" else "^D submit · ^E external · ^W del word · ^U del line · esc cancel", .style = theme.picker_query },
@@ -2034,7 +2076,7 @@ fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []cons
         if (out_row >= body_rows) break;
         const is_last = it.peek() == null;
         const text = if (is_last)
-            std.fmt.allocPrint(scratch, "{s}▌", .{line}) catch line
+            formatLabel(scratch, "{s}▌", .{line}, line)
         else
             line;
         _ = body_win.printSegment(.{ .text = text, .style = theme.picker }, .{ .row_offset = out_row, .wrap = .none });
@@ -2048,7 +2090,7 @@ fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []cons
 pub fn drawSubmit(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, seen: usize, total: usize) void {
     const rects = view_paint.paint(layouts.DialogSlot, layouts.dialog, layouts.submit_progress, win, theme);
     _ = childRect(win, rects.get(.header).content).printSegment(.{ .text = " Submitting review", .style = theme.picker_query }, .{ .wrap = .none });
-    const line = std.fmt.allocPrint(scratch, "  {d} / {d} items", .{ seen, total }) catch "  submitting…";
+    const line = formatLabel(scratch, "  {d} / {d} items", .{ seen, total }, "  submitting…");
     _ = childRect(win, rects.get(.body).content).printSegment(.{ .text = line, .style = theme.picker }, .{ .wrap = .none });
     _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = " publishing to Bitbucket…", .style = theme.picker_query }, .{ .wrap = .none });
 }
@@ -2079,9 +2121,9 @@ pub fn drawSubmitResult(
     const line: []const u8 = if (stale)
         "  reopen the PR before submitting"
     else if (aborted) |name|
-        std.fmt.allocPrint(scratch, "  {s} — all kept pending", .{name}) catch "  aborted"
+        formatLabel(scratch, "  {s} — all kept pending", .{name}, "  aborted")
     else
-        std.fmt.allocPrint(scratch, "  {d} posted · {d} failed · {d} skipped", .{ posted, failed, skipped }) catch "  done";
+        formatLabel(scratch, "  {d} posted · {d} failed · {d} skipped", .{ posted, failed, skipped }, "  done");
     _ = childRect(win, rects.get(.body).content).printSegment(.{ .text = line, .style = theme.picker }, .{ .wrap = .none });
     _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .wrap = .none });
 }
@@ -2096,14 +2138,14 @@ pub fn drawSubmissionTree(
     tree: @import("presentation.zig").SubmissionTreeProjection,
 ) void {
     const rects = view_paint.paint(layouts.SubmissionSlot, layouts.submission, {}, win, theme);
-    const title = std.fmt.allocPrint(scratch, " Submission for {s}#{d}", .{ tree.key.repository(), tree.key.pull_request_id }) catch " Submission";
+    const title = formatLabel(scratch, " Submission for {s}#{d}", .{ tree.key.repository(), tree.key.pull_request_id }, " Submission");
     _ = childRect(win, rects.get(.title).content).printSegment(.{ .text = title, .style = theme.picker_query }, .{ .wrap = .none });
-    const summary = std.fmt.allocPrint(scratch, " {d} posted | {d} failed | {d} skipped | {d} outcome unknown", .{
+    const summary = formatLabel(scratch, " {d} posted | {d} failed | {d} skipped | {d} outcome unknown", .{
         tree.posted,
         tree.failed,
         tree.skipped,
         tree.outcome_unknown,
-    }) catch " Submission progress";
+    }, " Submission progress");
     _ = childRect(win, rects.get(.summary).content).printSegment(.{ .text = summary, .style = theme.picker }, .{ .wrap = .none });
 
     const items = childRect(win, rects.get(.items).content);
@@ -2120,14 +2162,14 @@ pub fn drawSubmissionTree(
         var body = std.mem.trim(u8, item.body, " \t\r\n");
         if (std.mem.indexOfScalar(u8, body, '\n')) |newline| body = body[0..newline];
         const indent = tryIndent(scratch, item.depth);
-        const text = std.fmt.allocPrint(scratch, "{s}{s}Draft #{d} [{s}] {s} - {s}", .{
+        const text = formatLabel(scratch, "{s}{s}Draft #{d} [{s}] {s} - {s}", .{
             if (index == tree.selected) "> " else "  ",
             indent,
             item.temp_id,
             submissionStateText(item.state),
             item.context,
             body,
-        }) catch "Draft";
+        }, "Draft");
         const style = if (index == tree.selected) theme.picker_selected else if (item.state == .outcome_unknown) theme.outcome_unknown else theme.picker;
         fillRow(items, item_row, style);
         _ = items.printSegment(.{ .text = text, .style = style }, .{ .row_offset = item_row, .wrap = .none });
@@ -2138,7 +2180,9 @@ pub fn drawSubmissionTree(
 
 fn tryIndent(scratch: std.mem.Allocator, depth: usize) []const u8 {
     const amount = @min(depth * 2, 20);
-    const result = scratch.alloc(u8, amount) catch return "";
+    const result = scratch.alloc(u8, amount) catch |err| switch (err) {
+        error.OutOfMemory => return "",
+    };
     @memset(result, ' ');
     return result;
 }
@@ -2166,23 +2210,23 @@ fn drawSubmissionDetail(
 ) void {
     if (detail.height == 0) return;
     fillRow(detail, 0, theme.picker_query);
-    const identity = std.fmt.allocPrint(scratch, " Draft #{d}: {s}; {d} Reply descendant(s)", .{ item.temp_id, item.context, item.reply_descendants }) catch " Draft detail";
+    const identity = formatLabel(scratch, " Draft #{d}: {s}; {d} Reply descendant(s)", .{ item.temp_id, item.context, item.reply_descendants }, " Draft detail");
     _ = detail.printSegment(.{ .text = identity, .style = theme.picker_query }, .{ .wrap = .none });
     var row: u16 = 1;
     if (tree.stale_repair) |stale| if (row < detail.height) {
-        const source = std.fmt.allocPrint(scratch, " Stale repair: loaded {s}; observed {s}; {s}", .{
+        const source = formatLabel(scratch, " Stale repair: loaded {s}; observed {s}; {s}", .{
             stale.loaded_source_commit,
             stale.observed_source_commit,
             if (stale.reloaded) "reloaded - repair this scope before retry" else "R reload PullRequest; no submit-anyway",
-        }) catch " Stale repair required";
+        }, " Stale repair required");
         _ = detail.printSegment(.{ .text = source, .style = theme.outcome_unknown }, .{ .row_offset = row, .wrap = .none });
         row += 1;
     };
     if (row < detail.height) {
         const reason = if (item.reason) |err|
-            std.fmt.allocPrint(scratch, " Reason: {s}", .{@errorName(err)}) catch " Reason unavailable"
+            formatLabel(scratch, " Reason: {s}", .{@errorName(err)}, " Reason unavailable")
         else if (item.blocking_ancestor) |ancestor|
-            std.fmt.allocPrint(scratch, " Blocked by nearest ancestor Draft #{d}; no independent retry", .{ancestor}) catch " Blocked by ancestor"
+            formatLabel(scratch, " Blocked by nearest ancestor Draft #{d}; no independent retry", .{ancestor}, " Blocked by ancestor")
         else if (item.state == .outcome_unknown)
             " outcome unknown - resolve before editing"
         else
@@ -2191,21 +2235,21 @@ fn drawSubmissionDetail(
         row += 1;
     }
     if (row < detail.height) {
-        const attempts = std.fmt.allocPrint(scratch, " Attempts: POST {d}/{d}; publication checks {d}/{d}", .{
+        const attempts = formatLabel(scratch, " Attempts: POST {d}/{d}; publication checks {d}/{d}", .{
             item.post_attempts,
             bbr.review.submission.max_attempts,
             item.publication_checks,
             bbr.review.submission.max_attempts,
-        }) catch " Attempts unavailable";
+        }, " Attempts unavailable");
         _ = detail.printSegment(.{ .text = attempts, .style = theme.picker }, .{ .row_offset = row, .wrap = .none });
         row += 1;
     }
     if (row < detail.height) {
-        const delay = if (item.retry) |retry| std.fmt.allocPrint(scratch, " Static delay: local {d}ms; server {s}; effective {d}ms", .{
+        const delay = if (item.retry) |retry| formatLabel(scratch, " Static delay: local {d}ms; server {s}; effective {d}ms", .{
             retry.local_delay_ms,
-            if (retry.server_delay_ms) |server| std.fmt.allocPrint(scratch, "{d}ms", .{server}) catch "set" else "none",
+            if (retry.server_delay_ms) |server| formatLabel(scratch, "{d}ms", .{server}, "set") else "none",
             retry.effective_delay_ms,
-        }) catch " Static delay unavailable" else " Static delay: none";
+        }, " Static delay unavailable") else " Static delay: none";
         _ = detail.printSegment(.{ .text = delay, .style = theme.picker }, .{ .row_offset = row, .wrap = .none });
         row += 1;
     }
@@ -2234,7 +2278,7 @@ fn helpEntry(scratch: std.mem.Allocator, entry: help_mod.Entry, availability: pr
     if (entry.action) |action| {
         result.available = availability.available(action);
         if (sourceRefusalLabel(availability, action)) |label|
-            result.text = std.fmt.allocPrint(scratch, "{s} ({s})", .{ entry.description, label }) catch entry.description;
+            result.text = formatLabel(scratch, "{s} ({s})", .{ entry.description, label }, entry.description);
     }
     return .{ .text = result.text, .available = result.available };
 }
@@ -2284,7 +2328,7 @@ fn fitHelpKeys(scratch: std.mem.Allocator, keys: []const u8, width: u16) []const
         cells += next.cell_width;
         end += next.byte_len;
     }
-    return std.fmt.allocPrint(scratch, "{s}…", .{keys[0..end]}) catch keys[0..end];
+    return formatLabel(scratch, "{s}…", .{keys[0..end]}, keys[0..end]);
 }
 
 pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, help: help_mod.View, availability: presentation.ActionAvailability) void {
@@ -2300,7 +2344,7 @@ pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, hel
         .none => {},
         .input, .kept => |text| {
             const query_win = childRect(win, rects.get(.query).content);
-            const query = std.fmt.allocPrint(scratch, "/{s}{s}", .{ text, if (help.query == .input) "▏" else "" }) catch text;
+            const query = formatLabel(scratch, "/{s}{s}", .{ text, if (help.query == .input) "▏" else "" }, text);
             var start: usize = 0;
             while (start < query.len and query_win.gwidth(query[start..]) > query_win.width) start += terminal_cell_metrics.next(query[start..]).byte_len;
             _ = query_win.printSegment(.{ .text = query[start..], .style = theme.picker_query }, .{ .wrap = .none });
@@ -2350,9 +2394,9 @@ pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: ?u64, them
     win.clear();
     const rects = view_paint.paint(layouts.LoadingSlot, layouts.loading, {}, win, theme);
     const text: []const u8 = if (status_msg) |m|
-        if (id) |pr_id| std.fmt.allocPrint(scratch, " PR #{d}: {s}", .{ pr_id, m }) catch m else m
+        if (id) |pr_id| formatLabel(scratch, " PR #{d}: {s}", .{ pr_id, m }, m) else m
     else if (id) |pr_id|
-        std.fmt.allocPrint(scratch, " Loading PR #{d}…", .{pr_id}) catch "Loading…"
+        formatLabel(scratch, " Loading PR #{d}…", .{pr_id}, "Loading…")
     else
         " Loading local review…";
     _ = childRect(win, rects.get(.line).content).printSegment(.{ .text = text, .style = theme.picker_query }, .{ .wrap = .none });
@@ -2377,7 +2421,9 @@ fn drawSideGutter(win: vaxis.Window, row: u16, no: ?u32, style: vaxis.Style) voi
 }
 
 fn formatNumCol(output: []u8, no: ?u32) usize {
-    if (no) |number| return (std.fmt.bufPrint(output, "{d: >4}", .{number}) catch return 0).len;
+    if (no) |number| return (std.fmt.bufPrint(output, "{d: >4}", .{number}) catch |err| switch (err) {
+        error.NoSpaceLeft => return 0,
+    }).len;
     @memcpy(output[0..4], "    ");
     return 4;
 }
@@ -4363,7 +4409,7 @@ test "M23 highlighting selected Suggestion Preview uses shared syntax and retain
     while (command == .enrich_file) command = state.takeCommand().?;
     const job = command.highlight_code;
     try testing.expectEqualStrings("before.js", job.path);
-    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     try state.dispatch(.{ .code_highlight_completed = job.execute(highlighter.highlighter()) });
     const after = state.projection();
@@ -4420,7 +4466,7 @@ test "M23 highlighting published Frame renders real syntax through wrapping Sele
     drawReview(a, win, state.projection().review.?, theme_dark, 0);
     try testing.expectEqualStrings("c", win.readCell(x, y).?.char.grapheme);
     try testing.expectEqual(theme_dark.context.fg, win.readCell(x, y).?.style.fg);
-    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null, .{});
     defer highlighter.deinit();
     const job = state.takeCommand().?.highlight_code;
     try state.dispatch(.{ .code_highlight_completed = job.execute(highlighter.highlighter()) });

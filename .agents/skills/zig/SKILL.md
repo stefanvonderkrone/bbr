@@ -21,6 +21,7 @@ Before editing, read each reference that matches the work:
 
 - [Standard library](stdlib.md) covers process initialization, collections, readers, writers, file limits, paths, and reserved names.
 - [Runtime ownership](runtime.md) covers concurrent work, HTTP clients, terminal cell text, SQLite bindings, and dynamic library lifetimes.
+- [Error handling](errors.md) covers where `try` stops, `catch` and `errdefer` handlers that record a failure, and `error.Reported`.
 - [Tests](testing.md) covers test discovery, module ownership, hermetic fixtures, and stalled pagination tests.
 - [Builds and performance](build-performance.md) covers native dependencies, platform workarounds, benchmarks, allocation metrics, and bounded algorithms.
 
