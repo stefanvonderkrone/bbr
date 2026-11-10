@@ -121,19 +121,23 @@ pub fn encode(allocator: Allocator, account: Account, snapshot: Snapshot) Alloca
 
 /// Reads the Snapshot of `account` into `arena`. Returns null for every parse
 /// error, a wrong version, another account, and input larger than
-/// `max_bytes`. The Snapshot does not borrow `bytes`.
-pub fn decode(arena: Allocator, bytes: []const u8, account: Account) ?Snapshot {
+/// `max_bytes`. Each of them is a Summary Cache miss, so bbr rebuilds the
+/// file. The Snapshot does not borrow `bytes`.
+pub fn decode(arena: Allocator, bytes: []const u8, account: Account) Allocator.Error!?Snapshot {
     if (bytes.len > max_bytes) return null;
-    const file = std.json.parseFromSliceLeaky(FileRecord, arena, bytes, .{ .allocate = .alloc_always }) catch return null;
+    const file = std.json.parseFromSliceLeaky(FileRecord, arena, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (file.version != version or !std.mem.eql(u8, file.account, &account.hex)) return null;
-    const repositories = arena.alloc(Repository, file.repositories.len) catch return null;
+    const repositories = try arena.alloc(Repository, file.repositories.len);
     for (file.repositories, repositories) |record, *repository| {
         repository.* = .{
             .summary = .{ .slug = record.slug, .name = record.name, .updated_on = record.updated_on },
             .pull_requests = null,
         };
         const records = record.pull_requests orelse continue;
-        const prs = arena.alloc(PullRequestSummary, records.len) catch return null;
+        const prs = try arena.alloc(PullRequestSummary, records.len);
         for (records, prs) |pr_record, *pr| pr.* = .{
             .id = pr_record.id,
             .title = pr_record.title,
@@ -175,7 +179,7 @@ test "M24 cache encode then decode returns an equal Snapshot" {
     defer testing.allocator.free(bytes);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const decoded = decode(arena.allocator(), bytes, account).?;
+    const decoded = (try decode(arena.allocator(), bytes, account)).?;
     try testing.expectEqualDeep(test_snapshot, decoded);
 }
 
@@ -186,20 +190,20 @@ test "M24 cache decode returns null for truncated JSON, a wrong version, another
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expect(decode(a, bytes[0 .. bytes.len - 1], account) == null);
-    try testing.expect(decode(a, "", account) == null);
-    try testing.expect(decode(a, bytes, .of("bo@example.com")) == null);
-    try testing.expect(decode(a, "{\"version\":1,\"workspace\":\"check24\",\"repositories\":[]}", account) == null);
+    try testing.expect((try decode(a, bytes[0 .. bytes.len - 1], account)) == null);
+    try testing.expect((try decode(a, "", account)) == null);
+    try testing.expect((try decode(a, bytes, .of("bo@example.com"))) == null);
+    try testing.expect((try decode(a, "{\"version\":1,\"workspace\":\"check24\",\"repositories\":[]}", account)) == null);
     const valid = try std.fmt.allocPrint(a, "{{\"version\":2,\"account\":\"{s}\",\"workspace\":\"check24\",\"repositories\":[]}}", .{&account.hex});
-    try testing.expect(decode(a, valid, account) != null);
+    try testing.expect((try decode(a, valid, account)) != null);
     const with_token = try std.fmt.allocPrint(a, "{s},\"token\":\"x\"}}", .{valid[0 .. valid.len - 1]});
-    try testing.expect(decode(a, with_token, account) == null);
+    try testing.expect((try decode(a, with_token, account)) == null);
 
     const oversized = try testing.allocator.alloc(u8, max_bytes + 1);
     defer testing.allocator.free(oversized);
     @memset(oversized, ' ');
     @memcpy(oversized[0..valid.len], valid);
-    try testing.expect(decode(a, oversized, account) == null);
+    try testing.expect((try decode(a, oversized, account)) == null);
 }
 
 fn expectAllowedKeys(value: std.json.Value) !void {

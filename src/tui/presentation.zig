@@ -13476,11 +13476,13 @@ pub const Presentation = struct {
     /// start only shows it.
     fn startBrowser(self: *Presentation, start: BrowserStart) void {
         if (self.browser == null) {
-            self.commands.ensureUnusedCapacity(self.allocator, 2) catch {
+            self.commands.ensureUnusedCapacity(self.allocator, 2) catch |err| {
+                self.reportFailure(.browser_list, .admission, err, @src());
                 self.action_error = .out_of_memory;
                 return;
             };
-            const state = browser_mod.Browser.create(self.allocator, start, frame_mod.browserEntries(self.geometry).height) catch {
+            const state = browser_mod.Browser.create(self.allocator, start, frame_mod.browserEntries(self.geometry).height) catch |err| {
+                self.reportFailure(.browser_list, .prepare, err, @src());
                 self.action_error = .out_of_memory;
                 return;
             };
@@ -13498,7 +13500,10 @@ pub const Presentation = struct {
 
     /// Shows the Detecting Frame and queues the AdjacentPullRequest list.
     fn detectStartup(self: *Presentation, detection: StartupDetection) void {
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch return self.startBrowser(.{ .workspace = detection.workspace });
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.startup_detection, .admission, err, @src());
+            return self.startBrowser(.{ .workspace = detection.workspace });
+        };
         self.commands.appendAssumeCapacity(.{ .detect_adjacent_pull_requests = .{ .detection = detection } });
         self.surface = .{ .detecting = detection.branch };
     }
@@ -13525,8 +13530,12 @@ pub const Presentation = struct {
         }
         const key = if (self.published) |published| published.key else self.failed_replacement_key orelse return self.refuse(.action_refused);
         self.startBrowser(.{
-            .workspace = browser_mod.Name.init(key.workspace()) catch return self.refuse(.action_refused),
-            .repository = browser_mod.Name.init(key.repository()) catch return self.refuse(.action_refused),
+            .workspace = browser_mod.Name.init(key.workspace()) catch |err| switch (err) {
+                error.NameTooLong => return self.refuse(.action_refused),
+            },
+            .repository = browser_mod.Name.init(key.repository()) catch |err| switch (err) {
+                error.NameTooLong => return self.refuse(.action_refused),
+            },
             .pull_request_id = key.pull_request_id,
         });
     }
@@ -13559,7 +13568,10 @@ pub const Presentation = struct {
             },
             .open_browser_entry => self.openBrowserEntry(state),
             .refresh => self.refreshBrowser(state),
-            .cycle_browser_sort => state.cycleSort() catch self.refuse(.out_of_memory),
+            .cycle_browser_sort => state.cycleSort() catch |err| {
+                self.reportFailure(.browser_list, .prepare, err, @src());
+                self.refuse(.out_of_memory);
+            },
             .close_browser => if (self.published == null) {
                 self.action_error = .no_review_open;
             } else {
@@ -13584,9 +13596,13 @@ pub const Presentation = struct {
                 self.rebuildBrowser(state);
             } else self.expandBrowserRepository(state, node),
             .pull_request => |pr| {
-                const key = OwnedReviewIdentity.init(state.workspace.slice(), state.nodes.items[pr.repository].summary.slug, state.pullRequest(entry).?.id) catch
-                    return self.refuse(.action_refused);
-                self.choosePullRequest(key, .browser) catch return self.refuse(.out_of_memory);
+                const key = OwnedReviewIdentity.init(state.workspace.slice(), state.nodes.items[pr.repository].summary.slug, state.pullRequest(entry).?.id) catch |err| switch (err) {
+                    error.NameTooLong => return self.refuse(.action_refused),
+                };
+                self.choosePullRequest(key, .browser) catch |err| {
+                    self.reportFailure(.browser_list, .admission, err, @src());
+                    return self.refuse(.out_of_memory);
+                };
                 if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, key)) {
                     self.surface = .review;
                 };
@@ -13603,7 +13619,10 @@ pub const Presentation = struct {
     /// Reloads the Repository list and every expanded Repository. Each new
     /// WorkId supersedes the load in flight.
     fn refreshBrowser(self: *Presentation, state: *browser_mod.Browser) void {
-        self.commands.ensureUnusedCapacity(self.allocator, 1) catch return self.refuse(.out_of_memory);
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.reportFailure(.browser_list, .admission, err, @src());
+            return self.refuse(.out_of_memory);
+        };
         self.dropQueuedBrowserCommands();
         self.next_work_id += 1;
         state.repositories.work = self.next_work_id;
@@ -13639,11 +13658,16 @@ pub const Presentation = struct {
         while (self.browser_pull_request_commands < browser_pull_request_bound) {
             const index = state.nextWaiting() orelse return;
             const load = &state.nodes.items[index].pull_requests;
-            const repository = browser_mod.Name.init(state.nodes.items[index].summary.slug) catch {
-                load.request = null;
-                continue;
+            const repository = browser_mod.Name.init(state.nodes.items[index].summary.slug) catch |err| switch (err) {
+                error.NameTooLong => {
+                    load.request = null;
+                    continue;
+                },
             };
-            self.commands.ensureUnusedCapacity(self.allocator, 1) catch return self.refuse(.out_of_memory);
+            self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+                self.reportFailure(.browser_list, .admission, err, @src());
+                return self.refuse(.out_of_memory);
+            };
             self.next_work_id += 1;
             load.request = .{ .issued = self.next_work_id };
             self.commands.appendAssumeCapacity(.{ .list_browser_pull_requests = .{ .work_id = self.next_work_id, .repository = repository } });
@@ -13652,7 +13676,10 @@ pub const Presentation = struct {
     }
 
     fn rebuildBrowser(self: *Presentation, state: *browser_mod.Browser) void {
-        state.rebuild() catch self.refuse(.out_of_memory);
+        state.rebuild() catch |err| {
+            self.reportFailure(.browser_list, .prepare, err, @src());
+            self.refuse(.out_of_memory);
+        };
     }
 
     fn acceptBrowserRepositories(self: *Presentation, loaded: BrowserRepositoriesLoaded) void {
@@ -13664,7 +13691,8 @@ pub const Presentation = struct {
         switch (loaded.outcome) {
             .loaded => |list| if (state.replaceRepositories(list)) |_| {
                 self.saveSummaryCache(state);
-            } else |_| {
+            } else |err| {
+                self.reportFailure(.browser_list, .prepare, err, @src());
                 list.destroy();
                 self.action_error = .out_of_memory;
             },
@@ -13687,10 +13715,13 @@ pub const Presentation = struct {
             return self.pumpBrowserLoads(state);
         };
         state.storePullRequests(node, loaded.outcome);
-        if (loaded.outcome == .failed and loaded.outcome.failed == error.RateLimited) {
-            state.dropWaiting();
-            self.action_error = .browser_rate_limited;
-        }
+        if (loaded.outcome == .failed) switch (loaded.outcome.failed) {
+            error.RateLimited => {
+                state.dropWaiting();
+                self.action_error = .browser_rate_limited;
+            },
+            else => {},
+        };
         if (loaded.outcome == .loaded) self.saveSummaryCache(state);
         self.pumpBrowserLoads(state);
         self.rebuildBrowser(state);
@@ -13704,7 +13735,10 @@ pub const Presentation = struct {
         const cache = loaded.cache orelse return;
         const state = self.browser orelse return input.deinit();
         if (state.repositories.loaded != null) return input.deinit();
-        state.fillFromCache(cache) catch return input.deinit();
+        state.fillFromCache(cache) catch |err| {
+            self.reportFailure(.summary_cache, .prepare, err, @src());
+            return input.deinit();
+        };
         self.rebuildBrowser(state);
     }
 
@@ -13726,13 +13760,19 @@ pub const Presentation = struct {
             self.summary_cache_save_waiting = true;
             return;
         };
-        const command = self.encodeSummaryCache(state) catch return;
+        const command = self.encodeSummaryCache(state) catch |err| {
+            self.reportFailure(.summary_cache, .prepare, err, @src());
+            return;
+        };
         for (self.commands.items) |*queued| if (queued.* == .save_summary_cache) {
             queued.deinit();
             queued.* = .{ .save_summary_cache = command };
             return;
         };
-        self.commands.append(self.allocator, .{ .save_summary_cache = command }) catch command.destroy();
+        self.commands.append(self.allocator, .{ .save_summary_cache = command }) catch |err| {
+            self.reportFailure(.summary_cache, .admission, err, @src());
+            command.destroy();
+        };
     }
 
     fn encodeSummaryCache(self: *Presentation, state: *const browser_mod.Browser) Allocator.Error!*SaveSummaryCache {
@@ -34221,7 +34261,7 @@ fn takeSaveSummaryCacheCommand(presentation: *Presentation, arena: Allocator) !s
     defer command.deinit();
     if (command != .save_summary_cache) return error.UnexpectedCommand;
     const save = command.save_summary_cache;
-    return .{ .command_id = save.command_id, .snapshot = bbr.bitbucket.summary_cache.decode(arena, save.bytes, test_summary_cache_account) orelse return error.InvalidSnapshot };
+    return .{ .command_id = save.command_id, .snapshot = (try bbr.bitbucket.summary_cache.decode(arena, save.bytes, test_summary_cache_account)) orelse return error.InvalidSnapshot };
 }
 
 fn queuedSummaryCacheSaves(presentation: *const Presentation) usize {

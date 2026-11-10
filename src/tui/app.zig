@@ -1560,7 +1560,9 @@ fn browserStatusItems(frame: std.mem.Allocator, active_theme: theme.Theme, proje
     if (presentationStatus(frame, projection, null)) |message| {
         items.add(.message, message, .message);
     } else if (projection.replacing) {
-        const text = if (projection.loading_pull_request_id) |id| std.fmt.allocPrint(frame, "Loading PR #{d}…", .{id}) catch "loading…" else "loading…";
+        const text = if (projection.loading_pull_request_id) |id| std.fmt.allocPrint(frame, "Loading PR #{d}…", .{id}) catch |err| switch (err) {
+            error.OutOfMemory => "loading…",
+        } else "loading…";
         items.add(.message, text, .busy);
     } else {
         items.hint(.open_entry, "Enter", " open");

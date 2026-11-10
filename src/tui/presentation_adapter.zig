@@ -402,7 +402,7 @@ pub fn executeReviewerVerdict(
 }
 
 /// Runs the remote step of Startup Detection. A failed detection and a name
-/// that does not fit give a plain Browser.
+/// that does not fit give a plain Browser, and the completion carries the cause.
 pub fn detectAdjacentPullRequests(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, command: presentation.DetectAdjacentPullRequests) presentation.OwnedInput {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -412,9 +412,20 @@ pub fn detectAdjacentPullRequests(allocator: std.mem.Allocator, client: bbr.bitb
         .branch = detection.branch.slice(),
         .named = detection.named,
     });
-    return .{ .adjacent_detected = .{
+    const context: bbr.diagnostic.Context = .{ .command_id = command.command_id };
+    const plain: presentation.AdjacentOutcome = .{ .browse = .{ .workspace = detection.workspace } };
+    const adjacent = adjacentOutcome(detection.workspace, outcome) catch |err| return .{ .adjacent_detected = .{
+        .evidence = bbr.diagnostic.Failure.capture(.startup_detection, .prepare, context, .{ .zig = err }, @src()),
         .command_id = command.command_id,
-        .outcome = adjacentOutcome(detection.workspace, outcome) catch .{ .browse = .{ .workspace = detection.workspace } },
+        .outcome = plain,
+    } };
+    return .{ .adjacent_detected = .{
+        .evidence = switch (outcome) {
+            .failed => |failed| bbr.diagnostic.Failure.capture(.startup_detection, .execute, context, .{ .zig = failed.reason }, @src()),
+            .open, .browse => null,
+        },
+        .command_id = command.command_id,
+        .outcome = adjacent,
     } };
 }
 
@@ -443,21 +454,29 @@ pub fn startInput(workspace: []const u8, start: bbr.startup.Start) !presentation
         .open => |target| .{ .choose_pull_request = try presentation.OwnedReviewIdentity.init(workspace, target.repository, target.id) },
         .detect => |detection| .{ .detect_startup = .{
             .workspace = name,
-            .repository = browser.Name.init(detection.repository) catch return .{ .start_browser = .{ .workspace = name } },
-            .branch = browser.Name.init(detection.branch) catch return .{ .start_browser = .{ .workspace = name } },
+            .repository = browser.Name.init(detection.repository) catch |err| switch (err) {
+                error.NameTooLong => return .{ .start_browser = .{ .workspace = name } },
+            },
+            .branch = browser.Name.init(detection.branch) catch |err| switch (err) {
+                error.NameTooLong => return .{ .start_browser = .{ .workspace = name } },
+            },
             .named = detection.named,
         } },
-        .browse => |browse| .{ .start_browser = browserStart(name, browse) catch .{ .workspace = name } },
+        .browse => |browse| .{ .start_browser = browserStart(name, browse) catch |err| switch (err) {
+            error.NameTooLong => .{ .workspace = name },
+        } },
     };
 }
 
 /// Lists the Repository Summaries of the Workspace. The completion owns them.
 pub fn listBrowserRepositories(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, command: presentation.ListBrowserRepositories) presentation.OwnedInput {
-    return .{ .browser_repositories_loaded = .{
+    const outcome = loadRepositories(allocator, client) catch |err| return .{ .browser_repositories_loaded = .{
+        .evidence = bbr.diagnostic.Failure.capture(.browser_list, .execute, .{ .command_id = command.command_id, .work_id = command.work_id }, .{ .zig = err }, @src()),
         .command_id = command.command_id,
         .work_id = command.work_id,
-        .outcome = loadRepositories(allocator, client) catch |err| .{ .failed = browser.failure(err) },
+        .outcome = .{ .failed = browser.failure(err) },
     } };
+    return .{ .browser_repositories_loaded = .{ .command_id = command.command_id, .work_id = command.work_id, .outcome = outcome } };
 }
 
 fn loadRepositories(allocator: std.mem.Allocator, client: bbr.bitbucket.Client) !browser.RepositoriesOutcome {
@@ -470,11 +489,13 @@ fn loadRepositories(allocator: std.mem.Allocator, client: bbr.bitbucket.Client) 
 /// Lists the open PullRequest Summaries of one Repository. The completion
 /// owns them.
 pub fn listBrowserPullRequests(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, command: presentation.ListBrowserPullRequests) presentation.OwnedInput {
-    return .{ .browser_pull_requests_loaded = .{
+    const outcome = loadPullRequests(allocator, client, command.repositoryName()) catch |err| return .{ .browser_pull_requests_loaded = .{
+        .evidence = bbr.diagnostic.Failure.capture(.browser_list, .execute, .{ .command_id = command.command_id, .work_id = command.work_id }, .{ .zig = err }, @src()),
         .command_id = command.command_id,
         .work_id = command.work_id,
-        .outcome = loadPullRequests(allocator, client, command.repositoryName()) catch |err| .{ .failed = browser.failure(err) },
+        .outcome = .{ .failed = browser.failure(err) },
     } };
+    return .{ .browser_pull_requests_loaded = .{ .command_id = command.command_id, .work_id = command.work_id, .outcome = outcome } };
 }
 
 fn loadPullRequests(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, repository: []const u8) !browser.PullRequestsOutcome {
@@ -488,19 +509,27 @@ const summary_cache = bbr.bitbucket.summary_cache;
 const summary_cache_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
 
 /// Reads the Summary Cache. A missing file, a parse error, another account,
-/// or another Workspace gives an empty result. The completion owns the cache.
+/// or another Workspace is a Summary Cache miss and gives an empty result.
+/// Another read failure also gives an empty result, and the completion carries
+/// its cause. The completion owns the cache.
 pub fn loadSummaryCache(allocator: std.mem.Allocator, io: std.Io, path: []const u8, command: presentation.LoadSummaryCache) presentation.OwnedInput {
-    return .{ .summary_cache_loaded = .{
+    const cache = readSummaryCache(allocator, io, path, command.account, command.workspaceName()) catch |err| return .{ .summary_cache_loaded = .{
+        .evidence = bbr.diagnostic.Failure.capture(.summary_cache, .read, .{ .command_id = command.command_id }, .{ .zig = err }, @src()),
         .command_id = command.command_id,
-        .cache = readSummaryCache(allocator, io, path, command.account, command.workspaceName()),
+        .cache = null,
     } };
+    return .{ .summary_cache_loaded = .{ .command_id = command.command_id, .cache = cache } };
 }
 
-fn readSummaryCache(allocator: std.mem.Allocator, io: std.Io, path: []const u8, account: summary_cache.Account, workspace: []const u8) ?*browser.CachedSummaries {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(summary_cache.max_bytes + 1)) catch return null;
+fn readSummaryCache(allocator: std.mem.Allocator, io: std.Io, path: []const u8, account: summary_cache.Account, workspace: []const u8) !?*browser.CachedSummaries {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(summary_cache.max_bytes + 1)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return null,
+        else => |other| return other,
+    };
     defer allocator.free(bytes);
-    const cache = browser.CachedSummaries.create(allocator) catch return null;
-    const snapshot = summary_cache.decode(cache.arena.allocator(), bytes, account) orelse {
+    const cache = try browser.CachedSummaries.create(allocator);
+    errdefer cache.destroy();
+    const snapshot = (try summary_cache.decode(cache.arena.allocator(), bytes, account)) orelse {
         cache.destroy();
         return null;
     };
@@ -515,7 +544,11 @@ fn readSummaryCache(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
 /// Writes the Summary Cache atomically with mode 0600 and consumes `command`.
 pub fn saveSummaryCache(io: std.Io, path: []const u8, command: *presentation.SaveSummaryCache) presentation.OwnedInput {
     defer command.destroy();
-    writeSummaryCache(io, path, command.bytes) catch return .{ .summary_cache_saved = .{ .command_id = command.command_id, .saved = false } };
+    writeSummaryCache(io, path, command.bytes) catch |err| return .{ .summary_cache_saved = .{
+        .evidence = bbr.diagnostic.Failure.capture(.summary_cache, .write, .{ .command_id = command.command_id }, .{ .zig = err }, @src()),
+        .command_id = command.command_id,
+        .saved = false,
+    } };
     return .{ .summary_cache_saved = .{ .command_id = command.command_id, .saved = true } };
 }
 

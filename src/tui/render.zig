@@ -2426,9 +2426,13 @@ fn dimmed(style: vaxis.Style) vaxis.Style {
 }
 
 fn drawBrowserRepository(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, node: browser.RepositoryNode, style: vaxis.Style) void {
-    const date_buf = scratch.create([10]u8) catch return;
+    const date_buf = scratch.create([10]u8) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
     const date = browser.formatDate(date_buf, node.summary.updated_on) orelse "";
-    const count = if (node.count()) |n| std.fmt.allocPrint(scratch, "{d}", .{n}) catch "?" else "?";
+    const count = if (node.count()) |n| std.fmt.allocPrint(scratch, "{d}", .{n}) catch |err| switch (err) {
+        error.OutOfMemory => "?",
+    } else "?";
     const count_style = if (node.pull_requests.settled == .cached) dimmed(style) else style;
     const differs = !std.mem.eql(u8, node.summary.name, node.summary.slug);
     drawBrowserParts(scratch, win, row, 0, &.{
@@ -2444,7 +2448,9 @@ fn drawBrowserRepository(scratch: std.mem.Allocator, win: vaxis.Window, row: u16
 }
 
 fn drawBrowserPullRequest(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, pr: browser.PullRequestSummary, style: vaxis.Style) void {
-    const date_buf = scratch.create([10]u8) catch return;
+    const date_buf = scratch.create([10]u8) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
     const date = browser.formatDate(date_buf, pr.updated_on) orelse "";
     const right = std.fmt.allocPrint(scratch, "{s}  {s}  {s} → {s}  ✓{d} ✗{d}", .{
         pr.author_display_name,
@@ -2453,9 +2459,13 @@ fn drawBrowserPullRequest(scratch: std.mem.Allocator, win: vaxis.Window, row: u1
         pr.destination_branch,
         pr.approval_count,
         pr.changes_requested_count,
-    }) catch return;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
     drawBrowserParts(scratch, win, row, 2, &.{
-        .{ .text = std.fmt.allocPrint(scratch, "#{d} ", .{pr.id}) catch return, .style = style },
+        .{ .text = std.fmt.allocPrint(scratch, "#{d} ", .{pr.id}) catch |err| switch (err) {
+            error.OutOfMemory => return,
+        }, .style = style },
         .{ .text = pr.title, .style = style, .flexible = true },
     }, &.{.{ .text = right, .style = style }});
 }
@@ -2463,10 +2473,14 @@ fn drawBrowserPullRequest(scratch: std.mem.Allocator, win: vaxis.Window, row: u1
 fn drawBrowserMessage(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, message: browser.Message, style: vaxis.Style) void {
     const indent: u16, const text: []const u8 = switch (message) {
         .loading_repositories => .{ 0, "Loading Repositories…" },
-        .repositories_failed => |reason| .{ 0, std.fmt.allocPrint(scratch, "Repositories not loaded: {s}", .{@errorName(reason)}) catch "Repositories not loaded" },
+        .repositories_failed => |reason| .{ 0, std.fmt.allocPrint(scratch, "Repositories not loaded: {s}", .{@errorName(reason)}) catch |err| switch (err) {
+            error.OutOfMemory => "Repositories not loaded",
+        } },
         .no_repositories => .{ 0, "No Repositories in this Workspace" },
         .loading_pull_requests => .{ 2, "Loading PullRequests…" },
-        .pull_requests_failed => |failed| .{ 2, std.fmt.allocPrint(scratch, "PullRequests not loaded: {s}", .{@errorName(failed.reason)}) catch "PullRequests not loaded" },
+        .pull_requests_failed => |failed| .{ 2, std.fmt.allocPrint(scratch, "PullRequests not loaded: {s}", .{@errorName(failed.reason)}) catch |err| switch (err) {
+            error.OutOfMemory => "PullRequests not loaded",
+        } },
         .no_pull_requests => .{ 2, "No open PullRequests" },
     };
     drawBrowserParts(scratch, win, row, indent, &.{.{ .text = text, .style = dimmed(style), .flexible = true }}, &.{});
@@ -2505,7 +2519,9 @@ fn fitText(scratch: std.mem.Allocator, text: []const u8, width: usize) []const u
         if (vaxis.gwidth.gwidth(text[0..next], .unicode) + 1 > width) break;
         end = next;
     }
-    return std.fmt.allocPrint(scratch, "{s}…", .{text[0..end]}) catch "…";
+    return std.fmt.allocPrint(scratch, "{s}…", .{text[0..end]}) catch |err| switch (err) {
+        error.OutOfMemory => "…",
+    };
 }
 
 /// The boot/switch frame shown until a Session arrives: a centered floating
@@ -2532,7 +2548,9 @@ pub fn drawDetecting(scratch: std.mem.Allocator, win: vaxis.Window, branch: []co
     if (win.height == 0 or win.width == 0) return;
     win.clear();
     const rects = view_paint.paint(layouts.LoadingSlot, layouts.loading, {}, win, theme);
-    const text = std.fmt.allocPrint(scratch, " Detecting PR for {s}…", .{branch}) catch " Detecting PR…";
+    const text = std.fmt.allocPrint(scratch, " Detecting PR for {s}…", .{branch}) catch |err| switch (err) {
+        error.OutOfMemory => " Detecting PR…",
+    };
     _ = childRect(win, rects.get(.line).content).printSegment(.{ .text = text, .style = theme.picker_query }, .{ .wrap = .none });
 }
 

@@ -26,7 +26,10 @@ pub fn failure(err: anyerror) Failure {
 
 /// A failure that tells the reviewer the previous list is no longer theirs to see.
 fn dropsPrevious(reason: Failure) bool {
-    return reason == error.Forbidden or reason == error.NotFound;
+    return switch (reason) {
+        error.Forbidden, error.NotFound => true,
+        else => false,
+    };
 }
 
 /// Owned PullRequest Summaries: one list load, or a populated Picker.
@@ -338,7 +341,9 @@ pub fn formatDate(buf: *[10]u8, seconds: ?i64) ?[]const u8 {
         year_day.year,
         month_day.month.numeric(),
         @as(u8, month_day.day_index) + 1,
-    }) catch null;
+    }) catch |err| switch (err) {
+        error.NoSpaceLeft => null,
+    };
 }
 
 /// The Browser state. It belongs to the process: Presentation keeps it
@@ -575,9 +580,13 @@ pub const Browser = struct {
 
     fn selectionAt(self: *const Browser, index: usize) ?Selection {
         return switch (self.entries[index]) {
-            .repository => |node| .{ .repository = Name.init(self.nodes.items[node].summary.slug) catch return null },
+            .repository => |node| .{ .repository = Name.init(self.nodes.items[node].summary.slug) catch |err| switch (err) {
+                error.NameTooLong => return null,
+            } },
             .pull_request => |pr| .{ .pull_request = .{
-                .repository = Name.init(self.nodes.items[pr.repository].summary.slug) catch return null,
+                .repository = Name.init(self.nodes.items[pr.repository].summary.slug) catch |err| switch (err) {
+                    error.NameTooLong => return null,
+                },
                 .id = self.pullRequest(self.entries[index]).?.id,
             } },
             .message => null,
