@@ -25,7 +25,7 @@ class TaskSpawnCheckTest(unittest.TestCase):
         found = self.check("fn list(self: Client) void {\n" + OLD_PAGE_SPAWN + "\n}\n")
         self.assertEqual(len(found), 1)
         self.assertIn("src/bitbucket/client.zig:2: starts a task with `.concurrent(`", found[0])
-        self.assertIn("diagnostics.concurrent or diagnostics.selectConcurrent", found[0])
+        self.assertIn("diagnostics.concurrent, diagnostics.selectConcurrent, or diagnostics.groupConcurrent", found[0])
 
     def test_an_io_spawn_and_an_async_spawn_are_rejected(self):
         text = "\n".join((
@@ -45,6 +45,7 @@ class TaskSpawnCheckTest(unittest.TestCase):
             "fn start(io: std.Io) void {",
             "    var future = try bbr.diagnostics.concurrent(io, work, .{});",
             "    try diagnostics.selectConcurrent(&select, .page, fetch, .{});",
+            "    try bbr.diagnostics.groupConcurrent(&group, io, work, .{});",
             "}",
         ))
         self.assertEqual(self.check(text), [])

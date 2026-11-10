@@ -104,6 +104,17 @@ pub fn selectConcurrent(
     return select.concurrent(field, function, args);
 }
 
+/// `std.Io.Group.concurrent` with the check of `concurrent`.
+pub fn groupConcurrent(
+    group: *std.Io.Group,
+    io: std.Io,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) std.Io.ConcurrentError!void {
+    rejectSharedSlot(args);
+    return group.concurrent(io, function, args);
+}
+
 fn rejectSharedSlot(args: anytype) void {
     if (builtin.mode != .Debug) return;
     if (holdsSlot(args)) @panic("a concurrent task got a diagnostics.Handle with an evidence slot. " ++

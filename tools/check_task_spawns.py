@@ -3,8 +3,9 @@
 
 A copied `diagnostics.Handle` shares its evidence slot. Two concurrent tasks that note
 into one slot overwrite each other's evidence, so the one record of a failure can hold
-the evidence of another failure. `diagnostics.concurrent` and
-`diagnostics.selectConcurrent` reject a Handle with a slot in the task arguments, so
+the evidence of another failure. `diagnostics.concurrent`,
+`diagnostics.selectConcurrent`, and `diagnostics.groupConcurrent` reject a Handle with
+a slot in the task arguments, so
 every production task starts through them. The receiver must be the `diagnostics` module
 by a top-level declaration, not only a value with that name.
 """
@@ -30,7 +31,7 @@ WRAPPER = re.compile(
 BBR_ALIAS = re.compile(r"^const\s+diagnostics\s*=\s*bbr\s*\.\s*diagnostics\s*;", re.MULTILINE)
 BBR = re.compile(r'^const\s+bbr\s*=\s*@import\("bbr"\)\s*;', re.MULTILINE)
 FIX = (
-    "Start the task with diagnostics.concurrent or diagnostics.selectConcurrent, which reject "
+    "Start the task with diagnostics.concurrent, diagnostics.selectConcurrent, or diagnostics.groupConcurrent, which reject "
     "a Handle with an evidence slot in the task arguments. Give the task its own slot by pointer "
     "and adopt it after the join."
 )
@@ -76,7 +77,7 @@ def main():
         print(message, file=sys.stderr)
     if found:
         return 1
-    print("Production tasks start through diagnostics.concurrent and diagnostics.selectConcurrent.")
+    print("Production tasks start through diagnostics.concurrent, diagnostics.selectConcurrent, and diagnostics.groupConcurrent.")
     return 0
 
 
