@@ -380,7 +380,7 @@ pub const Client = struct {
         defer deinitRepositorySummaries(allocator, repositories);
         shape.repositories = repositories.len;
         if (repo_slug == null) {
-            if (repositories.len == 0) return error.NoRepositories;
+            if (repositories.len == 0) return noted(self.diagnostic, error.NoRepositories, .validate, null);
             allocator.free(shape.repository);
             shape.repository = try allocator.dupe(u8, repositories[0].slug);
         }
@@ -408,8 +408,7 @@ pub const Client = struct {
         while (true) {
             const body = try self.requestJson(allocator, .GET, url, null);
             defer allocator.free(body);
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch |err|
-                return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+            const parsed = try parseResponse(std.json.Value, self.diagnostic, allocator, body);
             defer parsed.deinit();
             const values = jsonPath(parsed.value, "values") orelse return "values";
             if (values != .array) return "values";
@@ -2746,32 +2745,33 @@ pub fn deinitRepositorySummaries(allocator: Allocator, summaries: []types.Reposi
 }
 
 fn parseUpdatedOn(text: ?[]const u8) ?i64 {
-    return parseIso8601(text orelse return null) catch null;
+    return parseIso8601(text orelse return null);
 }
 
-/// `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` to Unix seconds. Bitbucket always sends a zone.
-fn parseIso8601(text: []const u8) !i64 {
-    if (text.len < 20 or text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return error.Malformed;
-    const year = try decimal(text[0..4]);
-    const month = try decimal(text[5..7]);
-    const day = try decimal(text[8..10]);
-    const hour = try decimal(text[11..13]);
-    const minute = try decimal(text[14..16]);
-    const second = try decimal(text[17..19]);
-    if (month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 59) return error.Malformed;
-    if (day > std.time.epoch.getDaysInMonth(year, @enumFromInt(month))) return error.Malformed;
+/// `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` to Unix seconds, or null for another shape.
+/// Bitbucket always sends a zone.
+fn parseIso8601(text: []const u8) ?i64 {
+    if (text.len < 20 or text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
+    const year = decimal(text[0..4]) orelse return null;
+    const month = decimal(text[5..7]) orelse return null;
+    const day = decimal(text[8..10]) orelse return null;
+    const hour = decimal(text[11..13]) orelse return null;
+    const minute = decimal(text[14..16]) orelse return null;
+    const second = decimal(text[17..19]) orelse return null;
+    if (month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 59) return null;
+    if (day > std.time.epoch.getDaysInMonth(year, @enumFromInt(month))) return null;
     var rest = text[19..];
     if (rest[0] == '.') {
         var digits: usize = 1;
         while (digits < rest.len and std.ascii.isDigit(rest[digits])) digits += 1;
-        if (digits == 1) return error.Malformed;
+        if (digits == 1) return null;
         rest = rest[digits..];
     }
     const offset: i64 = if (std.mem.eql(u8, rest, "Z")) 0 else offset: {
-        if (rest.len != 6 or (rest[0] != '+' and rest[0] != '-') or rest[3] != ':') return error.Malformed;
-        const offset_hours = try decimal(rest[1..3]);
-        const offset_minutes = try decimal(rest[4..6]);
-        if (offset_hours > 23 or offset_minutes > 59) return error.Malformed;
+        if (rest.len != 6 or (rest[0] != '+' and rest[0] != '-') or rest[3] != ':') return null;
+        const offset_hours = decimal(rest[1..3]) orelse return null;
+        const offset_minutes = decimal(rest[4..6]) orelse return null;
+        if (offset_hours > 23 or offset_minutes > 59) return null;
         const magnitude = @as(i64, offset_hours) * 3600 + @as(i64, offset_minutes) * 60;
         break :offset if (rest[0] == '-') -magnitude else magnitude;
     };
@@ -2785,10 +2785,10 @@ fn parseIso8601(text: []const u8) !i64 {
     return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset;
 }
 
-fn decimal(text: []const u8) !u16 {
+fn decimal(text: []const u8) ?u16 {
     var value: u16 = 0;
     for (text) |c| {
-        if (!std.ascii.isDigit(c)) return error.Malformed;
+        if (!std.ascii.isDigit(c)) return null;
         value = value * 10 + (c - '0');
     }
     return value;
