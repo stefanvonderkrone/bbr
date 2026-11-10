@@ -50,8 +50,8 @@ MUTATIONS = [
              "if (false) return &slot.*.?;",
              "test-builtin-grammars"),
     Mutation("m27-lazy-init", HIGHLIGHTER,
-             "return .{ .registry = registry, .packages = .{ .allocator = allocator, .io = io } };",
-             "var self: TreeSitterHighlighter = .{ .registry = registry, .packages = .{ .allocator = allocator, .io = io } }; "
+             "return .{ .registry = registry, .packages = .{ .allocator = allocator, .io = io, .diagnostic = diagnostic_handle } };",
+             "var self: TreeSitterHighlighter = .{ .registry = registry, .packages = .{ .allocator = allocator, .io = io, .diagnostic = diagnostic_handle } }; "
              "for (std.meta.tags(BuiltInGrammar)) |grammar| _ = self.packages.get(grammar) catch {}; return self;",
              "test-builtin-grammars"),
     Mutation("m27-predicate-negation", PREDICATES,
