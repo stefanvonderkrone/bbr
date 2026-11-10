@@ -1,6 +1,6 @@
 # 07: Run the live M29 outside check
 
-Status: ready-for-human
+Status: resolved
 Blocked by: 06
 Spec: [M29 spec](../SPEC.md)
 
@@ -42,15 +42,15 @@ LocalReview:
 
 ## Acceptance criteria
 
-- [ ] The RemoteReview count matches the Bitbucket web UI count plus the Drafts.
-- [ ] Each toggle, the query, and the File Tree Filter give the expected entries.
-- [ ] Newest first puts the newest Thread at the top.
-- [ ] Each Enter lands on the right ReviewCard, also for a collapsed resolved Thread.
-- [ ] Each view keeps its state across several switches.
-- [ ] The Review Search route selects the Review-level item in the Comment Overview.
-- [ ] `R` shows the DiffPane and resets the Comment Overview.
-- [ ] On the LocalReview, mine only shows every Draft.
-- [ ] The results, the PullRequest, and the bbr commit are recorded under `## Completion` in this ticket.
+- [x] The RemoteReview count matches the Bitbucket web UI count plus the Drafts.
+- [x] Each toggle, the query, and the File Tree Filter give the expected entries.
+- [x] Newest first puts the newest Thread at the top.
+- [x] Each Enter lands on the right ReviewCard, also for a collapsed resolved Thread.
+- [x] Each view keeps its state across several switches.
+- [x] The Review Search route selects the Review-level item in the Comment Overview.
+- [x] `R` shows the DiffPane and resets the Comment Overview.
+- [ ] On the LocalReview, mine only shows every Draft. (Skipped by the operator.)
+- [x] The results, the PullRequest, and the bbr commit are recorded under `## Completion` in this ticket.
 
 ## Comments
 
@@ -100,3 +100,14 @@ What to look for:
 Record under `## Completion`: the PullRequest URL, the commit hash, each count, and each step result.
 If a step fails, write the step, the expected result, and the actual result under `## Comments`.
 Then set this ticket to `resolved`, and set the M29 spec to `resolved`.
+
+## Completion
+
+The operator ran the RemoteReview check on 2026-11-10 at commit `8e5a94a`.
+The PullRequest is a test PullRequest in the operator's Workspace. Its id stays outside the repository, because the repository is public.
+bbr ran in a tmux window of 100 by 50 cells.
+
+- RemoteReview steps 1 to 11 pass.
+- The operator skipped the LocalReview part.
+- [Ticket 11](11-show-overview-entries-as-reviewcards.md) records the request for ReviewCard entries.
+- [Ticket 12](12-enter-on-a-hidden-indicator-sometimes-does-not-expand.md) records a DiffPane expand failure on Draft cards.
