@@ -274,7 +274,9 @@ pub const IoClock = struct {
 
     fn sleep(ptr: *anyopaque, ns: u64) void {
         const self: *IoClock = @ptrCast(@alignCast(ptr));
-        self.io.sleep(.fromNanoseconds(ns), .awake) catch {};
+        self.io.sleep(.fromNanoseconds(ns), .awake) catch |err| switch (err) {
+            error.Canceled => self.io.recancel(),
+        };
     }
 };
 
@@ -287,8 +289,13 @@ const Notes = struct {
     fn print(self: *Notes, comptime format: []const u8, args: anytype) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.writer.print(format ++ "\n", args) catch {};
-        self.writer.flush() catch {};
+        // A note is best effort. A failed stderr write must not stop a measurement.
+        self.writer.print(format ++ "\n", args) catch |err| switch (err) {
+            error.WriteFailed => return,
+        };
+        self.writer.flush() catch |err| switch (err) {
+            error.WriteFailed => {},
+        };
     }
 
     /// Notes a wait of `ns` that starts now. `what` is the reason and its details.
@@ -351,7 +358,9 @@ pub const RequestWindow = struct {
         var lines = std.mem.tokenizeScalar(u8, complete, '\n');
         // An entry in the future stays. Then a wall clock that goes back keeps the window conservative.
         while (lines.next()) |line| {
-            const at = std.fmt.parseInt(u64, line, 10) catch continue;
+            const at = std.fmt.parseInt(u64, line, 10) catch |err| switch (err) {
+                error.Overflow, error.InvalidCharacter => continue,
+            };
             if (at +| hour_ns <= wall_now) continue;
             try entries.append(allocator, at);
             try kept.print(allocator, "{d}\n", .{at});
@@ -395,7 +404,9 @@ pub const RequestWindow = struct {
 
     fn append(self: *RequestWindow, at: u64) !void {
         var buffer: [24]u8 = undefined;
-        const line = std.fmt.bufPrint(&buffer, "{d}\n", .{at}) catch unreachable;
+        const line = std.fmt.bufPrint(&buffer, "{d}\n", .{at}) catch |err| switch (err) {
+            error.NoSpaceLeft => unreachable,
+        };
         try self.entries.append(std.heap.page_allocator, at);
         try self.file.writePositionalAll(self.io, line, self.offset);
         self.offset += line.len;
@@ -499,8 +510,10 @@ pub const MeasuringHttpClient = struct {
             const elapsed = self.clock.now() -| start;
             const retryable = request.method == .GET and if (result) |response|
                 response.status == 429 or (response.status >= 500 and response.status <= 599)
-            else |err|
-                err != error.OutOfMemory and err != error.Canceled;
+            else |err| switch (err) {
+                error.OutOfMemory, error.Canceled => false,
+                else => true,
+            };
             const give_up = retryable and attempt >= self.policy.max_attempts;
             self.count(request, result, elapsed, retryable, give_up);
             if (!retryable) return result;
@@ -545,8 +558,8 @@ pub const MeasuringHttpClient = struct {
             // A 404 is a missing side, which the merged PullRequest check counts.
             if (response.status >= 400 and response.status != 404) self.traffic.failures += 1;
         } else |_| self.traffic.failures += 1;
-        self.latencies.append(std.heap.page_allocator, elapsed) catch {
-            self.out_of_memory = true;
+        self.latencies.append(std.heap.page_allocator, elapsed) catch |err| switch (err) {
+            error.OutOfMemory => self.out_of_memory = true,
         };
     }
 
@@ -672,8 +685,8 @@ const TimedHttpClient = struct {
             .response => |result| if (result) |response| allocator.free(response.body) else |_| {},
             .timer => {},
         };
-        try select.concurrent(.response, sendInner, .{ self.inner, allocator, request });
-        try select.concurrent(.timer, std.Io.sleep, .{ self.io, self.timeout, .awake });
+        try bbr.diagnostics.selectConcurrent(&select, .response, sendInner, .{ self.inner, allocator, request });
+        try bbr.diagnostics.selectConcurrent(&select, .timer, std.Io.sleep, .{ self.io, self.timeout, .awake });
         return switch (try select.await()) {
             .response => |result| result,
             .timer => |result| {
@@ -778,7 +791,9 @@ pub const Options = struct {
     }
 
     fn number(comptime T: type, value: []const u8) error{InvalidArguments}!T {
-        return std.fmt.parseInt(T, value, 10) catch error.InvalidArguments;
+        return std.fmt.parseInt(T, value, 10) catch |err| switch (err) {
+            error.Overflow, error.InvalidCharacter => error.InvalidArguments,
+        };
     }
 
     fn queryText(value: []const u8) error{InvalidArguments}![]const u8 {
@@ -806,13 +821,15 @@ pub const Environment = struct {
     random: std.Random,
 };
 
+/// Runs one command. A closed stdout pipe returns `error.StdoutClosed`.
 pub fn main(init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_version: []const u8) !void {
+    return bbr.stdout.write(init.io, runCommand, .{ init, highlighter, bbr_version });
+}
+
+fn runCommand(out: *std.Io.Writer, init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_version: []const u8) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     if (args.len < 2) return usage();
-    var output_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    const out = &stdout.interface;
     var notes_buffer: [1024]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(init.io, &notes_buffer);
 
@@ -838,10 +855,21 @@ pub fn main(init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_
 
     if (!std.mem.eql(u8, args[1], "remote") or args.len < 4) return usage();
     const repository = args[2];
-    const pull_request_id = std.fmt.parseInt(u64, args[3], 10) catch return usage();
+    const pull_request_id = std.fmt.parseInt(u64, args[3], 10) catch |err| switch (err) {
+        error.Overflow, error.InvalidCharacter => return usage(),
+    };
     const rest: []const []const u8 = @ptrCast(args[4..]);
-    const options = Options.parse(rest) catch return usage();
-    var owned = bbr.bitbucket.auth.resolve(arena, init.io, init.environ_map, null) catch return error.MissingCredential;
+    const options = Options.parse(rest) catch |err| switch (err) {
+        error.InvalidArguments => return usage(),
+    };
+    // Only the error name reaches stderr, never a Credential field.
+    var owned = bbr.bitbucket.auth.resolve(arena, init.io, init.environ_map, null) catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => return err,
+        else => {
+            std.debug.print("credential error={t}\n", .{err});
+            return error.MissingCredential;
+        },
+    };
     defer owned.deinit(arena);
     var transport: StdTransport = .{ .io = init.io, .arena = arena, .environ_map = init.environ_map };
     var clock: IoClock = .{ .io = init.io };
@@ -1167,7 +1195,9 @@ const Checkpoint = struct {
         var buffer: [512]u8 = undefined;
         const current = std.fmt.bufPrint(&buffer, "network_label={s} bbr_version={s} cache_max_bytes={d} dwell_ms={d} seed={d} query_bytes={d} second_query_bytes={d} hourly_request_budget={d} cols={d} rows={d}", .{
             options.network_label, env.bbr_version, options.cache_max_bytes, options.dwell_ms, options.seed, options.query.len, options.second_query.len, options.hourly_request_budget, frame_geometry.cols, frame_geometry.rows,
-        }) catch return "bbr_version";
+        }) catch |err| switch (err) {
+            error.NoSpaceLeft => return "bbr_version",
+        };
         for (settings) |key| {
             const stored = lineValue(self.header.items, key) orelse return key;
             if (!std.mem.eql(u8, stored, lineValue(current, key).?)) return key;
@@ -1311,8 +1341,10 @@ const Driver = struct {
     }
 
     fn deinit(self: *Driver) void {
-        self.quiesce();
-        self.group.await(self.env.io) catch {};
+        self.quiesce() catch |err| self.note("quiesce_error={t}", .{err});
+        self.group.await(self.env.io) catch |err| switch (err) {
+            error.Canceled => self.env.io.recancel(),
+        };
         if (self.state) |*state| state.deinit();
         self.store.deinit();
         const gpa = self.env.gpa;
@@ -1400,7 +1432,7 @@ const Driver = struct {
 
     /// Closes the Presentation and the network client, then starts both again.
     fn restart(self: *Driver) !u64 {
-        self.quiesce();
+        try self.quiesce();
         self.ui().deinit();
         self.state = null;
         self.env.transport.close();
@@ -1431,7 +1463,7 @@ const Driver = struct {
                 if (enrich.source != .remote) return self.unsupportedCommand(command.*);
                 try self.span_fetches.ensureUnusedCapacity(self.env.gpa, 1);
                 try self.in_flight.ensureUnusedCapacity(self.env.gpa, 1);
-                try group.concurrent(io, enrichmentWorker, .{ completion, io, self.client(), self.env.highlighter, enrich });
+                try bbr.diagnostics.groupConcurrent(group, io, enrichmentWorker, .{ completion, io, self.client(), self.env.highlighter, enrich });
                 const fetch: Fetch = .{ .work_id = enrich.work_id, .file_index = enrich.file_index, .admitted_before = self.admitted[enrich.file_index] };
                 self.span_fetches.appendAssumeCapacity(fetch);
                 self.in_flight.appendAssumeCapacity(fetch);
@@ -1441,13 +1473,15 @@ const Driver = struct {
             },
             .load_session => |load| {
                 if (load.key.kind != .remote) return self.unsupportedCommand(command.*);
-                try group.concurrent(io, loadWorker, .{ completion, io, self.client(), load });
+                try bbr.diagnostics.groupConcurrent(group, io, loadWorker, .{ completion, io, self.client(), load });
             },
-            .prepare_session => |job| try group.concurrent(io, prepareWorker, .{ completion, job }),
-            .highlight_code => |job| try group.concurrent(io, highlightWorker, .{ completion, self.env.highlighter, job }),
-            .scan_buffer_search => |scan| try group.concurrent(io, bufferSearchWorker, .{ completion, scan }),
-            .build_buffer_disclosure => |job| try group.concurrent(io, disclosureWorker, .{ completion, job }),
-            .scan_review_source => |scan| try group.concurrent(io, reviewSourceWorker, .{ completion, scan }),
+            .prepare_session => |job| try bbr.diagnostics.groupConcurrent(group, io, prepareWorker, .{ completion, job }),
+            .highlight_code => |job| try bbr.diagnostics.groupConcurrent(group, io, highlightWorker, .{ completion, self.env.highlighter, job }),
+            .scan_buffer_search => |scan| try bbr.diagnostics.groupConcurrent(group, io, bufferSearchWorker, .{ completion, scan }),
+            .build_buffer_disclosure => |job| try bbr.diagnostics.groupConcurrent(group, io, disclosureWorker, .{ completion, job }),
+            .scan_review_source => |scan| try bbr.diagnostics.groupConcurrent(group, io, reviewSourceWorker, .{ completion, scan }),
+            .set_diagnostics,
+            .report_diagnostic,
             .post_draft,
             .update_comment,
             .delete_comment,
@@ -1471,6 +1505,8 @@ const Driver = struct {
     fn drain(self: *Driver) !void {
         while (self.ui().takeCommand()) |value| {
             var command = value;
+            // The benchmark has no diagnostic Sink, and a report gets no completion.
+            if (command == .report_diagnostic) continue;
             self.executor().execute(self.sink(), &command) catch |err| {
                 command.deinit();
                 return err;
@@ -1515,14 +1551,31 @@ const Driver = struct {
         while (self.outstanding > 0 and try self.queue.get(self.env.io, &ready, 0) == 1) try self.accept(ready[0]);
     }
 
-    /// Accepts every outstanding completion and starts no new work.
-    fn quiesce(self: *Driver) void {
+    /// Accepts every outstanding completion and starts no new work. It accepts the rest
+    /// after a failed dispatch, then returns the first failure.
+    fn quiesce(self: *Driver) !void {
+        var first: ?anyerror = null;
         while (self.outstanding > 0) {
-            var input = self.queue.getOneUncancelable(self.env.io) catch return;
+            var input = self.queue.getOneUncancelable(self.env.io) catch |err| switch (err) {
+                error.Closed => break,
+            };
             self.outstanding -= 1;
             self.observe(input);
-            if (self.state) |*state| state.dispatch(input) catch {} else input.deinit();
+            if (self.state) |*state| state.dispatch(input) catch |err| {
+                first = first orelse err;
+            } else input.deinit();
         }
+        if (first) |err| return err;
+    }
+
+    /// Writes one `key=value` line to stderr after every worker delivered its completion.
+    fn note(self: *Driver, comptime format: []const u8, args: anytype) void {
+        self.env.notes.print(format ++ "\n", args) catch |err| switch (err) {
+            error.WriteFailed => return,
+        };
+        self.env.notes.flush() catch |err| switch (err) {
+            error.WriteFailed => {},
+        };
     }
 
     fn observe(self: *Driver, input: OwnedInput) void {
@@ -1589,10 +1642,10 @@ const Driver = struct {
             checked_bit.* = c == '1';
         }
         var largest = std.mem.splitScalar(u8, lineValue(progress, "largest") orelse return error.InvalidCheckpoint, ',');
-        for (self.largest_result) |*bytes| bytes.* = std.fmt.parseInt(usize, largest.next() orelse return error.InvalidCheckpoint, 10) catch return error.InvalidCheckpoint;
+        for (self.largest_result) |*bytes| bytes.* = try checkpointNumber(largest.next() orelse return error.InvalidCheckpoint);
         if (largest.next() != null) return error.InvalidCheckpoint;
-        self.not_found_sides = std.fmt.parseInt(usize, lineValue(progress, "not_found_sides") orelse return error.InvalidCheckpoint, 10) catch return error.InvalidCheckpoint;
-        self.hunk_mismatch_files = std.fmt.parseInt(usize, lineValue(progress, "hunk_mismatch_files") orelse return error.InvalidCheckpoint, 10) catch return error.InvalidCheckpoint;
+        self.not_found_sides = try checkpointNumber(lineValue(progress, "not_found_sides") orelse return error.InvalidCheckpoint);
+        self.hunk_mismatch_files = try checkpointNumber(lineValue(progress, "hunk_mismatch_files") orelse return error.InvalidCheckpoint);
         self.state_len = @min(state_text.len, self.state_buffer.len);
         @memcpy(self.state_buffer[0..self.state_len], state_text[0..self.state_len]);
     }
@@ -1907,12 +1960,24 @@ fn replacementJumps(driver: *Driver, recorder: *Recorder, comptime replace: fn (
     }
 }
 
+fn checkpointNumber(text: []const u8) error{InvalidCheckpoint}!usize {
+    return std.fmt.parseInt(usize, text, 10) catch |err| switch (err) {
+        error.Overflow, error.InvalidCharacter => error.InvalidCheckpoint,
+    };
+}
+
 fn resolved(side: file_enrichment.SideView) bool {
-    return side != .fetch_failed or side.fetch_failed == error.NotFound;
+    return side != .fetch_failed or notFound(side);
 }
 
 fn notFound(side: file_enrichment.SideView) bool {
-    return side == .fetch_failed and side.fetch_failed == error.NotFound;
+    return switch (side) {
+        .fetch_failed => |err| switch (err) {
+            error.NotFound => true,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 /// A Hunk mismatch File has a Hunk Line whose text differs from the blob line at its number.
@@ -1962,7 +2027,10 @@ fn enrichmentWorker(
         client,
         highlighter,
         command.request(),
-    )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+    )) |result| .{ .completed = result } else |err| .{ .failed = switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.Canceled => .launch_failed,
+    } };
     runtime.deliver(completion, .{ .file_enrichment_completed = .{
         .command_id = command.command_id,
         .work_id = command.work_id,
@@ -3480,7 +3548,7 @@ const SlowSourceHttpClient = struct {
         const self: *SlowSourceHttpClient = @ptrCast(@alignCast(ptr));
         if (std.mem.indexOf(u8, request.url, "/src/") != null) {
             const delay_ms = if (std.mem.indexOf(u8, request.url, "/b.zig") != null) self.second_file_delay_ms else self.delay_ms;
-            testing.io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
+            try testing.io.sleep(.fromMilliseconds(delay_ms), .awake);
         }
         return self.fake.httpClient().send(allocator, request);
     }
@@ -3547,7 +3615,7 @@ test "M28 cache a File Jump whose fetch the Presentation still queues at the spa
     try driver.init(env, fixture_options, &measuring, "repo", 7);
     defer driver.deinit();
     _ = try driver.start();
-    driver.quiesce();
+    try driver.quiesce();
     const target = driver.file_count - 1;
     try testing.expect(!driver.ui().published.?.session.enrichment.isTerminal(target));
     // The Driver issues nothing after the jump, as when a running disclosure build holds the queue head.
