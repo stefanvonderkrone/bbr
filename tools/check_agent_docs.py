@@ -23,6 +23,14 @@ PUBLIC_PULL_REQUESTS = {
         "the agreed M23 test PullRequest for published evidence",
     (".scratch/m26-credential-login-logout/issues/13-docs-and-completion-evidence.md", "12"):
         "a pull request of the public bbr GitHub repository",
+    (".scratch/error-handling-discipline", "19"):
+        "a pull request of the public bbr GitHub repository",
+    (".scratch/error-handling-discipline", "22"):
+        "a pull request of the public bbr GitHub repository",
+    (".scratch/error-handling-discipline", "2647"):
+        "an issue of the public Zig repository",
+    ("docs/adr/0014-a-failure-is-recorded-once-and-error-reported-marks-it.md", "2647"):
+        "an issue of the public Zig repository",
 }
 
 
