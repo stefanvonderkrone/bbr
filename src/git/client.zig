@@ -719,7 +719,7 @@ test "M22 read shell client diff gives full binary blob ids whatever core.abbrev
     defer testing.allocator.free(source.canonical);
     defer testing.allocator.free(source.commit);
 
-    const raw = try client.diff(testing.allocator, base.commit, source.commit);
+    const raw = try client.diff(testing.allocator, base.commit, source.commit, .{});
     defer testing.allocator.free(raw);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
