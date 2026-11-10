@@ -112,6 +112,14 @@ with tempfile.TemporaryDirectory(prefix="bbr-record-once-cli-") as directory:
         ["local", "main", "record-once-missing-source"], {}, b"bbr local: cannot resolve SourceRef 'record-once-missing-source': UnknownRef\n",
         "session_load", "UnknownRef", cwd=repository, status=0, evidence=" cause=git termination=exited code=128 error=UnknownRef",
     )
+    # Startup Detection turns a Git error into a Browser Start. The probe lines show the
+    # error without a record, and `inspect` records the cause once.
+    check(["detect"], credentials, b"branch: main\nremote: <NoRemote>\nresolved: browser\n", "startup", "NoRemote", cwd=repository, status=0)
+    check(["detect"], credentials, b"branch: <NotAGitRepo>\nremote: <NoRemote>\nresolved: browser\n", "startup", "NoRemote", status=0)
+    check(
+        ["detect", "record-once"], credentials, b"branch: <NotAGitRepo>\nremote: <NoRemote>\nresolved: browser record-once expanded\n",
+        "startup", "NotAGitRepo", status=0, evidence=" cause=git termination=exited code=128 error=NotAGitRepo",
+    )
     auth_file = root / "data/bbr/auth.toml"
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     auth_file.write_text("record-once-invalid")

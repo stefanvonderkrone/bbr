@@ -276,7 +276,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred).withDiagnostics(diagnostic);
 
     // The arena outlives `app.run`, so the Start strings stay valid.
-    const start = bbr.startup.start(a, git.gitClient(), cred.workspace, input) catch |err| {
+    const start = bbr.startup.start(a, git.gitClient(), cred.workspace, input, diagnostic) catch |err| {
         _ = diagnostic.failure(.execute, .{ .zig = err }, @src());
         std.debug.print("bbr: could not resolve a PR to open: {s}\n", .{@errorName(err)});
         return;
@@ -305,7 +305,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     }
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null, diagnostic.forContext(.highlighting, .{}));
     defer tree_sitter_highlighter.deinit();
-    const summary_cache_path = summaryCachePath(gpa, init.environ_map);
+    const summary_cache_path = try summaryCachePath(gpa, init.environ_map);
     defer if (summary_cache_path) |path| gpa.free(path);
 
     try app.run(.{
@@ -486,10 +486,10 @@ fn statePath(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.M
 
 /// `<state home>/bbr/browser-cache.json`, or null without a state home. The
 /// save worker creates the directory. Caller frees.
-fn summaryCachePath(gpa: std.mem.Allocator, env_map: *std.process.Environ.Map) ?[]u8 {
-    const base = (bbr.xdg.stateHome(gpa, env_map) catch return null) orelse return null;
+fn summaryCachePath(gpa: std.mem.Allocator, env_map: *std.process.Environ.Map) !?[]u8 {
+    const base = (try bbr.xdg.stateHome(gpa, env_map)) orelse return null;
     defer gpa.free(base);
-    return std.fmt.allocPrint(gpa, "{s}/bbr/browser-cache.json", .{base}) catch null;
+    return try std.fmt.allocPrint(gpa, "{s}/bbr/browser-cache.json", .{base});
 }
 
 fn openSubmissionLockDir(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map) !std.Io.Dir {
@@ -898,7 +898,7 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
         std.debug.print("remote: {s}/{s}\n", .{ r.workspace, r.repo_slug });
     } else |err| std.debug.print("remote: <{s}>\n", .{@errorName(err)});
 
-    const outcome: bbr.startup.Outcome = switch (bbr.startup.inspect(a, git.gitClient(), cred.workspace, input)) {
+    const outcome: bbr.startup.Outcome = switch (bbr.startup.inspect(a, git.gitClient(), cred.workspace, input, diagnostic)) {
         .browse => |browse| .{ .browse = browse },
         .detect => |detection| blk: {
             var client = bbr.http.StdHttpClient.init(gpa, init.io);
@@ -1595,13 +1595,13 @@ test "M24 cache the Summary Cache path lives under the XDG state home" {
         .{ "relative/state", "/home/ada/.local/state/bbr/browser-cache.json" },
     }) |case| {
         try env.put("XDG_STATE_HOME", case[0]);
-        const path = summaryCachePath(std.testing.allocator, &env).?;
+        const path = (try summaryCachePath(std.testing.allocator, &env)).?;
         defer std.testing.allocator.free(path);
         try std.testing.expectEqualStrings(case[1], path);
     }
     _ = env.swapRemove("HOME");
     _ = env.swapRemove("XDG_STATE_HOME");
-    try std.testing.expect(summaryCachePath(std.testing.allocator, &env) == null);
+    try std.testing.expect((try summaryCachePath(std.testing.allocator, &env)) == null);
 }
 
 test "M24 acquisition check-browser fails when a required field is missing" {

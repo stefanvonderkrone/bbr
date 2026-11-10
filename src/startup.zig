@@ -15,6 +15,7 @@ const Client = @import("bitbucket/client.zig").Client;
 const gitmod = @import("git/client.zig");
 const GitClient = gitmod.GitClient;
 const url = @import("bitbucket/url.zig");
+const diagnostics = @import("diagnostics.zig");
 
 /// What the caller passes through from argv.
 pub const Input = struct {
@@ -75,30 +76,35 @@ pub const Start = union(enum) {
 /// The Start for argv. Only plain `bbr` and `bbr <repo-slug>` inspect Git.
 /// The URL Workspace must match the Credential Workspace; the Client enforces
 /// that on fetch.
-pub fn start(allocator: Allocator, git: GitClient, workspace: []const u8, input: Input) !Start {
+pub fn start(allocator: Allocator, git: GitClient, workspace: []const u8, input: Input, diagnostic: diagnostics.Handle) !Start {
     if (input.url) |text| {
         const ref = try url.parse(text);
         return .{ .open = .{ .repository = try allocator.dupe(u8, ref.repo_slug), .id = ref.id } };
     }
     if (input.id) |id| return .{ .open = .{ .repository = input.repo_slug orelse return error.MissingRepository, .id = id } };
-    return switch (inspect(allocator, git, workspace, input)) {
+    return switch (inspect(allocator, git, workspace, input, diagnostic)) {
         .detect => |detection| .{ .detect = detection },
         .browse => |browse| .{ .browse = browse },
     };
 }
 
 /// Reads the current branch and the Remote. It takes no Client, so it sends
-/// no request. Every Git error gives a Browser Start. The strings belong to
-/// `allocator`.
-pub fn inspect(allocator: Allocator, git: GitClient, workspace: []const u8, input: Input) Inspection {
+/// no request. Every Git error gives a Browser Start. The Start drops the
+/// cause, so `inspect` records it once. The strings belong to `allocator`.
+pub fn inspect(allocator: Allocator, git: GitClient, workspace: []const u8, input: Input, diagnostic: diagnostics.Handle) Inspection {
     if (input.repo_slug) |repository| {
-        const branch = git.currentBranch(allocator) catch return .{ .browse = .{ .repository = repository } };
+        const branch = git.currentBranch(allocator) catch |err| return browseAfter(diagnostic, err, .{ .repository = repository });
         return .{ .detect = .{ .repository = repository, .branch = branch, .named = true } };
     }
-    const remote = git.remote(allocator) catch return .{ .browse = .{} };
+    const remote = git.remote(allocator) catch |err| return browseAfter(diagnostic, err, .{});
     if (!std.ascii.eqlIgnoreCase(remote.workspace, workspace)) return .{ .browse = .{} };
-    const branch = git.currentBranch(allocator) catch return .{ .browse = .{ .repository = remote.repo_slug } };
+    const branch = git.currentBranch(allocator) catch |err| return browseAfter(diagnostic, err, .{ .repository = remote.repo_slug });
     return .{ .detect = .{ .repository = remote.repo_slug, .branch = branch, .named = false } };
+}
+
+fn browseAfter(diagnostic: diagnostics.Handle, cause: anyerror, browse: Browse) Inspection {
+    _ = diagnostic.failure(.read, .{ .zig = cause }, @src());
+    return .{ .browse = browse };
 }
 
 /// Lists the open PullRequests whose source Branch is `detection.branch`. The
@@ -183,19 +189,19 @@ test "M24 startup every Inspection and Outcome" {
 
     // Inspection: a named Repository with a branch, then with each Git error.
     var git: FakeGitClient = .{ .branch = "feature/x" };
-    try expectDetect("named", true, inspect(a, git.gitClient(), "check24", .{ .repo_slug = "named" }));
+    try expectDetect("named", true, inspect(a, git.gitClient(), "check24", .{ .repo_slug = "named" }, .{}));
     for ([_]anyerror{ GitError.DetachedHead, GitError.NotAGitRepo, error.GitFailed }) |err| {
         git = .{ .branch = err, .remote_result = remote };
-        try expectBrowse(.{ .repository = "named" }, (inspect(a, git.gitClient(), "check24", .{ .repo_slug = "named" })).browse);
+        try expectBrowse(.{ .repository = "named" }, (inspect(a, git.gitClient(), "check24", .{ .repo_slug = "named" }, .{})).browse);
     }
     // No argument: the Remote Repository, a detached HEAD, and no Remote.
     git = .{ .branch = "feature/x", .remote_result = remote };
-    try expectDetect("pr-webapp", false, inspect(a, git.gitClient(), "check24", .{}));
+    try expectDetect("pr-webapp", false, inspect(a, git.gitClient(), "check24", .{}, .{}));
     git = .{ .branch = GitError.DetachedHead, .remote_result = remote };
-    try expectBrowse(.{ .repository = "pr-webapp" }, (inspect(a, git.gitClient(), "check24", .{})).browse);
+    try expectBrowse(.{ .repository = "pr-webapp" }, (inspect(a, git.gitClient(), "check24", .{}, .{})).browse);
     for ([_]anyerror{ GitError.NotAGitRepo, GitError.NoRemote }) |err| {
         git = .{ .branch = "feature/x", .remote_result = err };
-        try expectBrowse(.{}, (inspect(a, git.gitClient(), "check24", .{})).browse);
+        try expectBrowse(.{}, (inspect(a, git.gitClient(), "check24", .{}, .{})).browse);
     }
 
     // Outcome: one, several, and no AdjacentPullRequest.
@@ -230,12 +236,12 @@ test "M24 startup a Remote in another Workspace gives a plain Browser, and ASCII
     const a = arena.allocator();
 
     var git: FakeGitClient = .{ .branch = "feature/x", .remote_result = .{ .workspace = "elsewhere", .repo_slug = "pr-webapp" } };
-    try expectBrowse(.{}, (inspect(a, git.gitClient(), "check24", .{})).browse);
+    try expectBrowse(.{}, (inspect(a, git.gitClient(), "check24", .{}, .{})).browse);
     git.branch = GitError.DetachedHead;
-    try expectBrowse(.{}, (inspect(a, git.gitClient(), "check24", .{})).browse);
+    try expectBrowse(.{}, (inspect(a, git.gitClient(), "check24", .{}, .{})).browse);
 
     git = .{ .branch = "feature/x", .remote_result = .{ .workspace = "Check24", .repo_slug = "pr-webapp" } };
-    try expectDetect("pr-webapp", false, inspect(a, git.gitClient(), "CHECK24", .{}));
+    try expectDetect("pr-webapp", false, inspect(a, git.gitClient(), "CHECK24", .{}, .{}));
 }
 
 test "M24 startup the URL and the <repo> <id> paths open directly without Git" {
@@ -244,17 +250,17 @@ test "M24 startup the URL and the <repo> <id> paths open directly without Git" {
     const a = arena.allocator();
     var git: FakeGitClient = .{ .branch = GitError.NotAGitRepo };
 
-    const pasted = try start(a, git.gitClient(), "check24", .{ .url = "https://bitbucket.org/check24/pr-webapp/pull-requests/1726" });
+    const pasted = try start(a, git.gitClient(), "check24", .{ .url = "https://bitbucket.org/check24/pr-webapp/pull-requests/1726" }, .{});
     try testing.expectEqualStrings("pr-webapp", pasted.open.repository);
     try testing.expectEqual(@as(u64, 1726), pasted.open.id);
 
-    const explicit = try start(a, git.gitClient(), "check24", .{ .repo_slug = "myrepo", .id = 7 });
+    const explicit = try start(a, git.gitClient(), "check24", .{ .repo_slug = "myrepo", .id = 7 }, .{});
     try testing.expectEqualStrings("myrepo", explicit.open.repository);
     try testing.expectEqual(@as(u64, 7), explicit.open.id);
 
-    try expectBrowse(.{}, (try start(a, git.gitClient(), "check24", .{})).browse);
+    try expectBrowse(.{}, (try start(a, git.gitClient(), "check24", .{}, .{})).browse);
     git = .{ .branch = "feature/x" };
-    try testing.expectEqualStrings("feature/x", (try start(a, git.gitClient(), "check24", .{ .repo_slug = "myrepo" })).detect.branch);
+    try testing.expectEqualStrings("feature/x", (try start(a, git.gitClient(), "check24", .{ .repo_slug = "myrepo" }, .{})).detect.branch);
 }
 
 test "M24 startup describe prints each bbr detect line" {
