@@ -22,6 +22,7 @@ If you need to find a ticket, set the search directory to `.scratch/` and use a 
 For example, use Glob with `path: <checkout>/.scratch` and one of these patterns:
 `**/SPEC.md`, `**/PRD.md`, or `**/issues/*.md`.
 Root-level Glob patterns such as `.scratch/**/*.md` can return no files even when the files exist.
+Glob skips dot directories unless the call passes `hidden: true`, so pass it with a root-level pattern.
 Read the `.scratch/` directory before you treat an empty search result as an absent ticket.
 
 For a feature, read its `map.md` and follow the links to its decisions and implementation tickets.
