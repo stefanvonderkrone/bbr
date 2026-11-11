@@ -1,6 +1,6 @@
 # 05: Run the live M22 outside check
 
-Status: ready-for-human
+Status: resolved
 Blocked by: 04
 Spec: [M22 spec](../SPEC.md)
 
@@ -32,12 +32,12 @@ LocalReview:
 
 ## Acceptance criteria
 
-- [ ] On the RemoteReview, only the changed File is bold after the push, the merge, and `R`.
-- [ ] On the RemoteReview, read state survives a restart and a PullRequest switch.
-- [ ] On the LocalReview, only the changed File is bold after the new commit and `R`.
-- [ ] A `core.abbrev` change does not reset a LocalReview binary File.
-- [ ] The result records whether Bitbucket sends `index` ids for binary Files, and their length.
-- [ ] The results, the PullRequest, and the bbr commit are recorded under `## Completion` in this ticket.
+- [x] On the RemoteReview, only the changed File is bold after the push, the merge, and `R`.
+- [x] On the RemoteReview, read state survives a restart and a PullRequest switch.
+- [x] On the LocalReview, only the changed File is bold after the new commit and `R`.
+- [x] A `core.abbrev` change does not reset a LocalReview binary File.
+- [x] The result records whether Bitbucket sends `index` ids for binary Files, and their length.
+- [x] The results, the PullRequest, and the bbr commit are recorded under `## Completion` in this ticket.
 
 ## Comments
 
@@ -117,4 +117,16 @@ bbr ran in tmux with a separate state home, so the operator's database stayed un
 - `file_read_receipts` holds one RemoteReview receipt for the PNG File.
 - After a restart, the PNG row stays regular, and an unmarked PNG row stays bold.
 
-Still open: LocalReview steps 1 to 5. The operator postponed them.
+## Completion
+
+All steps pass. The bbr commit is `23b28e2`.
+
+- RemoteReview steps 1 to 6 and 8, and the extra checks: the operator, on 2026-11-03.
+- RemoteReview step 7: the runner, on 2026-11-11, on PullRequest B. Bitbucket sends 10-character `index` ids for binary Files, and a PNG File stays read after a restart.
+- LocalReview steps 1 to 5: the runner, on 2026-11-11, at the operator's request.
+  The runner made a scratch Git Repository under `$TMPDIR`, with three changed text Files, one changed binary File, and one added binary File.
+  bbr ran as `bbr local main feature` in tmux, with a separate state home.
+  - All five Files start bold. `m` on each File makes it regular.
+  - A new commit on `feature` changes one text File. After `R`, only that File is bold.
+  - After `git config core.abbrev 12` and `R`, both binary Files stay regular.
+  - The runner read the weight from the terminal escape codes of each File Tree row.
