@@ -35,13 +35,13 @@ Run each step in a terminal with 30 rows, then repeat it in a terminal with 80 r
 
 ## Acceptance criteria
 
-- [ ] Every checked mark sits in the track cell of a real item of its kind, at 30 and at 80 rows.
+- [x] Every checked mark sits in the track cell of a real item of its kind, at 30 and at 80 rows.
 - [ ] Every drag reaches the first and the last row of its scroll bar.
-- [ ] A drag past the window edges pins the scroll at the end.
-- [ ] The thumb and the marks follow File isolation, the Layout switch, and the resize.
-- [ ] The wheel works as before.
-- [ ] Notes on how readable the marks are in a crowded track are recorded for ticket 08.
-- [ ] The results, the terminal sizes, and the bbr commit are recorded under `## Completion` in this ticket.
+- [x] A drag past the window edges pins the scroll at the end.
+- [x] The thumb and the marks follow File isolation, the Layout switch, and the resize.
+- [x] The wheel works as before.
+- [x] Notes on how readable the marks are in a crowded track are recorded for ticket 08.
+- [x] The results, the terminal sizes, and the bbr commit are recorded under `## Completion` in this ticket.
 
 ## Agent notes for the human
 
@@ -184,3 +184,75 @@ The SPEC lists "A press on a Scroll Mark that jumps to the item of the mark" und
 The brief asks only to compare each mark position with the real row of its item.
 The runner kept the SPEC and narrowed step 3 and the first criterion to the mark position.
 Ticket 10 records the jump to the item for triage.
+
+## Completion
+
+The runner ran the check on 2026-11-11 at the operator's request.
+The operator made the two Drafts of step 2.
+
+- bbr commit: `5ec0ed3`. `bbr --version`: `bbr 2026.11.10-0+g5ec0ed32d1ba`.
+- Terminal: tmux 3.7 with mouse input on, at 120 × 30 and at 160 × 80.
+  The runner sent SGR mouse events with `tmux send-keys -H` and read glyphs and styles with `tmux capture-pane -e`.
+- State: a separate `XDG_STATE_HOME`, so the operator's database stayed unchanged.
+- PullRequest A has about 111,700 Buffer rows, two local Drafts, one current unresolved Thread, and six outdated unresolved Threads.
+  It has no resolved Thread. So the runner checked the `✓` mark on PullRequest B, which has 18 resolved inline Threads.
+
+The runner did not use `j` and `k` alone to find an item in a cell, because one cell holds up to about 4,500 rows.
+It went to the item with Buffer Search, `]`, or `10j` steps instead, and read the thumb there.
+The thumb covers the cell of every visible row, so the item is in the cell when the thumb sits on the mark cell.
+
+### Results
+
+| Step | 30 rows | 80 rows |
+| --- | --- | --- |
+| 3. `✎` mark, first and last cell | Pass | Pass |
+| 3. `●` mark | Pass | Pass |
+| 3. `━` mark, then `]` to the File header | Pass | Pass |
+| 3. `✓` mark, PullRequest B | Pass | Pass |
+| 4. Three `◆` marks for a query with 634 hits | Pass | Pass |
+| 5. Clear the query | See finding 2 | See finding 2 |
+| 6. Drag the DiffPane thumb from top to bottom | Partial, see finding 1 | Partial, see finding 1 |
+| 7. Drag past the bottom and the top | Pass | Pass |
+| 8. Drag the File Tree thumb | Partial, see finding 1 | Pass |
+| 9. Drag the Review Search list thumb | Pass | Pass |
+| 10. Isolate one File with `o` | Pass | Pass after a restart, see finding 4 |
+| 11. SideBySide and back | Pass | Pass |
+| 12. Resize during a drag | Pass, 30 to 40 rows and back | Pass, 80 to 60 rows and back |
+| 13. Wheel | Pass | Pass |
+
+Step 3: each press on a mark off the thumb moved the thumb over the pressed cell.
+Step 4: after each press, `j` and then `n` went to a real hit, and the thumb stayed on the pressed cell.
+Step 10: with an isolated File, the track showed one `━` mark and no other marks, and a drag reached the last row of that File.
+Step 13: three wheel notches moved the DiffPane and three notches back restored it. The wheel over the track did nothing.
+The branch changes no production wheel code.
+
+### Findings
+
+1. A drag that stops on the last track cell does not reach the last row when the thumb is one cell long.
+   `dragScrollBar` maps the pointer cell to the first row of that cell.
+   On PullRequest A, one cell holds about 4,500 rows at 30 rows and about 1,500 rows at 80 rows.
+   The last row comes only when the pointer goes past the track, onto the border or further.
+   The 30-row File Tree shows the same behavior. A longer thumb, as in the 80-row File Tree and in an isolated File, reaches the last row.
+2. No input clears an accepted Buffer Search query.
+   `/`, `Ctrl-U`, and `Enter` repeat the accepted query. `Esc` and a motion keep the highlights.
+   The hit marks follow the highlights in every case, as the SPEC asks.
+   Only a query with no hits removes the marks and the highlights.
+3. An outdated unresolved Thread in a collapsed Outdated group has no `●` mark.
+   `scroll_marks.rowMarks` marks only a visible root ReviewCard and a resolved Thread disclosure.
+   On PullRequest A, only the one current Thread has a `●` mark.
+4. In the 80-row Session, a Review Search for `e` started File Enrichment of the Files.
+   After that, a worker used 100 percent CPU for more than 25 minutes.
+   A sample showed repeated `DisclosureBuild.buildBuffer`, `buildVisualRowsWithOptions`, and `SearchProjection.create` calls.
+   During that time, `o` did not isolate a File. A restart cleared it.
+   The 30-row Session did not show it. The runner did not check `main`.
+5. `Ctrl-U` does not clear the Review Search input.
+
+### Notes for ticket 08
+
+- On PullRequest A, almost every track cell has a File header, so `━` replaces the border in 22 of 25 cells at 30 rows and in 67 of 76 cells at 80 rows.
+  The right border reads as a column of `━`.
+- The `━` mark is dim and not bold, so the bold `✎`, `●`, and `◆` marks stay easy to see in that column.
+- A mark on the thumb takes the thumb style, so it keeps its glyph and loses its color.
+  A one-cell thumb on a `━` cell shows a bold `━`, not `┃`. In a crowded track, the thumb is hard to find.
+- A common query, such as `enum` with 775 hits, puts `◆` in every cell, and the other marks disappear.
+
