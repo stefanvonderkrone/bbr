@@ -102,3 +102,19 @@ This is the approved behavior from decision 3 of the brief.
 
 For LocalReview step 5, run `git config core.abbrev 12` in the test Repository.
 Remove it afterward with `git config --unset core.abbrev`.
+
+### Partial result on 2026-11-11
+
+The operator ran RemoteReview steps 1 to 6 and 8 on 2026-11-03. They pass.
+The extra checks pass: a Directory row stays bold while a File below it is unread, `m` does nothing on a Directory row, and the Command Palette lists "Toggle File Read".
+
+The runner ran RemoteReview step 7 on 2026-11-11 at commit `23b28e2`, at the operator's request.
+It used PullRequest B, a test PullRequest whose diff modifies 7 PNG Files.
+bbr ran in tmux with a separate state home, so the operator's database stayed unchanged.
+
+- The Bitbucket PullRequest RawDiff sends an `index <old>..<new>` line for each binary File. The ids have 10 characters.
+- `m` on a PNG File changed its File Tree row from bold to regular weight. No status message appeared.
+- `file_read_receipts` holds one RemoteReview receipt for the PNG File.
+- After a restart, the PNG row stays regular, and an unmarked PNG row stays bold.
+
+Still open: LocalReview steps 1 to 5. The operator postponed them.
