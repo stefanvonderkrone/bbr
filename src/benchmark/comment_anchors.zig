@@ -16,6 +16,7 @@ pub fn run(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, c
         .drafts = context.drafts,
         .expanded_disclosures = context.expanded_disclosures,
         .scratch_allocator = scratch_allocator,
+        .cell_metrics = @import("benchmark_tui").terminal_cell_metrics,
     });
 }
 
