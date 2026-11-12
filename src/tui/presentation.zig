@@ -2818,7 +2818,7 @@ pub const DisclosureBuild = struct {
     input_rebuilt_batch: ?search.Batch = null,
     input_ranges: ?[]frame_mod.ProjectedSourceRange = null,
     input_navigation_rows: ?[]SearchNavigationRow = null,
-    review_selected: ?usize = null,
+    destination_occurrence: ?usize = null,
     review_request_id: u64 = 0,
     review_destination_id: u64 = 0,
     destination_row: ?usize = null,
@@ -2894,7 +2894,6 @@ pub const DisclosureBuild = struct {
         }
         if (published.review_search.batch) |*batch| {
             job.review_snapshot = try batch.retain(published.allocator);
-            job.review_selected = published.review_search.selected;
         }
         if (published.buffer_search.input) |input| {
             job.input_request_id = input.request_id;
@@ -3036,7 +3035,7 @@ pub const DisclosureBuild = struct {
         }
         self.buffer = try self.buildBuffer();
         if (self.kind == .review_destination) {
-            const occurrence = self.review_snapshot.?.occurrences[self.review_selected.?];
+            const occurrence = self.review_snapshot.?.occurrences[self.destination_occurrence.?];
             if (occurrence.location == .source and self.preferences.scope == .changes) {
                 const hidden = sourceFoldDisclosure(self.session, self.buffer, occurrence.location.source);
                 const target: DisclosureTarget = .{ .base = self.disclosure_keys.?, .add = hidden };
@@ -3107,7 +3106,7 @@ pub const DisclosureBuild = struct {
             .selected_version = self.preferences.selected_version,
         });
         if (self.kind == .review_destination) {
-            self.destination_row = occurrenceVisualRowFor(self.buffer, self.visual_rows, self.review_snapshot.?.occurrences[self.review_selected.?]);
+            self.destination_row = occurrenceVisualRowFor(self.buffer, self.visual_rows, self.review_snapshot.?.occurrences[self.destination_occurrence.?]);
         }
         if (self.kind == .card_destination) {
             self.destination_row = self.projection.?.navigation.owners.get(cardHeaderOwner(self.destination_card.?));
@@ -3123,7 +3122,7 @@ pub const DisclosureBuild = struct {
             self.accepted_navigation_rows = accepted.navigation_rows;
         };
         if (self.review_snapshot) |batch| {
-            self.review_ranges = try self.projection.?.projectRanges(std.heap.page_allocator, batch, self.review_selected);
+            self.review_ranges = try self.projection.?.projectRanges(std.heap.page_allocator, batch, null);
         }
         if (self.input_rebuilt_batch) |batch| {
             const input = try self.projection.?.project(std.heap.page_allocator, batch);
@@ -4245,8 +4244,7 @@ const Published = struct {
                 input.active = self.input_active;
                 self.input_ranges = null;
             };
-            if (self.published.review_search.ranges) |ranges| std.heap.page_allocator.free(ranges);
-            self.published.review_search.ranges = self.review_ranges;
+            self.published.publishReviewRanges(self.review_ranges);
             self.review_ranges = null;
             self.published.frame_revision += 1;
             self.published.visual_rows_revision = self.published.frame_revision;
@@ -4972,7 +4970,7 @@ const Published = struct {
             markActiveSearchRanges(ranges, input_active);
         }
         const review_ranges = if (self.review_search.batch) |batch|
-            try search_projection.projectRanges(std.heap.page_allocator, batch, self.review_search.selected)
+            try search_projection.projectRanges(std.heap.page_allocator, batch, null)
         else
             null;
         errdefer if (review_ranges) |ranges| std.heap.page_allocator.free(ranges);
@@ -5130,6 +5128,12 @@ const Published = struct {
     fn projectBufferSearchRanges(self: *const Published, batch: search.Batch, active: ?usize) ![]frame_mod.ProjectedSourceRange {
         if (!builtin.is_test) @compileError(full_projection_is_a_test_oracle);
         return projectBufferSearchRangesFor(self.allocator, self.buffer, self.visual_rows, batch, active);
+    }
+
+    fn publishReviewRanges(self: *Published, ranges: ?[]frame_mod.ProjectedSourceRange) void {
+        if (self.review_search.ranges) |old| std.heap.page_allocator.free(old);
+        self.review_search.ranges = ranges;
+        if (ranges) |current| markActiveSearchRanges(current, self.review_search.selected);
     }
 
     fn projectReviewRanges(self: *const Published, batch: search.Batch, active: ?usize) ![]frame_mod.ProjectedSourceRange {
@@ -9067,6 +9071,7 @@ pub const Presentation = struct {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
         const job = try DisclosureBuild.create(published, preferences, .{ .base = published.disclosure_keys, .add = required }, published.search_generation, published.buffer_search.active);
         job.kind = .review_destination;
+        job.destination_occurrence = published.review_search.selected;
         job.review_request_id = published.review_search.request_id;
         published.review_search.destination_generation +%= 1;
         job.review_destination_id = published.review_search.destination_generation;
@@ -9564,7 +9569,7 @@ pub const Presentation = struct {
         else
             false else published.buffer_search.accepted_batch == null;
         const same_review = if (job.review_snapshot) |snapshot| if (published.review_search.batch) |current|
-            snapshot.occurrences.ptr == current.occurrences.ptr and snapshot.occurrences.len == current.occurrences.len and job.review_selected == published.review_search.selected
+            snapshot.occurrences.ptr == current.occurrences.ptr and snapshot.occurrences.len == current.occurrences.len
         else
             false else published.review_search.batch == null;
         if (!same_batch or !same_review) {
@@ -9611,8 +9616,7 @@ pub const Presentation = struct {
         published.buffer_search.accepted_ranges = accepted_ranges;
         published.buffer_search.accepted_navigation_rows = job.accepted_navigation_rows;
         job.accepted_navigation_rows = null;
-        if (published.review_search.ranges) |old| std.heap.page_allocator.free(old);
-        published.review_search.ranges = review_ranges;
+        published.publishReviewRanges(review_ranges);
         if (input.batch) |*old| old.deinit(self.allocator);
         if (input.ranges) |old| std.heap.page_allocator.free(old);
         if (input.navigation_rows) |old| std.heap.page_allocator.free(old);
@@ -9656,7 +9660,7 @@ pub const Presentation = struct {
                 state.destination_pending = false;
                 return;
             };
-            if (!searchOccurrenceEql(job.review_snapshot.?.occurrences[job.review_selected.?], batch.occurrences[selected])) {
+            if (!searchOccurrenceEql(job.review_snapshot.?.occurrences[job.destination_occurrence.?], batch.occurrences[selected])) {
                 state.destination_pending = false;
                 return;
             }
@@ -9714,7 +9718,9 @@ pub const Presentation = struct {
         }
         if (job.review_snapshot) |snapshot| {
             const current = published.review_search.batch;
-            if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr or job.review_selected != published.review_search.selected) {
+            if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr or
+                (job.kind == .review_destination and job.destination_occurrence != published.review_search.selected))
+            {
                 self.retryContentBuild(published, job);
                 return;
             }
@@ -9750,7 +9756,7 @@ pub const Presentation = struct {
                     return;
                 },
             };
-            if (job.review_snapshot.?.occurrences[job.review_selected.?].location == .source and
+            if (job.review_snapshot.?.occurrences[job.destination_occurrence.?].location == .source and
                 published.review_search.saved_disclosures == null and !sameDisclosures(job.disclosures, published.expanded_disclosures.items))
             {
                 review_saved = published.disclosure_keys.retain();
@@ -9884,8 +9890,7 @@ pub const Presentation = struct {
             input.corpus.release();
             input.corpus = published.search_corpus.?;
         }
-        if (published.review_search.ranges) |ranges| std.heap.page_allocator.free(ranges);
-        published.review_search.ranges = job.review_ranges;
+        published.publishReviewRanges(job.review_ranges);
         job.review_ranges = null;
         self.preferences = job.preferences;
         self.geometry = job.geometry;
@@ -9920,7 +9925,7 @@ pub const Presentation = struct {
                 published.review_search.saved_disclosures = keys;
                 review_saved = null;
             }
-            const occurrence = job.review_snapshot.?.occurrences[job.review_selected.?];
+            const occurrence = job.review_snapshot.?.occurrences[job.destination_occurrence.?];
             if (occurrence.location == .source) {
                 published.session.enrichment.focusAdmitted(.single(occurrence.location.source.file_index));
                 published.pending_cache_focus = .single(occurrence.location.source.file_index);
@@ -10306,7 +10311,7 @@ pub const Presentation = struct {
         }
         if (job.review_snapshot) |snapshot| {
             const review = published.review_search.batch orelse return;
-            if (snapshot.occurrences.ptr != review.occurrences.ptr or job.review_selected != published.review_search.selected) {
+            if (snapshot.occurrences.ptr != review.occurrences.ptr) {
                 self.retryAcceptedDisclosure(published, job);
                 return;
             }
@@ -10375,8 +10380,7 @@ pub const Presentation = struct {
         job.ranges = null;
         published.buffer_search.accepted_navigation_rows = job.navigation_rows;
         job.navigation_rows = null;
-        if (published.review_search.ranges) |ranges| std.heap.page_allocator.free(ranges);
-        published.review_search.ranges = job.review_ranges;
+        published.publishReviewRanges(job.review_ranges);
         job.review_ranges = null;
         published.buffer_search.active = job.active;
         published.expanded_disclosures.deinit(self.allocator);
@@ -17998,7 +18002,7 @@ test "M21 authored destination cancellation rejects queued and issued work" {
         try completeBufferSearchScan(&presentation);
         try presentation.dispatch(.{ .action = .open_search_occurrence });
         const job = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
-        const before = presentation.projection().review.?.frame;
+        const before = presentation.projection().review.?;
         switch (change) {
             .escape => try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } }),
             .query => try presentation.dispatch(.{ .key = .{ .codepoint = 'i', .text = "i" } }),
@@ -18009,7 +18013,10 @@ test "M21 authored destination cancellation rejects queued and issued work" {
             worker.build();
             try presentation.dispatch(.{ .buffer_disclosure_built = worker });
         }
-        try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+        const after = presentation.projection().review.?;
+        try testing.expectEqual(before.frame.visual_rows.ptr, after.frame.visual_rows.ptr);
+        try testing.expectEqual(before.navigation, after.navigation);
+        try testing.expectEqual(before.frame.focus, after.frame.focus);
         for (presentation.commands.items) |command| try testing.expect(command != .build_buffer_disclosure);
         if (change == .selection) {
             try presentation.dispatch(.{ .action = .open_search_occurrence });
@@ -33586,6 +33593,63 @@ fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Alloc
     try completeBufferSearchScan(&presentation);
     try testing.expectEqual(@as(usize, 2), presentation.published.?.review_search.batch.?.occurrences.len);
     return presentation;
+}
+
+test "Review Search admits an enrichment rebuild after a selection move with the current active ranges" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    var buffer: [2]EnrichFile = undefined;
+    const commands = takeQueuedTestEnrichments(&presentation, &buffer);
+    try testing.expectEqual(@as(usize, 2), commands.len);
+    try deliverTestEnrichment(&presentation, commands[0]);
+    const job = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.enrichment, job.kind);
+    const published = presentation.published.?;
+    const selected = published.review_search.selected.?;
+    try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+    try testing.expect(selected != published.review_search.selected.?);
+
+    job.build();
+    try testing.expect(!job.failed);
+    const visual_rows = job.visual_rows.ptr;
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+
+    try testing.expectEqual(visual_rows, published.visual_rows.ptr);
+    for (presentation.commands.items) |command| try testing.expect(command != .build_buffer_disclosure);
+    try expectReviewSearchMatchesFullProjection(published, published.review_search.batch.?, published.review_search.selected);
+}
+
+test "Review Search rejects and retries an enrichment rebuild after its batch clears" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    var buffer: [2]EnrichFile = undefined;
+    const commands = takeQueuedTestEnrichments(&presentation, &buffer);
+    try testing.expectEqual(@as(usize, 2), commands.len);
+    try deliverTestEnrichment(&presentation, commands[0]);
+    const job = presentation.takeCommand().?.build_buffer_disclosure;
+    const published = presentation.published.?;
+    const visual_rows = published.visual_rows.ptr;
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } } });
+    try testing.expect(published.review_search.batch == null);
+    try testing.expect(job.review_snapshot != null);
+    try testing.expectEqual(job.request_id, published.search_generation);
+    try testing.expectEqual(job.frame_revision, published.visual_rows_revision);
+    job.build();
+    try testing.expect(!job.failed);
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+
+    try testing.expectEqual(visual_rows, published.visual_rows.ptr);
+    try testing.expect(published.session.enrichment.file(0).new == .pending);
+    try testing.expectEqual(@as(usize, 1), queuedEnrichmentBuilds(&presentation));
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(published.session.enrichment.file(0).new == .content);
+    try testing.expectEqual(@as(usize, 0), queuedEnrichmentBuilds(&presentation));
+    try testing.expect(published.review_search.ranges == null);
 }
 
 test "a Review Search selection move does not walk the visual rows" {
