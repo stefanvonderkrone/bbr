@@ -2,6 +2,7 @@
 
 Status: needs-triage
 Blocked by: none
+Session: OpenCode `ses_e76b68046ffeuy22et9of1N7Dp`
 
 ## Summary
 
@@ -17,6 +18,7 @@ A stale rebuild runs in full, the Presentation rejects it, and the rebuild goes 
 ## Reproduction
 
 1. Open PullRequest A, the largest benchmark PullRequest from M28, at 160 × 80.
+   Its id is in `pullrequests.txt` outside the repository, in the comment line that names this ticket.
    It has 593 Files and about 111,700 Buffer rows.
 2. Open Review Search with `g f`, and type `e`.
 3. Watch the CPU use of bbr. It stays at about 100 percent.
