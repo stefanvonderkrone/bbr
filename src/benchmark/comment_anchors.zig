@@ -1,6 +1,7 @@
 const std = @import("std");
 const bbr = @import("bbr");
-const buffer_mod = @import("benchmark_tui").buffer;
+const tui = @import("benchmark_tui");
+const buffer_mod = tui.buffer;
 
 pub const DisclosureKey = buffer_mod.DisclosureKey;
 
@@ -16,7 +17,7 @@ pub fn run(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, c
         .drafts = context.drafts,
         .expanded_disclosures = context.expanded_disclosures,
         .scratch_allocator = scratch_allocator,
-        .cell_metrics = @import("benchmark_tui").terminal_cell_metrics,
+        .cell_metrics = tui.terminal_cell_metrics,
     });
 }
 

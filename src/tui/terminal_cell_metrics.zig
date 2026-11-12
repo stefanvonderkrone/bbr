@@ -2,6 +2,7 @@
 //! benchmarks share this one adapter, so a benchmark measures the same
 //! grapheme work as a Buffer rebuild.
 
+const std = @import("std");
 const vaxis = @import("vaxis");
 const cell_metrics = @import("cell_metrics.zig");
 
@@ -20,7 +21,6 @@ fn widthText(_: *const anyopaque, text: []const u8) usize {
 }
 
 test "vaxis measures each printable ASCII byte before ASCII or the end as one grapheme of one cell" {
-    const std = @import("std");
     try std.testing.expect(metrics.ascii_is_narrow);
     for (0x20..0x7f) |first| {
         const alone = [_]u8{@intCast(first)};
