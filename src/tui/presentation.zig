@@ -2720,6 +2720,12 @@ const EnrichedFile = struct {
     speculative: bool,
     /// Review Search takes the File's cache lease when the rebuild commits.
     hold: bool = false,
+
+    /// Only speculative Files fail without a message.
+    fn allSpeculative(enrichments: []const EnrichedFile) bool {
+        for (enrichments) |enriched| if (!enriched.speculative) return false;
+        return true;
+    }
 };
 
 pub const DisclosureBuild = struct {
@@ -3105,13 +3111,6 @@ pub const DisclosureBuild = struct {
     fn enrichedFile(self: *const DisclosureBuild, index: usize) ?*const EnrichedFile {
         for (self.enrichments.items) |*enriched| if (enriched.index == index) return enriched;
         return null;
-    }
-
-    /// Only an enrichment build whose every result is speculative stays silent.
-    fn silent(self: *const DisclosureBuild) bool {
-        if (self.enrichments.items.len == 0) return false;
-        for (self.enrichments.items) |enriched| if (!enriched.speculative) return false;
-        return true;
     }
 
     fn buildBuffer(self: *DisclosureBuild) !buffer_mod.Buffer {
@@ -4068,6 +4067,21 @@ const ReviewSearchState = struct {
         };
     }
 };
+
+fn releaseEnrichments(published: *Published, enrichments: []const EnrichedFile) void {
+    for (enrichments) |enriched| {
+        published.cancelReviewLocationForFile(enriched.index);
+        published.session.enrichment.resetLoading(enriched.index);
+    }
+}
+
+/// The Storage takes a result once, and a build takes one result for each File.
+fn admissible(published: *const Published, job: *const DisclosureBuild, enriched: *const EnrichedFile) bool {
+    published.session.enrichment.checkAdmission(enriched.index, &enriched.result) catch |err| switch (err) {
+        error.AlreadyAdmitted, error.AlreadyTransferred, error.FileOutOfRange => return false,
+    };
+    return job.enrichedFile(enriched.index).? == enriched;
+}
 
 /// Review Search holds the cache lease of each File it acquires for a query.
 fn reviewSearchHolds(published: *const Published, index: usize) bool {
@@ -9642,9 +9656,8 @@ pub const Presentation = struct {
             if (job.kind == .draft_save) published.pending_draft_save = null;
             if (job.kind == .draft_mutation) published.pending_draft_mutation = null;
             if (job.kind == .card_destination) return self.failCardDestination(published, .buffer_build_failed);
-            for (job.enrichments.items) |enriched| published.cancelReviewLocationForFile(enriched.index);
-            if (!job.silent()) self.action_error = .buffer_build_failed;
-            for (job.enrichments.items) |enriched| published.session.enrichment.resetLoading(enriched.index);
+            if (job.kind != .enrichment or !EnrichedFile.allSpeculative(job.enrichments.items)) self.action_error = .buffer_build_failed;
+            releaseEnrichments(published, job.enrichments.items);
             return;
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -9716,18 +9729,7 @@ pub const Presentation = struct {
                 return;
             };
         }
-        for (job.enrichments.items) |*enriched| {
-            const admissible = if (published.session.enrichment.checkAdmission(enriched.index, &enriched.result)) |_|
-                job.enrichedFile(enriched.index).? == enriched
-            else |err| switch (err) {
-                error.AlreadyAdmitted, error.AlreadyTransferred, error.FileOutOfRange => false,
-            };
-            if (!admissible) {
-                for (job.enrichments.items) |refused| published.session.enrichment.resetLoading(refused.index);
-                self.action_error = .action_refused;
-                return;
-            }
-        }
+        for (job.enrichments.items) |*enriched| if (!admissible(published, job, enriched)) return self.refuseEnrichments(published, job);
         for (job.enrichments.items) |*enriched| {
             if (reviewSearchHolds(published, enriched.index)) {
                 published.session.enrichment.hold(enriched.index);
@@ -9911,7 +9913,7 @@ pub const Presentation = struct {
         }
         if (job.kind != .enrichment) {
             self.action_error = null;
-        } else if (!job.silent()) {
+        } else if (!EnrichedFile.allSpeculative(job.enrichments.items)) {
             // A File Enrichment runs beside other work, so it clears only an error of the enrichment path.
             if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
                 self.action_error = null;
@@ -10066,6 +10068,7 @@ pub const Presentation = struct {
             queued.enrichments.insertSlice(queued.arena.allocator(), index, enrichments) catch |err| switch (err) {
                 error.OutOfMemory => return self.dropEnrichments(published, enrichments),
             };
+            for (queued.enrichments.items[index..][0..enrichments.len]) |*enriched| enriched.hold = reviewSearchHolds(published, enriched.index);
             return;
         }
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
@@ -10118,14 +10121,23 @@ pub const Presentation = struct {
     }
 
     fn dropEnrichments(self: *Presentation, published: *Published, enrichments: []EnrichedFile) void {
-        var silent = true;
-        for (enrichments) |*enriched| {
-            published.cancelReviewLocationForFile(enriched.index);
-            published.session.enrichment.resetLoading(enriched.index);
-            if (!enriched.speculative) silent = false;
-            enriched.result.deinit();
+        if (!EnrichedFile.allSpeculative(enrichments)) self.action_error = .out_of_memory;
+        releaseEnrichments(published, enrichments);
+        for (enrichments) |*enriched| enriched.result.deinit();
+    }
+
+    /// Admission refuses only the Files it cannot admit, as a single-File
+    /// rebuild did. The worker preview included them, so the other Files
+    /// need a new rebuild.
+    fn refuseEnrichments(self: *Presentation, published: *Published, job: *DisclosureBuild) void {
+        self.action_error = .action_refused;
+        var index = job.enrichments.items.len;
+        while (index > 0) {
+            index -= 1;
+            const enriched = &job.enrichments.items[index];
+            if (admissible(published, job, enriched)) self.queueEnrichments(published, enriched[0..1], .front) else enriched.result.deinit();
         }
-        if (!silent) self.action_error = .out_of_memory;
+        job.enrichments = .empty;
     }
 
     /// The worker built the saved Reply's Frame and disclosure inputs before
@@ -29696,6 +29708,7 @@ test "File Enrichment results that arrive during an enrichment rebuild join one 
     const running = presentation.takeCommand().?.build_buffer_disclosure;
     for (commands[1..]) |command| try deliverTestEnrichment(&presentation, command);
     try testing.expectEqual(@as(usize, 1), queuedEnrichmentBuilds(&presentation));
+    try testing.expectEqual(@as(usize, 4), presentation.queuedEnrichmentBuild(1).?.enrichments.items.len);
 
     running.build();
     try presentation.dispatch(.{ .buffer_disclosure_built = running });
@@ -29895,6 +29908,119 @@ test "batched enrichment rebuilds publish the Buffer and candidates of single-Fi
     }
     try testing.expectEqual(candidates[0], candidates[1]);
     try testing.expectEqualStrings(buffers[0], buffers[1]);
+}
+
+test "batched enrichment rebuild opens the waiting Review Search occurrence" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        .geometry = .{ .cols = 100, .rows = 25 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try completeBufferSearchScan(&presentation);
+    var buffer: [3]EnrichFile = undefined;
+    const initial = takeQueuedTestEnrichments(&presentation, &buffer);
+    try testing.expectEqual(@as(usize, 3), initial.len);
+    for (initial) |command| try deliverTestEnrichment(&presentation, command);
+    try completeQueuedTestWork(&presentation);
+    const results = presentation.projection().review_search.?.results;
+    const selected = for (results, 0..) |result, index| {
+        if (result.occurrence.location == .source and result.occurrence.location.source.file_index == 1) break index;
+    } else return error.MissingSourceOccurrence;
+    while (presentation.projection().review_search.?.selected.? != selected)
+        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().review_search != null);
+    const waiting = presentation.takeCommand().?.enrich_file;
+    try testing.expectEqual(@as(usize, 1), waiting.file_index);
+    try presentation.queueFileEnrichment(presentation.published.?, 2, false);
+    const other = presentation.takeCommand().?.enrich_file;
+    try deliverTestEnrichment(&presentation, other);
+    try deliverTestEnrichment(&presentation, waiting);
+    try testing.expect(presentation.queuedEnrichmentBuild(waiting.session_epoch).?.enrichments.items.len >= 2);
+
+    try completeQueuedTestWork(&presentation);
+
+    const projection = presentation.projection();
+    try testing.expect(projection.review_search == null);
+    const review = projection.review.?;
+    const row = review.frame.visual_rows[review.navigation.cursor];
+    try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(row.buffer_index));
+    try testing.expectEqualStrings("new 1", (frame_mod.selectedSource(row, .new) orelse return error.SourceLocationLost).text);
+    try testing.expect(review.frame.search_ranges.len > 0);
+}
+
+test "batched enrichment rebuild restores the waiting Selected Version location" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .select_old_version });
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(cursorOwner(&presentation) == .file);
+    const waiting = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(@as(usize, 1), waiting.file_index);
+    try presentation.queueFileEnrichment(presentation.published.?, 0, true);
+    const other = presentation.takeCommand().?.enrich_file;
+    try deliverTestEnrichment(&presentation, other);
+    try deliverTestEnrichment(&presentation, waiting);
+    try testing.expect(presentation.queuedEnrichmentBuild(waiting.session_epoch).?.enrichments.items.len >= 2);
+
+    try completeDisclosureBuild(&presentation);
+
+    const review = presentation.projection().review.?;
+    try testing.expectEqual(SelectedVersion.old, review.selected_version);
+    const row = review.frame.visual_rows[review.navigation.cursor];
+    try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(row.buffer_index));
+    try testing.expectEqualStrings("old b", (frame_mod.selectedSource(row, .old) orelse return error.VersionLocationLost).text);
+}
+
+test "batched enrichment rebuild restores the pending WholeFile review location after refresh" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try presentation.dispatch(.{ .action = .next_file });
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    try presentation.dispatch(.{ .action = .center });
+    const before = presentation.projection().review.?.navigation;
+    const offset = before.cursor - before.scroll;
+    try refreshRecoverySession(&presentation, try testTwoFileSession(testing.allocator, 1));
+    try testing.expect(cursorOwner(&presentation) == .file);
+    const waiting = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(@as(usize, 1), waiting.file_index);
+    try presentation.queueFileEnrichment(presentation.published.?, 0, true);
+    const other = presentation.takeCommand().?.enrich_file;
+    try deliverTestEnrichment(&presentation, other);
+    try deliverTestEnrichment(&presentation, waiting);
+    try testing.expect(presentation.queuedEnrichmentBuild(waiting.session_epoch).?.enrichments.items.len >= 2);
+
+    try completeDisclosureBuild(&presentation);
+
+    const review = presentation.projection().review.?;
+    const row = review.frame.visual_rows[review.navigation.cursor];
+    try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(row.buffer_index));
+    try testing.expectEqualStrings("new b", (frame_mod.selectedSource(row, .new) orelse return error.SourceLocationLost).text);
+    try testing.expectEqual(offset, review.navigation.cursor - review.navigation.scroll);
 }
 
 test "Session replacement rejects a staged File Enrichment Frame" {
