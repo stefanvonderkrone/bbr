@@ -2394,29 +2394,10 @@ const SearchProjection = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const temp = arena.allocator();
-        var projected: std.ArrayList(frame_mod.ProjectedSourceRange) = .empty;
         const navigation_rows = try temp.alloc(?usize, batch.occurrences.len);
         @memset(navigation_rows, null);
-        for (batch.occurrences, 0..) |occurrence, occurrence_index| switch (occurrence.location) {
-            .source => |source| {
-                for (self.occurrenceRows(occurrence)) |index| {
-                    const row = self.rows[index];
-                    if (row.left) |half| if ((source.relation == .old or source.relation == .neutral) and projectionLineMatches(half, source, .old))
-                        try appendIndexedIntersections(temp, &projected, navigation_rows, occurrence, occurrence_index, index, .old, half.start, half.end);
-                    if (row.right) |half| if ((source.relation == .new or source.relation == .neutral) and projectionLineMatches(half, source, .new))
-                        try appendIndexedIntersections(temp, &projected, navigation_rows, occurrence, occurrence_index, index, .new, half.start, half.end);
-                    if (row.single) |half| if (projectionLineMatches(half, source, source.relation))
-                        try appendIndexedIntersections(temp, &projected, navigation_rows, occurrence, occurrence_index, index, source.relation, half.start, half.end);
-                }
-            },
-            .review_body => for (self.occurrenceRows(occurrence)) |index| {
-                const row = self.rows[index];
-                if (occurrence.definition_ranges.len > 0 and !self.referenceRowMatches(index, occurrence)) continue;
-                try appendIndexedIntersections(temp, &projected, navigation_rows, occurrence, occurrence_index, index, .neutral, row.start, row.end);
-            },
-        };
-        std.mem.sort(frame_mod.ProjectedSourceRange, projected.items, {}, searchRangeLess);
-        const ranges = try allocator.dupe(frame_mod.ProjectedSourceRange, projected.items);
+        const projected = try self.projectOccurrences(temp, batch, navigation_rows);
+        const ranges = try allocator.dupe(frame_mod.ProjectedSourceRange, projected);
         errdefer allocator.free(ranges);
         const rows = try allocator.alloc(SearchNavigationRow, batch.occurrences.len);
         errdefer allocator.free(rows);
@@ -2450,6 +2431,37 @@ const SearchProjection = struct {
         }
         return .{ .ranges = ranges, .navigation_rows = rows };
     }
+
+    fn projectRanges(self: *const SearchProjection, allocator: Allocator, batch: search.Batch, active: ?usize) ![]frame_mod.ProjectedSourceRange {
+        const ranges = try self.projectOccurrences(allocator, batch, null);
+        markActiveSearchRanges(ranges, active);
+        return ranges;
+    }
+
+    fn projectOccurrences(self: *const SearchProjection, allocator: Allocator, batch: search.Batch, navigation_rows: ?[]?usize) ![]frame_mod.ProjectedSourceRange {
+        var projected: std.ArrayList(frame_mod.ProjectedSourceRange) = .empty;
+        errdefer projected.deinit(allocator);
+        for (batch.occurrences, 0..) |occurrence, occurrence_index| switch (occurrence.location) {
+            .source => |source| {
+                for (self.occurrenceRows(occurrence)) |index| {
+                    const row = self.rows[index];
+                    if (row.left) |half| if ((source.relation == .old or source.relation == .neutral) and projectionLineMatches(half, source, .old))
+                        try appendIndexedIntersections(allocator, &projected, navigation_rows, occurrence, occurrence_index, index, .old, half.start, half.end);
+                    if (row.right) |half| if ((source.relation == .new or source.relation == .neutral) and projectionLineMatches(half, source, .new))
+                        try appendIndexedIntersections(allocator, &projected, navigation_rows, occurrence, occurrence_index, index, .new, half.start, half.end);
+                    if (row.single) |half| if (projectionLineMatches(half, source, source.relation))
+                        try appendIndexedIntersections(allocator, &projected, navigation_rows, occurrence, occurrence_index, index, source.relation, half.start, half.end);
+                }
+            },
+            .review_body => for (self.occurrenceRows(occurrence)) |index| {
+                const row = self.rows[index];
+                if (occurrence.definition_ranges.len > 0 and !self.referenceRowMatches(index, occurrence)) continue;
+                try appendIndexedIntersections(allocator, &projected, navigation_rows, occurrence, occurrence_index, index, .neutral, row.start, row.end);
+            },
+        };
+        std.mem.sort(frame_mod.ProjectedSourceRange, projected.items, {}, searchRangeLess);
+        return projected.toOwnedSlice(allocator);
+    }
 };
 
 fn projectionLineMatches(half: SearchProjection.Half, source: search.SourceLocation, relation: search.VersionRelation) bool {
@@ -2460,10 +2472,12 @@ fn projectionLineMatches(half: SearchProjection.Half, source: search.SourceLocat
     };
 }
 
-fn appendIndexedIntersections(allocator: Allocator, projected: *std.ArrayList(frame_mod.ProjectedSourceRange), navigation_rows: []?usize, occurrence: search.Occurrence, occurrence_index: usize, visual_index: usize, relation: search.VersionRelation, start: usize, end: usize) !void {
+fn appendIndexedIntersections(allocator: Allocator, projected: *std.ArrayList(frame_mod.ProjectedSourceRange), navigation_rows: ?[]?usize, occurrence: search.Occurrence, occurrence_index: usize, visual_index: usize, relation: search.VersionRelation, start: usize, end: usize) !void {
     const before = projected.items.len;
     try appendSearchIntersections(allocator, projected, occurrence, false, visual_index, relation, start, end);
-    if (projected.items.len > before and navigation_rows[occurrence_index] == null) navigation_rows[occurrence_index] = visual_index;
+    if (navigation_rows) |rows| if (projected.items.len > before and rows[occurrence_index] == null) {
+        rows[occurrence_index] = visual_index;
+    };
     for (projected.items[before..]) |*range| range.occurrence_index = occurrence_index;
 }
 
@@ -2472,6 +2486,12 @@ fn mergedSearchRange(range: frame_mod.ProjectedSourceRange, merged_index: []cons
     result.occurrence_index = merged_index[range.occurrence_index.?];
     result.active = result.occurrence_index == active;
     return result;
+}
+
+const full_projection_is_a_test_oracle = "the full Review Search projection walks every visual row; use SearchProjection.projectRanges, mergeReviewRanges, or markActiveSearchRanges";
+
+fn markActiveSearchRanges(ranges: []frame_mod.ProjectedSourceRange, active: ?usize) void {
+    for (ranges) |*range| range.active = range.occurrence_index == active;
 }
 
 fn searchRangeLess(_: void, left: frame_mod.ProjectedSourceRange, right: frame_mod.ProjectedSourceRange) bool {
@@ -3103,10 +3123,7 @@ pub const DisclosureBuild = struct {
             self.accepted_navigation_rows = accepted.navigation_rows;
         };
         if (self.review_snapshot) |batch| {
-            const review = try self.projection.?.project(std.heap.page_allocator, batch);
-            self.review_ranges = review.ranges;
-            std.heap.page_allocator.free(review.navigation_rows);
-            for (self.review_ranges.?) |*range| range.active = range.occurrence_index == self.review_selected;
+            self.review_ranges = try self.projection.?.projectRanges(std.heap.page_allocator, batch, self.review_selected);
         }
         if (self.input_rebuilt_batch) |batch| {
             const input = try self.projection.?.project(std.heap.page_allocator, batch);
@@ -4949,13 +4966,13 @@ const Published = struct {
             }
         };
         if (accepted_ranges) |ranges| {
-            for (ranges) |*range| range.active = range.occurrence_index == accepted_active;
+            markActiveSearchRanges(ranges, accepted_active);
         }
         if (input_ranges) |ranges| {
-            for (ranges) |*range| range.active = range.occurrence_index == input_active;
+            markActiveSearchRanges(ranges, input_active);
         }
         const review_ranges = if (self.review_search.batch) |batch|
-            try projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, self.review_search.selected)
+            try search_projection.projectRanges(std.heap.page_allocator, batch, self.review_search.selected)
         else
             null;
         errdefer if (review_ranges) |ranges| std.heap.page_allocator.free(ranges);
@@ -5111,11 +5128,12 @@ const Published = struct {
     }
 
     fn projectBufferSearchRanges(self: *const Published, batch: search.Batch, active: ?usize) ![]frame_mod.ProjectedSourceRange {
+        if (!builtin.is_test) @compileError(full_projection_is_a_test_oracle);
         return projectBufferSearchRangesFor(self.allocator, self.buffer, self.visual_rows, batch, active);
     }
 
     fn projectReviewRanges(self: *const Published, batch: search.Batch, active: ?usize) ![]frame_mod.ProjectedSourceRange {
-        return projectBufferSearchRangesFor(std.heap.page_allocator, self.buffer, self.visual_rows, batch, active);
+        return self.search_projection.projectRanges(std.heap.page_allocator, batch, active);
     }
 
     /// Projects only `part` through the retained SearchProjection and merges its
@@ -5131,15 +5149,14 @@ const Published = struct {
         part_index: []const usize,
         active: ?usize,
     ) ![]frame_mod.ProjectedSourceRange {
-        const projected = try self.search_projection.project(scratch, part);
-        defer scratch.free(projected.ranges);
-        defer scratch.free(projected.navigation_rows);
-        const merged = try std.heap.page_allocator.alloc(frame_mod.ProjectedSourceRange, ranked_ranges.len + projected.ranges.len);
+        const projected = try self.search_projection.projectOccurrences(scratch, part, null);
+        defer scratch.free(projected);
+        const merged = try std.heap.page_allocator.alloc(frame_mod.ProjectedSourceRange, ranked_ranges.len + projected.len);
         var left: usize = 0;
         var right: usize = 0;
         for (merged) |*target| {
             const ranked = if (left < ranked_ranges.len) mergedSearchRange(ranked_ranges[left], ranked_index, active) else null;
-            const added = if (right < projected.ranges.len) mergedSearchRange(projected.ranges[right], part_index, active) else null;
+            const added = if (right < projected.len) mergedSearchRange(projected[right], part_index, active) else null;
             if (added != null and (ranked == null or searchRangeLess({}, added.?, ranked.?))) {
                 target.* = added.?;
                 right += 1;
@@ -5158,6 +5175,7 @@ const Published = struct {
         batch: search.Batch,
         active: ?usize,
     ) ![]frame_mod.ProjectedSourceRange {
+        if (!builtin.is_test) @compileError(full_projection_is_a_test_oracle);
         var projected: std.ArrayList(frame_mod.ProjectedSourceRange) = .empty;
         errdefer projected.deinit(allocator);
         var source_rows: std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)) = .empty;
@@ -8829,13 +8847,15 @@ pub const Presentation = struct {
         if (state.pending) return;
         const batch = state.batch orelse return;
         if (index >= batch.occurrences.len) return;
-        const ranges = published.projectReviewRanges(batch, index) catch |err| {
-            self.reportFailure(.review_search, .prepare, err, @src());
-            self.action_error = .out_of_memory;
-            return;
-        };
-        if (state.ranges) |old| std.heap.page_allocator.free(old);
-        state.ranges = ranges;
+        if (state.ranges) |ranges| {
+            markActiveSearchRanges(ranges, index);
+        } else {
+            state.ranges = published.projectReviewRanges(batch, index) catch |err| {
+                self.reportFailure(.review_search, .prepare, err, @src());
+                self.action_error = .out_of_memory;
+                return;
+            };
+        }
         if (state.selected != index) {
             self.discardQueuedReviewSearchScans();
             state.opening_source = false;
@@ -15159,7 +15179,7 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         rebuilt.deinit();
 
         start = std.Io.Clock.awake.now(io);
-        const ranges = try published.projectBufferSearchRanges(batch, input.active);
+        const ranges = try published.search_projection.projectRanges(allocator, batch, input.active);
         times[@intFromEnum(Stage.projection)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (ranges.len == 0) return error.MissingRanges;
         allocator.free(ranges);
@@ -25173,12 +25193,8 @@ test "M21 disclosure worker projects retained accepted and Review Search Batches
     try testing.expect(!job.failed);
     const expected = try Published.projectBufferSearchRangesFor(testing.allocator, job.buffer, job.visual_rows, job.accepted_snapshot.?, null);
     defer testing.allocator.free(expected);
-    try testing.expectEqual(expected.len, job.accepted_ranges.?.len);
-    try testing.expectEqual(expected.len, job.review_ranges.?.len);
-    for (expected, job.accepted_ranges.?, job.review_ranges.?) |source, accepted, review| {
-        try testing.expectEqualDeep(source.source, accepted.source);
-        try testing.expectEqualDeep(source.row, review.row);
-    }
+    try testing.expectEqualDeep(expected, job.accepted_ranges.?);
+    try testing.expectEqualDeep(expected, job.review_ranges.?);
 }
 
 test "M21 disclosure publication transfers accepted and Review Search ranges" {
@@ -33558,7 +33574,8 @@ fn publishCheckedReviewSources(presentation: *Presentation, hide_rows: bool, bet
 
 fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize) !Presentation {
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "a new idea\n\nnew again" });
+    // The emphasis splits one ReviewBody match into two ranges.
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "a new idea\n\nn**e**w again" });
     var presentation = try Presentation.init(allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testManyFileSession(testing.allocator, 1, file_count) },
         .geometry = .{ .cols = 100, .rows = 40 },
@@ -33569,6 +33586,122 @@ fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Alloc
     try completeBufferSearchScan(&presentation);
     try testing.expectEqual(@as(usize, 2), presentation.published.?.review_search.batch.?.occurrences.len);
     return presentation;
+}
+
+test "a Review Search selection move does not walk the visual rows" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 4);
+    defer presentation.deinit();
+    const Between = struct {
+        fn run(_: *Presentation, _: usize) !void {}
+    };
+    try testing.expectEqual(@as(usize, 4), try publishCheckedReviewSources(&presentation, false, Between.run));
+    const published = presentation.published.?;
+    const state = &published.review_search;
+    const selected = (state.selected.? + 1) % state.batch.?.occurrences.len;
+    {
+        const visual_rows = published.visual_rows;
+        const rows = published.buffer.rows;
+        defer published.visual_rows = visual_rows;
+        defer published.buffer.rows = rows;
+        published.visual_rows = &.{};
+        published.buffer.rows = &.{};
+        presentation.moveReviewSearch(1);
+    }
+    try expectReviewSearchMatchesFullProjection(published, state.batch.?, selected);
+}
+
+test "Review Search selection moves keep source and ReviewBody ranges active in place" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 4);
+    defer presentation.deinit();
+    const Between = struct {
+        fn run(_: *Presentation, _: usize) !void {}
+    };
+    _ = try publishCheckedReviewSources(&presentation, false, Between.run);
+    const published = presentation.published.?;
+    const state = &published.review_search;
+    const ranges = state.ranges.?.ptr;
+    var saw_source = false;
+    var saw_body = false;
+    var saw_multiple_active = false;
+    for (0..state.batch.?.occurrences.len) |_| {
+        const selected = (state.selected.? + 1) % state.batch.?.occurrences.len;
+        presentation.moveReviewSearch(1);
+        try expectReviewSearchMatchesFullProjection(published, state.batch.?, selected);
+        try testing.expectEqual(ranges, state.ranges.?.ptr);
+        switch (state.batch.?.occurrences[selected].location) {
+            .source => saw_source = true,
+            .review_body => saw_body = true,
+        }
+        var active_count: usize = 0;
+        for (state.ranges.?) |range| {
+            try testing.expectEqual(range.occurrence_index == selected, range.active);
+            active_count += @intFromBool(range.active);
+        }
+        try testing.expect(active_count > 0);
+        saw_multiple_active = saw_multiple_active or active_count > 1;
+    }
+    try testing.expect(saw_source and saw_body and saw_multiple_active);
+    presentation.moveReviewSearch(1);
+    try testing.expect(state.selected.? != 0);
+    presentation.scrollReviewSearch(-1);
+    try expectReviewSearchMatchesFullProjection(published, state.batch.?, 0);
+    try testing.expectEqual(ranges, state.ranges.?.ptr);
+    presentation.scrollReviewSearch(1);
+    try expectReviewSearchMatchesFullProjection(published, state.batch.?, state.batch.?.occurrences.len - 1);
+    try testing.expectEqual(ranges, state.ranges.?.ptr);
+    const list = frame_mod.reviewSearchGeometry(presentation.geometry).?.list;
+    try presentation.dispatch(.{ .mouse = .{ .col = list.x, .row = list.y + 1, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = list.x, .row = list.y + 1, .button = .left, .type = .release } });
+    try expectReviewSearchMatchesFullProjection(published, state.batch.?, 1);
+    try testing.expectEqual(ranges, state.ranges.?.ptr);
+}
+
+test "a Review Search selection move allocates nothing and keeps its ranges array" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearch(&store, failing.allocator(), 4);
+    defer presentation.deinit();
+    const Between = struct {
+        fn run(_: *Presentation, _: usize) !void {}
+    };
+    _ = try publishCheckedReviewSources(&presentation, false, Between.run);
+    const published = presentation.published.?;
+    const state = &published.review_search;
+    const ranges = state.ranges.?.ptr;
+    const selected = (state.selected.? + 1) % state.batch.?.occurrences.len;
+    const alloc_index = failing.alloc_index;
+    failing.fail_index = alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    presentation.moveReviewSearch(1);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectEqual(alloc_index, failing.alloc_index);
+    try testing.expectEqual(ranges, state.ranges.?.ptr);
+    try expectReviewSearchMatchesFullProjection(published, state.batch.?, selected);
+}
+
+test "a Review Search selection move projects absent ranges" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 4);
+    defer presentation.deinit();
+    const Between = struct {
+        fn run(_: *Presentation, _: usize) !void {}
+    };
+    _ = try publishCheckedReviewSources(&presentation, false, Between.run);
+    const published = presentation.published.?;
+    const state = &published.review_search;
+    const selected = (state.selected.? + 1) % state.batch.?.occurrences.len;
+    std.heap.page_allocator.free(state.ranges.?);
+    state.ranges = null;
+    presentation.moveReviewSearch(1);
+    try expectReviewSearchMatchesFullProjection(published, state.batch.?, selected);
 }
 
 test "each Review Search source publication matches a full projection of the combined state" {
