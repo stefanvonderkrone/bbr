@@ -1,6 +1,6 @@
 # 02: Project Review Search ranges once for each publication batch
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: none
 
 ## Summary
@@ -16,12 +16,53 @@ Most samples are in `munmap`, in `ArrayList(usize).append`, and in `PageAllocato
 `search.occurrenceLessThan` also appears.
 The match count grew from about 83,000 to about 87,400 in the last 100 seconds.
 
-## Cause (guess)
+## Cause
 
-Each `review_source_scanned` publication for one File projects the ranges of every occurrence again.
-With about 87,000 occurrences and 593 Files, the total work grows with the product of the two.
-The runner did not confirm this in the code.
+The triage confirmed the cause in `src/tui/presentation.zig` on 2026-11-12.
+`main` has the same code, so ticket 01 did not add it. Ticket 01 only made it visible.
 
-## Next step
+`acceptReviewSourceScanned` runs on the Presentation thread once for each File whose source scan completes.
+For each File, it does this work over the whole Review Search state:
 
-Triage the cause, measure it, and decide if the Presentation can project only the new File's occurrences or project once for a batch of publications.
+1. It copies the old occurrences and the new part into a new array.
+2. `search.rank` sorts the combined array again.
+3. `projectReviewRanges` calls `projectBufferSearchRangesFor`.
+   That function builds a `SourceRowKey` hash map over every visual row, about 111,700 on PullRequest A.
+   Then it projects every occurrence, not only the new ones.
+4. It allocates a new `ReviewSearchResult` array for every occurrence.
+
+So the cost of one publication grows with the visual rows plus all occurrences, and the total grows with the number of Files times that.
+On PullRequest A, that is 593 publications over about 87,000 occurrences.
+The work blocks the Presentation thread, so input also waits.
+
+## What to build
+
+The cost of one source scan publication grows with the occurrences of the new File, not with all visual rows and all occurrences.
+
+- Build the source row index once for each visual row revision, and reuse it for later publications.
+  Build it again only when the visual rows change.
+- Project only the occurrences of the new part, and merge the result into the sorted ranges.
+- Merge the new part into the ranked occurrences instead of sorting the whole array again, if the rank order allows a merge.
+- Keep the selection, the active range, and the results that a Review Search shows today.
+
+Another design that meets the criteria is also acceptable, for example one projection for each batch of publications.
+
+## Acceptance criteria
+
+- [ ] A test publishes the source scans of several Files one by one. After each publication, the ranges, the order of the occurrences, the selection, and the results are the same as a full projection of the combined state.
+- [ ] A test changes the visual rows between two publications, for example with a Layout switch or `o`. The ranges after the next publication match the new visual rows.
+- [ ] A test shows that a publication does not walk all visual rows when the visual rows did not change.
+  It can count index builds or use a seam that the implementation exposes.
+- [ ] Allocation failure tests for the new path keep the previous Review Search state, as `reviewSourcePublicationFailed` does today.
+- [ ] The live check: Review Search `e` on PullRequest A at 160 × 80 returns the CPU use to idle soon after the last File Enrichment.
+  Before the change, File Enrichment ended at about 86 seconds and the CPU became idle at about 255 seconds.
+  The completion records both times.
+- [ ] `zig build test` passes.
+
+## Comments
+
+### 2026-11-12 triage
+
+The runner triaged the ticket at the operator's request and set it to `ready-for-agent`.
+The triage read the code and confirmed the cause that the ticket guessed.
+The same publication path exists on `main`.
