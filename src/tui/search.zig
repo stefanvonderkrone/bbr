@@ -1260,6 +1260,27 @@ pub fn rank(batch: *Batch) void {
     std.mem.sort(Occurrence, batch.occurrences, Mode.fuzzy, occurrenceLessThan);
 }
 
+/// Merges two ranked arrays into `merged` in the order that `rank` gives to
+/// `ranked ++ part`. `ranked_index` and `part_index` receive the merged index
+/// of each input Occurrence.
+pub fn mergeRanked(ranked: []const Occurrence, part: []const Occurrence, merged: []Occurrence, ranked_index: []usize, part_index: []usize) void {
+    std.debug.assert(merged.len == ranked.len + part.len and ranked_index.len == ranked.len and part_index.len == part.len);
+    var left: usize = 0;
+    var right: usize = 0;
+    for (merged, 0..) |*target, index| {
+        // `rank` is stable, so an equal Occurrence of `ranked` comes first.
+        if (right < part.len and (left == ranked.len or occurrenceLessThan(.fuzzy, part[right], ranked[left]))) {
+            target.* = part[right];
+            part_index[right] = index;
+            right += 1;
+        } else {
+            target.* = ranked[left];
+            ranked_index[left] = index;
+            left += 1;
+        }
+    }
+}
+
 pub fn appendReviewBodyCandidates(
     allocator: std.mem.Allocator,
     body: review_body.ReviewBody,

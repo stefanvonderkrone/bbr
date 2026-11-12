@@ -2467,6 +2467,13 @@ fn appendIndexedIntersections(allocator: Allocator, projected: *std.ArrayList(fr
     for (projected.items[before..]) |*range| range.occurrence_index = occurrence_index;
 }
 
+fn mergedSearchRange(range: frame_mod.ProjectedSourceRange, merged_index: []const usize, active: ?usize) frame_mod.ProjectedSourceRange {
+    var result = range;
+    result.occurrence_index = merged_index[range.occurrence_index.?];
+    result.active = result.occurrence_index == active;
+    return result;
+}
+
 fn searchRangeLess(_: void, left: frame_mod.ProjectedSourceRange, right: frame_mod.ProjectedSourceRange) bool {
     if (left.visual_row != right.visual_row) return left.visual_row < right.visual_row;
     if (left.occurrence_index != right.occurrence_index) return (left.occurrence_index orelse 0) < (right.occurrence_index orelse 0);
@@ -5109,6 +5116,39 @@ const Published = struct {
 
     fn projectReviewRanges(self: *const Published, batch: search.Batch, active: ?usize) ![]frame_mod.ProjectedSourceRange {
         return projectBufferSearchRangesFor(std.heap.page_allocator, self.buffer, self.visual_rows, batch, active);
+    }
+
+    /// Projects only `part` through the retained SearchProjection and merges its
+    /// ranges into `ranked_ranges`, which are projected for the same visual rows.
+    /// The index slices map each input Occurrence to its merged index.
+    /// `scratch` holds the part projection. The result belongs to `page_allocator`.
+    fn mergeReviewRanges(
+        self: *const Published,
+        scratch: Allocator,
+        ranked_ranges: []const frame_mod.ProjectedSourceRange,
+        ranked_index: []const usize,
+        part: search.Batch,
+        part_index: []const usize,
+        active: ?usize,
+    ) ![]frame_mod.ProjectedSourceRange {
+        const projected = try self.search_projection.project(scratch, part);
+        defer scratch.free(projected.ranges);
+        defer scratch.free(projected.navigation_rows);
+        const merged = try std.heap.page_allocator.alloc(frame_mod.ProjectedSourceRange, ranked_ranges.len + projected.ranges.len);
+        var left: usize = 0;
+        var right: usize = 0;
+        for (merged) |*target| {
+            const ranked = if (left < ranked_ranges.len) mergedSearchRange(ranked_ranges[left], ranked_index, active) else null;
+            const added = if (right < projected.ranges.len) mergedSearchRange(projected.ranges[right], part_index, active) else null;
+            if (added != null and (ranked == null or searchRangeLess({}, added.?, ranked.?))) {
+                target.* = added.?;
+                right += 1;
+            } else {
+                target.* = ranked.?;
+                left += 1;
+            }
+        }
+        return merged;
     }
 
     fn projectBufferSearchRangesFor(
@@ -8640,6 +8680,7 @@ pub const Presentation = struct {
             part.owner = std.heap.page_allocator;
             var transferred = false;
             defer if (!transferred) part.deinit(self.allocator);
+            search.rank(&part);
             const old = state.batch orelse {
                 self.reviewSourcePublicationFailed(published, completed.file_index);
                 return;
@@ -8658,16 +8699,28 @@ pub const Presentation = struct {
                     return;
                 },
             };
-            @memcpy(occurrences[0..old.occurrences.len], if (old_copy) |copy| copy.occurrences else old.occurrences);
-            @memcpy(occurrences[old.occurrences.len..], part.occurrences);
-            var combined: search.Batch = .{ .occurrences = occurrences, .owner = std.heap.page_allocator };
-            search.rank(&combined);
+            const merged_index = self.allocator.alloc(usize, occurrences.len) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    std.heap.page_allocator.free(occurrences);
+                    self.reviewSourcePublicationFailed(published, completed.file_index);
+                    return;
+                },
+            };
+            defer self.allocator.free(merged_index);
+            const ranked_index = merged_index[0..old.occurrences.len];
+            const part_index = merged_index[old.occurrences.len..];
+            search.mergeRanked(if (old_copy) |copy| copy.occurrences else old.occurrences, part.occurrences, occurrences, ranked_index, part_index);
+            const combined: search.Batch = .{ .occurrences = occurrences, .owner = std.heap.page_allocator };
             const selected = retainedSearchIndex(state.batch, state.selected, combined);
             const same_selection = if (state.selected) |before| if (selected) |after|
                 before < old.occurrences.len and searchOccurrenceEql(old.occurrences[before], combined.occurrences[after])
             else
                 false else false;
-            const ranges = published.projectReviewRanges(combined, selected) catch |err| {
+            const merged_ranges = if (state.ranges) |ranked_ranges|
+                published.mergeReviewRanges(self.allocator, ranked_ranges, ranked_index, part, part_index, selected)
+            else
+                published.projectReviewRanges(combined, selected);
+            const ranges = merged_ranges catch |err| {
                 self.reportFailure(.review_search, .prepare, err, @src());
                 std.heap.page_allocator.free(occurrences);
                 self.reviewSourcePublicationFailed(published, completed.file_index);
@@ -33429,4 +33482,208 @@ test "Sidebar mouse click toggles a Directory and focuses a child File" {
     try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
     try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
+}
+
+/// Publishes `completed` and checks the result against a full rank and projection.
+/// With `hide_rows`, the publication runs without visual rows or Buffer rows.
+fn expectReviewSourcePublication(presentation: *Presentation, completed: ReviewSourceScanned, hide_rows: bool) !void {
+    const published = presentation.published.?;
+    const state = &published.review_search;
+    var ranked = try state.batch.?.clone(testing.allocator);
+    defer ranked.deinit(testing.allocator);
+    const ranked_selected = state.selected;
+    var part = try completed.outcome.scanned.clone(testing.allocator);
+    defer part.deinit(testing.allocator);
+    const visual_rows = published.visual_rows;
+    const rows = published.buffer.rows;
+    if (hide_rows) {
+        published.visual_rows = &.{};
+        published.buffer.rows = &.{};
+    }
+    const dispatched = presentation.dispatch(.{ .review_source_scanned = completed });
+    published.visual_rows = visual_rows;
+    published.buffer.rows = rows;
+    try dispatched;
+    const expected = try testing.allocator.alloc(search.Occurrence, ranked.occurrences.len + part.occurrences.len);
+    defer testing.allocator.free(expected);
+    @memcpy(expected[0..ranked.occurrences.len], ranked.occurrences);
+    @memcpy(expected[ranked.occurrences.len..], part.occurrences);
+    var full: search.Batch = .{ .occurrences = expected };
+    search.rank(&full);
+    try expectReviewSearchMatchesFullProjection(published, full, retainedSearchIndex(ranked, ranked_selected, full));
+}
+
+fn expectReviewSearchMatchesFullProjection(published: *Published, full: search.Batch, selected: ?usize) !void {
+    const state = &published.review_search;
+    const batch = state.batch.?;
+    try testing.expectEqual(full.occurrences.len, batch.occurrences.len);
+    for (full.occurrences, batch.occurrences) |want, got| try testing.expect(searchOccurrenceEql(want, got));
+    try testing.expectEqual(selected, state.selected);
+    const ranges = try published.projectBufferSearchRanges(batch, state.selected);
+    defer published.allocator.free(ranges);
+    try testing.expectEqualDeep(ranges, state.ranges.?);
+    try testing.expectEqual(batch.occurrences.len, state.results.?.len);
+    for (batch.occurrences, state.results.?) |occurrence, result| {
+        try testing.expect(searchOccurrenceEql(occurrence, result.occurrence));
+        try testing.expectEqualStrings(if (occurrence.location == .source) "SOURCE" else "DRAFT", result.kind);
+    }
+}
+
+/// Runs the queued work of a Review Search until no command remains and checks
+/// each source scan publication against a full projection. `between` runs
+/// after each publication. With `hide_rows`, every publication after the first
+/// runs without visual rows or Buffer rows.
+fn publishCheckedReviewSources(presentation: *Presentation, hide_rows: bool, between: *const fn (*Presentation, usize) anyerror!void) !usize {
+    var publications: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try expectReviewSourcePublication(presentation, completed, hide_rows and publications > 0);
+                publications += 1;
+                try between(presentation, publications);
+            },
+            else => return error.UnexpectedCommand,
+        }
+    }
+    return publications;
+}
+
+fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize) !Presentation {
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "a new idea\n\nnew again" });
+    var presentation = try Presentation.init(allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testManyFileSession(testing.allocator, 1, file_count) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    errdefer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try completeBufferSearchScan(&presentation);
+    try testing.expectEqual(@as(usize, 2), presentation.published.?.review_search.batch.?.occurrences.len);
+    return presentation;
+}
+
+test "each Review Search source publication matches a full projection of the combined state" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 12);
+    defer presentation.deinit();
+    const Between = struct {
+        // Selecting the last occurrence moves the selection that each later
+        // publication must keep.
+        fn run(target: *Presentation, publication: usize) !void {
+            if (publication % 3 == 1) target.selectReviewSearch(target.published.?.review_search.batch.?.occurrences.len - 1);
+        }
+    };
+    try testing.expectEqual(@as(usize, 12), try publishCheckedReviewSources(&presentation, false, Between.run));
+    const state = &presentation.published.?.review_search;
+    try testing.expectEqual(@as(usize, 14), state.batch.?.occurrences.len);
+    // Path order puts "10.zig" before "2.zig", so the Files do not arrive in rank order.
+    try testing.expectEqualStrings("0.zig", state.batch.?.occurrences[0].location.source.new_path);
+    try testing.expectEqualStrings("10.zig", state.batch.?.occurrences[2].location.source.new_path);
+}
+
+test "a Review Search source publication after a resize projects the new visual rows" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 6);
+    defer presentation.deinit();
+    const Between = struct {
+        fn run(target: *Presentation, publication: usize) !void {
+            if (publication != 2) return;
+            const published = target.published.?;
+            const rows = published.visual_rows.len;
+            const revision = published.visual_rows_revision;
+            try target.dispatch(.{ .resize = .{ .cols = 40, .rows = 40 } });
+            // A publication makes a queued view build stale, so the next scan
+            // waits until the view build commits.
+            try testing.expect(target.commands.items[0] == .scan_review_source);
+            const scan = target.commands.orderedRemove(0);
+            defer target.commands.insertAssumeCapacity(0, scan);
+            try completeDisclosureBuild(target);
+            try testing.expect(published.visual_rows_revision != revision);
+            try testing.expect(published.visual_rows.len != rows);
+        }
+    };
+    try testing.expectEqual(@as(usize, 6), try publishCheckedReviewSources(&presentation, false, Between.run));
+}
+
+test "a Review Search source publication does not walk the visual rows" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 4);
+    defer presentation.deinit();
+    const Between = struct {
+        fn run(_: *Presentation, _: usize) !void {}
+    };
+    // A publication that read the rows would lose the ranges of the new File.
+    try testing.expectEqual(@as(usize, 4), try publishCheckedReviewSources(&presentation, true, Between.run));
+}
+
+test "an allocation failure in a Review Search source publication keeps the previous state" {
+    var offset: usize = 0;
+    var failures: usize = 0;
+    while (true) : (offset += 1) {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try openTestReviewSourceSearch(&store, failing.allocator(), 3);
+        defer presentation.deinit();
+        const published = presentation.published.?;
+        const state = &published.review_search;
+        var publications: usize = 0;
+        const induced = while (presentation.takeCommand()) |next| {
+            var command = next;
+            switch (command) {
+                .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+                .build_buffer_disclosure => |job| {
+                    job.build();
+                    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+                },
+                .scan_review_source => |*scan| {
+                    const completed = executeReviewSourceScan(testing.allocator, scan);
+                    command.deinit();
+                    if (publications == 0) {
+                        try presentation.dispatch(.{ .review_source_scanned = completed });
+                        publications += 1;
+                        continue;
+                    }
+                    const file_index = completed.file_index;
+                    const occurrences = state.batch.?.occurrences;
+                    const ranges = state.ranges.?;
+                    const results = state.results.?;
+                    const selected = state.selected;
+                    const revision = presentation.projection().revision.frame;
+                    failing.fail_index = failing.alloc_index + offset;
+                    try presentation.dispatch(.{ .review_source_scanned = completed });
+                    failing.fail_index = std.math.maxInt(usize);
+                    if (!failing.has_induced_failure) break false;
+                    // A failure after the commit, such as in the next scan request, still publishes.
+                    if (state.batch.?.occurrences.len == occurrences.len) {
+                        try testing.expectEqual(occurrences.ptr, state.batch.?.occurrences.ptr);
+                        try testing.expectEqual(ranges.ptr, state.ranges.?.ptr);
+                        try testing.expectEqual(results.ptr, state.results.?.ptr);
+                        try testing.expectEqual(selected, state.selected);
+                        try testing.expectEqual(revision, presentation.projection().revision.frame);
+                        try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+                        try testing.expect(!state.source_scanned.?[file_index]);
+                        failures += 1;
+                    }
+                    break true;
+                },
+                else => return error.UnexpectedCommand,
+            }
+        } else return error.MissingSecondPublication;
+        if (!induced) break;
+    }
+    // The merge index, the part projection, and the results each fail once at least.
+    try testing.expect(failures >= 3);
 }
