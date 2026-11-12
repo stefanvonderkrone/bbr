@@ -1,6 +1,6 @@
 # 01: Coalesce File Enrichment rebuilds
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: none
 Session: OpenCode `ses_e76b68046ffeuy22et9of1N7Dp`
 
@@ -63,16 +63,41 @@ All paths are in `src/tui/presentation.zig`.
 ## What to build
 
 At most one enrichment rebuild waits in the queue.
-That rebuild applies every File Enrichment result that arrived before the worker starts it.
-A result that arrives while a rebuild runs goes into the next rebuild.
-A view rebuild, such as the one for `o`, is not starved by enrichment results.
+That rebuild carries every File Enrichment result that arrived before the worker starts it.
+A result that arrives while a rebuild runs joins the queued rebuild.
+When the Presentation rejects a stale enrichment rebuild, it replaces the queued rebuild with one rebuild that carries the results of both.
+It does not append a second rebuild.
+
+A batched rebuild keeps each per-File effect of the current single-File rebuild.
+These effects are in `acceptFileEnrichment`, `retryEnrichmentBuild`, and the enrichment branch after the commit in `acceptViewBuild`:
+
+- The `hold_enrichment` cache lease, for each File that Review Search does not hold yet.
+- The speculative flag, for each result.
+- `countFileCandidates`, the `acquired` flag, and `pumpReviewSearchAcquisition`.
+- The Review Search occurrence that waits for the File, the pending review location, and the version restoration.
+- On an allocation failure, `cancelReviewLocationForFile` and `resetLoading` for every File in the batch, and the error message only for a result that is not speculative.
+
+A view rebuild, such as the one for `o`, does not wait behind more than one enrichment rebuild.
+
+[M21 ticket 06](../../m21-buffer-review-search/issues/06-define-streaming-file-acquisition.md) coalesces query scans in the same way.
+It is prior art, not a blocker.
 
 ## Acceptance criteria
 
-- [ ] The number of enrichment rebuilds is not larger than the number of enrichment commits plus one for each rebuild that a user action made stale.
-- [ ] A test with many File Enrichment results and a slow rebuild shows that a stale rebuild is not run again for each later commit.
-- [ ] `o` during a Review Search acquisition of all Files isolates the File after at most one enrichment rebuild.
-- [ ] Review Search on PullRequest A acquires all Files, and the CPU use returns to idle in a time close to one rebuild for each batch of results.
-- [ ] The Review Search candidate count and the Buffer content after all Files are enriched are the same as before the change.
+- [ ] A Presentation test delivers many File Enrichment results while one enrichment rebuild runs. The queue then holds at most one enrichment rebuild, and it carries all of those results.
+- [ ] A Presentation test makes the queued enrichment rebuild stale. The Presentation replaces it with one rebuild that carries every result. No result is lost, and no result is built twice after its commit.
+- [ ] A Presentation test dispatches `o` while results arrive. The isolation applies after at most one enrichment rebuild.
+- [ ] Tests show each per-File effect in the list above for a batch of at least two Files, including an allocation failure in a batch with a speculative and a non-speculative result.
+- [ ] After all Files are enriched, the Review Search candidate count and the Buffer are the same as with single-File rebuilds.
+- [ ] The live check: Review Search `e` on PullRequest A at 160 × 80 returns the CPU use to idle. The completion records the time and the number of enrichment rebuilds. Before the change, the estimate was about 2 hours and 23 rebuilds for each File.
+- [ ] `zig build test` passes.
 
 ## Comments
+
+### 2026-11-12 triage
+
+The runner triaged the ticket at the operator's request and set it to `ready-for-agent`.
+The measurements in this ticket prove the cause, and no other ticket covers it.
+The triage added the per-File effects of a batched rebuild and made the acceptance criteria testable at the Presentation seam.
+The live check needs a Bitbucket Credential and the VPN. An agent can run it in tmux with a separate `XDG_STATE_HOME`, as the M30 outside check did.
+
