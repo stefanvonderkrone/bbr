@@ -71,7 +71,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tui/benchmark.zig"),
         .target = target,
         .optimize = bench_optimize,
-        .imports = &.{.{ .name = "bbr", .module = bench_core_mod }},
+        .imports = &.{
+            .{ .name = "bbr", .module = bench_core_mod },
+            .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+        },
     });
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/benchmark/main.zig"),

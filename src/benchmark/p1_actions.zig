@@ -76,14 +76,32 @@ pub fn bufferChecksum(buffer: tui.buffer.Buffer) u64 {
 
 pub const VisualRowsContext = struct {
     rows: []const tui.buffer.Row,
+    layout: tui.buffer.Layout = .unified,
     width: usize = 120,
 };
 
 pub fn visualRows(allocator: std.mem.Allocator, context: *const VisualRowsContext) ![]const tui.frame.VisualRow {
-    return tui.frame.buildVisualRowsWithOptions(allocator, context.rows, .bytes, .{
-        .layout = .unified,
+    return tui.frame.buildVisualRowsWithOptions(allocator, context.rows, tui.terminal_cell_metrics, .{
+        .layout = context.layout,
         .width = context.width,
     });
+}
+
+/// Source Lines of review-sized text in `count` rows: `.line` rows for
+/// Unified and `.line_pair` rows for SideBySide.
+pub fn sourceRows(allocator: std.mem.Allocator, texts: []const []const u8, count: usize, layout: tui.buffer.Layout) ![]const tui.buffer.Row {
+    const lines = try allocator.alloc(bbr.diff.Line, count);
+    const rows = try allocator.alloc(tui.buffer.Row, count);
+    for (lines, rows, 0..) |*line, *row, index| {
+        const number: u32 = @intCast(index + 1);
+        line.* = .{ .old_no = number, .new_no = number, .kind = .context, .text = texts[index % texts.len] };
+        const line_row: tui.buffer.LineRow = .{ .line = line, .decoration = .{ .runs = &.{} } };
+        row.* = switch (layout) {
+            .unified => .{ .line = line_row },
+            .side_by_side => .{ .line_pair = .{ .left = line_row, .right = line_row } },
+        };
+    }
+    return rows;
 }
 
 pub fn visualRowsChecksum(rows: []const tui.frame.VisualRow) u64 {
@@ -113,7 +131,7 @@ pub fn fileTree(allocator: std.mem.Allocator, context: *const FileTreeContext) !
         50,
         null,
         0,
-        .bytes,
+        tui.terminal_cell_metrics,
     );
 }
 
