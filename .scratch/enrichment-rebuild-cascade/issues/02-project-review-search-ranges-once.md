@@ -35,6 +35,11 @@ So the cost of one publication grows with the visual rows plus all occurrences, 
 On PullRequest A, that is 593 publications over about 87,000 occurrences.
 The work blocks the Presentation thread, so input also waits.
 
+## Goal
+
+The goal is a significant reduction of the CPU load of a Review Search on a large PullRequest.
+A change that is correct but does not reduce the measured CPU time does not resolve this ticket.
+
 ## What to build
 
 The cost of one source scan publication grows with the occurrences of the new File, not with all visual rows and all occurrences.
@@ -54,9 +59,12 @@ Another design that meets the criteria is also acceptable, for example one proje
 - [ ] A test shows that a publication does not walk all visual rows when the visual rows did not change.
   It can count index builds or use a seam that the implementation exposes.
 - [ ] Allocation failure tests for the new path keep the previous Review Search state, as `reviewSourcePublicationFailed` does today.
-- [ ] The live check: Review Search `e` on PullRequest A at 160 × 80 returns the CPU use to idle soon after the last File Enrichment.
-  Before the change, File Enrichment ended at about 86 seconds and the CPU became idle at about 255 seconds.
-  The completion records both times.
+- [ ] Before the change, the runner measures a baseline at commit `93c4600`, with the same build mode and the same steps.
+  The steps: a ReleaseFast build, PullRequest A at 160 × 80 in tmux with a separate `XDG_STATE_HOME`, `g f`, then `e`, then wait until the CPU is idle.
+  The measures: the total CPU time of the bbr process from `e` until idle (`ps -o time=` before and after), the time when File Enrichment ends, and the time when the CPU becomes idle.
+- [ ] After the change, the same steps use at most half of the baseline CPU time.
+- [ ] After the change, the CPU becomes idle within 15 seconds after File Enrichment ends.
+- [ ] The completion records the baseline, the result, and the reduction in percent.
 - [ ] `zig build test` passes.
 
 ## Comments
