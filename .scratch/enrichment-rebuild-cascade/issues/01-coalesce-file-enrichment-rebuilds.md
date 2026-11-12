@@ -1,6 +1,6 @@
 # 01: Coalesce File Enrichment rebuilds
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 Session: OpenCode `ses_e76b68046ffeuy22et9of1N7Dp`
 
@@ -84,13 +84,67 @@ It is prior art, not a blocker.
 
 ## Acceptance criteria
 
-- [ ] A Presentation test delivers many File Enrichment results while one enrichment rebuild runs. The queue then holds at most one enrichment rebuild, and it carries all of those results.
-- [ ] A Presentation test makes the queued enrichment rebuild stale. The Presentation replaces it with one rebuild that carries every result. No result is lost, and no result is built twice after its commit.
-- [ ] A Presentation test dispatches `o` while results arrive. The isolation applies after at most one enrichment rebuild.
-- [ ] Tests show each per-File effect in the list above for a batch of at least two Files, including an allocation failure in a batch with a speculative and a non-speculative result.
-- [ ] After all Files are enriched, the Review Search candidate count and the Buffer are the same as with single-File rebuilds.
-- [ ] The live check: Review Search `e` on PullRequest A at 160 × 80 returns the CPU use to idle. The completion records the time and the number of enrichment rebuilds. Before the change, the estimate was about 2 hours and 23 rebuilds for each File.
-- [ ] `zig build test` passes.
+- [x] A Presentation test delivers many File Enrichment results while one enrichment rebuild runs. The queue then holds at most one enrichment rebuild, and it carries all of those results.
+- [x] A Presentation test makes the queued enrichment rebuild stale. The Presentation replaces it with one rebuild that carries every result. No result is lost, and no result is built twice after its commit.
+- [x] A Presentation test dispatches `o` while results arrive. The isolation applies after at most one enrichment rebuild.
+- [x] Tests show each per-File effect in the list above for a batch of at least two Files, including an allocation failure in a batch with a speculative and a non-speculative result.
+- [x] After all Files are enriched, the Review Search candidate count and the Buffer are the same as with single-File rebuilds.
+- [x] The live check: Review Search `e` on PullRequest A at 160 × 80 returns the CPU use to idle. The completion records the time and the number of enrichment rebuilds. Before the change, the estimate was about 2 hours and 23 rebuilds for each File.
+- [x] `zig build test` passes.
+
+## Completion
+
+Commits `ae39a66d` and `8c5770a6` on branch `enrichment-rebuild-cascade` fix the cascade in `src/tui/presentation.zig`.
+
+- At most one enrichment rebuild waits in the queue. It carries a list of File Enrichment results, and each new result joins it.
+- A stale enrichment rebuild gives its results to the queued rebuild, ahead of the later results. It does not append a second rebuild.
+- `takeCommand` snapshots the Session again when a worker takes the queued enrichment rebuild. Without this step, a rebuild that waited during a commit was always stale, so every second rebuild was lost.
+- A view rebuild goes ahead of the queued enrichment rebuild. It waits only for the running rebuild.
+- The commit admits the Files in arrival order. It keeps each per-File effect of the single-File rebuild. Admission refuses only a result that it cannot admit and queues the other results again.
+- `file_enrichment.Storage.checkAdmission` lets the commit check every result before it changes the Storage.
+
+### Tests
+
+New Presentation tests cover each criterion:
+
+- "File Enrichment results that arrive during an enrichment rebuild join one queued rebuild"
+- "a stale enrichment rebuild gives its results to the one queued rebuild"
+- "isolating a File during File Enrichment waits for the running rebuild only"
+- "one enrichment rebuild keeps the Review Search effects of each File in it": the hold, the candidate count, the acquisition, and the next acquisition.
+- "a failed enrichment rebuild releases each File and reports only demanded Files": a speculative and a demanded result in one failed rebuild.
+- "batched enrichment rebuild opens the waiting Review Search occurrence", "batched enrichment rebuild restores the waiting Selected Version location", and "batched enrichment rebuild restores the pending WholeFile review location after refresh"
+- "batched enrichment rebuilds publish the Buffer and candidates of single-File rebuilds"
+
+The first test failed on the old code with `expected 1, found 4` queued rebuilds.
+Four older tests expected one rebuild for each File. They now expect one rebuild for the batch.
+No test reaches the drop path after an allocation failure in `queueEnrichments`, or a refused admission, because no public input causes them.
+
+### Checks
+
+- `zig build test`: pass.
+- `zig fmt --check build.zig src tests`: pass.
+- `python3 tools/check_agent_docs.py`: pass.
+
+### Live check
+
+The runner ran a `ReleaseFast` build with temporary rebuild counters on PullRequest A at 160 × 80, with a separate `XDG_STATE_HOME`. Review Search `e` started after the Session load.
+
+| Measure | Before (ticket estimate) | After |
+| --- | --- | --- |
+| Enrichment rebuilds | about 23 for each File, about 2 hours of CPU | 103 for 592 Files |
+| Rejected enrichment rebuilds | 683 of 696 in 120 seconds | 1 |
+| Last enrichment rebuild | not reached | about 86 seconds |
+| CPU idle | not reached | about 255 seconds |
+
+The candidate count stopped at its final value at about 86 seconds.
+From about 86 to 255 seconds, the CPU sample shows the Presentation thread in `Published.projectReviewRanges` for each Review Search source scan publication. That cost is outside this ticket, and [ticket 02](02-project-review-search-ranges-once.md) records it.
+With Review Search open during acquisition, Esc and `o` changed the hint to `o all files` after 0.6 seconds. The view rebuild ran twice. The first run was stale because the running enrichment rebuild committed first.
+
+### Review
+
+The two-axis code review found no violation of a documented standard.
+The review found an all-or-nothing admission refusal and a missing hold for results that joined a queued rebuild. Commit `8c5770a6` fixes both. The review also asked for batch tests of three per-File effects, which commit `8c5770a6` adds.
+`refreshEnrichmentBuild` makes a new snapshot at each take, also when the queued rebuild is still current. The cost is small next to one rebuild, so the runner kept the simpler rule.
 
 ## Comments
 
