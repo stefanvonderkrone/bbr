@@ -334,9 +334,10 @@ pub fn buildVisualRowsWithOptions(
                 try visual_rows.append(allocator, makeVisualRow(row, buffer_index));
                 continue;
             }
+            const narrow_ascii = metrics.narrowAscii(line_row.line.text);
             var start: usize = 0;
             while (start < line_row.line.text.len) {
-                const end = wrapEnd(line_row.line.text, start, body_width, metrics);
+                const end = wrapEnd(line_row.line.text, start, body_width, metrics, narrow_ascii);
                 try appendWrappedVisualRow(allocator, &visual_rows, row, buffer_index, start, end);
                 start = end;
             }
@@ -439,9 +440,11 @@ fn appendWrappedLinePair(
     var right_start: usize = 0;
     var left_done = pair.left == null;
     var right_done = pair.right == null;
+    const left_ascii = if (pair.left) |half| metrics.narrowAscii(half.line.text) else false;
+    const right_ascii = if (pair.right) |half| metrics.narrowAscii(half.line.text) else false;
     while (!left_done or !right_done) {
-        const left = if (!left_done) makeVisualHalf(pair.left.?, left_start, widths.left, metrics) else null;
-        const right = if (!right_done) makeVisualHalf(pair.right.?, right_start, widths.right, metrics) else null;
+        const left = if (!left_done) makeVisualHalf(pair.left.?, left_start, widths.left, metrics, left_ascii) else null;
+        const right = if (!right_done) makeVisualHalf(pair.right.?, right_start, widths.right, metrics, right_ascii) else null;
         const target = right orelse left.?;
         try visual_rows.append(allocator, .{
             .buffer_index = buffer_index,
@@ -467,8 +470,8 @@ fn appendWrappedLinePair(
     }
 }
 
-fn makeVisualHalf(line_row: buffer_mod.LineRow, start: usize, width: usize, metrics: CellMetrics) VisualHalf {
-    const end = if (line_row.line.text.len == 0) 0 else wrapEnd(line_row.line.text, start, width, metrics);
+fn makeVisualHalf(line_row: buffer_mod.LineRow, start: usize, width: usize, metrics: CellMetrics, narrow_ascii: bool) VisualHalf {
+    const end = if (line_row.line.text.len == 0) 0 else wrapEnd(line_row.line.text, start, width, metrics, narrow_ascii);
     return .{
         .line = line_row.line,
         .source_start = start,
@@ -533,7 +536,15 @@ fn candidatesForLine(line: *const bbr.diff.Line) YankCandidates {
 
 pub const unified_gutter_cols: usize = anchor_cols + 10;
 
-fn wrapEnd(text: []const u8, start: usize, width: usize, metrics: CellMetrics) usize {
+/// `narrow_ascii` is `metrics.narrowAscii(text)`. Then each byte is one
+/// grapheme of one cell and the space is the only whitespace, so the wrap
+/// gives the same end as the grapheme loop without the adapter.
+fn wrapEnd(text: []const u8, start: usize, width: usize, metrics: CellMetrics, narrow_ascii: bool) usize {
+    if (narrow_ascii) {
+        if (text.len - start <= width) return text.len;
+        if (std.mem.lastIndexOfScalar(u8, text[start .. start + width], ' ')) |space| return start + space + 1;
+        return start + @max(width, 1);
+    }
     var pos = start;
     var cells: usize = 0;
     var whitespace_end: ?usize = null;
@@ -962,6 +973,104 @@ test "Unified hard wrapping keeps wide and combining graphemes complete" {
     try testing.expectEqual(@as(usize, 6), visual_rows[1].source_end);
     try testing.expectEqualStrings("e\xcc\x81", line.text[visual_rows[0].source_start..visual_rows[0].source_end]);
     try testing.expectEqualStrings("界", line.text[visual_rows[1].source_start..visual_rows[1].source_end]);
+}
+
+test "a printable ASCII Line wraps at the same positions as the grapheme loop" {
+    const terminal = @import("terminal_cell_metrics.zig").metrics;
+    const cases = [_][]const u8{
+        "short",
+        "abcdef",
+        "abcdefghijklmnopqrstuvwxyz",
+        "abcdef ghi",
+        "abc def ghi jkl ",
+        "trailing space ",
+        "  leading and  double  spaces  ",
+        "ascii then e\xcc\x81 combining",
+        "ascii then \xe7\x95\x8c\xe9\x9d\xa2 wide",
+        "abcde\xcc\x81",
+        "emoji \xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb and flag \xf0\x9f\x87\xac\xf0\x9f\x87\xa7 here",
+        "\tindented with a tab",
+        "a\tb\tc d\te",
+        "bell\x07 escape\x1b[0m nul\x00 del\x7f",
+        "carriage return\r",
+        "cr lf\r\n",
+        "~!@#$%^&*()_+{}|:\"<>? `-=[]\\;',./",
+    };
+    var prng = std.Random.DefaultPrng.init(0x7405);
+    const random = prng.random();
+    const ascii_parts = [_][]const u8{ "a", "Z", "0", "~", " ", "  ", "abc", "(x)" };
+    const mixed_parts = ascii_parts ++ [_][]const u8{ "\t", "\r", "\x01", "e\xcc\x81", "\xe7\x95\x8c", "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb", "\xc2\xa0" };
+    var generated: [400][64]u8 = undefined;
+    var generated_lens: [400]usize = undefined;
+    for (&generated, &generated_lens, 0..) |*storage, *len, index| {
+        const parts: []const []const u8 = if (index % 2 == 0) &ascii_parts else &mixed_parts;
+        len.* = 0;
+        while (true) {
+            const part = parts[random.uintLessThan(usize, parts.len)];
+            if (len.* + part.len > storage.len) break;
+            @memcpy(storage[len.*..][0..part.len], part);
+            len.* += part.len;
+            if (random.uintLessThan(u8, 8) == 0) break;
+        }
+    }
+
+    var texts: [cases.len + generated.len][]const u8 = undefined;
+    for (cases, 0..) |text, index| texts[index] = text;
+    for (&generated, generated_lens, cases.len..) |*storage, len, index| texts[index] = storage[0..len];
+    var ascii_texts: usize = 0;
+    for (texts) |text| {
+        if (terminal.narrowAscii(text)) ascii_texts += 1;
+    }
+    try testing.expect(ascii_texts > 200);
+
+    var grapheme_loop = terminal;
+    grapheme_loop.ascii_is_narrow = false;
+    for (texts) |text| {
+        const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = text };
+        const line_row: buffer_mod.LineRow = .{ .line = &line, .decoration = .{ .runs = &.{} } };
+        const unified = [_]buffer_mod.Row{.{ .line = line_row }};
+        const side_by_side = [_]buffer_mod.Row{.{ .line_pair = .{ .left = line_row, .right = line_row } }};
+        for (1..text.len + 3) |body_width| {
+            try expectSameVisualRows(&unified, terminal, grapheme_loop, .{ .layout = .unified, .width = unified_gutter_cols + body_width });
+            const side_width = 2 * (side_gutter_cols + body_width) + side_divider_cols;
+            try expectSameVisualRows(&side_by_side, terminal, grapheme_loop, .{ .layout = .side_by_side, .width = side_width });
+            try expectSameVisualRows(&side_by_side, terminal, grapheme_loop, .{ .layout = .side_by_side, .width = side_width + 1 });
+        }
+    }
+}
+
+test "a printable ASCII Line wraps after the last space that fits" {
+    const terminal = @import("terminal_cell_metrics.zig").metrics;
+    const expectations = [_]struct { text: []const u8, width: usize, rows: []const []const u8 }{
+        .{ .text = "abcdef", .width = 6, .rows = &.{"abcdef"} },
+        .{ .text = "abcdefg", .width = 6, .rows = &.{ "abcdef", "g" } },
+        .{ .text = "abcdef ghi", .width = 6, .rows = &.{ "abcdef", " ghi" } },
+        .{ .text = "abcde fghi", .width = 6, .rows = &.{ "abcde ", "fghi" } },
+        .{ .text = "ab cd ef gh", .width = 6, .rows = &.{ "ab cd ", "ef gh" } },
+        .{ .text = "abc   ", .width = 4, .rows = &.{ "abc ", "  " } },
+    };
+    for (expectations) |expected| {
+        const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = expected.text };
+        const rows = [_]buffer_mod.Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{} } } }};
+        const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, terminal, .{ .layout = .unified, .width = unified_gutter_cols + expected.width });
+        defer testing.allocator.free(visual_rows);
+        try testing.expectEqual(expected.rows.len, visual_rows.len);
+        for (expected.rows, visual_rows) |text, visual_row| try testing.expectEqualStrings(text, line.text[visual_row.source_start..visual_row.source_end]);
+    }
+}
+
+fn expectSameVisualRows(rows: []const buffer_mod.Row, fast: CellMetrics, grapheme_loop: CellMetrics, options: VisualRowOptions) !void {
+    const expected = try buildVisualRowsWithOptions(testing.allocator, rows, grapheme_loop, options);
+    defer testing.allocator.free(expected);
+    const actual = try buildVisualRowsWithOptions(testing.allocator, rows, fast, options);
+    defer testing.allocator.free(actual);
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| {
+        try testing.expectEqual(want.source_start, got.source_start);
+        try testing.expectEqual(want.source_end, got.source_end);
+        try testing.expectEqual(want.continuation, got.continuation);
+        try testing.expectEqual(want.halves, got.halves);
+    }
 }
 
 test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {

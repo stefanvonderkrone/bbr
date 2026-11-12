@@ -18,3 +18,16 @@ fn nextGrapheme(_: *const anyopaque, text: []const u8) cell_metrics.Measurement 
 fn widthText(_: *const anyopaque, text: []const u8) usize {
     return vaxis.gwidth.gwidth(text, .unicode);
 }
+
+test "vaxis measures each printable ASCII byte before ASCII or the end as one grapheme of one cell" {
+    const std = @import("std");
+    try std.testing.expect(metrics.ascii_is_narrow);
+    for (0x20..0x7f) |first| {
+        const alone = [_]u8{@intCast(first)};
+        try std.testing.expectEqual(cell_metrics.Measurement{ .byte_len = 1, .cell_width = 1 }, nextGrapheme(&context, &alone));
+        for (0..0x80) |second| {
+            const pair = [_]u8{ @intCast(first), @intCast(second) };
+            try std.testing.expectEqual(cell_metrics.Measurement{ .byte_len = 1, .cell_width = 1 }, nextGrapheme(&context, &pair));
+        }
+    }
+}
