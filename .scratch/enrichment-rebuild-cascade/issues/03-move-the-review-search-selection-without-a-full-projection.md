@@ -1,6 +1,6 @@
 # 03: Move the Review Search selection without a full projection
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -64,15 +64,15 @@ It is out of scope for this ticket. See the comment below.
 
 ## Acceptance criteria
 
-- [ ] A test moves the selection through several occurrences, in source and in ReviewBody locations. It uses `moveReviewSearch`, `scrollReviewSearch`, and a press in the results list. After each move, the ranges are the same as a full projection with the new selected index.
-- [ ] A test shows that a selection move does not walk the visual rows, in the same way as the test "a Review Search source publication does not walk the visual rows" of ticket 02.
-- [ ] A test shows that a selection move with ranges present makes no allocation, for example with a failing allocator.
-- [ ] A test covers the fallback when the ranges are absent.
-- [ ] The live check repeats the measurement of this ticket with the same workload and steps, before and after the change.
+- [x] A test moves the selection through several occurrences, in source and in ReviewBody locations. It uses `moveReviewSearch`, `scrollReviewSearch`, and a press in the results list. After each move, the ranges are the same as a full projection with the new selected index.
+- [x] A test shows that a selection move does not walk the visual rows, in the same way as the test "a Review Search source publication does not walk the visual rows" of ticket 02.
+- [x] A test shows that a selection move with ranges present makes no allocation, for example with a failing allocator.
+- [x] A test covers the fallback when the ranges are absent.
+- [x] The live check repeats the measurement of this ticket with the same workload and steps, before and after the change.
   50 `Down` presses use at most 10 percent of the baseline CPU time, at most 3.8 seconds.
   The CPU is idle within 2 seconds after the last press.
   The completion records both CPU times and the reduction in percent.
-- [ ] `zig build test` passes.
+- [x] `zig build test` passes.
 
 ## Comments
 
@@ -86,4 +86,64 @@ The first result of a query calls the same projection with the page allocator.
 On the same workload, it can cost about 0.77 seconds of Presentation time for each query generation.
 The triage did not measure it.
 A follow-up ticket can change `projectReviewRanges` to the retained `search_projection`, or give the row index an arena.
+
+### 2026-11-12 open point
+
+A disclosure build that starts before a selection move can publish its Review Search ranges with the selection of its start.
+The admissions in `src/tui/presentation.zig` that take `job.review_ranges` do not mark the active ranges again.
+This behavior existed before this ticket. This ticket did not change it.
+
+## Completion
+
+Commits `e995fc96` and `cc64438b`.
+
+### Change
+
+- A selection move with ranges present calls `markActiveSearchRanges` and keeps the same ranges array.
+  It does not project, does not walk the visual rows, and does not allocate.
+- Without ranges, a move projects through the retained `SearchProjection` with the new `SearchProjection.projectRanges`.
+- `acceptReviewSearchScanned`, the merge fallback, the disclosure rebuild, and the Buffer Search benchmark also use the retained `SearchProjection`.
+- `Published.projectBufferSearchRangesFor` and `Published.projectBufferSearchRanges` are a compile error outside a test build.
+  The tests use them as the independent oracle.
+  The old `projectReviewRanges` body of commit `48e6abc` fails `zig build` with this error.
+- The rules table in `AGENTS.md` has a row for the retained projection and its enforcement.
+- The fixture `openTestReviewSourceSearch` has an emphasized ReviewBody match, so one occurrence has two ranges.
+
+### Tests
+
+- "Review Search selection moves keep source and ReviewBody ranges active in place" uses `moveReviewSearch`, `scrollReviewSearch`, and a press in the results list.
+- "a Review Search selection move does not walk the visual rows".
+- "a Review Search selection move allocates nothing and keeps its ranges array".
+  The Presentation allocator records no allocation, and the ranges array keeps its pointer.
+- "a Review Search selection move projects absent ranges".
+- The M21 disclosure worker test now compares complete ranges with the oracle.
+
+### Live check
+
+ReleaseFast builds, the workload and the steps of the measurement above, one press each 0.2 seconds.
+The baseline is commit `48e6abc`. Runs alternated between the baseline and the change.
+
+| Run | CPU time of 50 `Down` presses | Busy time after the last press |
+| --- | --- | --- |
+| Baseline 1 | 37.95 seconds | 27.6 seconds |
+| Baseline 2 | 36.09 seconds | 25.6 seconds |
+| Change 1 | 1.97 seconds | 0.02 seconds |
+| Change 2 | 1.97 seconds | 0.02 seconds |
+| Change 3 | 1.94 seconds | 0.02 seconds |
+
+The CPU time went from 37.0 seconds (median of 2) to 1.97 seconds (median of 3), a reduction of 94.7 percent.
+Each run ended at selection 15645 of 160,576 matches, 50 moves after the start.
+The CPU time from the query until idle did not change measurably: 43.1 and 43.3 seconds before, 41.9 to 42.9 seconds after.
+
+### Checks
+
+- `zig build test --summary all`: exit code 0, 1623 of 1623 tests passed.
+- `zig fmt --check build.zig src tests`: exit code 0.
+- `python3 tools/check_agent_docs.py`: pass.
+
+### Review
+
+The Standards and Spec reviews found no hard violation.
+The fixes after the review: one constant for the compile error message, a `projectOccurrences` call in `mergeReviewRanges`, a selection check before the backward scroll, and a correct claim in the rules row.
+The open point above remains.
 
