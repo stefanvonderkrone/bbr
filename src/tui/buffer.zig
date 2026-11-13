@@ -216,7 +216,7 @@ pub const Fold = struct {
 /// deferred.) Every hidden-content owner keeps a persistent disclosure row and
 /// is expanded only when its tagged semantic key is explicitly present.
 pub const BuildOptions = struct {
-    /// Reclaimable storage for temporary rows. It must not be the result arena.
+    /// Reclaimable storage for ReviewCard projection scratch, separate from the result arena.
     scratch_allocator: std.mem.Allocator = std.heap.page_allocator,
     fold_context: bool = false,
     context_margin: usize = 3,
@@ -704,7 +704,8 @@ pub fn buildWithComments(
     opts: BuildOptions,
 ) BuildError!Buffer {
     var rows: std.ArrayList(Row) = .empty;
-    defer rows.deinit(opts.scratch_allocator);
+    errdefer rows.deinit(allocator);
+    try rows.ensureTotalCapacityPrecise(allocator, rowCapacity(diff, layout, threads, opts));
     var projection_scratch = std.heap.ArenaAllocator.init(opts.scratch_allocator);
     defer projection_scratch.deinit();
     var file_rows: std.ArrayList(FileRow) = .empty;
@@ -800,7 +801,7 @@ pub fn buildWithComments(
         if (!emitted_threads[index] and isPrLevel(thread)) pr_count += 1;
     };
     if (pr_count > 0) {
-        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
+        try rows.append(allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
         for (threads) |*t| {
             if (isPrLevel(t.*)) try w.emitThread(t);
         }
@@ -811,7 +812,7 @@ pub fn buildWithComments(
     // emitThread / emitDraft), not here.
     const pending_count = if (opts.only_file == null) countPendingRoots(opts.drafts) else 0;
     if (pending_count > 0) {
-        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
+        try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
         for (opts.drafts, 0..) |*d, i| {
             if (d.parent == null and draftScope(d, opts) == .review) try w.emitDraft(i);
         }
@@ -833,7 +834,7 @@ pub fn buildWithComments(
             file.old_path
         else
             file.new_path;
-        try rows.append(opts.scratch_allocator, .{ .file_header = .{ .file = file, .path = header_path } });
+        try rows.append(allocator, .{ .file_header = .{ .file = file, .path = header_path } });
 
         // File-level roots live at the File header, before hunks/folds/lines.
         for (threads) |*t| {
@@ -844,15 +845,15 @@ pub fn buildWithComments(
         }
 
         if (whole_unified) {
-            if (wholeFileState(opts, fi, file.*)) |state| try rows.append(opts.scratch_allocator, .{ .status_placeholder = switch (opts.selected_version) {
+            if (wholeFileState(opts, fi, file.*)) |state| try rows.append(allocator, .{ .status_placeholder = switch (opts.selected_version) {
                 .old => .{ .file = file, .old = state },
                 .new => .{ .file = file, .new = state },
             } });
         } else if (whole_side_by_side) {
             const old = wholeFileStateFor(opts, fi, file.*, .old);
             const new = wholeFileStateFor(opts, fi, file.*, .new);
-            if (old != null or new != null) try rows.append(opts.scratch_allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } });
-        } else try emitStatusPlaceholders(opts.scratch_allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
+            if (old != null or new != null) try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } });
+        } else try emitStatusPlaceholders(allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
 
         // True-whole-file: splice the fetched Hunk lines into the selected side's
         // unchanged lines and emit one continuous sequence without headers or
@@ -868,7 +869,7 @@ pub fn buildWithComments(
             try w.emitSideBySideWholeFile(file, old, new);
         } else if (!whole_unified) {
             for (file.hunks) |*hunk| {
-                try rows.append(opts.scratch_allocator, .{ .hunk_header = hunk });
+                try rows.append(allocator, .{ .hunk_header = hunk });
                 const folds = try computeFolds(allocator, hunk.lines, opts);
                 switch (layout) {
                     .unified => try w.emitUnifiedHunk(file, hunk.lines, if (opts.emphasis_cache) |cache| cache.entries.get(hunk).? else try computeEmphasis(allocator, hunk.lines), folds),
@@ -885,7 +886,7 @@ pub fn buildWithComments(
         if (od_count > 0) {
             const key: DisclosureKey = .{ .outdated_file = file };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
-            try rows.append(opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
+            try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
             if (expanded) {
                 for (threads) |*t| {
                     if (isFileOutdated(t.*, file.*)) try w.emitThreadContent(t, false);
@@ -924,7 +925,7 @@ pub fn buildWithComments(
     if (fallback_outdated_count > 0) {
         const key: DisclosureKey = .outdated_review;
         const expanded = w.expanded_disclosures.contains(disclosureId(key));
-        try rows.append(opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
+        try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
         if (expanded) {
             if (opts.only_file == null) for (threads, 0..) |*thread, thread_index| {
                 if (!emitted_threads[thread_index] and thread.root.state == .outdated) try w.emitThreadContent(thread, false);
@@ -945,7 +946,7 @@ pub fn buildWithComments(
         }
     }
     if (unavailable_count > 0) {
-        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .unavailable, .count = unavailable_count } });
+        try rows.append(allocator, .{ .section = .{ .kind = .unavailable, .count = unavailable_count } });
         for (opts.drafts, 0..) |*draft, draft_index| {
             if (draft.parent != null or emitted[draft_index]) continue;
             if (!draftInScope(draft, diff, opts)) continue;
@@ -970,14 +971,14 @@ pub fn buildWithComments(
             (opts.only_file == null and w.parentUnavailable(d.parent)))) stranded += 1;
     }
     if (stranded > 0) {
-        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
+        try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
         for (opts.drafts, 0..) |*d, i| {
             if (!emitted[i] and ((d.parent == null and draftInScope(d, diff, opts)) or
                 (opts.only_file == null and w.parentUnavailable(d.parent)))) try w.emitDraft(i);
         }
     }
 
-    const owned_rows = try allocator.dupe(Row, rows.items);
+    const owned_rows = try rows.toOwnedSlice(allocator);
     const row_kinds = try allocator.alloc(RowKind, owned_rows.len);
     if (tree_starts.items.len > 0) {
         const cards = try allocator.alloc(review_card.Card, w.card_count);
@@ -998,6 +999,39 @@ pub fn buildWithComments(
         .file_rows = try file_rows.toOwnedSlice(allocator),
         .file_rows_end = file_rows_end,
     };
+}
+
+fn rowCapacity(diff: model.Diff, layout: Layout, threads: []const Thread, opts: BuildOptions) usize {
+    // Estimate without projecting cards or folds. A miss still permits normal growth.
+    var count: usize = 5 + opts.expanded_disclosures.len;
+    for (diff.files, 0..) |file, index| {
+        if (opts.only_file) |only| if (index != only) continue;
+        count += 5;
+        for (file.hunks) |hunk| count += 1 + hunk.lines.len;
+        if (opts.whole_file and index < opts.blobs.len) {
+            const blob = opts.blobs[index];
+            if (layout == .side_by_side or opts.selected_version == .old) {
+                if (blob.old) |text| count += std.mem.count(u8, text, "\n") + 1;
+            }
+            if (layout == .side_by_side or opts.selected_version == .new) {
+                if (blob.new) |text| count += std.mem.count(u8, text, "\n") + 1;
+            }
+        }
+    }
+    const content_width = @max(@min(cardContentWidth(opts.card_width, anchor_cols), 40) / 2, 1);
+    for (threads) |thread| {
+        count += cardRowCapacity(thread.root.body, content_width);
+        for (thread.replies) |reply| count += cardRowCapacity(reply.body, content_width);
+    }
+    for (opts.drafts) |draft| {
+        count += cardRowCapacity(draft.body, content_width);
+        if (draft.snapshot) |snapshot| count += std.mem.count(u8, snapshot.text, "\n") + 1;
+    }
+    return count;
+}
+
+fn cardRowCapacity(body: []const u8, content_width: usize) usize {
+    return 8 + 2 * std.mem.count(u8, body, "\n") + body.len / content_width;
 }
 
 /// Build the semantic Buffer Search corpus before Fold and ReviewCard
@@ -1215,7 +1249,7 @@ const Weave = struct {
             const key: DisclosureKey = .{ .resolved_thread = t.root.id };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
             if (!expanded) {
-                try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = false, .count = t.replies.len, .author = t.root.author } });
+                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = false, .count = t.replies.len, .author = t.root.author } });
                 return;
             }
         }
@@ -1276,7 +1310,7 @@ const Weave = struct {
     }
 
     pub fn append(w: *Weave, row: ReviewCardRow) !void {
-        try w.rows.append(w.opts.scratch_allocator, switch (row.owner) {
+        try w.rows.append(w.a, switch (row.owner) {
             .comment => .{ .comment = row },
             .draft => .{ .draft = row },
         });
@@ -1346,7 +1380,7 @@ const Weave = struct {
             var lines = std.mem.splitScalar(u8, snapshot.text, '\n');
             var line_index: u32 = 0;
             while (lines.next()) |line| : (line_index += 1) {
-                try w.rows.append(w.opts.scratch_allocator, .{ .snapshot = .{
+                try w.rows.append(w.a, .{ .snapshot = .{
                     .draft = draft,
                     .line = line,
                     .selected = line_index >= snapshot.selection_start and line_index < snapshot.selection_start +| snapshot.selection_len,
@@ -1402,13 +1436,13 @@ const Weave = struct {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
                 const expanded = w.expanded_disclosures.contains(disclosureId(key));
-                try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
+                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
                     continue;
                 }
             }
-            try w.rows.append(w.opts.scratch_allocator, .{ .line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), emphasis[i]) });
+            try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), emphasis[i]) });
             try w.weaveInline(file, &lines[i]);
             i += 1;
         }
@@ -1418,7 +1452,7 @@ const Weave = struct {
         for (lines) |line| {
             var projected = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
             projected.display_version = side;
-            try w.rows.append(w.opts.scratch_allocator, .{ .line = projected });
+            try w.rows.append(w.a, .{ .line = projected });
             try w.weaveInlineSide(file, line, side);
         }
     }
@@ -1445,7 +1479,7 @@ const Weave = struct {
         if (count == 0) return;
         const key: DisclosureKey = .{ .opposite_version = file };
         const expanded = w.expanded_disclosures.contains(disclosureId(key));
-        try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{
+        try w.rows.append(w.a, .{ .disclosure = .{
             .key = key,
             .kind = .opposite_version,
             .expanded = expanded,
@@ -1519,7 +1553,7 @@ const Weave = struct {
             pair.right = try decoratedLine(w.a, line, w.span_cursors.lineSpansForSide(line.*, .new), &.{});
             pair.right.?.display_version = .new;
         }
-        try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = pair });
+        try w.rows.append(w.a, .{ .line_pair = pair });
     }
 
     fn emitWholeFileSideHunk(w: *Weave, file: *const model.File, lines: []const model.Line, side: SelectedVersion) !void {
@@ -1545,7 +1579,7 @@ const Weave = struct {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
                 const expanded = w.expanded_disclosures.contains(disclosureId(key));
-                try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
+                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
                     continue;
@@ -1560,7 +1594,7 @@ const Weave = struct {
                         .{ .right = line }
                     else
                         .{ .left = line, .right = line };
-                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = pair });
+                    try w.rows.append(w.a, .{ .line_pair = pair });
                     try w.weaveInline(file, &lines[i]);
                     i += 1;
                 },
@@ -1570,7 +1604,7 @@ const Weave = struct {
                     while (i < lines.len and lines[i].kind == .added) i += 1;
                     var p = start;
                     while (p < i) : (p += 1) {
-                        try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], w.span_cursors.lineSpans(lines[p]), &.{}) } });
+                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], w.span_cursors.lineSpans(lines[p]), &.{}) } });
                         try w.weaveInline(file, &lines[p]);
                     }
                 },
@@ -1676,7 +1710,7 @@ const Weave = struct {
                     const pair = try intraline.diff(w.a, removed[old_cursor].text, added[new_cursor].text);
                     const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), pair.old);
                     const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), pair.new);
-                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left, .right = right } });
+                    try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
                     try w.weaveInline(file, right.line);
                     try w.weaveInline(file, left.line);
                     old_cursor += 1;
@@ -1684,13 +1718,13 @@ const Weave = struct {
                 },
                 .right => {
                     const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), &.{});
-                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .right = right } });
+                    try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
                     try w.weaveInline(file, right.line);
                     new_cursor += 1;
                 },
                 .left => {
                     const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), &.{});
-                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left } });
+                    try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
                     try w.weaveInline(file, left.line);
                     old_cursor += 1;
                 },
@@ -1711,18 +1745,18 @@ const Weave = struct {
             const emphasize = pair.whole_line or intraline.similarity(pair) >= emphasis_threshold;
             const left = try decoratedLine(w.a, &removed[i], w.span_cursors.lineSpans(removed[i]), if (emphasize) pair.old else &.{});
             const right = try decoratedLine(w.a, &added[i], w.span_cursors.lineSpans(added[i]), if (emphasize) pair.new else &.{});
-            try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left, .right = right } });
+            try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
             try w.weaveInline(file, right.line);
             try w.weaveInline(file, left.line);
         }
         for (removed[pair_count..]) |*line| {
             const left = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
-            try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left } });
+            try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
             try w.weaveInline(file, left.line);
         }
         for (added[pair_count..]) |*line| {
             const right = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
-            try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .right = right } });
+            try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
             try w.weaveInline(file, right.line);
         }
     }
@@ -2983,6 +3017,71 @@ const long_context_diff =
     \\+B
     \\
 ;
+
+test "a Buffer build without ReviewCards builds its rows in the result storage" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, long_context_diff);
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |fold_context| {
+        const buf = try buildWithComments(a, diff, layout, &.{}, .{ .scratch_allocator = testing.failing_allocator, .fold_context = fold_context });
+        try testing.expect(buf.rows.len > 0);
+    };
+}
+
+test "rowCapacity holds every row of a Buffer build" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, long_context_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Root", .body = "First paragraph with **marked** text.\n\nSecond paragraph wraps across the narrow card width.", .anchor = .{ .path = "a.txt", .to = 1 } },
+        .{ .id = 2, .parent_id = 1, .author = "Reply", .body = "Reply\n\n```zig\nconst x = 1;\n```" },
+        .{ .id = 3, .author = "Resolved", .body = "Resolved body", .resolved = true, .anchor = .{ .path = "a.txt", .to = 12 } },
+        .{ .id = 4, .parent_id = 3, .author = "Reply", .body = "Resolved reply" },
+        .{ .id = 5, .author = "Old", .body = "Outdated body", .state = .outdated, .anchor = .{ .path = "a.txt", .to = 100 } },
+        .{ .id = 6, .author = "Review", .body = "Review body" },
+        .{ .id = 7, .author = "Old side", .body = "Old side body", .anchor = .{ .path = "a.txt", .from = 1 } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .comment, .body = "First Draft paragraph.\n\nSecond Draft paragraph with enough text to wrap.\n\nThird paragraph.", .anchor = .{ .path = "a.txt", .to = 1 } },
+        .{ .local_id = 2, .kind = .comment, .body = "Draft Reply", .parent = .{ .comment = 2 } },
+        .{ .local_id = 3, .kind = .comment, .body = "Nested Reply", .parent = .{ .draft = 2 } },
+        .{ .local_id = 4, .kind = .comment, .body = "Pending Review Draft" },
+    };
+    const blobs = [_]model.FileBlob{.{ .old = "a\nc1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10\nb\n", .new = "A\nc1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10\nB\n" }};
+    const statuses = [_]model.FileContent{.{ .old = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } }, .new = .{ .binary = 48 } }};
+    var keys: std.ArrayList(DisclosureKey) = .empty;
+    defer keys.deinit(a);
+    try keys.appendSlice(a, &.{ .outdated_review, .{ .outdated_file = &diff.files[0] }, .{ .opposite_version = &diff.files[0] }, .{ .resolved_thread = 3 } });
+    for (threads) |thread| {
+        try keys.append(a, .{ .review_card = .{ .comment = thread.root.id } });
+        for (thread.replies) |reply| try keys.append(a, .{ .review_card = .{ .comment = reply.id } });
+    }
+    for (drafts) |draft| try keys.append(a, .{ .review_card = .{ .draft = draft.local_id } });
+    const folded = try buildWithComments(a, diff, .unified, &.{}, .{ .fold_context = true });
+    for (folded.rows) |row| if (row == .disclosure and row.disclosure.kind == .fold) try keys.append(a, row.disclosure.key);
+
+    const Mode = enum { collapsed, expanded, semantic, whole_new, whole_old, isolated, statuses, whole_statuses };
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]usize{ 24, 80 }) |width| for (std.meta.tags(Mode)) |mode| {
+        const opts: BuildOptions = .{
+            .scratch_allocator = testing.allocator,
+            .drafts = &drafts,
+            .card_width = width,
+            .collapsed_rows = if (mode == .semantic) 0 else 3,
+            .fold_context = mode != .semantic,
+            .expanded_disclosures = if (mode == .collapsed or mode == .statuses) &.{} else keys.items,
+            .whole_file = mode == .whole_new or mode == .whole_old or mode == .whole_statuses,
+            .selected_version = if (mode == .whole_old) .old else .new,
+            .only_file = if (mode == .isolated) 0 else null,
+            .blobs = if (mode == .whole_statuses) &.{} else &blobs,
+            .content_statuses = if (mode == .statuses or mode == .whole_statuses) &statuses else &.{},
+        };
+        const buf = try buildWithComments(a, diff, layout, threads, opts);
+        try testing.expect(buf.rows.len <= rowCapacity(diff, layout, threads, opts));
+    };
+}
 
 test "the changes scope folds a long context run, keeping a margin each side" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
