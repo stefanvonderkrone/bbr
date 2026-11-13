@@ -88,3 +88,11 @@ The first version of this ticket asked for a cache in the Session or a cheaper m
 The prototype measured only the bound. Steps 1 and 3 have no prototype. The profile of the prototype supports them: `mmap` and `munmap` are 17 percent and the slow bound is 12.9 percent of its samples.
 
 **Dependencies.** None. Ticket 07 reuses the corpus only when the Layout does not change, so a SideBySide switch still runs the matching twice, and this ticket saves it in both builds. The row array change of the ticket 07 triage lowers the buffer phase of both Layouts. Measure against a baseline of the same run.
+
+### 2026-11-13 note from ticket 13
+
+[Ticket 13](13-find-why-a-switch-to-side-by-side-costs-three-times-more.md) measured the rejected direction of this ticket.
+The plans of the change blocks, kept in the Session and built in `Session.prepareEmphasis` next to `EmphasisCache`, need no hand-back from the worker, because the Session load builds them before the Session is published.
+The prototype cut a switch to SideBySide from 331.5 ms to 144.7 ms and a SideBySide resize from 332.6 ms to 139.9 ms, against about 85 ms for the bound of this ticket.
+It costs about 100 ms of CPU once per Session load.
+If the plan store of ticket 13 is built, this ticket only makes that one-time build cheaper, so its targets need a re-triage before work starts.

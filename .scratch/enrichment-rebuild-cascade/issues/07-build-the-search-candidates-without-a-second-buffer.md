@@ -112,3 +112,9 @@ Both Buffer builds of a rebuild pay this. The row prototype reserves the array o
 **Direction.** The reuse needs no new state outside the published corpus, which already has a reference count. A prototype of the reuse was not built. The saving on a hit is the candidates and corpus phases in the table, which the reuse skips completely.
 
 **Dependencies.** This ticket does not need ticket 08 or the row array change. A Layout switch changes the key, so ticket 08 still saves its matching twice on a switch. Measure against a baseline of the same run, so that the targets stay valid in any order.
+
+### 2026-11-13 note from ticket 13
+
+[Ticket 13](13-find-why-a-switch-to-side-by-side-costs-three-times-more.md) found that the matching is about 100 ms of the SideBySide candidates phase, and that a SideBySide resize costs as much as a switch.
+With the change block plans kept in the Session, the candidates and corpus phases of a SideBySide rebuild fall from about 127 ms to about 36 ms.
+So the saving of this ticket on a SideBySide resize shrinks to about 36 ms. The Unified targets of this ticket do not change.
