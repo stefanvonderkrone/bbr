@@ -1,6 +1,6 @@
 # 05: Make a Buffer rebuild faster
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -157,14 +157,14 @@ Add a case with non-ASCII rows too, so that the benchmark shows that the graphem
 
 ## Acceptance criteria
 
-- [ ] A frame test compares the fast path with the grapheme loop. It covers printable ASCII lines shorter than, equal to, and longer than the width, lines with no space, a space at the wrap column, a trailing space, a line that is ASCII up to a non-ASCII grapheme, tab and other control bytes, and CR LF. Each case gives the same visual rows as the grapheme loop, in Unified and SideBySide.
-- [ ] The new `zig build bench` cases exist and print a checksum that is the same before and after the change.
-- [ ] On the workload, the median worker CPU of a Unified disclosure toggle and of a Unified resize is at least 45 percent lower than the baseline of the same run. The triage baseline is 296 ms and 338 ms.
-- [ ] On the workload, the median worker CPU of a Layout switch to SideBySide is at least 30 percent lower than the baseline of the same run. The triage baseline is 602 ms.
-- [ ] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
-- [ ] The completion records the runs, the medians, the ranges, the phase split, and the process CPU of 8 actions, before and after.
-- [ ] No `[DEBUG-05]` or `[DEBUG-t05]` line stays in the repository.
-- [ ] `zig build test` passes.
+- [x] A frame test compares the fast path with the grapheme loop. It covers printable ASCII lines shorter than, equal to, and longer than the width, lines with no space, a space at the wrap column, a trailing space, a line that is ASCII up to a non-ASCII grapheme, tab and other control bytes, and CR LF. Each case gives the same visual rows as the grapheme loop, in Unified and SideBySide.
+- [x] The new `zig build bench` cases exist and print a checksum that is the same before and after the change.
+- [x] On the workload, the median worker CPU of a Unified disclosure toggle and of a Unified resize is at least 45 percent lower than the baseline of the same run. The triage baseline is 296 ms and 338 ms.
+- [x] On the workload, the median worker CPU of a Layout switch to SideBySide is at least 30 percent lower than the baseline of the same run. The triage baseline is 602 ms.
+- [x] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
+- [x] The completion records the runs, the medians, the ranges, the phase split, and the process CPU of 8 actions, before and after.
+- [x] No `[DEBUG-05]` or `[DEBUG-t05]` line stays in the repository.
+- [x] `zig build test` passes.
 
 ## Comments
 
@@ -180,3 +180,105 @@ The prototype binary does not prove that the wrap boundaries are equal. It only 
 
 The second profile also showed about 666 samples on the Presentation thread in `Presentation.actionAvailability`, at the `activeFile` calls, during 20 seconds of Layout switches and resizes.
 That cost is outside the worker rebuild and outside this ticket. A later ticket can measure it.
+
+## Completion
+
+### Change
+
+- `1567999` moves the vaxis adapter into `src/tui/terminal_cell_metrics.zig`. `render.zig`, a render test, and the benchmarks share it, and the benchmark module exports it as `tui.terminal_cell_metrics`. The visual row cases now use it: `visual_rows_terminal_wide_50000`, `visual_rows_terminal_narrow_50000`, `visual_rows_terminal_side_by_side_50000`, and `visual_rows_terminal_unicode_50000`. They replace `visual_rows_wide_50000` and `visual_rows_narrow_50000`, which measured `CellMetrics.bytes`.
+- `dd2764d` adds `CellMetrics.ascii_is_narrow` and `CellMetrics.narrowAscii`. The adapter states that each printable ASCII byte is one grapheme of one cell, and `width` and the Line wrap both read that statement. For a printable ASCII Line, the wrap ends after the last space that fits, else at the width. Other Lines keep the grapheme loop.
+- `843e6c6` puts the check in `WrapLine.init` in `src/tui/frame.zig`, so the visual row build checks each Line once and the flag always belongs to its text.
+- `19a9562` adds `tools/check_benchmark_metrics.py` and its tests, and a row in `AGENTS.md`. See the class result below.
+
+### Wrap equality
+
+The frame test "a printable ASCII Line wraps at the same positions as the grapheme loop" builds visual rows with a CellMetrics and with the same CellMetrics with `ascii_is_narrow` off, and compares the Buffer index, the source range, the continuation, and the halves of each visual row.
+It runs the terminal metrics and `CellMetrics.bytes`, Unified and SideBySide (both halves, one half, and halves of different lengths), every body width from 1 to the Line length plus 2, the listed cases of the acceptance criteria, and 400 generated Lines.
+A second test checks the wrap positions of six printable ASCII Lines against literal rows.
+Both tests failed on a fast path that also used a space just past the width, which is one reading of the triage prototype.
+The test "vaxis measures each printable ASCII byte before ASCII or the end as one grapheme of one cell" in `src/tui/terminal_cell_metrics.zig` checks the base of the fast path for every printable byte, alone and before each ASCII byte.
+
+### Live measurement
+
+The workload and method are the ones above, with `[DEBUG-t05]` marks in separate detached worktrees at `a1d029a` (baseline) and `19a9562` (result).
+The runs alternated baseline, result, three times each, with 8 actions of each kind per run. A resize action is one `tmux resize-window`, to 150 or back to 160.
+The machine has 18 cores, and its load average was 1.6 to 3.5 from other work.
+Wall time and thread CPU time agree within 1 ms, so each rebuild is CPU-bound on one worker core.
+
+Worker CPU per rebuild:
+
+| Rebuild | n per side | Baseline median (range) | Result median (range) | Change |
+| --- | --- | --- | --- | --- |
+| Disclosure toggle, Unified | 24 | 298.1 ms (276.5 to 305.9) | 124.0 ms (106.7 to 127.8) | −58.4 % |
+| Resize, Unified | 24 | 337.3 ms (327.3 to 352.0) | 163.3 ms (154.0 to 175.6) | −51.6 % |
+| Layout switch to Unified | 12 | 336.6 ms (317.3 to 359.9) | 166.5 ms (155.3 to 175.8) | −50.5 % |
+| Layout switch to SideBySide | 12 | 573.5 ms (545.1 to 583.3) | 371.6 ms (367.0 to 381.2) | −35.2 % |
+
+Phase medians in ms, baseline → result:
+
+| Rebuild | buffer | candidates | corpus | visual | tree | projection |
+| --- | --- | --- | --- | --- | --- | --- |
+| Disclosure toggle | 59.6 → 58.6 | none | none | 192.0 → 18.1 | 0.2 → 0.2 | 46.6 → 46.4 |
+| Resize | 59.6 → 59.2 | 37.4 → 38.8 | 4.8 → 4.9 | 188.2 → 14.3 | 0.2 → 0.2 | 47.3 → 46.9 |
+| Switch to Unified | 55.6 → 61.3 | 38.4 → 38.8 | 4.8 → 5.0 | 189.8 → 14.2 | 0.2 → 0.2 | 47.4 → 47.1 |
+| Switch to SideBySide | 162.1 → 160.8 | 140.6 → 139.2 | 4.9 → 4.8 | 215.3 → 17.3 | 0.2 → 0.2 | 51.5 → 50.6 |
+
+The visual phase lost 174 to 198 ms, and the whole rebuild lost the same amount, so the change removed only that work.
+The other phases did not change. They now limit a rebuild: buffer, candidates, and projection are about 145 ms of a Unified resize, and buffer and candidates are 300 ms of a SideBySide switch.
+The remaining visual phase is the append of about 206,000 visual rows of 168 bytes.
+
+Buffer rows and visual rows were the same on both sides: 187,839 and 206,104 for Unified, 187,856 and 206,121 with the Draft expanded, 209,672 visual rows at 150 columns, and 183,464 and 264,856 for SideBySide.
+Only the expected build kinds ran during the actions: `general` for a toggle and `view` for a resize and a Layout switch.
+
+Process CPU for 8 actions, three runs each:
+
+| Action | Baseline | Result |
+| --- | --- | --- |
+| Disclosure toggle | 2.45, 2.41, 2.42 s | 1.03, 0.99, 1.01 s |
+| Resize | 2.78, 2.77, 2.76 s | 1.37, 1.41, 1.38 s |
+| Layout switch | 3.69, 3.70, 3.72 s | 2.22, 2.25, 2.19 s |
+
+One more result run at `843e6c6` gave a toggle median of 123.6 ms, a resize median of 166.4 ms, and a SideBySide median of 378.4 ms, with the same row counts.
+
+### Benchmark
+
+`zig build bench`, ReleaseFast, two alternating runs per side, the median of 15 samples per run. Baseline is `1567999`, result is `843e6c6` and `dd2764d`:
+
+| Case | Baseline | Result | Checksum, both sides |
+| --- | --- | --- | --- |
+| `visual_rows_terminal_wide_50000` | 93.9, 90.2 ms | 0.82 to 0.85 ms | `5f5a2f49ab0fb96b` |
+| `visual_rows_terminal_narrow_50000` | 109.4, 108.2 ms | 1.53, 1.54 ms | `f17b464f3a1e0962` |
+| `visual_rows_terminal_side_by_side_50000` | 184.7, 183.0 ms | 1.68 to 1.89 ms | `31dea13c8fdb7a4a` |
+| `visual_rows_terminal_unicode_50000` | 71.9, 72.5 ms | 72.1 to 72.7 ms | `5b2e258b3887f92a` |
+
+The Unicode case shows that the grapheme loop did not get slower.
+
+### Mistake class
+
+A benchmark measured a proxy of the app path, so the cost that dominates a rebuild showed in no benchmark.
+`visual_rows_wide_50000`, `visual_rows_narrow_50000`, and `file_tree_tallies_2000` passed `CellMetrics.bytes` (`13c58b5`), `comment_anchors_*` took the `.bytes` default of `BuildOptions`, and `cell_width_ascii_1m` kept its own copy of the vaxis adapter (`f3ed2b3`).
+The architecture fix gives the adapter one owner that the benchmarks import.
+The type-level fix needs the `.bytes` defaults gone, which touches every test that builds a Buffer or a Presentation, so [ticket 10](10-require-the-cell-metrics-of-every-buffer-build.md) holds it.
+Until then, `tools/check_benchmark_metrics.py` rejects `.bytes` in the benchmark sources and names `tui.terminal_cell_metrics`. It fails on lines 83 and 116 of `src/benchmark/p1_actions.zig` at `a1d029a`.
+The second candidate class, a fast path that drifts from its slow path, has no past occurrence in the history, so it adds no rule. The wrap test covers this fast path.
+
+### Child tickets
+
+- [07](07-build-the-search-candidates-without-a-second-buffer.md): build the search candidates without a second Buffer.
+- [08](08-make-the-side-by-side-change-block-matching-cheaper.md): make the SideBySide change block matching cheaper.
+- [09](09-make-the-search-projection-cheaper.md): make `SearchProjection.create` cheaper.
+- [10](10-require-the-cell-metrics-of-every-buffer-build.md): require the cell metrics of every Buffer build.
+
+### Checks
+
+- `zig build test --summary all`: exit 0, 52 of 52 steps, 1,628 of 1,628 tests.
+- `zig fmt --check src build.zig`: exit 0.
+- `python3 tools/check_agent_docs.py`: pass.
+- No `[DEBUG-05]` or `[DEBUG-t05]` line in the repository.
+
+### Review
+
+The two-axis code review found no hard violation and no wrong behavior. It confirmed each edge of the fast path against the grapheme loop.
+`843e6c6` fixes its findings: the flag that could belong to another text, the missing one-half pairs and `.bytes` runs in the test, an inline import, a test-local `std`, and the missing files in `src/tui/IMPLEMENTATION.md`.
+The review also named the new `ascii_is_narrow` field as possible speculative generality. It stays, because it states the assumption that `width` and the wrap share, and the wrap test uses it as its oracle.
+It called the benchmark check and the replaced benchmark names scope creep. They are the class fix that the runner asked for, and the replaced cases measured the proxy.
