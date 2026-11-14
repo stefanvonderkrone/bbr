@@ -96,3 +96,12 @@ The plans of the change blocks, kept in the Session and built in `Session.prepar
 The prototype cut a switch to SideBySide from 331.5 ms to 144.7 ms and a SideBySide resize from 332.6 ms to 139.9 ms, against about 85 ms for the bound of this ticket.
 It costs about 100 ms of CPU once per Session load.
 If the plan store of ticket 13 is built, this ticket only makes that one-time build cheaper, so its targets need a re-triage before work starts.
+
+### 2026-11-14 note from ticket 14
+
+[Ticket 14](14-keep-the-side-by-side-change-block-plans-after-first-use.md) keeps the change block plans in the Session after the first SideBySide build.
+A later SideBySide rebuild, such as a second switch or a resize, runs no matching.
+The plans also cover the blocks above `side_by_side_work_limit`.
+The matching now runs once for each Session, in `SideBySidePlans.build`, on the first SideBySide build. On the workload of ticket 05, that build costs 108 to 112 ms of worker CPU, inside a first switch of 221 ms.
+A SideBySide build of one isolated File keeps no plans, so it still matches the blocks of that File once per rebuild.
+So the target of this ticket applies only to the one-time plan build and to isolated-File SideBySide builds. The re-triage must set a new target for these two cases.
