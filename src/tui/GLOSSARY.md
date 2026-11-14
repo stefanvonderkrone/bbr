@@ -157,7 +157,7 @@ One internally consistent projection of the published Session and its Session-re
 _Avoid_: screen (the terminal output), Buffer (only the DiffPane rows), render state, layout snapshot.
 
 **Navigation Anchor**:
-A DiffPane cursor, its viewport offset, and its Selection mark, held by the identity of their rows instead of their row numbers. Any later Presentation Frame of the same Session resolves it. A row that the Frame lost puts the cursor at the top of the Buffer. Every navigation restoration after a rebuild goes through it, and state that outlives a Frame, such as the start of the Buffer Search input, stores one.
+A DiffPane cursor, its viewport offset, and its Selection mark, held by the identity of their rows instead of their row numbers. Any later Presentation Frame of the same Session resolves it. A row that the Frame lost puts the cursor at the top of the Buffer. Every navigation restoration after a rebuild goes through it. State that outlives a Frame stores one, for example the start of the Buffer Search input.
 _Avoid_: Anchor (binds a Comment to source), saved navigation, origin.
 
 **Session Epoch**:

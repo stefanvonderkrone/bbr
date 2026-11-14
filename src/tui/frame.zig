@@ -743,17 +743,21 @@ pub const NavigationAnchor = struct {
         var restored = Nav.init(visual_rows.len, viewport);
         restored.count = self.count;
         const cursor_row = self.cursor orelse return restored;
-        const cursor = (if (index) |lookup| lookup.find(cursor_row) else findVisualRow(visual_rows, cursor_row)) orelse return restored;
+        const cursor = findRow(visual_rows, index, cursor_row) orelse return restored;
         restored.jumpTo(cursor);
         restored.count = self.count;
         restored.scroll = cursor -| self.cursor_offset;
         restored.setViewport(viewport);
 
         const mark = self.mark orelse return restored;
-        const restored_mark = (if (index) |lookup| lookup.find(mark.row) else findVisualRow(visual_rows, mark.row)) orelse return restored;
+        const restored_mark = findRow(visual_rows, index, mark.row) orelse return restored;
         const range = [2]usize{ @min(restored_mark, cursor), @max(restored_mark, cursor) };
         if ((mark.row.owner == .line and cursor_row.owner == .line) or std.meta.eql(mark.captured_range, range)) restored.mark = restored_mark;
         return restored;
+    }
+
+    fn findRow(visual_rows: []const VisualRow, index: ?NavigationIndex, row: VisualRow) ?usize {
+        return if (index) |lookup| lookup.find(row) else findVisualRow(visual_rows, row);
     }
 
     /// Row lookup reads only the owner and the source start. The other fields,
