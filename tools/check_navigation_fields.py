@@ -6,7 +6,7 @@ Presentation Frame where it was taken. State that outlives a Frame stores a
 `frame.NavigationAnchor`, which holds the rows by identity, and resolves it
 against the Frame that reads it. Only the containers in `FRAME_OWNERS` hold a
 `Nav` beside the rows of its own Frame. Test blocks and `*_test.zig` files
-are not production state.
+are not production state. A field whose type spans lines is not checked.
 """
 
 from pathlib import Path
@@ -25,9 +25,9 @@ FRAME_OWNERS = {
     (Path("src/tui/presentation.zig"), "ReviewProjection"),
 }
 TEST_START = re.compile(r"^test\b.*\{\s*$")
-FIELD = re.compile(r"^\s*(?:pub\s+)?([A-Za-z_]\w*)\s*:\s*([^=]+?)\s*(?:=.*)?,\s*$")
+FIELD = re.compile(r"^\s*(?:pub\s+)?([A-Za-z_]\w*)\s*:\s*([^=]+?)\s*(?:=.*|,\s*)$")
 NAV = re.compile(r"\bNav\b")
-CONTAINER = re.compile(r"\b(?:struct|union(?:\([^)]*\))?|opaque)\s*$")
+CONTAINER = re.compile(r"\b(?:struct|union|opaque)(?:\((?:[^()]|\([^()]*\))*\))?\s*$")
 NAME = re.compile(r"\bconst\s+([A-Za-z_]\w*)\s*=\s*(?:extern\s+|packed\s+)?(?:struct|union)\b")
 FIX = (
     "A Nav holds row numbers of one Frame. Store a frame.NavigationAnchor "
@@ -39,7 +39,7 @@ def violations(root):
     for relative, lines in zig_files(root, SOURCES, literals=False):
         if relative.name.endswith("_test.zig"):
             continue
-        stack = []
+        stack = [f"the file struct of {relative.name}"]
         in_test = False
         for number, line in enumerate(lines, 1):
             if in_test:

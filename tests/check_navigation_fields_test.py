@@ -62,6 +62,28 @@ class NavigationFieldsTest(unittest.TestCase):
         self.assertIn("`saved` of `Outer`", found[1])
         self.assertIn("`nav` of `an anonymous container`", found[2])
 
+    def test_tagged_packed_file_and_multiline_default_fields_are_rejected(self):
+        found = self.check(
+            "kept: Nav,\n"
+            "const Flags = packed struct(u8) {\n"
+            "    nav: ?Nav = null,\n"
+            "};\n"
+            "const Choice = union(enum(u8)) {\n"
+            "    nav: Nav,\n"
+            "};\n"
+            "const Pending = struct {\n"
+            "    nav: Nav = .{\n"
+            "        .row_count = 0,\n"
+            "        .viewport = 1,\n"
+            "    },\n"
+            "};\n"
+        )
+        self.assertEqual([message.split(":")[1] for message in found], ["1", "3", "6", "9"])
+        self.assertIn("of `the file struct of presentation.zig`", found[0])
+        self.assertIn("of `Flags`", found[1])
+        self.assertIn("of `Choice`", found[2])
+        self.assertIn("of `Pending`", found[3])
+
     def test_frame_owners_anchors_parameters_and_tests_are_allowed(self):
         found = self.check(
             "pub const Published = struct {\n"
