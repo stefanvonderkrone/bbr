@@ -34136,6 +34136,138 @@ test "Buffer Search admits an enrichment rebuild after a current occurrence move
     }
 }
 
+test "M21 kernel Buffer Search retries a hidden reply move after Whole File enrichment adds earlier matches" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testDisclosureSession(testing.allocator, 1);
+    const a = session.arena.allocator();
+    session.diff = try bbr.diff.parse(a,
+        \\diff --git a/0.txt b/0.txt
+        \\--- a/0.txt
+        \\+++ b/0.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+        \\@@ -6 +6 @@
+        \\-b
+        \\+B
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+    );
+    const comments = try a.alloc(bbr.review.Comment, 3);
+    comments[0] = .{ .id = 1, .author = "Ada", .body = "resolved", .resolved = true, .anchor = .{ .path = "a.txt", .to = 1 } };
+    comments[1] = .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "fixed zz" };
+    comments[2] = .{ .id = 3, .author = "Cy", .body = "open zz", .anchor = .{ .path = "a.txt", .to = 1 } };
+    session.threads = try bbr.review.buildThreads(a, comments);
+    try session.initializeEnrichment();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try testing.expectEqual(Scope.whole, presentation.preferences.scope);
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'z', .text = "zz" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const published = presentation.published.?;
+    var wanted = try published.buffer_search.accepted_batch.?.clone(testing.allocator);
+    defer wanted.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), wanted.occurrences.len);
+    try testing.expectEqual(@as(?usize, 0), published.buffer_search.active);
+
+    try presentation.queueFileEnrichment(published, 0, false);
+    const command = presentation.takeCommand().?.enrich_file;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "a\nzz1\nzz2\nzz3\nzz4\nb\n" },
+        .{ .status = 200, .body = "A\nzz1\nzz2\nzz3\nzz4\nB\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+    try presentation.dispatch(.{ .action = .next_search_occurrence });
+    try completeQueuedTestWork(&presentation);
+
+    const batch = published.buffer_search.accepted_batch.?;
+    try testing.expectEqual(@as(usize, 6), batch.occurrences.len);
+    const active = published.buffer_search.active.?;
+    try testing.expect(searchOccurrenceEql(wanted.occurrences[1], batch.occurrences[active]));
+    const expected_row = published.occurrenceVisualRow(wanted.occurrences[1]).?;
+    try testing.expectEqual(expected_row, published.navigation.cursor);
+}
+
+test "M21 kernel Buffer Search retries a hidden move after an isolation removes its target" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    for ([_][]const u8{ "0.txt", "a.txt" }, 1..) |path, id| {
+        try store.store().put(key.storeKey(), .{
+            .local_id = id,
+            .kind = .comment,
+            .scope = .{ .@"inline" = .{ .path = path, .to = 1, .commit = "source" } },
+            .body = "one\n\ntwo\n\nthree\n\nfour\n\nfive\n\nzz",
+        });
+    }
+    const session = try testDisclosureSession(testing.allocator, 1);
+    const a = session.arena.allocator();
+    session.diff = try bbr.diff.parse(a,
+        \\diff --git a/0.txt b/0.txt
+        \\--- a/0.txt
+        \\+++ b/0.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+    );
+    session.threads = &.{};
+    try session.initializeEnrichment();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = key, .session = session },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'z', .text = "zz" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeQueuedTestWork(&presentation);
+    const published = presentation.published.?;
+    var wanted = try published.buffer_search.accepted_batch.?.clone(testing.allocator);
+    defer wanted.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), wanted.occurrences.len);
+    try testing.expectEqual(@as(?usize, 0), published.buffer_search.active);
+    try testing.expect(published.occurrenceVisualRow(wanted.occurrences[1]) == null);
+    try presentation.dispatch(.{ .action = .isolate });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
+    try completeQueuedTestWork(&presentation);
+
+    const batch = published.buffer_search.accepted_batch.?;
+    const active = published.buffer_search.active.?;
+    try testing.expectEqual(@as(?usize, 0), published.isolated_file);
+    try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+    try testing.expect(searchOccurrenceEql(wanted.occurrences[0], batch.occurrences[active]));
+    try testing.expectEqual(published.occurrenceVisualRow(wanted.occurrences[0]).?, published.navigation.cursor);
+}
+
 test "Buffer Search rejects and retries an enrichment rebuild after its accepted batch changes" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
