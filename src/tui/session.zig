@@ -52,6 +52,9 @@ pub const Session = struct {
     mention_names: review_body.MentionNames = .empty,
     enrichment: file_enrichment.Storage,
     emphasis_cache: ?buffer.EmphasisCache = null,
+    /// Built by the first SideBySide build. Only the Presentation thread reads
+    /// or sets it. A worker gets a copy of the pointer when its build starts.
+    side_by_side_plans: ?*buffer.SideBySidePlans = null,
     /// Independently acquired mutation capability. A missing UUID never makes
     /// the read-only Session unusable.
     authenticated_account_uuid: ?[]const u8 = null,
@@ -63,6 +66,7 @@ pub const Session = struct {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         const backing = self.arena.child_allocator;
         self.enrichment.deinit();
+        if (self.side_by_side_plans) |plans| plans.destroy();
         self.arena.deinit();
         for (&self.acquisition_arenas) |*arena| if (arena.*) |*owned| owned.deinit();
         backing.destroy(self);
@@ -141,6 +145,7 @@ pub fn create(backing: Allocator) !*Session {
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
+    s.side_by_side_plans = null;
     s.mention_names = .empty;
     errdefer s.arena.deinit();
     s.threads = &.{};
@@ -259,6 +264,7 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
+    s.side_by_side_plans = null;
     s.mention_names = .empty;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
@@ -312,6 +318,7 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
+    s.side_by_side_plans = null;
     s.mention_names = .empty;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
@@ -425,6 +432,7 @@ pub fn loadLocalWith(
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
+    s.side_by_side_plans = null;
     s.mention_names = .empty;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();

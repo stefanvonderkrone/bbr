@@ -2827,6 +2827,12 @@ pub const DisclosureBuild = struct {
     /// 0 for the first build, 1 for the build with the disclosures that the
     /// first build found.
     destination_attempt: u1 = 0,
+    /// The Session's change block plans when the build started. The worker
+    /// reads only this copy, never the Session field.
+    plans: ?*const buffer_mod.SideBySidePlans = null,
+    /// Plans that this build made because `plans` was null. The Presentation
+    /// thread moves complete plans into the Session in `keepPlans`.
+    built_plans: ?*buffer_mod.SideBySidePlans = null,
     buffer: buffer_mod.Buffer = undefined,
     visual_rows: []const frame_mod.VisualRow = &.{},
     projection: ?*SearchProjection = null,
@@ -2867,6 +2873,7 @@ pub const DisclosureBuild = struct {
             .cache_revision = published.session.enrichment.revision,
             .cache_policy = published.session.enrichment.cache,
             .cache_focused = published.session.enrichment.focused,
+            .plans = published.session.side_by_side_plans,
         };
         job.inputs.retain();
         _ = job.target.base.retain();
@@ -3033,6 +3040,13 @@ pub const DisclosureBuild = struct {
                 self.content_statuses = inputs.content_statuses;
             }
         }
+        if (self.preferences.layout == .side_by_side and self.plans == null) {
+            // Without plans, each change block plans itself, as before plans existed.
+            self.built_plans = buffer_mod.SideBySidePlans.build(self.session.arena.child_allocator, self.session.diff, self.isolated_file) catch |err| switch (err) {
+                error.OutOfMemory => null,
+            };
+            self.plans = self.built_plans;
+        }
         self.buffer = try self.buildBuffer();
         if (self.kind == .review_destination) {
             const occurrence = self.review_snapshot.?.occurrences[self.destination_occurrence.?];
@@ -3064,6 +3078,7 @@ pub const DisclosureBuild = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.collapsed_rows,
                 .emphasis_cache = &self.session.emphasis_cache.?,
+                .side_by_side_plans = self.plans,
                 .mention_names = &self.session.mention_names,
             }, self.epoch);
             self.search_corpus = try BufferSearchCorpus.create(candidates);
@@ -3152,11 +3167,23 @@ pub const DisclosureBuild = struct {
             .cell_metrics = self.cell_metrics,
             .collapsed_rows = self.collapsed_rows,
             .emphasis_cache = &self.session.emphasis_cache.?,
+            .side_by_side_plans = self.plans,
             .mention_names = &self.session.mention_names,
         });
     }
 
+    /// Runs on the Presentation thread, which owns the Session's plans. The
+    /// first complete plans of the Session stay. Other plans stay with the
+    /// job, and `destroy` frees them.
+    fn keepPlans(self: *DisclosureBuild) void {
+        const plans = self.built_plans orelse return;
+        if (!plans.complete or self.session.side_by_side_plans != null) return;
+        self.session.side_by_side_plans = plans;
+        self.built_plans = null;
+    }
+
     pub fn destroy(self: *DisclosureBuild) void {
+        if (self.built_plans) |plans| plans.destroy();
         if (self.deletion_origin) |origin| origin.release();
         for (self.enrichments.items) |*enriched| enriched.result.deinit();
         if (self.batch) |*batch| batch.deinit(std.heap.page_allocator);
@@ -4440,6 +4467,12 @@ const Published = struct {
         const cell_metrics = published.cell_metrics;
         if (session.emphasis_cache == null) try session.prepareEmphasis();
         published.emphasis_cache = session.emphasis_cache.?;
+        // No other thread sees the candidate Session yet, so its first SideBySide build stores the plans directly.
+        if (preferences.layout == .side_by_side and session.side_by_side_plans == null) {
+            session.side_by_side_plans = buffer_mod.SideBySidePlans.build(session.arena.child_allocator, session.diff, null) catch |err| switch (err) {
+                error.OutOfMemory => null,
+            };
+        }
 
         const buffer_allocator = published.buffers.begin();
         errdefer published.buffers.abort();
@@ -4466,6 +4499,7 @@ const Published = struct {
                     .cell_metrics = cell_metrics,
                     .collapsed_rows = published.comments_collapsed_rows,
                     .emphasis_cache = &published.emphasis_cache,
+                    .side_by_side_plans = session.side_by_side_plans,
                     .mention_names = &session.mention_names,
                 },
             ) catch |err| switch (err) {
@@ -4866,6 +4900,7 @@ const Published = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
+                .side_by_side_plans = self.session.side_by_side_plans,
                 .mention_names = &self.session.mention_names,
             },
         ) catch |err| switch (err) {
@@ -5051,6 +5086,7 @@ const Published = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
+                .side_by_side_plans = self.session.side_by_side_plans,
                 .mention_names = &self.session.mention_names,
             },
             self.epoch,
@@ -5084,6 +5120,7 @@ const Published = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
+                .side_by_side_plans = self.session.side_by_side_plans,
                 .mention_names = &self.session.mention_names,
             },
             self.epoch,
@@ -9531,6 +9568,7 @@ pub const Presentation = struct {
     }
 
     fn acceptBufferDisclosure(self: *Presentation, job: *DisclosureBuild) void {
+        job.keepPlans();
         var owned = true;
         defer if (owned) job.destroy();
         if (!self.consumeCommand(job.command_id, .build_buffer_disclosure)) return;
@@ -16718,6 +16756,133 @@ test "M21 kernel view failures preserve Frame preferences geometry and navigatio
         try startTestViewChange(&presentation, change);
         try completeDisclosureBuild(&presentation);
         try testing.expect(presentation.projection().action_error == null);
+    }
+}
+
+fn testPlansPresentation(store: *bbr.review.InMemoryStore) !Presentation {
+    return Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 12 },
+    });
+}
+
+test "a Unified Session that never switches to SideBySide builds no change block plans" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testPlansPresentation(&store);
+    defer presentation.deinit();
+    for ([_]u16{ 80, 90 }) |cols| {
+        try presentation.dispatch(.{ .resize = .{ .cols = cols, .rows = 12 } });
+        const job = presentation.takeCommand().?.build_buffer_disclosure;
+        job.build();
+        try testing.expect(job.built_plans == null);
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    }
+    try testing.expectEqual(Layout.unified, presentation.projection().review.?.preferences.layout);
+    try testing.expect(presentation.published.?.session.side_by_side_plans == null);
+}
+
+test "the first SideBySide build keeps its change block plans for later SideBySide builds of the Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testPlansPresentation(&store);
+    defer presentation.deinit();
+    const session = presentation.published.?.session;
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    const first = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expect(first.plans == null);
+    first.build();
+    const built = first.built_plans.?;
+    try testing.expect(first.plans == built);
+    try presentation.dispatch(.{ .buffer_disclosure_built = first });
+    try testing.expectEqual(Layout.side_by_side, presentation.projection().review.?.preferences.layout);
+    try testing.expect(session.side_by_side_plans == built);
+
+    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 12 } });
+    const second = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expect(second.plans == built);
+    second.build();
+    try testing.expect(second.built_plans == null);
+    try presentation.dispatch(.{ .buffer_disclosure_built = second });
+    try testing.expectEqual(@as(u16, 80), presentation.projection().review.?.frame.geometry.cols);
+    try testing.expect(session.side_by_side_plans == built);
+}
+
+test "a discarded first SideBySide build keeps its plans and a second first build frees its own" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testPlansPresentation(&store);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    var jobs: [2]*DisclosureBuild = undefined;
+    for (&jobs) |*job| {
+        job.* = try DisclosureBuild.create(published, .{ .layout = .side_by_side }, .{ .base = published.disclosure_keys }, 0, null);
+        job.*.build();
+        try testing.expect(job.*.built_plans != null);
+    }
+    const kept = jobs[0].built_plans.?;
+    for (jobs) |job| try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    try testing.expectEqual(Layout.unified, presentation.projection().review.?.preferences.layout);
+    try testing.expect(published.session.side_by_side_plans == kept);
+}
+
+test "a SideBySide build of one isolated File keeps no change block plans" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testPlansPresentation(&store);
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .isolate });
+    try testing.expect(presentation.projection().review.?.isolated_file != null);
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    const job = presentation.takeCommand().?.build_buffer_disclosure;
+    job.build();
+    try testing.expect(!job.built_plans.?.complete);
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    try testing.expectEqual(Layout.side_by_side, presentation.projection().review.?.preferences.layout);
+    try testing.expect(presentation.published.?.session.side_by_side_plans == null);
+}
+
+test "a SideBySide build that completes after a Session replacement keeps its plans out of the new Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try testPlansPresentation(&store);
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    const stale = presentation.takeCommand().?.build_buffer_disclosure;
+    stale.build();
+    try testing.expect(stale.built_plans.?.complete);
+    try presentation.dispatch(.{ .action = .refresh });
+    const load = presentation.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 1) } } });
+    const replacement = presentation.published.?.session;
+    try testing.expect(replacement != stale.session);
+    try testing.expect(replacement.side_by_side_plans == null);
+    try presentation.dispatch(.{ .buffer_disclosure_built = stale });
+    try testing.expect(presentation.published.?.session == replacement);
+    try testing.expect(replacement.side_by_side_plans == null);
+}
+
+test "a Session replacement drops the change block plans of the replaced Session" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try testPlansPresentation(&store);
+        defer presentation.deinit();
+        try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try testing.expect(presentation.published.?.session.side_by_side_plans != null);
+        if (layout == .unified) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try presentation.dispatch(.{ .action = .refresh });
+        const load = presentation.takeCommand().?.load_session;
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 1) } } });
+        const session = presentation.published.?.session;
+        try testing.expectEqual(layout, presentation.projection().review.?.preferences.layout);
+        if (layout == .unified) {
+            try testing.expect(session.side_by_side_plans == null);
+        } else {
+            const plans = session.side_by_side_plans.?;
+            try testing.expect(plans.complete);
+            try testing.expect(plans.blocks.get(&session.diff.files[0].hunks[0].lines[0]) != null);
+        }
     }
 }
 

@@ -253,8 +253,207 @@ pub const BuildOptions = struct {
     cell_metrics: CellMetrics = .bytes,
     collapsed_rows: usize = 9,
     emphasis_cache: ?*const EmphasisCache = null,
+    /// A block without a plan here plans itself, as without plans.
+    side_by_side_plans: ?*const SideBySidePlans = null,
     mention_names: *const @import("review_body.zig").MentionNames = &.empty,
 };
+
+/// One SideBySide row of a change block. A pair row holds the emphasis of
+/// its removed and its added Line. The rows that a plan leaves out follow
+/// it: the remaining removed Lines, then the remaining added Lines.
+pub const ChangeStep = union(enum) {
+    pair: struct { old: []const Segment, new: []const Segment },
+    left,
+    right,
+};
+
+/// The SideBySide change block plans depend only on the Diff. A Session keeps
+/// them after their first use, so a later SideBySide build does not match the
+/// Lines again. A block is keyed by its first removed Line. A block without
+/// added Lines has no plan, because its rows need no matching.
+pub const SideBySidePlans = struct {
+    arena: std.heap.ArenaAllocator,
+    blocks: std.AutoHashMapUnmanaged(*const model.Line, []const ChangeStep) = .empty,
+    /// True when the plans cover every File of the Diff.
+    complete: bool,
+
+    pub fn build(backing: std.mem.Allocator, diff: model.Diff, only_file: ?usize) !*SideBySidePlans {
+        const plans = try backing.create(SideBySidePlans);
+        plans.* = .{ .arena = .init(backing), .complete = only_file == null };
+        errdefer plans.destroy();
+        const a = plans.arena.allocator();
+        var scratch: ChangeBlockScratch = .init(backing);
+        defer scratch.deinit();
+        const files = if (only_file) |index| diff.files[index..][0..1] else diff.files;
+        for (files) |file| for (file.hunks) |hunk| {
+            var i: usize = 0;
+            while (i < hunk.lines.len) {
+                if (hunk.lines[i].kind != .removed) {
+                    i += 1;
+                    continue;
+                }
+                const block = changeBlockAt(hunk.lines, i);
+                i += block.removed.len + block.added.len;
+                if (block.added.len == 0) continue;
+                try plans.blocks.put(a, &block.removed[0], try planChangeBlock(a, &scratch, block.removed, block.added));
+            }
+        };
+        return plans;
+    }
+
+    pub fn destroy(self: *SideBySidePlans) void {
+        const backing = self.arena.child_allocator;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
+};
+
+const ChangeBlock = struct { removed: []const model.Line, added: []const model.Line };
+
+/// The change block that starts at the removed Line `lines[start]`: its run of
+/// removed Lines and the run of added Lines that follows it.
+fn changeBlockAt(lines: []const model.Line, start: usize) ChangeBlock {
+    var added_start = start;
+    while (added_start < lines.len and lines[added_start].kind == .removed) added_start += 1;
+    var end = added_start;
+    while (end < lines.len and lines[end].kind == .added) end += 1;
+    return .{ .removed = lines[start..added_start], .added = lines[added_start..end] };
+}
+
+const ChangeBlockScratch = struct {
+    match: std.heap.ArenaAllocator,
+    lexical: std.heap.ArenaAllocator,
+
+    fn init(backing: std.mem.Allocator) ChangeBlockScratch {
+        return .{ .match = .init(backing), .lexical = .init(backing) };
+    }
+
+    fn deinit(self: *ChangeBlockScratch) void {
+        self.match.deinit();
+        self.lexical.deinit();
+    }
+};
+
+/// Plan the rows of a change block into `allocator`. Small blocks pair each
+/// removed Line with its most similar added Line in order. Above
+/// `side_by_side_work_limit`, the block pairs Lines by index.
+fn planChangeBlock(
+    allocator: std.mem.Allocator,
+    scratch: *ChangeBlockScratch,
+    removed: []const model.Line,
+    added: []const model.Line,
+) ![]const ChangeStep {
+    if (added.len == 0) return &.{};
+    var old_parts: usize = 0;
+    for (removed) |line| old_parts +|= intraline.lexicalPartCount(line.text);
+    var new_parts: usize = 0;
+    for (added) |line| new_parts +|= intraline.lexicalPartCount(line.text);
+    const work = removed.len *| added.len +| old_parts *| new_parts;
+    if (work > side_by_side_work_limit) {
+        const steps = try allocator.alloc(ChangeStep, @min(removed.len, added.len));
+        for (steps, removed[0..steps.len], added[0..steps.len]) |*step, old, new| {
+            const pair = try intraline.diff(allocator, old.text, new.text);
+            const emphasize = pair.whole_line or intraline.similarity(pair) >= emphasis_threshold;
+            step.* = .{ .pair = if (emphasize) .{ .old = pair.old, .new = pair.new } else .{ .old = &.{}, .new = &.{} } };
+        }
+        return steps;
+    }
+
+    defer _ = scratch.match.reset(.retain_capacity);
+    const match = scratch.match.allocator();
+    const stride = added.len + 1;
+    const similarities = try match.alloc(f64, removed.len * added.len);
+    for (removed, 0..) |old, old_index| {
+        for (added, 0..) |new, new_index| {
+            _ = scratch.lexical.reset(.retain_capacity);
+            similarities[old_index * added.len + new_index] = try intraline.matchingSimilarity(scratch.lexical.allocator(), old.text, new.text);
+        }
+    }
+
+    const cells = try match.alloc(MatchCell, (removed.len + 1) * stride);
+    var old_cursor = removed.len + 1;
+    while (old_cursor > 0) {
+        old_cursor -= 1;
+        var new_cursor = added.len + 1;
+        while (new_cursor > 0) {
+            new_cursor -= 1;
+            if (old_cursor == removed.len and new_cursor == added.len) {
+                cells[old_cursor * stride + new_cursor] = .{ .cost = 0, .exact_pairs = 0, .operation = .done };
+                continue;
+            }
+
+            var best: ?MatchCell = null;
+            if (old_cursor < removed.len and new_cursor < added.len) {
+                const score = similarities[old_cursor * added.len + new_cursor];
+                if (score >= emphasis_threshold) {
+                    const next = cells[(old_cursor + 1) * stride + new_cursor + 1];
+                    chooseMatch(&best, .{
+                        .cost = next.cost + 1.0 - score,
+                        .exact_pairs = next.exact_pairs + @intFromBool(std.mem.eql(u8, removed[old_cursor].text, added[new_cursor].text)),
+                        .first_old = old_cursor,
+                        .first_new = new_cursor,
+                        .operation = .pair,
+                    });
+                }
+            }
+            if (old_cursor < removed.len) {
+                const next = cells[(old_cursor + 1) * stride + new_cursor];
+                chooseMatch(&best, .{
+                    .cost = next.cost + 1.0,
+                    .exact_pairs = next.exact_pairs,
+                    .first_old = next.first_old,
+                    .first_new = next.first_new,
+                    .operation = .left,
+                });
+            }
+            if (new_cursor < added.len) {
+                const next = cells[old_cursor * stride + new_cursor + 1];
+                chooseMatch(&best, .{
+                    .cost = next.cost + 1.0,
+                    .exact_pairs = next.exact_pairs,
+                    .first_old = next.first_old,
+                    .first_new = next.first_new,
+                    .operation = .right,
+                });
+            }
+            cells[old_cursor * stride + new_cursor] = best.?;
+        }
+    }
+
+    var step_count: usize = 0;
+    old_cursor = 0;
+    var new_cursor: usize = 0;
+    while (true) : (step_count += 1) switch (cells[old_cursor * stride + new_cursor].operation) {
+        .pair => {
+            old_cursor += 1;
+            new_cursor += 1;
+        },
+        .left => old_cursor += 1,
+        .right => new_cursor += 1,
+        .done => break,
+    };
+    const steps = try allocator.alloc(ChangeStep, step_count);
+    old_cursor = 0;
+    new_cursor = 0;
+    for (steps) |*step| switch (cells[old_cursor * stride + new_cursor].operation) {
+        .pair => {
+            const pair = try intraline.diff(allocator, removed[old_cursor].text, added[new_cursor].text);
+            step.* = .{ .pair = .{ .old = pair.old, .new = pair.new } };
+            old_cursor += 1;
+            new_cursor += 1;
+        },
+        .left => {
+            step.* = .left;
+            old_cursor += 1;
+        },
+        .right => {
+            step.* = .right;
+            new_cursor += 1;
+        },
+        .done => unreachable,
+    };
+    return steps;
+}
 
 /// Hunk emphasis depends only on the Diff. Keep its segments in the Session
 /// arena so a disclosure rebuild does not repeat word-level diff work.
@@ -1609,17 +1808,9 @@ const Weave = struct {
                     }
                 },
                 .removed => {
-                    const rem_start = i;
-                    while (i < lines.len and lines[i].kind == .removed) i += 1;
-                    const rem_end = i;
-                    var add_start = i;
-                    var add_end = i;
-                    if (i < lines.len and lines[i].kind == .added) {
-                        add_start = i;
-                        while (i < lines.len and lines[i].kind == .added) i += 1;
-                        add_end = i;
-                    }
-                    try w.emitSideBySideChangeBlock(file, lines[rem_start..rem_end], lines[add_start..add_end]);
+                    const block = changeBlockAt(lines, i);
+                    i += block.removed.len + block.added.len;
+                    try w.emitSideBySideChangeBlock(file, block.removed, block.added);
                 },
             }
         }
@@ -1631,134 +1822,56 @@ const Weave = struct {
         removed: []const model.Line,
         added: []const model.Line,
     ) !void {
-        var old_parts: usize = 0;
-        for (removed) |line| old_parts +|= intraline.lexicalPartCount(line.text);
-        var new_parts: usize = 0;
-        for (added) |line| new_parts +|= intraline.lexicalPartCount(line.text);
-        const work = removed.len *| added.len +| old_parts *| new_parts;
-        if (work > side_by_side_work_limit) return w.emitIndexedChangeBlock(file, removed, added);
-
-        var match_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer match_scratch.deinit();
-        const scratch = match_scratch.allocator();
-        const stride = added.len + 1;
-        const similarities = try scratch.alloc(f64, removed.len * added.len);
-        var lexical_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer lexical_scratch.deinit();
-        for (removed, 0..) |old, old_index| {
-            for (added, 0..) |new, new_index| {
-                _ = lexical_scratch.reset(.retain_capacity);
-                similarities[old_index * added.len + new_index] = try intraline.matchingSimilarity(lexical_scratch.allocator(), old.text, new.text);
-            }
-        }
-
-        const cells = try scratch.alloc(MatchCell, (removed.len + 1) * stride);
-        var old_cursor = removed.len + 1;
-        while (old_cursor > 0) {
-            old_cursor -= 1;
-            var new_cursor = added.len + 1;
-            while (new_cursor > 0) {
-                new_cursor -= 1;
-                if (old_cursor == removed.len and new_cursor == added.len) {
-                    cells[old_cursor * stride + new_cursor] = .{ .cost = 0, .exact_pairs = 0, .operation = .done };
-                    continue;
-                }
-
-                var best: ?MatchCell = null;
-                if (old_cursor < removed.len and new_cursor < added.len) {
-                    const score = similarities[old_cursor * added.len + new_cursor];
-                    if (score >= emphasis_threshold) {
-                        const next = cells[(old_cursor + 1) * stride + new_cursor + 1];
-                        chooseMatch(&best, .{
-                            .cost = next.cost + 1.0 - score,
-                            .exact_pairs = next.exact_pairs + @intFromBool(std.mem.eql(u8, removed[old_cursor].text, added[new_cursor].text)),
-                            .first_old = old_cursor,
-                            .first_new = new_cursor,
-                            .operation = .pair,
-                        });
-                    }
-                }
-                if (old_cursor < removed.len) {
-                    const next = cells[(old_cursor + 1) * stride + new_cursor];
-                    chooseMatch(&best, .{
-                        .cost = next.cost + 1.0,
-                        .exact_pairs = next.exact_pairs,
-                        .first_old = next.first_old,
-                        .first_new = next.first_new,
-                        .operation = .left,
-                    });
-                }
-                if (new_cursor < added.len) {
-                    const next = cells[old_cursor * stride + new_cursor + 1];
-                    chooseMatch(&best, .{
-                        .cost = next.cost + 1.0,
-                        .exact_pairs = next.exact_pairs,
-                        .first_old = next.first_old,
-                        .first_new = next.first_new,
-                        .operation = .right,
-                    });
-                }
-                cells[old_cursor * stride + new_cursor] = best.?;
-            }
-        }
-
-        old_cursor = 0;
-        var new_cursor: usize = 0;
-        while (old_cursor < removed.len or new_cursor < added.len) {
-            switch (cells[old_cursor * stride + new_cursor].operation) {
-                .pair => {
-                    const pair = try intraline.diff(w.a, removed[old_cursor].text, added[new_cursor].text);
-                    const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), pair.old);
-                    const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), pair.new);
-                    try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
-                    try w.weaveInline(file, right.line);
-                    try w.weaveInline(file, left.line);
-                    old_cursor += 1;
-                    new_cursor += 1;
-                },
-                .right => {
-                    const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), &.{});
-                    try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
-                    try w.weaveInline(file, right.line);
-                    new_cursor += 1;
-                },
-                .left => {
-                    const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), &.{});
-                    try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
-                    try w.weaveInline(file, left.line);
-                    old_cursor += 1;
-                },
-                .done => unreachable,
-            }
-        }
+        if (w.opts.side_by_side_plans) |plans| if (plans.blocks.get(&removed[0])) |steps| {
+            return w.emitChangeSteps(file, removed, added, steps);
+        };
+        var scratch: ChangeBlockScratch = .init(std.heap.page_allocator);
+        defer scratch.deinit();
+        try w.emitChangeSteps(file, removed, added, try planChangeBlock(w.a, &scratch, removed, added));
     }
 
-    fn emitIndexedChangeBlock(
+    fn emitChangeSteps(
         w: *Weave,
         file: *const model.File,
         removed: []const model.Line,
         added: []const model.Line,
+        steps: []const ChangeStep,
     ) !void {
-        const pair_count = @min(removed.len, added.len);
-        for (0..pair_count) |i| {
-            const pair = try intraline.diff(w.a, removed[i].text, added[i].text);
-            const emphasize = pair.whole_line or intraline.similarity(pair) >= emphasis_threshold;
-            const left = try decoratedLine(w.a, &removed[i], w.span_cursors.lineSpans(removed[i]), if (emphasize) pair.old else &.{});
-            const right = try decoratedLine(w.a, &added[i], w.span_cursors.lineSpans(added[i]), if (emphasize) pair.new else &.{});
-            try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
-            try w.weaveInline(file, right.line);
-            try w.weaveInline(file, left.line);
-        }
-        for (removed[pair_count..]) |*line| {
-            const left = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
-            try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
-            try w.weaveInline(file, left.line);
-        }
-        for (added[pair_count..]) |*line| {
-            const right = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
-            try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
-            try w.weaveInline(file, right.line);
-        }
+        var old_cursor: usize = 0;
+        var new_cursor: usize = 0;
+        for (steps) |step| switch (step) {
+            .pair => |segments| {
+                const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), segments.old);
+                const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), segments.new);
+                try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
+                try w.weaveInline(file, right.line);
+                try w.weaveInline(file, left.line);
+                old_cursor += 1;
+                new_cursor += 1;
+            },
+            .left => {
+                try w.emitLeft(file, &removed[old_cursor]);
+                old_cursor += 1;
+            },
+            .right => {
+                try w.emitRight(file, &added[new_cursor]);
+                new_cursor += 1;
+            },
+        };
+        for (removed[old_cursor..]) |*line| try w.emitLeft(file, line);
+        for (added[new_cursor..]) |*line| try w.emitRight(file, line);
+    }
+
+    fn emitLeft(w: *Weave, file: *const model.File, line: *const model.Line) !void {
+        const left = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
+        try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
+        try w.weaveInline(file, left.line);
+    }
+
+    fn emitRight(w: *Weave, file: *const model.File, line: *const model.Line) !void {
+        const right = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
+        try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
+        try w.weaveInline(file, right.line);
     }
 
     /// Append any current/moved inline threads anchored to `ln` in `file`
@@ -2747,6 +2860,117 @@ test "side_by_side indexed fallback leaves unrelated pairs without IntraLineSegm
     try testing.expectEqualStrings("line_1", buffer.rows[2].line_pair.right.?.line.text);
     try testing.expect(!buffer.rows[2].line_pair.left.?.decoration.runs[0].emphasis);
     try testing.expect(!buffer.rows[2].line_pair.right.?.decoration.runs[0].emphasis);
+}
+
+fn changeBlockDiff(a: std.mem.Allocator) !model.Diff {
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.appendSlice(a,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,14 +1,11 @@
+        \\ keep
+        \\-const host = config.host;
+        \\-const port = config.port;
+        \\+const host = settings.host;
+        \\+const port = settings.port;
+        \\ keep2
+        \\-import legacy
+        \\-legacy.boot()
+        \\+const service = createService()
+        \\+return service.run()
+        \\ keep3
+        \\-client.open(source);
+        \\-client.retry(source);
+        \\-client.close(source);
+        \\+client.open(target);
+        \\+client.close(target);
+        \\ keep4
+        \\-dropped one
+        \\-dropped two
+        \\ keep5
+        \\
+    );
+    const line_count = 260;
+    try raw.print(a, "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1,{d} +1,{d} @@\n", .{ line_count, line_count });
+    for (0..line_count) |i| try raw.print(a, "-line_{d}\n", .{i});
+    for (0..line_count) |i| if (i % 2 == 0) try raw.print(a, "+line_{d}x\n", .{i}) else try raw.print(a, "+other {d}\n", .{i});
+    return parse(a, raw.items);
+}
+
+fn expectSameRows(expected: Buffer, actual: Buffer) !void {
+    try testing.expectEqual(expected.rows.len, actual.rows.len);
+    for (expected.rows, actual.rows) |want, got| {
+        try testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+        switch (want) {
+            .line_pair => |pair| for ([_]?LineRow{ pair.left, pair.right }, [_]?LineRow{ got.line_pair.left, got.line_pair.right }) |want_side, got_side| {
+                try testing.expectEqual(want_side == null, got_side == null);
+                const want_line = want_side orelse continue;
+                const got_line = got_side.?;
+                try testing.expectEqual(want_line.line, got_line.line);
+                try testing.expectEqual(want_line.display_version, got_line.display_version);
+                try testing.expectEqualDeep(want_line.decoration.runs, got_line.decoration.runs);
+            },
+            .comment => |card| {
+                try testing.expectEqual(card.owner, got.comment.owner);
+                try testing.expectEqual(card.part, got.comment.part);
+            },
+            else => {},
+        }
+    }
+}
+
+test "side_by_side rows with stored change block plans equal rows that plan each block" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try changeBlockDiff(a);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "why?", .anchor = .{ .path = "a.txt", .to = 3 } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const plans = try SideBySidePlans.build(testing.allocator, diff, null);
+    defer plans.destroy();
+    try testing.expect(plans.complete);
+
+    const blobs = try a.alloc(model.FileBlob, diff.files.len);
+    for (diff.files, blobs) |file, *blob| {
+        var old: std.ArrayList(u8) = .empty;
+        var new: std.ArrayList(u8) = .empty;
+        for (file.hunks[0].lines) |line| {
+            if (line.old_no != 0) try old.print(a, "{s}\n", .{line.text});
+            if (line.new_no != 0) try new.print(a, "{s}\n", .{line.text});
+        }
+        blob.* = .{ .old = old.items, .new = new.items };
+    }
+
+    for ([_]bool{ false, true }) |whole_file| for ([_]bool{ false, true }) |fold_context| for ([_]?usize{ null, 0, 1 }) |only_file| for ([_]SelectedVersion{ .new, .old }) |selected_version| for ([_][]const model.FileBlob{ &.{}, blobs }) |file_blobs| {
+        const options: BuildOptions = .{ .whole_file = whole_file, .fold_context = fold_context, .only_file = only_file, .selected_version = selected_version, .blobs = file_blobs };
+        const planned = try buildWithComments(a, diff, .side_by_side, threads, options);
+        var with_plans = options;
+        with_plans.side_by_side_plans = plans;
+        try expectSameRows(planned, try buildWithComments(a, diff, .side_by_side, threads, with_plans));
+    };
+    const indexed = (try buildWithComments(a, diff, .side_by_side, threads, .{ .side_by_side_plans = plans })).rows;
+    var emphasized: usize = 0;
+    for (indexed) |row| if (row == .line_pair) if (row.line_pair.right) |right| {
+        for (right.decoration.runs) |run| emphasized += @intFromBool(run.emphasis);
+    };
+    try testing.expect(emphasized > 0);
+}
+
+test "side_by_side plans of one File leave the other Files to plan their own blocks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try changeBlockDiff(a);
+    const plans = try SideBySidePlans.build(testing.allocator, diff, 0);
+    defer plans.destroy();
+    try testing.expect(!plans.complete);
+
+    const planned = try buildWithComments(a, diff, .side_by_side, &.{}, .{});
+    const stored = try buildWithComments(a, diff, .side_by_side, &.{}, .{ .side_by_side_plans = plans });
+    try expectSameRows(planned, stored);
 }
 
 test "side_by_side weaves an inline thread once, under its anchored pair" {
