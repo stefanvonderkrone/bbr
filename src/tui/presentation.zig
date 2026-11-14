@@ -2756,7 +2756,30 @@ const EnrichedFile = struct {
 };
 
 pub const DisclosureBuild = struct {
-    const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, cache_update, draft_save, draft_mutation, review_destination, card_destination };
+    const Kind = enum {
+        input,
+        accepted,
+        restore,
+        general,
+        clear_input,
+        open_input,
+        view,
+        enrichment,
+        cache_update,
+        draft_save,
+        draft_mutation,
+        review_destination,
+        card_destination,
+
+        /// Whether a build of this kind opens the Buffer Search occurrence in
+        /// `destination_active`. Every other kind keeps the current occurrence.
+        fn opensOccurrence(kind: Kind) bool {
+            return switch (kind) {
+                .input, .accepted, .restore, .clear_input => true,
+                .general, .open_input, .view, .enrichment, .cache_update, .draft_save, .draft_mutation, .review_destination, .card_destination => false,
+            };
+        }
+    };
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
     evidence: ?bbr.diagnostic.Failure = null,
     arena: std.heap.ArenaAllocator,
@@ -2806,8 +2829,8 @@ pub const DisclosureBuild = struct {
     clear_review_disclosures: bool = false,
     command_id: CommandId = 0,
     frame_revision: frame_mod.Revision,
-    /// The Buffer Search occurrence that an `.input`, `.accepted`, `.restore`,
-    /// or `.clear_input` build opens. Every other build keeps the current
+    /// The Buffer Search occurrence that the build opens when
+    /// `Kind.opensOccurrence` holds. Every other build keeps the current
     /// occurrence of the Presentation, which can move while the build runs.
     destination_active: ?usize = null,
     clear_saved_disclosures: bool = false,
@@ -10417,7 +10440,7 @@ pub const Presentation = struct {
         job.navigation_rows = null;
         published.publishReviewRanges(job.review_ranges);
         job.review_ranges = null;
-        if (job.kind != .general and job.kind != .open_input) published.buffer_search.active = job.destination_active;
+        if (job.kind.opensOccurrence()) published.buffer_search.active = job.destination_active;
         published.expanded_disclosures.deinit(self.allocator);
         published.expanded_disclosures = disclosures;
         published.disclosure_keys.release();
@@ -10436,7 +10459,7 @@ pub const Presentation = struct {
             published.review_search.saved_disclosures = null;
         }
         if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
-        if (job.restore_navigation == null and job.kind != .general and job.kind != .open_input) {
+        if (job.restore_navigation == null and job.kind.opensOccurrence()) {
             if (job.destination_active) |index| {
                 if (published.buffer_search.accepted_navigation_rows) |rows| {
                     if (rows[index].visible) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(current.?.occurrences[index]);
