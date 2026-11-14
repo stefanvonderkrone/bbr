@@ -1,6 +1,6 @@
 # 19: Remap the Buffer Search input origin after every rebuild
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -129,7 +129,7 @@ With the sketch, the 4 reproducing tests passed, and `zig build test --summary a
 
 ## Acceptance criteria
 
-- [ ] Tests through `Presentation` in the `M21 kernel` group reproduce the 4 cases of the Evidence table:
+- [x] Tests through `Presentation` in the `M21 kernel` group reproduce the 4 cases of the Evidence table:
   - "M21 kernel Buffer Search input Escape returns to its start after a File Enrichment adds rows above"
   - "M21 kernel Buffer Search input Escape returns to its start after a Draft deletion removes rows above"
   - "M21 kernel Buffer Search input Escape returns to its start after a Draft save adds rows above"
@@ -138,11 +138,11 @@ With the sketch, the 4 reproducing tests passed, and `zig build test --summary a
   Each test finds the row of the start place in the current Frame by identity (`published.search_projection.navigation.find(row)`, or `fileHeaderRow` with `visualIndexForBufferIndex`), not by a fixed number.
   After Escape and the queued work, the cursor is on that row, `activeFile()` is the File of that row, the input is closed, and `action_error` is null.
   The first 3 tests fail at `bff3397`. The fourth test fails at `bff3397` and also with only the kind condition in `acceptViewBuild` removed.
-- [ ] `BufferSearchInput` has no `Nav` or row-number field. `origin` and `saved_navigation` no longer exist.
-- [ ] `acceptViewBuild` and `acceptBufferDisclosure` do not write the input place.
-- [ ] `restoreNavigationWith` and the input place use `NavigationAnchor`.
-- [ ] The `Review recovery` tests, the ticket 16, 17, and 18 tests, and the test "M21 authored Buffer Search opening drops old input projection after resize and scans the newest Query" pass.
-- [ ] `zig build test` passes. `zig fmt --check build.zig src tests` passes. `python3 tools/check_agent_docs.py` passes.
+- [x] `BufferSearchInput` has no `Nav` or row-number field. `origin` and `saved_navigation` no longer exist.
+- [x] `acceptViewBuild` and `acceptBufferDisclosure` do not write the input place.
+- [x] `restoreNavigationWith` and the input place use `NavigationAnchor`.
+- [x] The `Review recovery` tests, the ticket 16, 17, and 18 tests, and the test "M21 authored Buffer Search opening drops old input projection after resize and scans the newest Query" pass.
+- [x] `zig build test` passes. `zig fmt --check build.zig src tests` passes. `python3 tools/check_agent_docs.py` passes.
 
 ## Overlap with ticket 15
 
@@ -184,3 +184,46 @@ After this fix, no long-lived state of the Buffer Search holds a row number, and
 A line check for a `Nav` field outside `Published.navigation` is possible, but `VersionRestoration` and the job-local rows would need exceptions. The build agent decides the level.
 
 The probe worktree is deleted. No live run was needed.
+
+## Completion
+
+Commits:
+
+- `542fc7b` adds the 4 reproducing tests.
+- `b845aed` adds `frame.NavigationAnchor` and replaces `saved_navigation` and `origin` with `input.start`.
+- `2813f5f` and `485de89` add `tools/check_navigation_fields.py` and its test, and the `AGENTS.md` row.
+- `b8ce793` merges the two row lookups of the anchor into one helper.
+- `04f1eb7` files [ticket 20](20-keep-the-cursor-on-a-whole-file-gap-line-after-a-rebuild.md).
+
+Change:
+
+- `NavigationAnchor` holds the count, the viewport offset of the cursor, the cursor row, and the mark row by identity.
+  It holds no `Nav`, so only `resolve` against a Frame gives row numbers.
+  The stored rows keep only `owner` and `source_start`, because a lookup reads only these fields.
+  `restoreNavigationWith` is deleted. `restoreNavigationIndexed` and `restoreNavigation` capture and resolve an anchor.
+- `DisclosureBuild.restore_navigation` is a `?frame_mod.NavigationAnchor`.
+  `acceptBufferDisclosure` uses the expression of step 4. `keepPlans` stays its first statement.
+- `Published.resolveNavigation` resolves an anchor against the published Frame.
+  `cancelBufferSearch`, the query clear, `acceptBufferSearchScanned`, and both benchmark readers use it.
+- The 3 remap blocks and the `clear_review_disclosures` navigation branch are deleted.
+  The `clear_review_disclosures` field stays, because it also releases the Review Search baseline.
+
+Checks:
+
+- At `5682c4d`, the 4 tests fail with `expected 7, found 2`, `expected 9, found 12`, `expected 34, found 30`, and `expected 11, found 8`.
+- With the kind condition in `acceptViewBuild` removed, the first 3 tests pass and the fourth test still fails with `expected 11, found 8`.
+- `zig build test --summary all`: exit 0, 56/56 steps, 1651/1651 tests.
+- `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_benchmark_metrics.py`, `python3 tools/check_diagnostics.py`, and `python3 tools/check_search_index.py` pass.
+- `tools/check_navigation_fields.py` fails on the tree of `5682c4d` at `restore_navigation` (line 2826) and `saved_navigation` (line 3972).
+- Live check of the `.enrichment` case, ReleaseFast on native `aarch64-macos`, 160 × 80, with a 25 second delay in the File Enrichment worker.
+  The cursor was on the header of File 1, the input was open, and the File Enrichment of File 0 moved that header from row 2 to row 75.
+  At `542fc7b`, Escape put the cursor on row 2 in File 0. At `04f1eb7`, Escape put it on row 75, the File 1 header.
+
+Review:
+
+- Standards: no hard violation. The review found gaps in the checker patterns and long sentences in the docs. Both are fixed.
+  The name `restore_navigation` stays, because tickets 15 and 16 use it.
+- Spec: every reader resolves the start against its own Frame.
+  Step 7 is partial. Each Buffer build makes its own Whole File gap Lines, so an anchor on a gap Line falls back to the top after a rebuild.
+  The cursor restore of every admission has the same gap. Ticket 20 tracks it.
+- The tests do not check the viewport offset. In the test fixtures, the whole Buffer fits in the DiffPane, so the scroll is always 0.
