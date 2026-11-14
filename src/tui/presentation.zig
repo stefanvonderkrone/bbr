@@ -34417,6 +34417,7 @@ test "M21 kernel Buffer Search clears the current occurrence when a Draft deleti
     try testing.expect(searchOccurrenceEql(wanted.occurrences[0], batch.occurrences[0]));
     try testing.expect(published.buffer_search.active == null);
     try testing.expect(published.buffer_search.projection().?.active == null);
+    try testing.expect(published.occurrenceVisualRow(wanted.occurrences[0]) == null);
     try testing.expect(presentation.action_error == null);
 
     try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
@@ -34434,9 +34435,9 @@ test "M21 kernel Buffer Search retries a move into an isolated File without matc
     try presentation.dispatch(.{ .action = .to_top });
     try completeQueuedTestWork(&presentation);
     try testing.expect(published.buffer_search.saved_disclosures == null);
+    try presentation.dispatch(.{ .action = .isolate });
     const before = try testing.allocator.dupe(buffer_mod.DisclosureKey, published.expanded_disclosures.items);
     defer testing.allocator.free(before);
-    try presentation.dispatch(.{ .action = .isolate });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
     try completeQueuedTestWork(&presentation);
 
