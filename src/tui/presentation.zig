@@ -2806,12 +2806,14 @@ pub const DisclosureBuild = struct {
     clear_review_disclosures: bool = false,
     command_id: CommandId = 0,
     frame_revision: frame_mod.Revision,
-    active: ?usize,
+    /// The Buffer Search occurrence that an `.input`, `.accepted`, `.restore`,
+    /// or `.clear_input` build opens. Every other build keeps the current
+    /// occurrence of the Presentation, which can move while the build runs.
+    destination_active: ?usize = null,
     clear_saved_disclosures: bool = false,
     batch: ?search.Batch = null,
     accepted_snapshot: ?search.Batch = null,
     review_snapshot: ?search.Batch = null,
-    accepted_active: ?usize = null,
     accepted_query_text: ?[]const u8 = null,
     input_request_id: ?u64 = null,
     input_query_text: ?[]const u8 = null,
@@ -2851,7 +2853,7 @@ pub const DisclosureBuild = struct {
     surviving_row: ?SurvivingRow = null,
     failed: bool = false,
 
-    fn create(published: *Published, preferences: Preferences, target: DisclosureTarget, request_id: u64, active: ?usize) !*DisclosureBuild {
+    fn create(published: *Published, preferences: Preferences, target: DisclosureTarget, request_id: u64) !*DisclosureBuild {
         if (!published.disclosure_inputs_current) return error.OutOfMemory;
         const backing = std.heap.page_allocator;
         const job = try backing.create(DisclosureBuild);
@@ -2869,7 +2871,6 @@ pub const DisclosureBuild = struct {
             .epoch = published.epoch,
             .request_id = request_id,
             .frame_revision = published.visual_rows_revision,
-            .active = active,
             .cache_revision = published.session.enrichment.revision,
             .cache_policy = published.session.enrichment.cache,
             .cache_focused = published.session.enrichment.focused,
@@ -2896,7 +2897,6 @@ pub const DisclosureBuild = struct {
         }
         if (published.buffer_search.accepted_batch) |*batch| {
             job.accepted_snapshot = try batch.retain(published.allocator);
-            job.accepted_active = published.buffer_search.active;
             if (published.buffer_search.accepted_query) |query| job.accepted_query_text = try a.dupe(u8, query.text);
         }
         if (published.review_search.batch) |*batch| {
@@ -3092,7 +3092,6 @@ pub const DisclosureBuild = struct {
                     return err;
                 };
                 self.rebuilt_batch.?.owner_arena = arena;
-                self.active = retainedSearchIndex(self.accepted_snapshot, self.accepted_active, self.rebuilt_batch.?);
             }
             if (self.input_query_text) |text| {
                 const query = try search.Query.init(a, text);
@@ -7959,7 +7958,7 @@ pub const Presentation = struct {
 
     fn queueCardDestination(self: *Presentation, published: *Published, owner: search.ReviewBodyOwner, required: SearchDisclosureSet, isolated: ?usize, attempt: u1) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
-        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys, .add = required }, published.search_generation, published.buffer_search.active);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys, .add = required }, published.search_generation);
         job.kind = .card_destination;
         job.destination_card = owner;
         job.destination_attempt = attempt;
@@ -9106,7 +9105,7 @@ pub const Presentation = struct {
 
     fn queueReviewSearchDestination(self: *Presentation, published: *Published, preferences: Preferences, isolated: ?usize, required: SearchDisclosureSet, active_file: ?usize) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
-        const job = try DisclosureBuild.create(published, preferences, .{ .base = published.disclosure_keys, .add = required }, published.search_generation, published.buffer_search.active);
+        const job = try DisclosureBuild.create(published, preferences, .{ .base = published.disclosure_keys, .add = required }, published.search_generation);
         job.kind = .review_destination;
         job.destination_occurrence = published.review_search.selected;
         job.review_request_id = published.review_search.request_id;
@@ -9165,7 +9164,7 @@ pub const Presentation = struct {
     fn queueBufferSearchOpening(self: *Presentation, published: *Published, baseline: *DisclosureKeys) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
         const request_id = if (published.search_generation == std.math.maxInt(u64)) 1 else published.search_generation + 1;
-        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = baseline }, request_id, published.buffer_search.active);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = baseline }, request_id);
         job.kind = .open_input;
         job.clear_review_disclosures = true;
         published.search_generation = request_id;
@@ -9558,9 +9557,10 @@ pub const Presentation = struct {
             };
             return false;
         }
-        const job = try DisclosureBuild.create(published, self.preferences, target, request_id, active);
+        const job = try DisclosureBuild.create(published, self.preferences, target, request_id);
         errdefer job.destroy();
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
+        job.destination_active = active;
         job.clear_saved_disclosures = required.len == 0;
         job.batch = batch;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
@@ -9603,7 +9603,7 @@ pub const Presentation = struct {
             return;
         }
         const same_batch = if (job.accepted_snapshot) |snapshot| if (published.buffer_search.accepted_batch) |current|
-            snapshot.occurrences.ptr == current.occurrences.ptr and snapshot.occurrences.len == current.occurrences.len and job.accepted_active == published.buffer_search.active
+            snapshot.occurrences.ptr == current.occurrences.ptr and snapshot.occurrences.len == current.occurrences.len
         else
             false else published.buffer_search.accepted_batch == null;
         const same_review = if (job.review_snapshot) |snapshot| if (published.review_search.batch) |current|
@@ -9663,7 +9663,7 @@ pub const Presentation = struct {
         input.ranges = ranges;
         input.navigation_rows = job.navigation_rows;
         job.navigation_rows = null;
-        input.active = job.active;
+        input.active = job.destination_active;
         input.pending = false;
         published.expanded_disclosures.deinit(self.allocator);
         published.expanded_disclosures = disclosures;
@@ -9674,14 +9674,14 @@ pub const Presentation = struct {
             if (published.buffer_search.saved_disclosures) |baseline| baseline.release();
             published.buffer_search.saved_disclosures = null;
         }
-        if (job.active) |index| {
+        if (job.destination_active) |index| {
             if (input.navigation_rows) |rows| {
                 if (rows[index].visible) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(input.batch.?.occurrences[index]);
             } else _ = published.jumpToSearchOccurrence(input.batch.?.occurrences[index]);
         }
         published.frame_revision += 1;
         published.visual_rows_revision = published.frame_revision;
-        self.action_error = if (job.active == null) .buffer_search_no_matches else null;
+        self.action_error = if (job.destination_active == null) .buffer_search_no_matches else null;
         if (input.accept_when_ready) self.acceptBufferSearch();
     }
 
@@ -9746,7 +9746,7 @@ pub const Presentation = struct {
         }
         if (job.accepted_snapshot) |snapshot| {
             const current = published.buffer_search.accepted_batch;
-            if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr or job.accepted_active != published.buffer_search.active) {
+            if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr) {
                 self.retryContentBuild(published, job);
                 return;
             }
@@ -9902,6 +9902,7 @@ pub const Presentation = struct {
         if (published.search_corpus) |old| old.release();
         published.search_corpus = job.search_corpus;
         job.search_corpus = null;
+        const active = if (job.rebuilt_batch) |rebuilt| retainedSearchIndex(published.buffer_search.accepted_batch, published.buffer_search.active, rebuilt) else published.buffer_search.active;
         if (published.buffer_search.accepted_batch) |*old| old.deinit(self.allocator);
         published.buffer_search.accepted_batch = job.rebuilt_batch;
         job.rebuilt_batch = null;
@@ -9911,7 +9912,7 @@ pub const Presentation = struct {
         job.ranges = null;
         published.buffer_search.accepted_navigation_rows = job.navigation_rows;
         job.navigation_rows = null;
-        published.buffer_search.active = job.active;
+        published.buffer_search.active = active;
         if (published.buffer_search.input) |*input| {
             const next_active = if (job.input_rebuilt_batch) |batch| retainedProjectedSearchIndex(input.batch, input.active, batch, job.input_navigation_rows) else null;
             if (input.batch) |*old| old.deinit(self.allocator);
@@ -10096,7 +10097,7 @@ pub const Presentation = struct {
 
     fn queueDraftBuild(self: *Presentation, published: *Published, draft: bbr.review.Draft) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
-        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation);
         errdefer job.destroy();
         job.kind = .draft_save;
         job.new_draft = try cloneDisclosureDraft(job.arena.allocator(), draft);
@@ -10105,7 +10106,7 @@ pub const Presentation = struct {
 
     fn queueCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
-        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation);
         job.kind = .cache_update;
         job.cache_focused = focused;
         job.cache_request_id = published.cache_update_generation +% 1;
@@ -10125,7 +10126,7 @@ pub const Presentation = struct {
 
     fn queueDraftMutation(self: *Presentation, published: *Published, mutation: DraftMutation, retry_id: ?u64) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
-        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation);
         errdefer job.destroy();
         job.kind = .draft_mutation;
         job.mutation = try mutation.clone(job.arena.allocator());
@@ -10200,7 +10201,7 @@ pub const Presentation = struct {
     /// Snapshots the current Session for `enrichments`, which the new build
     /// owns only when it returns.
     fn createEnrichmentBuild(self: *Presentation, published: *Published, enrichments: []const EnrichedFile) !*DisclosureBuild {
-        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation);
         errdefer job.destroy();
         job.kind = .enrichment;
         job.version_restoration = self.version_restoration;
@@ -10284,7 +10285,7 @@ pub const Presentation = struct {
     fn queueViewBuild(self: *Presentation, published: *Published, preferences: Preferences, isolated_file: ?usize, geometry: frame_mod.Geometry, policy: DisclosureBuild.NavigationPolicy) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
         const request_id = if (published.view_generation == std.math.maxInt(u64)) 1 else published.view_generation + 1;
-        const job = try DisclosureBuild.create(published, preferences, .{ .base = published.disclosure_keys }, request_id, published.buffer_search.active);
+        const job = try DisclosureBuild.create(published, preferences, .{ .base = published.disclosure_keys }, request_id);
         job.kind = .view;
         job.geometry = geometry;
         job.isolated_file = isolated_file;
@@ -10343,10 +10344,6 @@ pub const Presentation = struct {
         if (job.accepted_snapshot) |snapshot| {
             if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr) return;
         } else if (current != null or (job.kind != .restore and job.kind != .general and job.kind != .clear_input and job.kind != .open_input)) return;
-        if (job.kind == .general and job.accepted_active != published.buffer_search.active) {
-            self.retryAcceptedDisclosure(published, job);
-            return;
-        }
         if (job.review_snapshot) |snapshot| {
             const review = published.review_search.batch orelse return;
             if (snapshot.occurrences.ptr != review.occurrences.ptr) {
@@ -10420,7 +10417,7 @@ pub const Presentation = struct {
         job.navigation_rows = null;
         published.publishReviewRanges(job.review_ranges);
         job.review_ranges = null;
-        published.buffer_search.active = job.active;
+        if (job.kind != .general and job.kind != .open_input) published.buffer_search.active = job.destination_active;
         published.expanded_disclosures.deinit(self.allocator);
         published.expanded_disclosures = disclosures;
         published.disclosure_keys.release();
@@ -10440,7 +10437,7 @@ pub const Presentation = struct {
         }
         if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
         if (job.restore_navigation == null and job.kind != .general and job.kind != .open_input) {
-            if (job.active) |index| {
+            if (job.destination_active) |index| {
                 if (published.buffer_search.accepted_navigation_rows) |rows| {
                     if (rows[index].visible) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(current.?.occurrences[index]);
                 } else _ = published.jumpToSearchOccurrence(current.?.occurrences[index]);
@@ -10470,7 +10467,6 @@ pub const Presentation = struct {
     }
 
     fn retryAcceptedDisclosure(self: *Presentation, published: *Published, job: *const DisclosureBuild) void {
-        const active = if (job.kind == .general) published.buffer_search.active else job.active;
         if (job.kind == .open_input) {
             self.queueBufferSearchOpening(published, job.target.base) catch |err| switch (err) {
                 error.OutOfMemory => {
@@ -10480,7 +10476,7 @@ pub const Presentation = struct {
             };
             return;
         }
-        const replacement = self.queueAcceptedDisclosure(published, job.target, active, job.kind, job.result_error) catch |err| switch (err) {
+        const replacement = self.queueAcceptedDisclosure(published, job.target, job.destination_active, job.kind, job.result_error) catch |err| switch (err) {
             error.OutOfMemory => {
                 if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
                 self.action_error = .out_of_memory;
@@ -10617,10 +10613,11 @@ pub const Presentation = struct {
         published.frame_revision += 1;
     }
 
-    fn queueAcceptedDisclosure(self: *Presentation, published: *Published, disclosures: DisclosureTarget, active: ?usize, kind: DisclosureBuild.Kind, result_error: ?ActionError) !*DisclosureBuild {
+    fn queueAcceptedDisclosure(self: *Presentation, published: *Published, disclosures: DisclosureTarget, destination_active: ?usize, kind: DisclosureBuild.Kind, result_error: ?ActionError) !*DisclosureBuild {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
         const request_id = if (published.search_generation == std.math.maxInt(u64)) 1 else published.search_generation + 1;
-        const job = try DisclosureBuild.create(published, self.preferences, disclosures, request_id, active);
+        const job = try DisclosureBuild.create(published, self.preferences, disclosures, request_id);
+        job.destination_active = destination_active;
         var index: usize = 0;
         while (index < self.commands.items.len) {
             if (self.commands.items[index] == .build_buffer_disclosure and
@@ -12557,7 +12554,7 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
-        const job = DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active) catch |err| switch (err) {
+        const job = DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.action_error = .out_of_memory;
                 return;
@@ -12804,7 +12801,7 @@ pub const Presentation = struct {
             break;
         };
         if (target.remove == null) target.add.append(key);
-        const job = self.queueAcceptedDisclosure(published, target, published.buffer_search.active, .general, null) catch |err| switch (err) {
+        const job = self.queueAcceptedDisclosure(published, target, null, .general, null) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.action_error = .out_of_memory;
                 return;
@@ -15226,7 +15223,8 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         if (ranges.len == 0) return error.MissingRanges;
         allocator.free(ranges);
 
-        const job = try DisclosureBuild.create(published, presentation.preferences, .{ .base = published.disclosure_keys }, input.request_id, input.active);
+        const job = try DisclosureBuild.create(published, presentation.preferences, .{ .base = published.disclosure_keys }, input.request_id);
+        job.destination_active = input.active;
         job.batch = try batch.clone(std.heap.page_allocator);
         job.batch.?.owner = std.heap.page_allocator;
         published.buffer_search.input.?.pending = true;
@@ -15773,7 +15771,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
     }
     for (&times, &control) |*elapsed, *copy_elapsed| {
         var start = std.Io.Clock.awake.now(io);
-        const job = try DisclosureBuild.create(published, presentation.preferences, .{ .base = published.disclosure_keys }, 0, null);
+        const job = try DisclosureBuild.create(published, presentation.preferences, .{ .base = published.disclosure_keys }, 0);
         elapsed.* = @intCast(start.untilNow(io, .awake).toNanoseconds());
         std.mem.doNotOptimizeAway(job);
         job.destroy();
@@ -16816,7 +16814,7 @@ test "a discarded first SideBySide build keeps its plans and a second first buil
     const published = presentation.published.?;
     var jobs: [2]*DisclosureBuild = undefined;
     for (&jobs) |*job| {
-        job.* = try DisclosureBuild.create(published, .{ .layout = .side_by_side }, .{ .base = published.disclosure_keys }, 0, null);
+        job.* = try DisclosureBuild.create(published, .{ .layout = .side_by_side }, .{ .base = published.disclosure_keys }, 0);
         job.*.build();
         try testing.expect(job.*.built_plans != null);
     }
@@ -25353,7 +25351,7 @@ test "M21 disclosure worker projects retained accepted and Review Search Batches
     published.buffer_search.accepted_batch = try search.scan(testing.allocator, query, published.search_corpus.?.candidates, .literal);
     published.review_search.batch = try published.buffer_search.accepted_batch.?.clone(testing.allocator);
 
-    const job = try DisclosureBuild.create(published, presentation.preferences, .{ .base = published.disclosure_keys }, 1, null);
+    const job = try DisclosureBuild.create(published, presentation.preferences, .{ .base = published.disclosure_keys }, 1);
     defer job.destroy();
     job.batch = try search.scan(std.heap.page_allocator, query, published.search_corpus.?.candidates, .literal);
     if (published.buffer_search.accepted_batch) |*batch| batch.deinit(testing.allocator);
@@ -34048,4 +34046,93 @@ test "an allocation failure in a Review Search source publication keeps the prev
     }
     // The merge index, the part projection, and the results each fail once at least.
     try testing.expect(failures >= 3);
+}
+
+/// Accepts the Buffer Search " 0", which matches "old 0" and "new 0" in File 0,
+/// and leaves the first File Enrichment commands in the queue.
+fn acceptTestBufferSearchBeforeEnrichment(store: *bbr.review.InMemoryStore) !Presentation {
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 2) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    errdefer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = ' ', .text = " 0" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const published = presentation.published.?;
+    try testing.expectEqual(@as(usize, 2), published.buffer_search.accepted_batch.?.occurrences.len);
+    try testing.expectEqual(@as(?usize, 0), published.buffer_search.active);
+    try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
+    return presentation;
+}
+
+/// Delivers the File Enrichment of File 0 and takes the rebuild that it queues.
+fn startTestEnrichmentBuild(presentation: *Presentation) !*DisclosureBuild {
+    try presentation.queueFileEnrichment(presentation.published.?, 0, false);
+    try deliverTestEnrichment(presentation, presentation.takeCommand().?.enrich_file);
+    const job = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.enrichment, job.kind);
+    return job;
+}
+
+test "Buffer Search admits an enrichment rebuild after a current occurrence move and keeps that occurrence" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try acceptTestBufferSearchBeforeEnrichment(&store);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const job = try startTestEnrichmentBuild(&presentation);
+    try presentation.dispatch(.{ .action = .next_search_occurrence });
+    const moved = published.buffer_search.active.?;
+    try testing.expectEqual(@as(usize, 1), moved);
+    var wanted = try published.buffer_search.accepted_batch.?.clone(testing.allocator);
+    defer wanted.deinit(testing.allocator);
+
+    job.build();
+    try testing.expect(!job.failed);
+    const visual_rows = job.visual_rows.ptr;
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+
+    try testing.expectEqual(visual_rows, published.visual_rows.ptr);
+    for (presentation.commands.items) |command| try testing.expect(command != .build_buffer_disclosure);
+    const active = published.buffer_search.active.?;
+    try testing.expect(searchOccurrenceEql(wanted.occurrences[moved], published.buffer_search.accepted_batch.?.occurrences[active]));
+    const frame = published.frameProjection();
+    try testing.expectEqual(@as(?usize, active), frame.buffer_search_active);
+    const expected = try Published.projectBufferSearchRangesFor(testing.allocator, published.buffer, published.visual_rows, published.buffer_search.accepted_batch.?, active);
+    defer testing.allocator.free(expected);
+    var active_ranges: usize = 0;
+    for (expected) |range| active_ranges += @intFromBool(range.active);
+    try testing.expect(active_ranges > 0);
+    try testing.expectEqual(expected.len, frame.search_ranges.len);
+    for (expected, frame.search_ranges) |want, got| {
+        try testing.expectEqual(want.visual_row, got.visual_row);
+        try testing.expectEqual(want.occurrence_index, got.occurrence_index);
+        try testing.expectEqual(want.active, got.occurrence_index == frame.buffer_search_active);
+    }
+}
+
+test "Buffer Search rejects and retries an enrichment rebuild after its accepted batch changes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try acceptTestBufferSearchBeforeEnrichment(&store);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const job = try startTestEnrichmentBuild(&presentation);
+    const visual_rows = published.visual_rows.ptr;
+    const replaced = try published.buffer_search.accepted_batch.?.clone(testing.allocator);
+    published.buffer_search.accepted_batch.?.deinit(testing.allocator);
+    published.buffer_search.accepted_batch = replaced;
+
+    job.build();
+    try testing.expect(!job.failed);
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+
+    try testing.expectEqual(visual_rows, published.visual_rows.ptr);
+    try testing.expect(published.session.enrichment.file(0).new == .pending);
+    try testing.expectEqual(@as(usize, 1), queuedEnrichmentBuilds(&presentation));
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(published.session.enrichment.file(0).new == .content);
+    try testing.expect(published.visual_rows.ptr != visual_rows);
 }
