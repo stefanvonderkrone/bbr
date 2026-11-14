@@ -10499,7 +10499,17 @@ pub const Presentation = struct {
             };
             return;
         }
-        const replacement = self.queueAcceptedDisclosure(published, job.target, job.destination_active, job.kind, job.result_error) catch |err| switch (err) {
+        const destination = if (job.destination_active != null)
+            if (published.buffer_search.accepted_batch) |current| retainedSearchIndex(job.accepted_snapshot, job.destination_active, current) else null
+        else
+            null;
+        if ((job.kind == .accepted or job.kind == .restore) and job.restore_navigation == null) {
+            if (destination) |index| {
+                self.openBufferSearchOccurrence(published, index, job.result_error);
+                return;
+            }
+        }
+        const replacement = self.queueAcceptedDisclosure(published, job.target, destination, job.kind, job.result_error) catch |err| switch (err) {
             error.OutOfMemory => {
                 if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
                 self.action_error = .out_of_memory;
@@ -10595,44 +10605,43 @@ pub const Presentation = struct {
         } else searchFromInactiveRow(batch.*, published.buffer_search.accepted_navigation_rows, published.navigation.cursor, count, direction);
         const next = next_and_wrap[0];
         const wrapped = next_and_wrap[1];
+        const status: ?ActionError = if (wrapped) switch (direction) {
+            .forward => .buffer_search_hit_bottom,
+            .backward => .buffer_search_hit_top,
+        } else null;
+        self.openBufferSearchOccurrence(published, next, status);
+    }
+
+    fn openBufferSearchOccurrence(self: *Presentation, published: *Published, index: usize, status: ?ActionError) void {
+        const batch = published.buffer_search.accepted_batch.?;
         if (published.buffer_search.saved_disclosures == null) {
-            const row = if (published.buffer_search.accepted_navigation_rows) |rows| rows[next].visible else published.occurrenceVisualRow(batch.occurrences[next]);
+            const row = if (published.buffer_search.accepted_navigation_rows) |rows| rows[index].visible else published.occurrenceVisualRow(batch.occurrences[index]);
             if (row) |visible| {
-                published.buffer_search.active = next;
+                published.buffer_search.active = index;
                 published.navigation.jumpTo(visible);
-                self.action_error = if (wrapped) switch (direction) {
-                    .forward => .buffer_search_hit_bottom,
-                    .backward => .buffer_search_hit_top,
-                } else null;
+                self.action_error = status;
                 published.frame_revision += 1;
                 return;
             }
         }
-        const occurrence = batch.occurrences[next];
+        const occurrence = batch.occurrences[index];
         const required = searchDisclosureForVisibility(published, occurrence, published.occurrenceVisualRow(occurrence) != null);
         const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
         if (!target.matchesKeys(published.disclosure_keys)) {
-            const status: ?ActionError = if (wrapped) switch (direction) {
-                .forward => .buffer_search_hit_bottom,
-                .backward => .buffer_search_hit_top,
-            } else null;
-            _ = self.queueAcceptedDisclosure(published, target, next, if (required.len == 0) .restore else .accepted, status) catch |err| switch (err) {
+            _ = self.queueAcceptedDisclosure(published, target, index, if (required.len == 0) .restore else .accepted, status) catch |err| switch (err) {
                 error.OutOfMemory => {
                     self.action_error = .out_of_memory;
                 },
             };
             return;
         }
-        published.buffer_search.active = next;
+        published.buffer_search.active = index;
         if (required.len == 0) if (published.buffer_search.saved_disclosures) |saved| {
             saved.release();
             published.buffer_search.saved_disclosures = null;
         };
-        _ = published.jumpToSearchOccurrence(batch.occurrences[next]);
-        self.action_error = if (wrapped) switch (direction) {
-            .forward => .buffer_search_hit_bottom,
-            .backward => .buffer_search_hit_top,
-        } else null;
+        _ = published.jumpToSearchOccurrence(batch.occurrences[index]);
+        self.action_error = status;
         published.frame_revision += 1;
     }
 
@@ -34266,6 +34275,74 @@ test "M21 kernel Buffer Search retries a hidden move after an isolation removes 
     try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
     try testing.expect(searchOccurrenceEql(wanted.occurrences[0], batch.occurrences[active]));
     try testing.expectEqual(published.occurrenceVisualRow(wanted.occurrences[0]).?, published.navigation.cursor);
+}
+
+test "M21 kernel Buffer Search retries hidden fold moves after Changes enrichment" {
+    for ([_]enum { forward, backward }{ .forward, .backward }) |direction| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 40 },
+        });
+        defer presentation.deinit();
+        try testing.expectEqual(Scope.changes, presentation.preferences.scope);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c" } });
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const published = presentation.published.?;
+        var wanted = try published.buffer_search.accepted_batch.?.clone(testing.allocator);
+        defer wanted.deinit(testing.allocator);
+        try testing.expectEqual(@as(?usize, 0), published.buffer_search.active);
+        if (direction == .backward) {
+            try presentation.dispatch(.{ .key = .{ .codepoint = '4', .text = "4" } });
+            try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
+            try completeQueuedTestWork(&presentation);
+        }
+        const target: usize = if (direction == .forward) 4 else 2;
+        try presentation.queueFileEnrichment(published, 0, false);
+        try deliverTestEnrichment(&presentation, presentation.takeCommand().?.enrich_file);
+        try presentation.dispatch(.{ .key = .{ .codepoint = if (direction == .forward) '4' else '2', .text = if (direction == .forward) "4" else "2" } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = if (direction == .forward) 'n' else 'N' } });
+        try testing.expectEqual(if (direction == .forward) DisclosureBuild.Kind.accepted else .restore, presentation.commands.items[1].build_buffer_disclosure.kind);
+        try completeQueuedTestWork(&presentation);
+
+        const active = published.buffer_search.active.?;
+        try testing.expect(searchOccurrenceEql(wanted.occurrences[target], published.buffer_search.accepted_batch.?.occurrences[active]));
+        const expected_row = published.occurrenceVisualRow(wanted.occurrences[target]).?;
+        try testing.expectEqual(expected_row, published.navigation.cursor);
+        try testing.expect(presentation.action_error == null);
+    }
+}
+
+test "M21 kernel Buffer Search retries null destinations after enrichment without selecting a match" {
+    for ([_]enum { cancel, clear_active }{ .cancel, .clear_active }) |transition| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 40 },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+        try completeBufferSearchScan(&presentation);
+        if (transition == .clear_active) try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const published = presentation.published.?;
+        try presentation.queueFileEnrichment(published, 0, false);
+        try deliverTestEnrichment(&presentation, presentation.takeCommand().?.enrich_file);
+        switch (transition) {
+            .cancel => try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } }),
+            .clear_active => try presentation.dispatch(.{ .action = .to_top }),
+        }
+        try testing.expectEqual(DisclosureBuild.Kind.restore, presentation.commands.items[1].build_buffer_disclosure.kind);
+        try testing.expect(presentation.commands.items[1].build_buffer_disclosure.destination_active == null);
+        try completeQueuedTestWork(&presentation);
+        try testing.expect(published.buffer_search.active == null);
+        try testing.expect(published.buffer_search.input == null);
+        try testing.expect(presentation.action_error == null);
+    }
 }
 
 test "Buffer Search rejects and retries an enrichment rebuild after its accepted batch changes" {
