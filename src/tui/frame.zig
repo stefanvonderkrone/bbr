@@ -701,35 +701,75 @@ pub fn visualIndexForBufferIndex(rows: []const VisualRow, buffer_index: usize) ?
     return if (low < rows.len and rows[low].buffer_index == buffer_index) low else null;
 }
 
+/// A navigation held by the identity of its rows, so that any later Frame of
+/// the same Session can resolve it. State that outlives a Frame stores this,
+/// not a `Nav`, because only `resolve` against a Frame yields its row numbers.
+pub const NavigationAnchor = struct {
+    count: usize,
+    /// The rows between the top of the viewport and the cursor.
+    cursor_offset: usize,
+    cursor: ?VisualRow,
+    mark: ?Mark,
+
+    const Mark = struct {
+        row: VisualRow,
+        /// The mark and cursor rows of the capture Frame. A mark that is not
+        /// on a Line keeps only when it resolves to the same range.
+        captured_range: [2]usize,
+    };
+
+    pub fn capture(navigation: Nav, visual_rows: []const VisualRow) NavigationAnchor {
+        const cursor = visualRowAt(visual_rows, navigation.cursor);
+        const mark: ?Mark = if (navigation.mark) |mark| if (visualRowAt(visual_rows, mark)) |row| .{
+            .row = identity(row),
+            .captured_range = .{ @min(mark, navigation.cursor), @max(mark, navigation.cursor) },
+        } else null else null;
+        return .{
+            .count = navigation.count,
+            .cursor_offset = navigation.cursor -| navigation.scroll,
+            .cursor = if (cursor) |row| identity(row) else null,
+            .mark = mark,
+        };
+    }
+
+    /// The navigation in the Frame of `visual_rows`. A cursor row that the
+    /// Frame lost puts the cursor at the top of the Buffer.
+    pub fn resolve(self: NavigationAnchor, visual_rows: []const VisualRow, geometry: Geometry, index: NavigationIndex) Nav {
+        return self.resolveWith(visual_rows, geometry, index);
+    }
+
+    fn resolveWith(self: NavigationAnchor, visual_rows: []const VisualRow, geometry: Geometry, index: ?NavigationIndex) Nav {
+        const viewport = paneRects(geometry).diff_content.height;
+        var restored = Nav.init(visual_rows.len, viewport);
+        restored.count = self.count;
+        const cursor_row = self.cursor orelse return restored;
+        const cursor = (if (index) |lookup| lookup.find(cursor_row) else findVisualRow(visual_rows, cursor_row)) orelse return restored;
+        restored.jumpTo(cursor);
+        restored.count = self.count;
+        restored.scroll = cursor -| self.cursor_offset;
+        restored.setViewport(viewport);
+
+        const mark = self.mark orelse return restored;
+        const restored_mark = (if (index) |lookup| lookup.find(mark.row) else findVisualRow(visual_rows, mark.row)) orelse return restored;
+        const range = [2]usize{ @min(restored_mark, cursor), @max(restored_mark, cursor) };
+        if ((mark.row.owner == .line and cursor_row.owner == .line) or std.meta.eql(mark.captured_range, range)) restored.mark = restored_mark;
+        return restored;
+    }
+
+    /// Row lookup reads only the owner and the source start. The other fields,
+    /// such as `buffer_index`, are positions in the capture Frame.
+    fn identity(row: VisualRow) VisualRow {
+        return .{ .owner = row.owner, .source_start = row.source_start };
+    }
+};
+
 pub fn restoreNavigationIndexed(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry, index: NavigationIndex) Nav {
-    return restoreNavigationWith(previous, visual_rows, geometry, index);
+    return NavigationAnchor.capture(previous.navigation, previous.visual_rows).resolve(visual_rows, geometry, index);
 }
 
 /// Linear benchmark control and reference for indexed restoration.
 pub fn restoreNavigation(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry) Nav {
-    return restoreNavigationWith(previous, visual_rows, geometry, @as(?NavigationIndex, null));
-}
-
-fn restoreNavigationWith(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry, index: ?NavigationIndex) Nav {
-    var restored = Nav.init(visual_rows.len, paneRects(geometry).diff_content.height);
-    restored.count = previous.navigation.count;
-    const cursor_row = visualRowAt(previous.visual_rows, previous.navigation.cursor) orelse return restored;
-    const cursor = (if (index) |lookup| lookup.find(cursor_row) else findVisualRow(visual_rows, cursor_row)) orelse return restored;
-    restored.jumpTo(cursor);
-    restored.count = previous.navigation.count;
-
-    const old_offset = previous.navigation.cursor -| previous.navigation.scroll;
-    restored.scroll = cursor -| old_offset;
-    restored.setViewport(paneRects(geometry).diff_content.height);
-
-    if (previous.navigation.mark) |mark| {
-        const mark_row = visualRowAt(previous.visual_rows, mark) orelse return restored;
-        const restored_mark = (if (index) |lookup| lookup.find(mark_row) else findVisualRow(visual_rows, mark_row)) orelse return restored;
-        const old_range = [2]usize{ @min(mark, previous.navigation.cursor), @max(mark, previous.navigation.cursor) };
-        const new_range = [2]usize{ @min(restored_mark, cursor), @max(restored_mark, cursor) };
-        if ((mark_row.owner == .line and cursor_row.owner == .line) or std.meta.eql(old_range, new_range)) restored.mark = restored_mark;
-    }
-    return restored;
+    return NavigationAnchor.capture(previous.navigation, previous.visual_rows).resolveWith(visual_rows, geometry, null);
 }
 
 pub fn resizeViewports(navigation: *Nav, tree: *file_tree.Projection, geometry: Geometry) void {

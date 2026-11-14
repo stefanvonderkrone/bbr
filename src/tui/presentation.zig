@@ -2823,7 +2823,8 @@ pub const DisclosureBuild = struct {
     request_id: u64,
     kind: Kind = .input,
     result_error: ?ActionError = null,
-    restore_navigation: ?Nav = null,
+    /// The Buffer Search input start that the build puts the cursor on.
+    restore_navigation: ?frame_mod.NavigationAnchor = null,
     restore_search_disclosures: ?*DisclosureKeys = null,
     review_saved_disclosures: ?*DisclosureKeys = null,
     clear_review_disclosures: bool = false,
@@ -3969,8 +3970,9 @@ const BufferSearchInput = struct {
     active: ?usize = null,
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
     navigation_rows: ?[]SearchNavigationRow = null,
-    saved_navigation: Nav,
-    origin: usize,
+    /// Where the user opened the input. Escape returns there, and a preview
+    /// that a query change loses starts again from there.
+    start: frame_mod.NavigationAnchor,
     count: usize,
     saved_expanded_disclosures: *DisclosureKeys,
     saved_search_disclosures: ?*DisclosureKeys = null,
@@ -4627,6 +4629,10 @@ const Published = struct {
             .isolated_file = self.isolated_file,
             .frame = self.frameProjection(),
         };
+    }
+
+    fn resolveNavigation(self: *const Published, anchor: frame_mod.NavigationAnchor) Nav {
+        return anchor.resolve(self.visual_rows, self.geometry, self.search_projection.navigation);
     }
 
     fn frameProjection(self: *const Published) frame_mod.Projection {
@@ -9171,8 +9177,7 @@ pub const Presentation = struct {
         published.active_search = .buffer;
         published.navigation.count = 0;
         published.buffer_search.input = .{
-            .saved_navigation = published.navigation,
-            .origin = published.navigation.cursor,
+            .start = .capture(published.navigation, published.visual_rows),
             .count = count,
             .saved_expanded_disclosures = saved_expanded,
             .saved_search_disclosures = saved_search,
@@ -9197,7 +9202,7 @@ pub const Presentation = struct {
 
     fn cancelBufferSearch(self: *Presentation) void {
         const published = self.published orelse return;
-        const saved_navigation = if (published.buffer_search.input) |input| input.saved_navigation else return;
+        const start = if (published.buffer_search.input) |input| input.start else return;
         const input_disclosures = published.buffer_search.input.?.saved_expanded_disclosures;
         if (!sameDisclosures(published.expanded_disclosures.items, input_disclosures.items())) {
             const job = self.queueAcceptedDisclosure(published, .{ .base = input_disclosures }, published.buffer_search.active, .restore, null) catch |err| switch (err) {
@@ -9206,7 +9211,7 @@ pub const Presentation = struct {
                     return;
                 },
             };
-            job.restore_navigation = saved_navigation;
+            job.restore_navigation = start;
             job.clear_review_disclosures = published.buffer_search.input.?.restoring_review_disclosures;
             if (published.buffer_search.input.?.saved_search_disclosures) |saved| {
                 job.restore_search_disclosures = saved.retain();
@@ -9228,7 +9233,7 @@ pub const Presentation = struct {
         }
         var input = published.buffer_search.input orelse return;
         published.buffer_search.input = null;
-        published.navigation = saved_navigation;
+        published.navigation = published.resolveNavigation(start);
         input.deinit(self.allocator);
         self.discardQueuedBufferSearchScans(null);
         self.action_error = null;
@@ -9392,7 +9397,7 @@ pub const Presentation = struct {
             }
             if (old_ranges) |ranges| std.heap.page_allocator.free(ranges);
             if (old_navigation_rows) |rows| std.heap.page_allocator.free(rows);
-            if (queued == null) published.navigation = input.saved_navigation;
+            if (queued == null) published.navigation = published.resolveNavigation(input.start);
             self.action_error = null;
             published.frame_revision += 1;
             return;
@@ -9472,7 +9477,7 @@ pub const Presentation = struct {
         }
         const job = try self.queueAcceptedDisclosure(published, target, published.buffer_search.active, .clear_input, null);
         job.clear_saved_disclosures = required.len == 0;
-        job.restore_navigation = published.buffer_search.input.?.saved_navigation;
+        job.restore_navigation = published.buffer_search.input.?.start;
         return job;
     }
 
@@ -9520,7 +9525,7 @@ pub const Presentation = struct {
             return;
         }
         const retained = sameEditedSearchIndex(input.batch, input.active, batch, completed.navigation_rows);
-        const base = if (batch.occurrences.len == 0 or retained != null) 0 else firstSearchOccurrenceAtOrAfter(completed.navigation_rows, input.origin);
+        const base = if (batch.occurrences.len == 0 or retained != null) 0 else firstSearchOccurrenceAtOrAfter(completed.navigation_rows, published.resolveNavigation(input.start).cursor);
         const active = if (batch.occurrences.len == 0) null else retained orelse (base + input.count - 1) % batch.occurrences.len;
         if (self.queueBufferDisclosure(published, batch, active, input.request_id, completed.navigation_rows) catch |err| switch (err) {
             error.OutOfMemory => {
@@ -9912,13 +9917,6 @@ pub const Presentation = struct {
         published.geometry = job.geometry;
         published.selected_version = job.preferences.selected_version;
         published.isolated_file = job.isolated_file;
-        if (job.kind == .view or job.kind == .cache_update) if (published.buffer_search.input) |*input| {
-            var saved = previous;
-            saved.navigation = input.saved_navigation;
-            input.saved_navigation = frame_mod.restoreNavigationIndexed(saved, job.visual_rows, job.geometry, job.projection.?.navigation);
-            saved.navigation.cursor = input.origin;
-            input.origin = frame_mod.restoreNavigationIndexed(saved, job.visual_rows, job.geometry, job.projection.?.navigation).cursor;
-        };
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
         owned.* = false;
@@ -10412,22 +10410,10 @@ pub const Presentation = struct {
         published.buffer = job.buffer;
         published.visual_rows = job.visual_rows;
         published.tree = job.tree;
-        var navigation_origin = previous;
-        if (job.clear_review_disclosures) {
-            if (job.restore_navigation) |navigation| navigation_origin.navigation = navigation;
-        }
-        published.navigation = if (job.clear_review_disclosures)
-            frame_mod.restoreNavigationIndexed(navigation_origin, job.visual_rows, job.geometry, job.projection.?.navigation)
+        published.navigation = if (job.restore_navigation) |start|
+            start.resolve(job.visual_rows, job.geometry, job.projection.?.navigation)
         else
-            job.restore_navigation orelse frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation);
-        if (job.kind == .open_input) {
-            const input = &published.buffer_search.input.?;
-            var origin = previous;
-            origin.navigation = input.saved_navigation;
-            input.saved_navigation = frame_mod.restoreNavigationIndexed(origin, job.visual_rows, job.geometry, job.projection.?.navigation);
-            origin.navigation.cursor = input.origin;
-            input.origin = frame_mod.restoreNavigationIndexed(origin, job.visual_rows, job.geometry, job.projection.?.navigation).cursor;
-        }
+            frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation);
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
         owned.* = false;
@@ -15627,7 +15613,7 @@ fn benchmarkSearchSelection(presentation: *Presentation, io: std.Io) !void {
         try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(std.heap.page_allocator, &initial.scan_buffer_search) });
         const previous = published.buffer_search.input.?.batch.?;
         const active = published.buffer_search.input.?.active.?;
-        const origin = published.buffer_search.input.?.origin;
+        const origin = published.resolveNavigation(published.buffer_search.input.?.start).cursor;
         try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
         var command = presentation.takeCommand().?;
         defer command.deinit();
@@ -16044,7 +16030,7 @@ fn benchmarkAuthoredSearchInput(presentation: *Presentation, io: std.Io, label: 
         times[@intFromEnum(Stage.resize_worker)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (job.failed) return error.DisclosureBuildFailed;
         var origin = before;
-        origin.navigation = published.buffer_search.input.?.saved_navigation;
+        origin.navigation = published.resolveNavigation(published.buffer_search.input.?.start);
         const expected_navigation = frame_mod.restoreNavigation(origin, job.visual_rows, geometry);
         start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .buffer_disclosure_built = job });
@@ -16052,7 +16038,7 @@ fn benchmarkAuthoredSearchInput(presentation: *Presentation, io: std.Io, label: 
         const input = published.buffer_search.input orelse return error.MissingInput;
         if (published.worker_frame != job or input.request_id != generation or
             !std.mem.eql(u8, input.query.?.text, "needle") or input.batch.?.occurrences.len != expected_occurrences or
-            !std.meta.eql(input.saved_navigation, expected_navigation)) return error.AuthoredResizeMismatch;
+            !std.meta.eql(published.resolveNavigation(input.start), expected_navigation)) return error.AuthoredResizeMismatch;
         start = std.Io.Clock.awake.now(io);
         var control = try published.prepareBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, geometry);
         times[@intFromEnum(Stage.resize_control)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
