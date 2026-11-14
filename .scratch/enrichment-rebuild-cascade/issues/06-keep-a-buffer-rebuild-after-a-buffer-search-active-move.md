@@ -1,6 +1,6 @@
 # 06: Keep a Buffer rebuild after a Buffer Search current occurrence move
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -89,15 +89,15 @@ Today the worker runs the same scan, so the work does not grow, but it moves to 
 
 ## Acceptance criteria
 
-- [ ] A test through `Presentation` accepts a Buffer Search, starts an `.enrichment` build, moves the current occurrence with `n` inside the same File, and completes the build.
+- [x] A test through `Presentation` accepts a Buffer Search, starts an `.enrichment` build, moves the current occurrence with `n` inside the same File, and completes the build.
   The Presentation admits the build, and no `build_buffer_disclosure` command waits in the queue.
-- [ ] After that admission, the published current occurrence is the occurrence that was current before the admission, compared by content with `searchOccurrenceEql`.
+- [x] After that admission, the published current occurrence is the occurrence that was current before the admission, compared by content with `searchOccurrenceEql`.
   The published ranges mark exactly the ranges of that occurrence as active.
-- [ ] A rebuild whose accepted batch changed is still rejected and retried.
-- [ ] An `.accepted` build still opens the disclosure of the occurrence that it targets.
-- [ ] In the live run above, with `n` every 0.1 seconds for 200 presses, each run has at most 45 enrichment builds and at most 12 s of process CPU.
+- [x] A rebuild whose accepted batch changed is still rejected and retried.
+- [x] An `.accepted` build still opens the disclosure of the occurrence that it targets.
+- [x] In the live run above, with `n` every 0.1 seconds for 200 presses, each run has at most 45 enrichment builds and at most 12 s of process CPU.
   Today, the same run has 106 to 129 builds and 23.1 to 23.6 s.
-- [ ] `zig build test` passes.
+- [x] `zig build test` passes.
 
 ## Comments
 
@@ -116,3 +116,86 @@ The retries after an `n` into another File are out of scope.
 The runner replaced the triage questions with a measurable target.
 
 The probe worktrees, the logs, and the state directory are deleted.
+
+## Completion
+
+Commits:
+
+- `f1e7690` tui: keep a Buffer rebuild after a Buffer Search current occurrence move.
+- `e4676f0` tui: name the build kinds that open a Buffer Search occurrence.
+- `10dfeaa` agents: keep the Buffer Search occurrence out of a Buffer rebuild.
+
+### Change
+
+A `DisclosureBuild` no longer copies the Buffer Search current occurrence, and `DisclosureBuild.create` takes no occurrence.
+The worker no longer maps an occurrence into the rebuilt batch.
+`acceptViewBuild` maps the published current occurrence into the rebuilt batch with `retainedSearchIndex` before it frees the old batch.
+So no admission compares the current occurrence, and an `n` keeps a running rebuild.
+A build that opens an occurrence keeps it in `destination_active`.
+`Kind.opensOccurrence` names these kinds in an exhaustive switch: `.input`, `.accepted`, `.restore`, and `.clear_input`.
+A `.general` or `.open_input` admission keeps the current occurrence, so the `.general` comparison is gone too.
+
+The admission does not call `markActiveSearchRanges`.
+The DiffPane takes the active Buffer Search ranges from `buffer_search.active` (`src/tui/render.zig`), not from the range flags.
+The worker projected the ranges with no active flag before this change too.
+
+### Tests
+
+- "Buffer Search admits an enrichment rebuild after a current occurrence move and keeps that occurrence" covers criteria 1 and 2.
+  It failed before the change, because the Presentation retried the build and did not publish its visual rows.
+  It also fails when the old field and the old comparison in `acceptViewBuild` come back.
+  It compares the published ranges and the rendered active state with the full projection.
+- "Buffer Search rejects and retries an enrichment rebuild after its accepted batch changes" covers criterion 3.
+  It fails when the batch pointer check in `acceptViewBuild` is removed.
+- "M21 hidden traversal publishes a complete worker Frame" covers criterion 4.
+
+### Live run
+
+The run used the workload of the triage: ReleaseFast, `bbr local fb701b1 1836261`, 160 × 80, an empty state directory for each run, `/return`, Enter, then `n` at a fixed interval.
+The CPU is the process CPU from the first `n` until bbr is idle again.
+The baseline is `4bf740d`, the result is `f1e7690`. Both had the same temporary `[DEBUG-t06]` logs in separate detached worktrees.
+The sides alternated.
+Load average was 1.7 to 3.5 on 18 cores.
+
+`n` every 0.1 seconds, 200 presses:
+
+| Side | Runs | Process CPU | Enrichment builds | Retries | Retries for the current occurrence only | Builds admitted | Final match |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Baseline | 5 | 20.61 to 20.67 s, median 20.64 s | 153 to 155 | 151 to 153 | 116 to 117 | 2 | 201/6522 |
+| Result | 5 | 6.59 to 6.65 s, median 6.64 s | 44 | 19 to 21 | 0 | 23 to 25 | 201/6522 |
+
+`n` every 0.5 seconds, 40 presses:
+
+| Side | Runs | Process CPU | Enrichment builds | Retries | Final match |
+| --- | --- | --- | --- | --- | --- |
+| Baseline | 3 | 5.42 to 5.48 s | 38 | 0 | 41/6522 |
+| Result | 3 | 5.45 to 5.54 s | 38 | 0 | 41/6522 |
+
+At 0.1 seconds, the result uses 3.1 times less CPU and runs 3.5 times fewer builds.
+The baseline counts are higher than in the triage, and a build is cheaper, about 0.13 s of CPU instead of about 0.17 s.
+This is probably the effect of commits `f900968` and `8f69a51`, so more builds start during the presses. Nobody measured that cause.
+The build count explains the CPU: about 0.13 to 0.15 s per build on both sides.
+The remaining 19 to 21 retries follow an `n` into another File and are out of scope.
+At 0.5 seconds, each build ends before the next press, so neither side discards a build, and the sides do not differ.
+Every run ended on the expected match, so every press ran.
+The logs had no line other than the debug lines.
+
+### Checks
+
+- `zig build test`: exit 0.
+- `zig fmt --check src build.zig tests`: exit 0.
+- `python3 tools/check_agent_docs.py`: pass.
+- `python3 tools/check_benchmark_metrics.py`: pass.
+- `python3 tools/check_diagnostics.py`: pass.
+
+### Review
+
+A two-axis code review found no correctness problem.
+The Standards review found the list of kinds that open an occurrence in three places, and commit `e4676f0` moved it into `Kind.opensOccurrence`.
+It also found two sentences over 20 words in the new rules table row, and the commit split them.
+The Spec review confirmed that the skipped `markActiveSearchRanges` call is correct, because the DiffPane reads the index.
+It noted one older gap: a queued `.accepted` build stops without a retry when an earlier admission replaced the accepted batch.
+Each admitted rebuild replaces the batch, so the gap can occur more often now.
+In the live runs every press reached its match, so the runs did not show it.
+[Ticket 15](15-carry-the-search-destination-in-the-build-kind.md) asks whether the build kind should carry its destination.
+
