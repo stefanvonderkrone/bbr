@@ -34345,6 +34345,100 @@ test "M21 kernel Buffer Search retries null destinations after enrichment withou
     }
 }
 
+fn initTwoHiddenDraftMatches(store: *bbr.review.InMemoryStore) !Presentation {
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    for (1..3) |id| {
+        try store.store().put(key.storeKey(), .{
+            .local_id = id,
+            .kind = .comment,
+            .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 1, .commit = "source" } },
+            .body = "one\n\ntwo\n\nthree\n\nfour\n\nfive\n\nzz",
+        });
+    }
+    const session = try testDisclosureSession(testing.allocator, 1);
+    const a = session.arena.allocator();
+    session.diff = try bbr.diff.parse(a,
+        \\diff --git a/0.txt b/0.txt
+        \\--- a/0.txt
+        \\+++ b/0.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+    );
+    session.threads = &.{};
+    try session.initializeEnrichment();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = key, .session = session },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    errdefer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'z', .text = "zz" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeQueuedTestWork(&presentation);
+    const published = presentation.published.?;
+    try testing.expectEqual(@as(usize, 2), published.buffer_search.accepted_batch.?.occurrences.len);
+    try testing.expectEqual(@as(?usize, 0), published.buffer_search.active);
+    return presentation;
+}
+
+test "M21 kernel Buffer Search clears the current occurrence when a Draft deletion removes it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try initTwoHiddenDraftMatches(&store);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    var wanted = try published.buffer_search.accepted_batch.?.clone(testing.allocator);
+    defer wanted.deinit(testing.allocator);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(@as(?usize, 1), published.buffer_search.active);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+    try completeQueuedTestWork(&presentation);
+
+    const batch = published.buffer_search.accepted_batch.?;
+    try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+    try testing.expect(searchOccurrenceEql(wanted.occurrences[0], batch.occurrences[0]));
+    try testing.expect(published.buffer_search.active == null);
+    try testing.expect(published.buffer_search.projection().?.active == null);
+    try testing.expect(presentation.action_error == null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(@as(?usize, 0), published.buffer_search.active);
+    try testing.expectEqual(published.occurrenceVisualRow(wanted.occurrences[0]).?, published.navigation.cursor);
+}
+
+test "M21 kernel Buffer Search retries a move into an isolated File without matches and opens nothing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try initTwoHiddenDraftMatches(&store);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try presentation.dispatch(.{ .action = .to_top });
+    try completeQueuedTestWork(&presentation);
+    try testing.expect(published.buffer_search.saved_disclosures == null);
+    const before = try testing.allocator.dupe(buffer_mod.DisclosureKey, published.expanded_disclosures.items);
+    defer testing.allocator.free(before);
+    try presentation.dispatch(.{ .action = .isolate });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
+    try completeQueuedTestWork(&presentation);
+
+    try testing.expectEqual(@as(?usize, 0), published.isolated_file);
+    try testing.expectEqual(@as(usize, 0), published.buffer_search.accepted_batch.?.occurrences.len);
+    try testing.expectEqual(@as(?ActionError, .buffer_search_no_matches), presentation.action_error);
+    try testing.expectEqualDeep(before, published.expanded_disclosures.items);
+    try testing.expect(published.buffer_search.saved_disclosures == null);
+}
+
 test "Buffer Search rejects and retries an enrichment rebuild after its accepted batch changes" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
