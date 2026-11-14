@@ -10,7 +10,7 @@ Search occurrence and the Buffer Search input preview. The nearest rule
 user asked for and a list selection use it.
 
 The check matches a call of any function whose name starts with `nearest` and
-ends with `Index`, so a new nearest helper under another name also fails. Each
+ends with `Index`. So a new nearest helper under another name also fails. Each
 production function that calls one is in NEAREST with its reason. A new use
 fails until a reviewer adds it there.
 """

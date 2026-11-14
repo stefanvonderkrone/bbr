@@ -1,6 +1,6 @@
 # 18: Decide the Buffer Search input occurrence rule after a rebuild
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -117,16 +117,16 @@ With the sketch, `zig build test --summary all` passed with exit 0: 54/54 steps 
 
 ## Acceptance criteria
 
-- [ ] A test through `Presentation`, named for example "M21 kernel Buffer Search input clears its preview when a Draft deletion removes it", reproduces the steps above.
+- [x] A test through `Presentation`, named for example "M21 kernel Buffer Search input clears its preview when a Draft deletion removes it", reproduces the steps above.
   After the builds, the input batch has 1 occurrence, which equals the Draft 1 occurrence before the deletion (`searchOccurrenceEql`).
   `input.active` is null, the status projection has no active match, the cursor is not on the row of the remaining match, and `action_error` is null.
   After Enter, the input is closed, `buffer_search.active` is null, and the cursor has not moved.
   After `n`, `buffer_search.active` is 0 and the cursor is on the row of the remaining match.
   The test fails at `cf2d34c` on the `input.active == null` check.
-- [ ] `acceptViewBuild` and `prepareBufferControlForFile` call no nearest function, and `NEAREST` has no input preview entry.
-- [ ] `nearestProjectedSearchIndex` and `retainedEditedSearchIndex` no longer exist. `sameProjectedSearchIndex` and `sameEditedSearchIndex` have doc comments.
-- [ ] The ticket 06 test "Buffer Search admits an enrichment rebuild after a current occurrence move and keeps that occurrence", the ticket 16 "M21 kernel Buffer Search retries" tests, and the ticket 17 tests pass.
-- [ ] `zig build test` passes. `python3 tools/check_agent_docs.py` passes.
+- [x] `acceptViewBuild` and `prepareBufferControlForFile` call no nearest function, and `NEAREST` has no input preview entry.
+- [x] `nearestProjectedSearchIndex` and `retainedEditedSearchIndex` no longer exist. `sameProjectedSearchIndex` and `sameEditedSearchIndex` have doc comments.
+- [x] The ticket 06 test "Buffer Search admits an enrichment rebuild after a current occurrence move and keeps that occurrence", the ticket 16 "M21 kernel Buffer Search retries" tests, and the ticket 17 tests pass.
+- [x] `zig build test` passes. `python3 tools/check_agent_docs.py` passes.
 
 ## Overlap with ticket 15
 
@@ -154,6 +154,62 @@ Escape puts the cursor in File 0, not on the File 1 header where the user opened
 A later keystroke that loses the preview also computes it from the stale `input.origin`.
 The preview itself stays on the correct match.
 This defect is not part of this ticket. [Ticket 19](19-remap-the-buffer-search-input-origin-after-every-rebuild.md) records it.
+
+## Completion
+
+Commits:
+
+- `40a0207` files [ticket 19](19-remap-the-buffer-search-input-origin-after-every-rebuild.md) for the stale input origin.
+- `708a52b` adds the reproducing test. It fails on that commit at `input.active == null`.
+- `ae5cd84` fixes the input preview rule and changes `tools/check_search_index.py`.
+- The completion commit splits two long sentences after the review.
+
+### Change
+
+`acceptViewBuild` maps `input.active` with the new `sameProjectedSearchIndex`, and `prepareBufferControlForFile` maps it with `sameSearchIndex`.
+`nearestProjectedSearchIndex` is deleted. `retainedEditedSearchIndex` is now `sameEditedSearchIndex`.
+A rebuild that removes the preview occurrence now clears `input.active`, and the cursor stays.
+The old function also gave index 0 when `input.batch` or `input.active` was null. The new function gives null, because no preview is under the cursor in that state.
+`keepPlans` stays the first statement in `acceptBufferDisclosure`.
+
+The test "M21 kernel Buffer Search input clears its preview when a Draft deletion removes it" checks each acceptance criterion through `Presentation`.
+
+### Mistake class
+
+Class: a search occurrence index carried into a newer batch with the wrong rule. This ticket is the third case, after tickets 16 and 17.
+
+After the fix, every rebuild of a Buffer Search index uses a `same…` rule. These functions still call the nearest rule:
+
+| Function | Reason |
+| --- | --- |
+| `retryAcceptedDisclosure` | The retry of a move that the user asked for. |
+| `acceptReviewSourceScanned`, `acceptReviewSearchScanned` | The Review Search list selection. |
+| `expectReviewSourcePublication` | A test helper that computes the list selection. |
+
+`tools/check_search_index.py` is now simpler and stricter:
+
+- `NEAREST` has 4 entries, not 6, and its key is the function, not the function and the callee.
+- The check matches a call of any `nearest…Index` function. So a deleted nearest helper that comes back under its old name or a new name also fails.
+- Against the `src/tui/presentation.zig` of `d689abc`, the check fails with 2 errors: `prepareBufferControlForFile` line 5013 (`nearestSearchIndex`) and `acceptViewBuild` line 9940 (`nearestProjectedSearchIndex`).
+- The test `test_the_old_input_preview_line_is_rejected` rejects the real `acceptViewBuild` line of `d689abc`.
+
+A higher level is still not possible without ticket 15.
+Architecture cannot hide `nearestSearchIndex`, because each caller is in `src/tui/presentation.zig`, and a Zig file has no private scope inside it.
+A type that pairs an index with its batch would make the rule part of the mapping, so the `NEAREST` table could go away. That type is ticket 15.
+
+### Checks
+
+- `zig build test --summary all`: exit 0, 54/54 steps, 1647/1647 tests.
+- `zig fmt --check src build.zig tests`: exit 0.
+- `python3 tools/check_agent_docs.py`, `python3 tools/check_benchmark_metrics.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_search_index.py`: pass.
+
+### Review
+
+A two-axis code review ran.
+The Spec review found no missing requirement and no scope creep. It confirmed that the null result in place of index 0 follows the rule of ticket 17.
+The Standards review found two sentences with two thoughts each. The completion commit splits them.
+Both reviews noted that `sameEditedSearchIndex` checks the bounds of `active` and `sameSearchIndex` and `sameProjectedSearchIndex` do not. The fix keeps this, as ticket 17 decided: an out-of-range `active` breaks an invariant, and a guard would hide that break.
+The Standards review also noted that the `nearest…Index` pattern can match a future helper with another meaning. No such function exists today, and its owner can rename it or add it to `NEAREST`.
 
 ## Comments
 
