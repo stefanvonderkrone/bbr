@@ -34155,12 +34155,11 @@ test "Buffer Search admits an enrichment rebuild after a current occurrence move
     }
 }
 
-test "M21 kernel Buffer Search retries a hidden reply move after Whole File enrichment adds earlier matches" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
+fn testBufferSearchStartSession(third_file: bool) !*session_mod.Session {
     const session = try testDisclosureSession(testing.allocator, 1);
+    errdefer session.destroy();
     const a = session.arena.allocator();
-    session.diff = try bbr.diff.parse(a,
+    const diff =
         \\diff --git a/0.txt b/0.txt
         \\--- a/0.txt
         \\+++ b/0.txt
@@ -34176,13 +34175,180 @@ test "M21 kernel Buffer Search retries a hidden reply move after Whole File enri
         \\@@ -1 +1 @@
         \\-a
         \\+A
-    );
+        \\
+    ;
+    const extra =
+        \\diff --git a/b.txt b/b.txt
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+    ;
+    session.diff = try bbr.diff.parse(a, if (third_file) diff ++ extra else diff);
     const comments = try a.alloc(bbr.review.Comment, 3);
     comments[0] = .{ .id = 1, .author = "Ada", .body = "resolved", .resolved = true, .anchor = .{ .path = "a.txt", .to = 1 } };
     comments[1] = .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "fixed zz" };
     comments[2] = .{ .id = 3, .author = "Cy", .body = "open zz", .anchor = .{ .path = "a.txt", .to = 1 } };
     session.threads = try bbr.review.buildThreads(a, comments);
     try session.initializeEnrichment();
+    return session;
+}
+
+fn deliverTestBufferSearchStartEnrichment(presentation: *Presentation, file: usize, old: []const u8, new: []const u8) !void {
+    try presentation.queueFileEnrichment(presentation.published.?, file, false);
+    const command = presentation.takeCommand().?.enrich_file;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = old },
+        .{ .status = 200, .body = new },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+}
+
+test "M21 kernel Buffer Search input Escape returns to its start after a File Enrichment adds rows above" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testBufferSearchStartSession(false) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    const published = presentation.published.?;
+    const start = frame_mod.visualIndexForBufferIndex(published.visual_rows, fileHeaderRow(published.buffer, 1).?).?;
+    try moveToRow(&presentation, start);
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'z', .text = "zz" } });
+    try completeBufferSearchScan(&presentation);
+    try deliverTestBufferSearchStartEnrichment(&presentation, 0, "a\nzz1\nzz2\nzz3\nzz4\nb\n", "A\nzz1\nzz2\nzz3\nzz4\nB\n");
+    try completeQueuedTestWork(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try completeQueuedTestWork(&presentation);
+
+    const expected = frame_mod.visualIndexForBufferIndex(published.visual_rows, fileHeaderRow(published.buffer, 1).?).?;
+    try testing.expect(expected != start);
+    try testing.expect(published.buffer_search.input == null);
+    try testing.expect(presentation.action_error == null);
+    try testing.expectEqual(expected, published.navigation.cursor);
+    try testing.expectEqual(@as(?usize, 1), published.activeFile());
+}
+
+test "M21 kernel Buffer Search input Escape returns to its start after a Draft deletion removes rows above" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    for ([_]u32{ 1, 3 }, [_][]const u8{ "zz one", "zz two" }, 1..) |line, body, id| {
+        try store.store().put(key.storeKey(), .{
+            .local_id = id,
+            .kind = .comment,
+            .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = line, .commit = "source" } },
+            .body = body,
+        });
+    }
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+    try cursorToDraftCard(&presentation, 2);
+    const published = presentation.published.?;
+    const start = published.navigation.cursor;
+    const start_row = published.visual_rows[start];
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'z', .text = "zz one" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+    try completeQueuedTestWork(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try completeQueuedTestWork(&presentation);
+
+    const expected = published.search_projection.navigation.find(start_row).?;
+    try testing.expect(expected != start);
+    try testing.expect(published.buffer_search.input == null);
+    try testing.expect(presentation.action_error == null);
+    try testing.expectEqual(expected, published.navigation.cursor);
+    try testing.expectEqual(@as(?usize, 0), published.activeFile());
+}
+
+test "M21 kernel Buffer Search input Escape returns to its start after a Draft save adds rows above" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+    try moveToRow(&presentation, 6);
+    try presentation.dispatch(.{ .action = .review_comment });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
+    try presentation.dispatch(.{ .composer = .save });
+    try moveToRow(&presentation, 30);
+    const published = presentation.published.?;
+    const start = published.navigation.cursor;
+    const start_row = published.visual_rows[start];
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.replaceBufferSearchQuery("added 3");
+    try completeDisclosureBuild(&presentation);
+    try completeBufferSearchScan(&presentation);
+    try completeQueuedTestWork(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try completeQueuedTestWork(&presentation);
+
+    const expected = published.search_projection.navigation.find(start_row).?;
+    try testing.expect(expected != start);
+    try testing.expect(published.buffer_search.input == null);
+    try testing.expect(presentation.action_error == null);
+    try testing.expectEqual(expected, published.navigation.cursor);
+    try testing.expectEqual(@as(?usize, 0), published.activeFile());
+}
+
+test "M21 kernel Buffer Search input Escape returns to its start after an expansion and a File Enrichment between them" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testBufferSearchStartSession(true) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    const published = presentation.published.?;
+    const start = frame_mod.visualIndexForBufferIndex(published.visual_rows, fileHeaderRow(published.buffer, 2).?).?;
+    try moveToRow(&presentation, start);
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'f', .text = "fixed" } });
+    try completeBufferSearchScan(&presentation);
+    try completeQueuedTestWork(&presentation);
+    try testing.expect(frame_mod.visualIndexForBufferIndex(published.visual_rows, fileHeaderRow(published.buffer, 2).?).? > start);
+    try deliverTestBufferSearchStartEnrichment(&presentation, 1, "a\nc2\nc3\nc4\n", "A\nc2\nc3\nc4\n");
+    try completeQueuedTestWork(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try completeQueuedTestWork(&presentation);
+
+    const expected = frame_mod.visualIndexForBufferIndex(published.visual_rows, fileHeaderRow(published.buffer, 2).?).?;
+    try testing.expect(expected != start);
+    try testing.expect(published.buffer_search.input == null);
+    try testing.expect(presentation.action_error == null);
+    try testing.expectEqual(expected, published.navigation.cursor);
+    try testing.expectEqual(@as(?usize, 2), published.activeFile());
+}
+
+test "M21 kernel Buffer Search retries a hidden reply move after Whole File enrichment adds earlier matches" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testBufferSearchStartSession(false);
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
         .geometry = .{ .cols = 100, .rows = 40 },
