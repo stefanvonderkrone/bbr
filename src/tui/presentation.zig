@@ -4977,7 +4977,7 @@ const Published = struct {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.SearchFailed,
                 };
-                accepted_active = retainedSearchIndex(self.buffer_search.accepted_batch, self.buffer_search.active, batch);
+                accepted_active = sameSearchIndex(self.buffer_search.accepted_batch, self.buffer_search.active, batch);
                 const projected = search_projection.project(std.heap.page_allocator, batch) catch |err| {
                     batch.deinit(self.allocator);
                     return err;
@@ -9925,7 +9925,7 @@ pub const Presentation = struct {
         if (published.search_corpus) |old| old.release();
         published.search_corpus = job.search_corpus;
         job.search_corpus = null;
-        const active = if (job.rebuilt_batch) |rebuilt| retainedSearchIndex(published.buffer_search.accepted_batch, published.buffer_search.active, rebuilt) else published.buffer_search.active;
+        const active = if (job.rebuilt_batch) |rebuilt| sameSearchIndex(published.buffer_search.accepted_batch, published.buffer_search.active, rebuilt) else published.buffer_search.active;
         if (published.buffer_search.accepted_batch) |*old| old.deinit(self.allocator);
         published.buffer_search.accepted_batch = job.rebuilt_batch;
         job.rebuilt_batch = null;
@@ -10503,11 +10503,11 @@ pub const Presentation = struct {
             if (published.buffer_search.accepted_batch) |current| retainedSearchIndex(job.accepted_snapshot, job.destination_active, current) else null
         else
             null;
-        if ((job.kind == .accepted or job.kind == .restore) and job.restore_navigation == null) {
+        if ((job.kind == .accepted or job.kind == .restore) and job.restore_navigation == null and job.destination_active != null) {
             if (destination) |index| {
                 self.openBufferSearchOccurrence(published, index, job.result_error);
-                return;
-            }
+            } else self.action_error = .buffer_search_no_matches;
+            return;
         }
         const replacement = self.queueAcceptedDisclosure(published, job.target, destination, job.kind, job.result_error) catch |err| switch (err) {
             error.OutOfMemory => {
@@ -14208,6 +14208,14 @@ fn searchFromInactiveRow(batch: search.Batch, navigation_rows: ?[]SearchNavigati
 
 fn searchOccurrenceNavigationRow(published: *const Published, occurrence: search.Occurrence) ?usize {
     return published.search_projection.navigationRow(occurrence);
+}
+
+/// The index of the same occurrence in `next`, or null when `next` lost it.
+fn sameSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch) ?usize {
+    const previous = previous_batch orelse return null;
+    const active = previous_active orelse return null;
+    for (next.occurrences, 0..) |candidate, index| if (searchOccurrenceEql(previous.occurrences[active], candidate)) return index;
+    return null;
 }
 
 fn retainedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch) ?usize {
