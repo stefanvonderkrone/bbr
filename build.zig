@@ -246,6 +246,10 @@ pub fn build(b: *std.Build) void {
     search_index.addFileArg(b.path("tools/check_search_index.py"));
     search_index.addDirectoryArg(b.path("."));
     test_step.dependOn(&search_index.step);
+    const navigation_fields = b.addSystemCommand(&.{"python3"});
+    navigation_fields.addFileArg(b.path("tools/check_navigation_fields.py"));
+    navigation_fields.addDirectoryArg(b.path("."));
+    test_step.dependOn(&navigation_fields.step);
     const task_spawns = b.addSystemCommand(&.{"python3"});
     task_spawns.addFileArg(b.path("tools/check_task_spawns.py"));
     task_spawns.addDirectoryArg(b.path("."));
