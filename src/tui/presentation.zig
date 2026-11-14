@@ -5010,7 +5010,7 @@ const Published = struct {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.SearchFailed,
                 };
-                input_active = retainedSearchIndex(input.batch, input.active, batch);
+                input_active = nearestSearchIndex(input.batch, input.active, batch);
                 const projected = search_projection.project(std.heap.page_allocator, batch) catch |err| {
                     batch.deinit(self.allocator);
                     return err;
@@ -8792,7 +8792,7 @@ pub const Presentation = struct {
             const part_index = merged_index[old.occurrences.len..];
             search.mergeRanked(if (old_copy) |copy| copy.occurrences else old.occurrences, part.occurrences, occurrences, ranked_index, part_index);
             const combined: search.Batch = .{ .occurrences = occurrences, .owner = std.heap.page_allocator };
-            const selected = retainedSearchIndex(state.batch, state.selected, combined);
+            const selected = nearestSearchIndex(state.batch, state.selected, combined);
             const same_selection = if (state.selected) |before| if (selected) |after|
                 before < old.occurrences.len and searchOccurrenceEql(old.occurrences[before], combined.occurrences[after])
             else
@@ -8968,7 +8968,7 @@ pub const Presentation = struct {
         const selected = if (state.batch == null and state.previous_selection != null and batch.occurrences.len > 0)
             @min(state.previous_selection.?, batch.occurrences.len - 1)
         else
-            retainedSearchIndex(state.batch, state.selected, batch);
+            nearestSearchIndex(state.batch, state.selected, batch);
         const keep_preview = if (state.batch) |old| if (state.selected) |old_index| if (selected) |new_index|
             old_index < old.occurrences.len and searchOccurrenceEql(old.occurrences[old_index], batch.occurrences[new_index])
         else
@@ -9937,7 +9937,7 @@ pub const Presentation = struct {
         job.navigation_rows = null;
         published.buffer_search.active = active;
         if (published.buffer_search.input) |*input| {
-            const next_active = if (job.input_rebuilt_batch) |batch| retainedProjectedSearchIndex(input.batch, input.active, batch, job.input_navigation_rows) else null;
+            const next_active = if (job.input_rebuilt_batch) |batch| nearestProjectedSearchIndex(input.batch, input.active, batch, job.input_navigation_rows) else null;
             if (input.batch) |*old| old.deinit(self.allocator);
             if (input.ranges) |old| std.heap.page_allocator.free(old);
             if (input.navigation_rows) |old| std.heap.page_allocator.free(old);
@@ -10500,7 +10500,7 @@ pub const Presentation = struct {
             return;
         }
         const destination = if (job.destination_active != null)
-            if (published.buffer_search.accepted_batch) |current| retainedSearchIndex(job.accepted_snapshot, job.destination_active, current) else null
+            if (published.buffer_search.accepted_batch) |current| nearestSearchIndex(job.accepted_snapshot, job.destination_active, current) else null
         else
             null;
         if ((job.kind == .accepted or job.kind == .restore) and job.restore_navigation == null and job.destination_active != null) {
@@ -14218,7 +14218,9 @@ fn sameSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next:
     return null;
 }
 
-fn retainedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch) ?usize {
+/// The index of the same occurrence in `next`, or the nearest index when `next` lost it.
+/// A move that the user asked for, a list selection, and the Buffer Search input preview use this rule.
+fn nearestSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch) ?usize {
     if (next.occurrences.len == 0) return null;
     if (previous_batch) |previous| if (previous_active) |active| if (active < previous.occurrences.len) {
         const wanted = previous.occurrences[active];
@@ -14297,7 +14299,7 @@ fn searchIdentityIndexLess(batch: search.Batch, left: usize, right: usize) bool 
     return exactSearchOrder(batch.occurrences[left], batch.occurrences[right]) == .lt;
 }
 
-fn retainedProjectedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch, navigation_rows: ?[]SearchNavigationRow) ?usize {
+fn nearestProjectedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch, navigation_rows: ?[]SearchNavigationRow) ?usize {
     if (next.occurrences.len == 0) return null;
     if (previous_batch) |previous| if (previous_active) |active| if (active < previous.occurrences.len) {
         return indexedSearchIdentity(previous.occurrences[active], next, navigation_rows, true) orelse @min(active, next.occurrences.len - 1);
@@ -19313,10 +19315,10 @@ test "M21 kernel indexed Batch selection matches linear selection across hidden 
         try testing.expect(hidden and unavailable);
         for (before.occurrences, 0..) |wanted, active| {
             try testing.expectEqual(linearEditedSearchIndex(wanted, after), retainedEditedSearchIndex(before, active, after, projected.navigation_rows));
-            try testing.expectEqual(retainedSearchIndex(before, active, after), retainedProjectedSearchIndex(before, active, after, projected.navigation_rows));
+            try testing.expectEqual(nearestSearchIndex(before, active, after), nearestProjectedSearchIndex(before, active, after, projected.navigation_rows));
         }
         for (after.occurrences, 0..) |_, active| {
-            try testing.expectEqual(retainedSearchIndex(after, active, after), retainedProjectedSearchIndex(after, active, after, projected.navigation_rows));
+            try testing.expectEqual(nearestSearchIndex(after, active, after), nearestProjectedSearchIndex(after, active, after, projected.navigation_rows));
         }
         for (0..published.visual_rows.len + 2) |cursor| {
             try testing.expectEqual(linearSearchOrigin(published, after, projected.navigation_rows, cursor), firstSearchOccurrenceAtOrAfter(projected.navigation_rows, cursor));
@@ -33736,7 +33738,7 @@ fn expectReviewSourcePublication(presentation: *Presentation, completed: ReviewS
     @memcpy(expected[ranked.occurrences.len..], part.occurrences);
     var full: search.Batch = .{ .occurrences = expected };
     search.rank(&full);
-    try expectReviewSearchMatchesFullProjection(published, full, retainedSearchIndex(ranked, ranked_selected, full));
+    try expectReviewSearchMatchesFullProjection(published, full, nearestSearchIndex(ranked, ranked_selected, full));
 }
 
 fn expectReviewSearchMatchesFullProjection(published: *Published, full: search.Batch, selected: ?usize) !void {
