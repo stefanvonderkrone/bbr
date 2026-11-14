@@ -1,45 +1,176 @@
 # 20: Keep the cursor on a Whole File gap Line after a rebuild
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: none
 
 ## Summary
 
-In the Whole File scope, the cursor on an unchanged Line outside a Hunk goes to the top of the Buffer after an unrelated rebuild, for example a File Enrichment of another File.
+In the Whole File scope, the cursor on a gap Line goes to the top of the Buffer after an unrelated rebuild.
+A gap Line is an unchanged Line outside a Hunk (`in_hunk == false`) that the Buffer build makes from the File blob.
+The rebuilds that show the defect include a File Enrichment of another File, a resize that changes the width, and the deletion of a Draft whose next row is a gap Line.
+The DiffPane scrolls to the top, and the active File and the File Tree cursor change to the first File.
+No message tells the user that the cursor moved. This part is inferred from the code: the restore path sets no message.
 
-The cursor restore finds the cursor row by its `RowOwner`.
-For a Line, the owner is a `*const bbr.diff.Line`.
-`spliceSide` in `src/tui/buffer.zig` creates each gap Line again in each Buffer build, with the allocator of that build.
-So the next Frame has no row with the same pointer.
-`NavigationIndex.find` gives null, and `frame.NavigationAnchor.resolve` falls back to the top of the Buffer.
+The cause is the identity of the row.
+`frame.RowOwner.line` holds a `*const bbr.diff.Line`.
+A Hunk Line lives as long as the Session, so its pointer identifies it in every Frame.
+`spliceSide` in `src/tui/buffer.zig` allocates each gap Line again in each Buffer build, from the arena of that build.
+So the pointer of a gap Line identifies it only in the Frame that made it.
+Every lookup by row identity misses a gap Line after a rebuild, and `frame.NavigationAnchor.resolve` falls back to the top of the Buffer.
 
-The same gap applies to `BufferSearchInput.start` of [ticket 19](19-remap-the-buffer-search-input-origin-after-every-rebuild.md): a start on a gap Line resolves to the top after a rebuild.
-An anchor holds the pointer after its Frame is freed.
-The code only compares the pointer. It never reads through it.
-But a later Frame can allocate another Line at the same address.
-Then the anchor resolves to that Line.
-That last effect is inferred from the code. No test showed it.
+The fix holds a gap Line by its File and its line numbers, a value that every build of the same Session derives from the source.
 
 ## Evidence
 
-A throwaway test in `src/tui/presentation.zig` at commit `542fc7b` (and again with the ticket 19 fix) did these steps:
+All evidence is from throwaway tests through `Presentation` in a detached worktree at commit `e4c7d46`.
+The setup was `testBufferSearchStartSession(true)` (3 Files), 100 × 40, `cycle_scope` twice to the Whole File scope, and a File Enrichment of File 0 with the content `a`, `zz1`, `zz2`, `zz3`, `zz4`, `b`.
 
-1. `testBufferSearchStartSession(true)`, 100 × 40, and `cycle_scope` twice to the Whole File scope.
-2. A File Enrichment of File 0 with the content `a`, `zz1`, `zz2`, `zz3`, `zz4`, `b`.
-3. Move the cursor to the row of the gap Line `zz2` (row 3, `in_hunk == false`).
-4. A File Enrichment of File 1, then complete the queued work.
+### Reproduction
 
-Output:
+| Case | Before the rebuild | After the rebuild and the queued work, at `e4c7d46` | With the sketch below |
+| --- | --- | --- | --- |
+| A File Enrichment of File 1 | Cursor on the gap Line `zz2`, row 3, File 0 | Cursor 0 (the File 0 header), scroll 0 | Row 3, `zz2` |
+| A width resize to 90 × 38 | The same | Cursor 0, scroll 0 | Row 3, `zz2` |
+| SideBySide, 140 × 40, a File Enrichment of File 1 | Cursor on the `zz2` pair, row 4 | Cursor 0, scroll 0 | Row 4, `zz2` |
+| Buffer Search input opened on a gap Line, a File Enrichment, then Escape | Input start on `zz2`, row 3 | Cursor 0 | Row 3, `zz2` |
+| File 2 also enriched (`a`, `yy1`, `yy2`, `yy3`). Input start on `yy2` in File 2. A File Enrichment of File 1 and 6 width resizes, then Escape | Row 16, File 2 | Cursor 0, active File 0 | Row 21, `yy2`, File 2 |
+| A Draft on line 1 of File 0, so the row after its card is the gap Line `zz1`. Delete the Draft and confirm | Cursor on the Draft header, row 2 | Cursor 0 | Row 2, `zz1` |
 
-```
-[PROBE] gap row 3 in_hunk=false
-[PROBE] after other-File enrichment cursor 0 text -
-```
+The last case is a second instance of the same fault.
+`SurvivingRow.line` in `src/tui/presentation.zig` holds the pointer of the first surviving Line after the deleted card.
+For a gap Line, `followSurvivingRow` finds no row, and the cursor stays where `restoreNavigationIndexed` put it, the top of the Buffer.
 
-File Enrichment runs in the background while the user reads, so the real user can reach this state.
+A height-only resize does not rebuild the Buffer (`resize` calls `resizeHeight`), so it keeps the cursor.
+
+### The inferred wrong-line match
+
+An anchor keeps the pointer after its Frame is freed, and a later build can allocate another gap Line at the same address.
+Then the anchor would resolve to that other Line.
+No test showed this.
+The Buffer Search input cases above ran 2 rebuilds with `std.testing.allocator` and 7 rebuilds with `std.heap.smp_allocator` as the `Presentation` allocator. The start always fell back to the top.
+The cursor restore of an admission cannot match a reused address: it captures the anchor from the published Frame, which stays alive while the candidate build allocates.
+Only an anchor captured in an earlier Frame, such as `BufferSearchInput.start` or `DisclosureBuild.restore_navigation`, could meet a reused address.
+The fix removes the risk for gap Lines, because their identity holds no pointer into a build.
+
+### Reachability
+
+A real user reaches the defect with the default keys:
+
+1. Press `f` twice for the Whole File scope.
+2. Move to an unchanged Line outside a Hunk in a File whose content has loaded.
+3. Wait while File Enrichment loads another File in the background, or resize the terminal width.
+
+File Enrichment runs in the background while the user reads, and an evicted File loads again later, so the rebuild comes without user input.
+The Draft deletion case is reachable through the delete confirmation in the Whole File scope.
 No live run was made.
 
-## Open questions
+## Expected behavior and its precedent
 
-- Which identity of a gap Line survives a rebuild: the File, the side, and the line number, or a Session-owned Line from the File Enrichment?
-- Does `VersionRestoration`, which already restores by line number, give the precedent?
+After a rebuild that keeps the Whole File scope, the cursor stays on the same source Line: the same File, side, and line number, with the same viewport offset.
+The Selection mark and the Buffer Search input start keep their Lines the same way.
+After a Draft deletion, the cursor goes to the first surviving row after the card, also when that row is a gap Line.
+
+The precedent, so no human answer is needed:
+
+- The Diff glossary defines a gap Line as a Line synthesized from the File blob, with `old_no` or `new_no`. Its source position is its identity.
+- `VersionRestoration` restores the cursor across a Selected Version change to a source row of the same File, by its Hunk Line and source offset or else the nearest row. A File with no source row falls back to its File header.
+- `ReviewLocation` (the `Review recovery` rows of `AGENTS.md`) holds a source row as `{ side, line, source_offset }` and the File path, not as a pointer or a File index from an earlier Session.
+- The Navigation Anchor glossary entry says that any later Frame of the same Session resolves the anchor. Today that is false for a gap Line.
+
+The fallback for a row that a Frame really lost stays the top of the Buffer.
+This ticket does not change it, because every reproduced case lost the row only through the unstable identity.
+
+## Root cause
+
+The identity is unstable by construction. `resolve` and `NavigationIndex.find` look the row up by the correct key, but the key is a pointer into the arena of one Buffer build.
+A special case in `resolve` would not reach `SurvivingRow`, and it would keep the address-reuse risk.
+
+A Session-owned gap Line from the File Enrichment is not a stable identity either.
+`file_enrichment.clearText` evicts File content under the cache budget, and a later File Enrichment loads it again.
+So a pointer to Session-owned gap Lines would change after an eviction, and a freed array could give its address to another Line.
+
+## What to build
+
+1. In `src/tui/frame.zig`, add a public `LineOwner` and make `RowOwner.line` hold it:
+
+   ```zig
+   /// The identity of a Line row. A Hunk Line lives as long as the Session. Each
+   /// Buffer build makes its own Whole File gap Lines, so a gap Line is held by
+   /// its File and line numbers.
+   pub const LineOwner = union(enum) {
+       hunk: *const bbr.diff.Line,
+       gap: struct { file: *const bbr.diff.File, old_no: u32, new_no: u32 },
+
+       pub fn of(file: ?*const bbr.diff.File, line: *const bbr.diff.Line) LineOwner { ... }
+       /// The owner of another Line in the same File, such as the other half of a pair.
+       fn sibling(self: LineOwner, line: *const bbr.diff.Line) LineOwner { ... }
+       pub fn eql(a: LineOwner, b: LineOwner) bool { ... }
+       pub fn oldNo(self: LineOwner) ?u32 { ... }
+       pub fn newNo(self: LineOwner) ?u32 { ... }
+   };
+   ```
+
+   `of` gives `.hunk` when `line.in_hunk`, else `.gap` with the File.
+   The `.line` arm stays, so the checks `owner == .line` in `presentation.zig` and `render.zig` keep their meaning.
+2. Give `owner(row, file)` the File of the row. `buildVisualRowsWithOptions` and `buildUnwrappedVisualRows` keep the File of the last `.file_header` row and pass it to `makeVisualRow`, `appendWrappedVisualRow`, and `appendWrappedLinePair`.
+   Every Line row of a File follows its header, and `emitWholeFileGap` pairs a gap Line only with a gap Line, so the halves of a pair share the kind of the row owner.
+3. In `NavigationIndex.build`, key each half by `row.owner.line.sibling(half.line)`. In `lineRangeForOwner`, take a `LineOwner` and compare each half the same way.
+4. In `src/tui/presentation.zig`, change `SurvivingRow.line` to `frame_mod.LineOwner`. The deletion-row loop in `SearchProjection` keeps the File of the last `.file_header` row and passes it to `survivingRowIdentity(row, file)`.
+   `sourceLineForVisual` reads the Line from `row.yank_candidates` instead of the owner, and the search snapshot rows read `line.oldNo()` and `line.newNo()` from the `LineOwner`.
+5. Update the tests that build an owner from a Line pointer: `.{ .line = .{ .hunk = &line } }` in `frame.zig`, and `owner.line.hunk` in the `render.zig` and `presentation.zig` tests.
+6. Update the Navigation Anchor entry in `src/tui/GLOSSARY.md`: a Line row is held by its Hunk Line, or a Whole File gap Line by its File and line numbers.
+7. Add a row to the rules table in `AGENTS.md`: a `RowOwner` holds only identities that outlive a Buffer build, Session-owned pointers or values, and a Whole File gap Line is held by its File and line numbers. Name the reproducing tests in the enforcement column.
+
+A sketch of steps 1 to 5 in a detached worktree added about 80 production lines and removed about 30.
+With the sketch, the 6 reproducing cases of the Evidence table kept the cursor on its Line.
+`zig build test --summary all` passed with exit 0: 56/56 steps and 1657/1657 tests (1651 existing tests and the 6 probes).
+`zig fmt --check src build.zig tests` passed.
+
+## Acceptance criteria
+
+- [ ] Tests through `Presentation` in the `M21 kernel` group reproduce these cases. Each test puts the gap Line in a File after the first File, so that a fall back to the top of the Buffer changes the active File:
+  - "M21 kernel the cursor on a Whole File gap Line stays after a File Enrichment of another File"
+  - "M21 kernel the cursor on a Whole File gap Line stays after a width resize"
+  - "M21 kernel the cursor on a SideBySide Whole File gap Line stays after a File Enrichment of another File"
+  - "M21 kernel Buffer Search input Escape returns to its start on a Whole File gap Line after rebuilds"
+  - "M21 kernel a Draft deletion puts the cursor on the next Whole File gap Line"
+
+  Each test finds the expected row by its text and line number in the current Frame, not by a fixed number.
+  After the rebuild and the queued work, the cursor is on that row, `activeFile()` is its File, and `action_error` is null.
+  Each test fails at `e4c7d46`.
+- [ ] No `RowOwner` built from a Buffer row holds a pointer to a gap Line.
+- [ ] The `Review recovery` tests, the ticket 16 to 19 tests, and the Selected Version tests pass.
+- [ ] `zig build test` passes. `zig fmt --check build.zig src tests` passes. `python3 tools/check_agent_docs.py` passes.
+
+## Comments
+
+### 2026-11-14, triage
+
+Decision: `ready-for-agent`.
+
+The defect reproduces through `Presentation` for a File Enrichment of another File, a width resize, the SideBySide layout, the Buffer Search input start, and a Draft deletion before a gap Line.
+The real user reaches it with the default keys while File Enrichment runs in the background.
+The expected behavior has a precedent: the Diff glossary, `VersionRestoration`, and `ReviewLocation` identify a source row by its File, side, and line number.
+So the ticket needs no answer from a human.
+
+The ticket first suggested two identities.
+A Session-owned gap Line from the File Enrichment is not stable, because cache eviction frees File content and a later File Enrichment loads it again.
+The ticket now asks for a value identity derived from the source.
+The wrong-line match through a reused address was not observed in up to 7 rebuilds with two allocators. It stays inferred, and the fix removes it.
+
+Mistake class for the `correct` skill: this ticket forms its own class, an identity that points into a per-build allocation.
+It is not the class "a stored visual row number outlives its Frame" of ticket 19, because the fault is in the key, not in a stored row number.
+The cases found:
+
+| Identity | State |
+| --- | --- |
+| `RowOwner.line` for a gap Line, read by the cursor restore of every admission, the Selection mark, `BufferSearchInput.start`, and `DisclosureBuild.restore_navigation` | Reproduced |
+| `SurvivingRow.line` after a Draft deletion | Reproduced |
+| `VersionRestoration.destination_hunk_line` | Holds only a Hunk Line (`in_hunk` check). No gap |
+| `DisclosureKey.fold` | A Hunk Line in the Changes scope. No gap |
+| `SourceMatch.old_line` and `new_line` | Compared in the Frame that made them. Not checked across builds |
+
+A line check cannot see which allocation a pointer comes from.
+The `LineOwner` type puts the rule in one constructor, `LineOwner.of`, and the `AGENTS.md` row of step 7 names the tests.
+
+The probe worktree is deleted. The sketch diff is at `t20-sketch.diff` in the session temporary directory, outside the repo. No live run was needed.
