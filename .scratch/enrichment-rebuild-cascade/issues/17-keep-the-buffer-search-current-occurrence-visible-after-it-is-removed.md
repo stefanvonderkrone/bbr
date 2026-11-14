@@ -1,6 +1,6 @@
 # 17: Keep the Buffer Search current occurrence visible after it is removed
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -148,17 +148,17 @@ With the sketch, `zig build test --summary all` passed: 52/52 steps and 1646/164
 
 ## Acceptance criteria
 
-- [ ] A test through `Presentation` reproduces case 1: accept `zz`, press `n` to the second Draft, delete that Draft with `D` and confirm, and run the builds.
+- [x] A test through `Presentation` reproduces case 1: accept `zz`, press `n` to the second Draft, delete that Draft with `D` and confirm, and run the builds.
   After the builds, the batch has 1 occurrence, `buffer_search.active` is null, the status projection has no active match, the cursor keeps its row, and `action_error` is null.
   Then `n` makes the remaining occurrence current, and the cursor is on its visual row.
   The test fails at `7e1930b`, where `active` is 0 and the occurrence has no visual row.
-- [ ] A test through `Presentation` reproduces case 2: accept `zz`, press `gg`, isolate File `0.txt`, press `n`, and run the builds.
+- [x] A test through `Presentation` reproduces case 2: accept `zz`, press `gg`, isolate File `0.txt`, press `n`, and run the builds.
   After the builds, the batch is empty, `action_error` is `buffer_search_no_matches`, `expanded_disclosures` has the keys from before the `n`, and `buffer_search.saved_disclosures` is null.
   The test fails at `7e1930b`, where `action_error` is null and one Draft disclosure is open.
-- [ ] A rebuild that keeps the current occurrence still keeps it.
+- [x] A rebuild that keeps the current occurrence still keeps it.
   The ticket 06 test "Buffer Search admits an enrichment rebuild after a current occurrence move and keeps that occurrence" passes.
-- [ ] The four "M21 kernel Buffer Search retries" tests of ticket 16 pass.
-- [ ] `zig build test` passes.
+- [x] The four "M21 kernel Buffer Search retries" tests of ticket 16 pass.
+- [x] `zig build test` passes.
 
 ## Overlap with ticket 15
 
@@ -167,6 +167,65 @@ This fix does not need ticket 15.
 Step 2 adds `job.destination_active != null` to the test that tells a traversal move from other kinds, so that test now reads three fields.
 A Kind with a traversal arm that carries its occurrence would replace all three.
 If ticket 15 lands first, step 2 matches that arm instead.
+
+## Completion
+
+Commits:
+
+- `b913d84` adds the two reproducing tests. Both fail on that commit.
+- `52736d5` fixes both cases.
+- `0deeb71` makes the tests check that the remaining match stays hidden, and takes the disclosure keys just before `n`.
+- `abd54f0` renames the nearest rule and adds `tools/check_search_index.py`.
+
+### Change
+
+`acceptViewBuild` and the control path `prepareBufferControlForFile` map `buffer_search.active` with the new `sameSearchIndex`.
+A rebuild that removes the current occurrence now clears `active`, keeps `saved_disclosures`, and leaves the cursor where the rebuild put it.
+In `retryAcceptedDisclosure`, a traversal move with a destination always ends in the traversal branch.
+An empty batch sets `buffer_search_no_matches` and opens nothing.
+`keepPlans` stays the first statement in `acceptBufferDisclosure`.
+
+The new tests are "M21 kernel Buffer Search clears the current occurrence when a Draft deletion removes it" and "M21 kernel Buffer Search retries a move into an isolated File without matches and opens nothing".
+At `b913d84`, the first test failed at `active == null`, and the second test failed with `expected .buffer_search_no_matches, found null`.
+
+The case 1 criterion "the cursor keeps its row" cannot compare the row with the row before the deletion, because the deletion removes the rows above the old cursor.
+The test checks that the remaining match stays hidden instead, so the admission did not open its Draft or move the cursor to it.
+
+### Mistake class
+
+Class: a search occurrence index carried into a newer batch with the wrong rule.
+Ticket 16 used an unmapped index, and this ticket used the nearest fallback where the same occurrence was necessary. Two cases make a class.
+
+Each caller of the nearest rule and its rule:
+
+| Function | Rule | Reason |
+| --- | --- | --- |
+| `acceptViewBuild`, accepted occurrence | same | A rebuild does not move the cursor. This ticket. |
+| `prepareBufferControlForFile`, accepted occurrence | same | The control frame is the oracle for the worker frame. |
+| `retryAcceptedDisclosure` | nearest | The user asked for the move. Ticket 16. |
+| `acceptReviewSourceScanned`, `acceptReviewSearchScanned` | nearest | A list selection. |
+| `expectReviewSourcePublication` | nearest | A test helper for the list selection. |
+| `acceptViewBuild` and `prepareBufferControlForFile`, input preview | nearest | Open. Ticket 18 asks. |
+
+The fix renames the nearest functions to `nearestSearchIndex` and `nearestProjectedSearchIndex`.
+`tools/check_search_index.py` rejects a nearest call in a function that its `NEAREST` table does not list with a reason.
+It fails on the old `acceptViewBuild` line of `7e1930b` under the new name, and on that whole file with the names replaced.
+A type that pairs an index with its batch would be a higher level, but it overlaps [ticket 15](15-carry-the-search-destination-in-the-build-kind.md), so this ticket does not build it.
+`AGENTS.md` has a new rules row.
+
+### Checks
+
+- `zig build test --summary all`: exit 0, 54/54 steps, 1646/1646 tests.
+- `zig fmt --check src build.zig tests`: exit 0.
+- `python3 tools/check_agent_docs.py`, `python3 tools/check_benchmark_metrics.py`, `python3 tools/check_diagnostics.py`: pass.
+
+### Review
+
+A two-axis code review ran.
+The Standards review found two prose defects in the first draft: the rules row did not name the input preview exception, and two table reasons had a semicolon. Both are fixed.
+It suggested a bounds guard in `sameSearchIndex`. The fix does not add it, because an out-of-range `active` breaks an invariant, and a guard would hide that break.
+The Spec review asked for the cursor check and the later key snapshot in the tests. Commit `0deeb71` adds both.
+It also noted that `retainedEditedSearchIndex` keeps the old name. Ticket 18 records it.
 
 ## Comments
 
