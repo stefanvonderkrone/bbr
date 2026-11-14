@@ -31,3 +31,12 @@ The DiffPane takes the active Buffer Search ranges from `buffer_search.active` (
 One rule for both would remove the flag marking of Review Search ranges.
 
 ## Comments
+
+### 2026-11-14, from ticket 16
+
+[Ticket 16](16-keep-a-buffer-search-move-into-hidden-text-after-a-rebuild.md) found that `retryAcceptedDisclosure` reused `destination_active` against a newer accepted batch.
+The fix maps it with `retainedSearchIndex` and tells a traversal move from other kinds by `job.restore_navigation == null`.
+A Kind that carries the destination as the occurrence identity, or as an index together with its batch, would make an unmapped read of another batch impossible.
+It would also replace the `restore_navigation == null` test.
+A survey of the branch found six places that map a stored occurrence index into a new batch correctly, and only this retry did not.
+So the mistake does not count as a repeated class yet, and ticket 16 adds no check for it.

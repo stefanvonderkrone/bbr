@@ -1,6 +1,6 @@
 # 16: Keep a Buffer Search move into hidden text after a rebuild
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -139,15 +139,72 @@ If ticket 15 lands first, step 2 uses that Kind instead.
 
 ## Acceptance criteria
 
-- [ ] A test through `Presentation` reproduces the Whole File case above.
+- [x] A test through `Presentation` reproduces the Whole File case above.
   A File Enrichment build waits ahead of a hidden `n`, and its admission adds occurrences before the target.
   After the builds, `buffer_search.active` is the target occurrence, compared with `searchOccurrenceEql` against the batch before the `n`, and the cursor is on the visual row of that occurrence.
   The test fails at `62d0ac3`, where the move lands on occurrence 1 and visual row 3.
-- [ ] The same test with the hidden fold matches of `testDisclosureSession` passes for an `.accepted` move (`4n`) and a `.restore` move (`2N`).
-- [ ] A test removes the target occurrence with a rebuild that is admitted before the retried build, for example a Draft deletion.
+- [x] The same test with the hidden fold matches of `testDisclosureSession` passes for an `.accepted` move (`4n`) and a `.restore` move (`2N`).
+- [x] A test removes the target occurrence with a rebuild that is admitted before the retried build, for example a Draft deletion.
   The move ends on an occurrence that is in bounds, its disclosures are open, and the cursor is on its visual row.
-- [ ] A retried build with a null destination, such as the `.restore` of `cancelBufferSearch` with no current occurrence, still has a null destination.
-- [ ] `zig build test` passes.
+- [x] A retried build with a null destination, such as the `.restore` of `cancelBufferSearch` with no current occurrence, still has a null destination.
+- [x] `zig build test` passes.
+
+## Completion
+
+Commits:
+
+- `3829400` tui: reproduce Buffer Search moves retried after a rebuild.
+- `132d933` tui: map a retried Buffer Search move into the rebuilt batch.
+
+### Change
+
+`retryAcceptedDisclosure` maps a non-null `destination_active` into the current accepted batch with `retainedSearchIndex`.
+A null destination stays null, and a null accepted batch gives a null destination.
+The end of `traverseBufferSearchBy` is now `openBufferSearchOccurrence(published, index, status)`.
+A retried `.accepted` or `.restore` build with no `restore_navigation` and a mapped destination calls it with `job.result_error`.
+So a mapped occurrence that is now visible gets a direct jump, and a hidden one gets its disclosures computed again.
+Every other kind keeps its `target` and only maps the index.
+The fields that the reopen does not copy, such as `clear_saved_disclosures` and `restore_search_disclosures`, are set only by `.open_input`, `.clear_input`, `.general`, and the `.restore` of `cancelBufferSearch`, so a traversal move never has them.
+`job.keepPlans()` is still the first statement in `acceptBufferDisclosure`.
+
+### Tests
+
+- "M21 kernel Buffer Search retries a hidden reply move after Whole File enrichment adds earlier matches" covers criterion 1.
+  It failed at `3829400` on the identity check: the batch had 6 occurrences, and the move landed on a source match.
+- "M21 kernel Buffer Search retries a hidden move after an isolation removes its target" covers criterion 3.
+  It failed at `3829400` with `panic: index out of bounds: index 1, len 1` in `acceptAcceptedDisclosure`, so the out-of-bounds read of the triage is now shown, not only inferred.
+- "M21 kernel Buffer Search retries hidden fold moves after Changes enrichment" covers criterion 2 (`4n` for `.accepted`, `2N` for `.restore`). It passes before and after the fix.
+- "M21 kernel Buffer Search retries null destinations after enrichment without selecting a match" covers criterion 4 for the `.restore` of `cancelBufferSearch` and of `clearBufferSearchActive`.
+
+The criterion suggested a Draft deletion to remove the target.
+A Draft deletion cannot do it: its build has a stale `request_id` after the `n`, so `acceptViewBuild` retries it behind the move.
+An isolation can, because `acceptViewBuild` admits a `.view` build by `pending_view`, not by `search_generation`.
+The Draft deletion run found a separate gap, filed as [ticket 17](17-keep-the-buffer-search-current-occurrence-visible-after-it-is-removed.md).
+
+No live run: the local Review of the triage has no comments, and its live runs never reached a hidden match.
+
+### Checks
+
+- `zig build test --summary all`: exit 0, 52/52 steps, 1644/1644 tests.
+- `zig fmt --check src build.zig tests`: exit 0.
+- `python3 tools/check_agent_docs.py`: pass.
+- `python3 tools/check_benchmark_metrics.py`: pass.
+- `python3 tools/check_diagnostics.py`: pass.
+
+### Review
+
+A two-axis code review found no hard violation and no scope creep.
+The Standards review asked to rename the parameter `next` of `openBufferSearchOccurrence` to `index`, and the fix commit does that.
+It flagged the kind test `(.accepted or .restore) and restore_navigation == null` as a second list beside `Kind.opensOccurrence`. Ticket 15 owns that shape, and a comment there records it.
+It flagged the queue-order preconditions in the two guard tests as tied to the implementation. They stay, because they prove that the guard reaches the retry.
+The Spec review confirmed the Draft deletion reasoning and found the empty-batch case, which ticket 17 records.
+
+### Mistake class
+
+Candidate: an occurrence index outlives the batch that it was computed for.
+Six places map a stored index into a new batch correctly: `acceptViewBuild` for `buffer_search.active`, the input batch for `input.active`, Review Search for `selected` and for the range `occurrence_index` values, the identity check and reopen of `.review_destination`, and the rescan of an `.input` retry.
+Only this retry did not, since commit `45ddc6e`.
+One case does not make a class, so this ticket adds no check and no rules row.
 
 ## Comments
 
