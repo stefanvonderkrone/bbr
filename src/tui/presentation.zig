@@ -5010,7 +5010,7 @@ const Published = struct {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.SearchFailed,
                 };
-                input_active = nearestSearchIndex(input.batch, input.active, batch);
+                input_active = sameSearchIndex(input.batch, input.active, batch);
                 const projected = search_projection.project(std.heap.page_allocator, batch) catch |err| {
                     batch.deinit(self.allocator);
                     return err;
@@ -9519,7 +9519,7 @@ pub const Presentation = struct {
             self.retryStaleBufferDisclosure(published);
             return;
         }
-        const retained = retainedEditedSearchIndex(input.batch, input.active, batch, completed.navigation_rows);
+        const retained = sameEditedSearchIndex(input.batch, input.active, batch, completed.navigation_rows);
         const base = if (batch.occurrences.len == 0 or retained != null) 0 else firstSearchOccurrenceAtOrAfter(completed.navigation_rows, input.origin);
         const active = if (batch.occurrences.len == 0) null else retained orelse (base + input.count - 1) % batch.occurrences.len;
         if (self.queueBufferDisclosure(published, batch, active, input.request_id, completed.navigation_rows) catch |err| switch (err) {
@@ -9937,7 +9937,7 @@ pub const Presentation = struct {
         job.navigation_rows = null;
         published.buffer_search.active = active;
         if (published.buffer_search.input) |*input| {
-            const next_active = if (job.input_rebuilt_batch) |batch| nearestProjectedSearchIndex(input.batch, input.active, batch, job.input_navigation_rows) else null;
+            const next_active = if (job.input_rebuilt_batch) |batch| sameProjectedSearchIndex(input.batch, input.active, batch, job.input_navigation_rows) else null;
             if (input.batch) |*old| old.deinit(self.allocator);
             if (input.ranges) |old| std.heap.page_allocator.free(old);
             if (input.navigation_rows) |old| std.heap.page_allocator.free(old);
@@ -14219,7 +14219,7 @@ fn sameSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next:
 }
 
 /// The index of the same occurrence in `next`, or the nearest index when `next` lost it.
-/// A move that the user asked for, a list selection, and the Buffer Search input preview use this rule.
+/// A move that the user asked for and a list selection use this rule.
 fn nearestSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch) ?usize {
     if (next.occurrences.len == 0) return null;
     if (previous_batch) |previous| if (previous_active) |active| if (active < previous.occurrences.len) {
@@ -14299,15 +14299,15 @@ fn searchIdentityIndexLess(batch: search.Batch, left: usize, right: usize) bool 
     return exactSearchOrder(batch.occurrences[left], batch.occurrences[right]) == .lt;
 }
 
-fn nearestProjectedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch, navigation_rows: ?[]SearchNavigationRow) ?usize {
-    if (next.occurrences.len == 0) return null;
-    if (previous_batch) |previous| if (previous_active) |active| if (active < previous.occurrences.len) {
-        return indexedSearchIdentity(previous.occurrences[active], next, navigation_rows, true) orelse @min(active, next.occurrences.len - 1);
-    };
-    return 0;
+/// `sameSearchIndex` through the projected identity order of `next`.
+fn sameProjectedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch, navigation_rows: ?[]SearchNavigationRow) ?usize {
+    const previous = previous_batch orelse return null;
+    const active = previous_active orelse return null;
+    return indexedSearchIdentity(previous.occurrences[active], next, navigation_rows, true);
 }
 
-fn retainedEditedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch, navigation_rows: ?[]SearchNavigationRow) ?usize {
+/// The index in `next` of the occurrence at the same place under an edited query, or null when `next` has none.
+fn sameEditedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch, navigation_rows: ?[]SearchNavigationRow) ?usize {
     const previous = previous_batch orelse return null;
     const active = previous_active orelse return null;
     if (active >= previous.occurrences.len) return null;
@@ -15637,7 +15637,7 @@ fn benchmarkSearchSelection(presentation: *Presentation, io: std.Io) !void {
         if (completed.outcome != .scanned) return error.SearchFailed;
         const next = completed.outcome.scanned;
         var start = std.Io.Clock.awake.now(io);
-        const retained = retainedEditedSearchIndex(previous, active, next, completed.navigation_rows);
+        const retained = sameEditedSearchIndex(previous, active, next, completed.navigation_rows);
         std.mem.doNotOptimizeAway(retained);
         times[@intFromEnum(Stage.retention_lookup)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         start = std.Io.Clock.awake.now(io);
@@ -19314,11 +19314,11 @@ test "M21 kernel indexed Batch selection matches linear selection across hidden 
         }
         try testing.expect(hidden and unavailable);
         for (before.occurrences, 0..) |wanted, active| {
-            try testing.expectEqual(linearEditedSearchIndex(wanted, after), retainedEditedSearchIndex(before, active, after, projected.navigation_rows));
-            try testing.expectEqual(nearestSearchIndex(before, active, after), nearestProjectedSearchIndex(before, active, after, projected.navigation_rows));
+            try testing.expectEqual(linearEditedSearchIndex(wanted, after), sameEditedSearchIndex(before, active, after, projected.navigation_rows));
+            try testing.expectEqual(sameSearchIndex(before, active, after), sameProjectedSearchIndex(before, active, after, projected.navigation_rows));
         }
         for (after.occurrences, 0..) |_, active| {
-            try testing.expectEqual(nearestSearchIndex(after, active, after), nearestProjectedSearchIndex(after, active, after, projected.navigation_rows));
+            try testing.expectEqual(sameSearchIndex(after, active, after), sameProjectedSearchIndex(after, active, after, projected.navigation_rows));
         }
         for (0..published.visual_rows.len + 2) |cursor| {
             try testing.expectEqual(linearSearchOrigin(published, after, projected.navigation_rows, cursor), firstSearchOccurrenceAtOrAfter(projected.navigation_rows, cursor));
@@ -19328,8 +19328,8 @@ test "M21 kernel indexed Batch selection matches linear selection across hidden 
                 }
             }
         }
-        try testing.expectEqual(@as(?usize, null), retainedEditedSearchIndex(before, before.occurrences.len, after, projected.navigation_rows));
-        try testing.expectEqual(@as(?usize, null), retainedEditedSearchIndex(null, null, after, projected.navigation_rows));
+        try testing.expectEqual(@as(?usize, null), sameEditedSearchIndex(before, before.occurrences.len, after, projected.navigation_rows));
+        try testing.expectEqual(@as(?usize, null), sameEditedSearchIndex(null, null, after, projected.navigation_rows));
         var empty_query = try search.Query.init(testing.allocator, "no occurrence");
         defer empty_query.deinit(testing.allocator);
         var empty = try search.scan(testing.allocator, empty_query, candidates.items, .literal);
@@ -19338,7 +19338,7 @@ test "M21 kernel indexed Batch selection matches linear selection across hidden 
         defer testing.allocator.free(empty_projection.ranges);
         defer testing.allocator.free(empty_projection.navigation_rows);
         try testing.expectEqual(@as(usize, 0), firstSearchOccurrenceAtOrAfter(empty_projection.navigation_rows, 999));
-        try testing.expectEqual(@as(?usize, null), retainedEditedSearchIndex(before, 0, empty, empty_projection.navigation_rows));
+        try testing.expectEqual(@as(?usize, null), sameEditedSearchIndex(before, 0, empty, empty_projection.navigation_rows));
     };
 }
 

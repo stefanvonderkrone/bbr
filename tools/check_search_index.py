@@ -2,14 +2,17 @@
 """Reject a new nearest-index mapping of a search occurrence.
 
 A search occurrence index maps into a newer batch by one of two rules.
-`sameSearchIndex` keeps the same occurrence and gives null when the batch lost
-it. A rebuild uses it, because a rebuild does not move the cursor. The nearest
-rule (`nearestSearchIndex`, `nearestProjectedSearchIndex`) falls back to the
-nearest index. A move the user asked for, a list selection, and the Buffer
-Search input preview use it.
+`sameSearchIndex`, `sameProjectedSearchIndex`, and `sameEditedSearchIndex` keep
+the same occurrence and give null when the batch lost it. A rebuild uses them,
+because a rebuild does not move the cursor. This includes the accepted Buffer
+Search occurrence and the Buffer Search input preview. The nearest rule
+(`nearestSearchIndex`) falls back to the nearest index. Only a move that the
+user asked for and a list selection use it.
 
-Each production function that uses the nearest rule is in NEAREST with its
-reason. A new use fails until a reviewer adds it there.
+The check matches a call of any function whose name starts with `nearest` and
+ends with `Index`, so a new nearest helper under another name also fails. Each
+production function that calls one is in NEAREST with its reason. A new use
+fails until a reviewer adds it there.
 """
 
 from pathlib import Path
@@ -20,23 +23,19 @@ from check_diagnostics import production
 from source_lines import zig_files
 
 NEAREST = {
-    ("src/tui/presentation.zig", "prepareBufferControlForFile", "nearestSearchIndex"):
-        "the Buffer Search input preview, like acceptViewBuild. Ticket 18 of enrichment-rebuild-cascade decides its rule.",
-    ("src/tui/presentation.zig", "acceptReviewSourceScanned", "nearestSearchIndex"):
+    ("src/tui/presentation.zig", "acceptReviewSourceScanned"):
         "the Review Search list selection moves to the nearest entry",
-    ("src/tui/presentation.zig", "acceptReviewSearchScanned", "nearestSearchIndex"):
+    ("src/tui/presentation.zig", "acceptReviewSearchScanned"):
         "the Review Search list selection moves to the nearest entry",
-    ("src/tui/presentation.zig", "acceptViewBuild", "nearestProjectedSearchIndex"):
-        "the Buffer Search input preview. Ticket 18 of enrichment-rebuild-cascade decides its rule.",
-    ("src/tui/presentation.zig", "retryAcceptedDisclosure", "nearestSearchIndex"):
+    ("src/tui/presentation.zig", "retryAcceptedDisclosure"):
         "the retry of a move that the user asked for",
-    ("src/tui/presentation.zig", "expectReviewSourcePublication", "nearestSearchIndex"):
+    ("src/tui/presentation.zig", "expectReviewSourcePublication"):
         "a test helper that computes the Review Search list selection",
 }
-CALL = re.compile(r"\b(nearestSearchIndex|nearestProjectedSearchIndex)\s*\(")
+CALL = re.compile(r"\b(nearest\w*Index)\s*\(")
 FUNCTION = re.compile(r"^\s*(?:pub\s+)?fn\s+(\w+)\s*\(")
 FIX = (
-    "A rebuild that keeps an occurrence uses sameSearchIndex, which gives null when the batch lost it. "
+    "A rebuild uses sameSearchIndex or sameProjectedSearchIndex, which give null when the batch lost the occurrence. "
     "Use the nearest rule only for a move the user asked for or a list selection, "
     "and add the function to NEAREST in tools/check_search_index.py with its reason."
 )
@@ -53,13 +52,13 @@ def violations(root):
             for call in CALL.finditer(line):
                 if declared and declared.group(1) == call.group(1):
                     continue
-                key = (path.as_posix(), function, call.group(1))
+                key = (path.as_posix(), function)
                 seen[key] = seen.get(key, 0) + 1
                 if key not in NEAREST or seen[key] > 1:
                     yield f"{path}:{number}: {function} maps an occurrence with {call.group(1)}. {FIX}"
         for key in NEAREST:
             if key[0] == path.as_posix() and key not in seen:
-                yield f"{path}: {key[1]} no longer calls {key[2]}. Remove its entry from NEAREST in tools/check_search_index.py."
+                yield f"{path}: {key[1]} no longer calls the nearest rule. Remove its entry from NEAREST in tools/check_search_index.py."
 
 
 def main():
