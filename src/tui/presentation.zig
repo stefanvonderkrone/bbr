@@ -34428,6 +34428,60 @@ test "M21 kernel Buffer Search clears the current occurrence when a Draft deleti
     try testing.expectEqual(published.occurrenceVisualRow(wanted.occurrences[0]).?, published.navigation.cursor);
 }
 
+test "M21 kernel Buffer Search input clears its preview when a Draft deletion removes it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    for ([_]u32{ 1, 3 }, [_][]const u8{ "zz one", "zz two" }, 1..) |line, body, id| {
+        try store.store().put(key.storeKey(), .{
+            .local_id = id,
+            .kind = .comment,
+            .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = line, .commit = "source" } },
+            .body = body,
+        });
+    }
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+    try cursorToDraftCard(&presentation, 2);
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'z', .text = "zz" } });
+    try completeBufferSearchScan(&presentation);
+    const published = presentation.published.?;
+    var wanted = try published.buffer_search.input.?.batch.?.clone(testing.allocator);
+    defer wanted.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), wanted.occurrences.len);
+    try testing.expectEqual(@as(?usize, 1), published.buffer_search.input.?.active);
+    try testing.expectEqual(published.occurrenceVisualRow(wanted.occurrences[1]).?, published.navigation.cursor);
+
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+    try completeQueuedTestWork(&presentation);
+
+    const input = published.buffer_search.input.?;
+    try testing.expectEqual(@as(usize, 1), input.batch.?.occurrences.len);
+    try testing.expect(searchOccurrenceEql(wanted.occurrences[0], input.batch.?.occurrences[0]));
+    try testing.expect(input.active == null);
+    try testing.expect(published.buffer_search.projection().?.active == null);
+    const remaining_row = published.occurrenceVisualRow(wanted.occurrences[0]).?;
+    const cursor = published.navigation.cursor;
+    try testing.expect(cursor != remaining_row);
+    try testing.expect(presentation.action_error == null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeQueuedTestWork(&presentation);
+    try testing.expect(published.buffer_search.input == null);
+    try testing.expect(published.buffer_search.active == null);
+    try testing.expectEqual(cursor, published.navigation.cursor);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(@as(?usize, 0), published.buffer_search.active);
+    try testing.expectEqual(remaining_row, published.navigation.cursor);
+}
+
 test "M21 kernel Buffer Search retries a move into an isolated File without matches and opens nothing" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
