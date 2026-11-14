@@ -1,57 +1,174 @@
 # 16: Keep a Buffer Search move into hidden text after a rebuild
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: none
 
 ## Summary
 
 A Buffer Search `n` or `N` to a match that is hidden, for example in a collapsed fold or a collapsed disclosure, queues an `.accepted` or `.restore` build.
-When another Buffer rebuild is admitted before that build ends, the `.accepted` build can be dropped with no retry and no message.
-The user then presses `n`, and nothing happens.
+When another Buffer rebuild is admitted before that build ends, the build is not dropped.
+The Presentation retries it.
+But the retry keeps the occurrence index of the old accepted batch and uses it in the rebuilt batch.
+When the rebuild added or removed occurrences before the target, the move lands on another match.
 
-This gap is older than [ticket 06](06-keep-a-buffer-rebuild-after-a-buffer-search-active-move.md).
-The ticket 06 code review found it, and the ticket 06 completion records it.
-Ticket 06 admits more rebuilds while the user presses `n`, so the gap can now occur more often.
-Nobody has reproduced it. The evidence is a read of the code at commit `d5d9dbe`.
+A reproducing test shows the effect.
+The user presses `n` to go forward to a hidden reply, and the cursor goes back to an earlier source line.
+The status shows that earlier match as current.
 
 ## Evidence
 
-All paths are in `src/tui/presentation.zig`.
+All paths are in `src/tui/presentation.zig`. The evidence is from commit `62d0ac3`.
 
-1. `traverseBufferSearchBy` jumps directly to a visible match.
-   For a hidden match, it calls `queueAcceptedDisclosure` with the kind `.accepted`, or `.restore` when no disclosure must open.
-   It does not change `buffer_search.active`. The build sets it when the Presentation admits the build.
-2. The build copies the accepted batch into `accepted_snapshot` when it starts.
-3. `acceptViewBuild` admits a rebuild, for example a File Enrichment result.
-   It replaces `published.buffer_search.accepted_batch` with the rebuilt batch of that rebuild.
-4. `acceptAcceptedDisclosure` then compares the snapshot pointer with the current accepted batch:
+### The drop that the first reading suspected does not occur
 
-   ```zig
-   if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr) return;
-   ```
+The first reading suspected this check in `acceptAcceptedDisclosure`, which returns with no retry and no message:
 
-   On a mismatch, it returns. It does not call `retryAcceptedDisclosure`, and it sets no `action_error`.
-   The other stale checks in the same function call `retryAcceptedDisclosure`.
+```zig
+if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr) return;
+```
 
-The live runs of ticket 06 ended on the expected match index in every run.
-But they did not check that the DiffPane showed the match, and they did not aim `n` at hidden matches.
+An earlier check in the same function catches every admitted Buffer rebuild first:
 
-## Next step
+```zig
+if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or ...) {
+    self.retryAcceptedDisclosure(published, job);
+    return;
+}
+```
 
-Triage the ticket:
+`acceptViewBuild` sets `visual_rows_revision` on each admission.
+`DisclosureBuild.create` copies `visual_rows_revision` into `frame_revision`.
+So each admission that replaces `accepted_batch` also makes the `frame_revision` check fail, and the build is retried.
 
-1. Write a test through `Presentation` that does these steps:
-   - Press `n` to a hidden match.
-   - Admit a File Enrichment rebuild before the `.accepted` build ends.
-   - Deliver the `.accepted` build.
+The order of the builds limits when the case can occur.
+`takeCommand` issues one `build_buffer_disclosure` at a time, in queue order.
+A hidden `n` increments `search_generation`, so an `.enrichment` build that already runs is rejected by its `request_id` check and is retried behind the `.accepted` build.
+But an `.enrichment` build that waits in the queue ahead of the `.accepted` build gets a new `request_id` from `refreshEnrichmentBuild` when it is issued.
+That build is admitted first, and then the `.accepted` build is retried.
 
-   Check whether the match opens and the cursor reaches it.
-2. When the test confirms the drop, decide the fix.
-   One possible fix: map the target occurrence into the current accepted batch with `retainedSearchIndex` and admit or retry the build, as other stale checks do.
-   Another possible fix: retry the build with the target mapped into the new batch.
-3. Check whether the live workload can show the drop.
-   For example, use `n` at 10 presses per second on a query whose matches are mostly in collapsed folds while File Enrichment runs.
-   Count the dropped `.accepted` builds.
-4. Set the status and the acceptance criteria.
+### The retry keeps the old index
+
+`retryAcceptedDisclosure` passes `job.destination_active` and `job.target` unchanged to `queueAcceptedDisclosure`.
+The new build copies the current accepted batch into `accepted_snapshot`.
+So the index of the old batch now selects an occurrence of the new batch.
+`job.target` still holds the disclosures of the old occurrence.
+`acceptViewBuild` maps the published current occurrence with `retainedSearchIndex`, but nothing maps the destination of a waiting build.
+
+At admission, `acceptAcceptedDisclosure` reads `rows[index]` and `current.?.occurrences[index]` without a bounds check.
+A rebuilt batch that is shorter than the old index can therefore read out of bounds.
+This is inferred from the code. No test made a batch shorter.
+
+### Throwaway test
+
+A throwaway test in a detached worktree drove `Presentation` through these steps:
+
+1. Make a Session with two Files.
+   File `0.txt` has two hunks with a gap of unchanged lines that contain `zz`.
+   File `a.txt` has a resolved Thread with the reply `fixed zz` and an open comment `open zz`.
+2. Change the scope to Whole File with `cycle_scope`.
+   Before File Enrichment, File `0.txt` has no source occurrences.
+3. Accept the Buffer Search `zz`. The batch has 2 occurrences, both review bodies.
+4. Deliver the File Enrichment of File `0.txt`. Its `.enrichment` build waits in the queue.
+5. Press `n`. A `.restore` build to occurrence 1 waits behind the `.enrichment` build.
+6. Run the builds in queue order.
+
+Results at `62d0ac3`:
+
+| Step | Admitted | Current occurrence | Occurrences |
+| --- | --- | --- | --- |
+| `.enrichment` build | yes | 4 | 6 |
+| `.restore` build | no, retried | 4 | 6 |
+| retried `.restore` build | yes | 1 | 6 |
+
+The target was the reply on visual row 15.
+After the builds, the current occurrence is the source line `zz1` on visual row 3, and the cursor is on row 3.
+No message appears.
+
+The same steps in the Changes scope, with the hidden fold matches of `testDisclosureSession` (`c`, then `4n` for `.accepted` and `2N` for `.restore`), land on the correct match.
+There, File Enrichment does not change the occurrences, so the old index is still correct.
+
+### Live run
+
+A ReleaseFast build of `62d0ac3` with temporary `[DEBUG-t16]` logs ran `bbr local` on the two commits of ticket 04 at 160 × 80 with an empty state directory.
+Each run pressed `n` 200 times at 0.1 second intervals.
+
+| Scope | Query | Final match | Retried `.accepted` or `.restore` builds | Silent drops | `.accepted` or `.restore` admissions |
+| --- | --- | --- | --- | --- | --- |
+| Changes | `return` | 201/6522 | 0 | 0 | 0 |
+| Fetched | `return` | 201/6522 | 0 | 0 | 0 |
+| Whole | `return` | 1/1 | 0 | 0 | 0 |
+| Whole | `e` | 201/1542 | 0 | 0 | 0 |
+
+The runs did not reach a hidden match, so they neither show nor exclude the wrong landing.
+This local Review has no comments, and its first 201 matches are visible.
+The live workload is not a good reproduction of this ticket. The throwaway test is the evidence.
+
+### Other silent returns in `acceptAcceptedDisclosure`
+
+- `job.request_id != published.search_generation`: a later search move replaced the build. Dropping it is correct.
+- `.clear_input` input checks and `published.buffer_search.input != null`: the user opened the Buffer Search input. Dropping it is correct.
+- The accepted snapshot pointer check: as described above, only a batch replacement that does not change `visual_rows_revision` reaches it, for example `acceptBufferSearch` with a new query. Dropping it is correct, because the new query replaces the move.
+- `const review = published.review_search.batch orelse return;`: when the Review Search query is cleared while the build runs, the `n` is dropped with no message. The branch for a changed Review Search batch retries instead. This is a minor inconsistency and is out of scope.
+
+`acceptBufferDisclosure` and `acceptViewBuild` retry on every stale check.
+
+## What to build
+
+1. In `retryAcceptedDisclosure`, map a non-null `job.destination_active` into the current accepted batch before it queues the replacement:
+   `retainedSearchIndex(job.accepted_snapshot, job.destination_active, current)`.
+   This is the rule that `acceptViewBuild` already uses for the published current occurrence.
+   An exact match keeps the same occurrence.
+   When the occurrence is gone, `retainedSearchIndex` gives the nearest index that is in bounds.
+   A null destination stays null.
+2. A retried traversal move recomputes its disclosures for the mapped occurrence.
+   Move the end of `traverseBufferSearchBy`, from the `saved_disclosures == null` check on, into `openBufferSearchOccurrence(published, index, status)`.
+   `traverseBufferSearchBy` calls it with the wrap status.
+   `retryAcceptedDisclosure` calls it for an `.accepted` or `.restore` build whose `restore_navigation` is null, with `job.result_error` as the status.
+   Then a mapped occurrence that is now visible gets a direct jump with no build, and a hidden occurrence gets the disclosures that it needs.
+   Other kinds, such as the `.restore` of `cancelBufferSearch` and `.clear_input`, keep their `target` and only map the index.
+
+A sketch of steps 1 and 2 changed about 20 lines.
+The throwaway test failed before the sketch and passed after it, and `zig build test` passed with the sketch.
+
+### Overlap with ticket 15
+
+[Ticket 15](15-carry-the-search-destination-in-the-build-kind.md) asks whether `DisclosureBuild.Kind` should carry its destination.
+This fix does not need ticket 15.
+But a Kind that carries the target occurrence, and that separates a traversal move from the `.restore` of a cancel, would replace the `restore_navigation == null` test of step 2.
+If ticket 15 lands first, step 2 uses that Kind instead.
+
+## Acceptance criteria
+
+- [ ] A test through `Presentation` reproduces the Whole File case above.
+  A File Enrichment build waits ahead of a hidden `n`, and its admission adds occurrences before the target.
+  After the builds, `buffer_search.active` is the target occurrence, compared with `searchOccurrenceEql` against the batch before the `n`, and the cursor is on the visual row of that occurrence.
+  The test fails at `62d0ac3`, where the move lands on occurrence 1 and visual row 3.
+- [ ] The same test with the hidden fold matches of `testDisclosureSession` passes for an `.accepted` move (`4n`) and a `.restore` move (`2N`).
+- [ ] A test removes the target occurrence with a rebuild that is admitted before the retried build, for example a Draft deletion.
+  The move ends on an occurrence that is in bounds, its disclosures are open, and the cursor is on its visual row.
+- [ ] A retried build with a null destination, such as the `.restore` of `cancelBufferSearch` with no current occurrence, still has a null destination.
+- [ ] `zig build test` passes.
 
 ## Comments
+
+### 2026-11-14, triage
+
+Decision: `ready-for-agent`.
+
+The suspected silent drop does not occur.
+The `frame_revision` check in `acceptAcceptedDisclosure` retries the build before the snapshot pointer check, because each admitted Buffer rebuild sets `visual_rows_revision`.
+A throwaway test confirmed the retry in the Changes scope for `.accepted` and `.restore` moves into a collapsed fold, and both landed on the correct match.
+
+The test found a different defect in the same retry.
+The retry reuses the occurrence index of the old batch.
+In the Whole File scope, File Enrichment adds occurrences, and an `n` toward a hidden reply ended on an earlier source line instead.
+The status showed the wrong match and no message appeared.
+A sketch that maps the index with `retainedSearchIndex` and reopens the occurrence through the traversal fixed the test, and `zig build test` passed with the sketch.
+
+Four live runs with `n` held did not reach a hidden match.
+They had no retried and no dropped `.accepted` or `.restore` build, so the live workload does not show the defect.
+
+The runner rewrote the ticket around the stale index and listed the other silent returns.
+Ticket 15 overlaps only in how a traversal move is told apart from a cancel.
+
+The probe worktrees, the logs, and the state directory are deleted.
