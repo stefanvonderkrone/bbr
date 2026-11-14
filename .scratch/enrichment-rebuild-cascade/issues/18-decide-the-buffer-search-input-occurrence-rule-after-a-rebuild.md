@@ -153,7 +153,7 @@ Steps: in the Whole File scope of the ticket 16 test, put the cursor on the head
 Escape puts the cursor in File 0, not on the File 1 header where the user opened the input.
 A later keystroke that loses the preview also computes it from the stale `input.origin`.
 The preview itself stays on the correct match.
-This defect is not part of this ticket. It needs its own ticket.
+This defect is not part of this ticket. [Ticket 19](19-remap-the-buffer-search-input-origin-after-every-rebuild.md) records it.
 
 ## Comments
 
