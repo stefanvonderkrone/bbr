@@ -1,6 +1,6 @@
 # 21: Find why the visual rows cost more without a candidate build
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -128,3 +128,17 @@ No `sample` profile was taken. The counting allocator and the clock loop separat
 **Decision.** `ready-for-agent` for the reservation, with the small target above. The clock ramp part, about 7.3 ms, is inherent: it is part of every job that starts after idle, and it moved from the skipped phases into the visual rows. It is not new work, so no further ticket follows it.
 
 **Lead, not measured.** The `rest` phase of every rebuild has about 11,000 minor faults (about 170 MB at 16 KB pages). At the cost that the growth copy shows, about 1.5 µs per fault, that can be 15 ms of a 110 ms resize. A probe of `SearchProjection.create` with the same counting allocator can show whether a growth copy causes it.
+
+### 2026-11-15 operator decision
+
+The operator closed this ticket with its question answered and no code change of its own.
+About 7.3 ms of the gap is the CPU clock ramp after idle, which moved from the skipped phases into the visual rows.
+About 2.4 ms is the growth copy of the visual row array. That saving is about 2 percent of a resize, below the run-to-run range of the whole rebuild.
+[Ticket 25](25-measure-the-page-faults-of-the-phases-after-the-visual-rows.md) owns the reservation now, together with the larger lead above.
+
+## Answer
+
+The visual rows cost about 9 ms more without a candidate build for two reasons.
+About 7.3 ms is the CPU clock ramp of a worker that starts after idle, and code cannot recover it.
+About 2.4 ms is a growth copy of the visual row array in the job arena, and a capacity reservation removes it.
+Ticket 25 decides whether that reservation lands, together with the page faults of the later phases.
