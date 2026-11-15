@@ -1,6 +1,7 @@
 # 20: Keep the cursor on a Whole File gap Line after a rebuild
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade
 Blocked by: none
 
 ## Summary
