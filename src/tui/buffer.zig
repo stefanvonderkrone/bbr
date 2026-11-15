@@ -1233,37 +1233,153 @@ fn cardRowCapacity(body: []const u8, content_width: usize) usize {
     return 8 + 2 * std.mem.count(u8, body, "\n") + body.len / content_width;
 }
 
+/// Everything that decides the Buffer Search candidates. `key` reads every
+/// field, so two builds with the same key make the same candidates. The width,
+/// the cell metrics, the highlights, the folds, and the expanded disclosures
+/// are not inputs: the build wraps nothing that a candidate reads, and it
+/// expands every disclosure itself.
+pub const SearchCandidateInputs = struct {
+    diff: model.Diff,
+    threads: []const Thread,
+    mention_names: *const MentionNames,
+    /// Names the Session. A published Session never changes its Diff, its
+    /// Threads, or its mention names.
+    session_epoch: u64,
+    layout: Layout,
+    scope: SearchCandidateScope,
+    only_file: ?usize,
+    drafts: []const Draft,
+    scope_projections: []const anchor_projection.ScopeProjectionEntry,
+    /// Make the build faster and leave its candidates the same.
+    emphasis_cache: ?*const EmphasisCache = null,
+    side_by_side_plans: ?*const SideBySidePlans = null,
+
+    pub fn key(self: SearchCandidateInputs) SearchCandidateKey {
+        var hasher = std.hash.Wyhash.init(0);
+        inline for (comptime std.enums.values(std.meta.FieldEnum(SearchCandidateInputs))) |field| {
+            const value = @field(self, @tagName(field));
+            switch (field) {
+                .diff => hashIdentity(&hasher, value.files),
+                .threads => hashIdentity(&hasher, value),
+                .mention_names => std.hash.autoHash(&hasher, @intFromPtr(value)),
+                .session_epoch, .layout, .only_file, .drafts, .scope_projections => hashContent(&hasher, value),
+                .scope => {
+                    std.hash.autoHash(&hasher, std.meta.activeTag(value));
+                    switch (value) {
+                        .hunks => {},
+                        .whole_file => |whole| {
+                            std.hash.autoHash(&hasher, whole.selected_version);
+                            // A File side holds the same text whenever it is
+                            // loaded, so its identity changes only when it loads
+                            // or leaves.
+                            std.hash.autoHash(&hasher, whole.blobs.len);
+                            for (whole.blobs) |blob| {
+                                hashIdentity(&hasher, blob.old);
+                                hashIdentity(&hasher, blob.new);
+                            }
+                        },
+                    }
+                },
+                .emphasis_cache, .side_by_side_plans => {},
+            }
+        }
+        return @enumFromInt(hasher.final());
+    }
+};
+
+/// The source Lines that the candidates hold. The Changes and fetched scopes
+/// differ only in their folds, which hide nothing from the candidates.
+pub const SearchCandidateScope = union(enum) {
+    hunks,
+    whole_file: struct {
+        selected_version: SelectedVersion,
+        blobs: []const model.FileBlob,
+    },
+};
+
+pub const SearchCandidateKey = enum(u64) { _ };
+
+const MentionNames = @import("review_body.zig").MentionNames;
+
+fn hashIdentity(hasher: *std.hash.Wyhash, value: anytype) void {
+    switch (@typeInfo(@TypeOf(value))) {
+        .optional => if (value) |payload| {
+            hasher.update(&.{1});
+            hashIdentity(hasher, payload);
+        } else hasher.update(&.{0}),
+        else => {
+            std.hash.autoHash(hasher, @intFromPtr(value.ptr));
+            std.hash.autoHash(hasher, value.len);
+        },
+    }
+}
+
+/// Hashes the content behind slices, with the presence of each optional and
+/// the length of each slice, so that two different values never give the same
+/// byte stream.
+fn hashContent(hasher: *std.hash.Wyhash, value: anytype) void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .optional => if (value) |payload| {
+            hasher.update(&.{1});
+            hashContent(hasher, payload);
+        } else hasher.update(&.{0}),
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => {
+                std.hash.autoHash(hasher, value.len);
+                if (pointer.child == u8) hasher.update(value) else for (value) |item| hashContent(hasher, item);
+            },
+            .one => hashContent(hasher, value.*),
+            else => @compileError("hashContent cannot follow " ++ @typeName(T)),
+        },
+        .@"struct" => |info| inline for (info.fields) |field| hashContent(hasher, @field(value, field.name)),
+        .@"union" => {
+            std.hash.autoHash(hasher, std.meta.activeTag(value));
+            switch (value) {
+                inline else => |payload| hashContent(hasher, payload),
+            }
+        },
+        else => std.hash.autoHash(hasher, value),
+    }
+}
+
 /// Build the semantic Buffer Search corpus before Fold and ReviewCard
 /// disclosure projection. Returned Candidates borrow Diff and Review storage;
 /// generated ReviewBody text and mappings use `allocator`.
-pub fn buildSearchCandidates(
-    allocator: std.mem.Allocator,
-    diff: model.Diff,
-    layout: Layout,
-    threads: []const Thread,
-    opts: BuildOptions,
-    session_epoch: u64,
-) ![]search.Candidate {
+pub fn buildSearchCandidates(allocator: std.mem.Allocator, inputs: SearchCandidateInputs) ![]search.Candidate {
+    const diff = inputs.diff;
+    const session_epoch = inputs.session_epoch;
     var disclosures: std.ArrayList(DisclosureKey) = .empty;
     defer disclosures.deinit(allocator);
-    try disclosures.appendSlice(allocator, opts.expanded_disclosures);
     try disclosures.append(allocator, .outdated_review);
     for (diff.files) |*file| {
         try disclosures.append(allocator, .{ .outdated_file = file });
         try disclosures.append(allocator, .{ .opposite_version = file });
     }
-    for (threads) |thread| {
+    for (inputs.threads) |thread| {
         if (thread.resolved) try disclosures.append(allocator, .{ .resolved_thread = thread.root.id });
         try disclosures.append(allocator, .{ .review_card = .{ .comment = thread.root.id } });
         for (thread.replies) |reply| try disclosures.append(allocator, .{ .review_card = .{ .comment = reply.id } });
     }
-    for (opts.drafts) |draft| try disclosures.append(allocator, .{ .review_card = .{ .draft = draft.local_id } });
+    for (inputs.drafts) |draft| try disclosures.append(allocator, .{ .review_card = .{ .draft = draft.local_id } });
 
-    var semantic_options = opts;
-    semantic_options.fold_context = false;
-    semantic_options.expanded_disclosures = disclosures.items;
-    semantic_options.collapsed_rows = 0;
-    const semantic = try buildWithComments(allocator, diff, layout, threads, semantic_options);
+    const whole = switch (inputs.scope) {
+        .hunks => null,
+        .whole_file => |whole| whole,
+    };
+    const semantic = try buildWithComments(allocator, diff, inputs.layout, inputs.threads, .{
+        .expanded_disclosures = disclosures.items,
+        .drafts = inputs.drafts,
+        .scope_projections = inputs.scope_projections,
+        .only_file = inputs.only_file,
+        .whole_file = whole != null,
+        .selected_version = if (whole) |value| value.selected_version else .new,
+        .blobs = if (whole) |value| value.blobs else &.{},
+        .collapsed_rows = 0,
+        .emphasis_cache = inputs.emphasis_cache,
+        .side_by_side_plans = inputs.side_by_side_plans,
+        .mention_names = inputs.mention_names,
+    });
 
     var candidates: std.ArrayList(search.Candidate) = .empty;
     var corpus_order: usize = 0;
@@ -1286,14 +1402,14 @@ pub fn buildSearchCandidates(
         .comment => |card| {
             const comment = card.commentItem();
             if (!comment.deleted and !hasBodyOwner(candidates.items, .{ .comment = comment.id })) {
-                const body = try review_card.ReviewBody.parseWithMentions(allocator, comment.body, opts.mention_names);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, comment.body, inputs.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .comment = comment.id }, session_epoch, &corpus_order, &candidates);
             }
         },
         .draft => |card| {
             const draft = card.draftItem();
             if (!hasBodyOwner(candidates.items, .{ .draft = draft.local_id })) {
-                const body = try review_card.ReviewBody.parseWithMentions(allocator, draft.body, opts.mention_names);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, draft.body, inputs.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .draft = draft.local_id }, session_epoch, &corpus_order, &candidates);
             }
         },
@@ -4966,7 +5082,17 @@ test "M21 kernel Buffer Candidates include hidden semantic content and one share
         .{ .id = 2, .author = "Ada", .body = "generated ghost", .deleted = true },
     };
     const threads = try bbr.review.thread.build(allocator, &comments);
-    const candidates = try buildSearchCandidates(allocator, diff, .side_by_side, threads, .{ .fold_context = true }, 9);
+    const candidates = try buildSearchCandidates(allocator, .{
+        .diff = diff,
+        .threads = threads,
+        .mention_names = &.empty,
+        .session_epoch = 9,
+        .layout = .side_by_side,
+        .scope = .hunks,
+        .only_file = null,
+        .drafts = &.{},
+        .scope_projections = &.{},
+    });
 
     var same_count: usize = 0;
     var saw_body = false;
@@ -4991,15 +5117,22 @@ test "M21 kernel Buffer Candidate corpus follows Layout Scope and File isolation
         .{ .old = "before\nkeep\nold\nafter\n", .new = "before\nkeep\nnew\nafter\n" },
         .{ .old = "one\ntwo\nthree\nfour\nctx\n", .new = "one\ntwo\nthree\nfour\nctx\nextra\n" },
     };
-    const scopes = [_]BuildOptions{
-        .{ .fold_context = true },
-        .{},
-        .{ .whole_file = true, .blobs = &blobs },
+    const scopes = [_]SearchCandidateScope{
+        .hunks,
+        .{ .whole_file = .{ .selected_version = .new, .blobs = &blobs } },
     };
     for ([_]Layout{ .unified, .side_by_side }) |layout| for (scopes) |scope| for ([_]?usize{ null, 0 }) |only_file| {
-        var options = scope;
-        options.only_file = only_file;
-        const candidates = try buildSearchCandidates(allocator, diff, layout, &.{}, options, 1);
+        const candidates = try buildSearchCandidates(allocator, .{
+            .diff = diff,
+            .threads = &.{},
+            .mention_names = &.empty,
+            .session_epoch = 1,
+            .layout = layout,
+            .scope = scope,
+            .only_file = only_file,
+            .drafts = &.{},
+            .scope_projections = &.{},
+        });
         try testing.expect(candidates.len > 0);
         var saw_second_file = false;
         var shared_keep_count: usize = 0;
@@ -5015,6 +5148,6 @@ test "M21 kernel Buffer Candidate corpus follows Layout Scope and File isolation
         };
         try testing.expectEqual(@as(usize, 1), shared_keep_count);
         try testing.expectEqual(only_file == null, saw_second_file);
-        try testing.expectEqual(scope.whole_file, saw_whole_file_gap);
+        try testing.expectEqual(scope == .whole_file, saw_whole_file_gap);
     };
 }

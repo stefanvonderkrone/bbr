@@ -2037,7 +2037,23 @@ test "every OwnedCommand launch failure keeps its correlation and frees the comm
 pub const BufferSearchCorpus = struct {
     arena: std.heap.ArenaAllocator,
     candidates: []const search.Candidate,
+    /// The key of the inputs that built the candidates. Null for a corpus that
+    /// no `SearchCandidateInputs` built, which no build reuses.
+    key: ?buffer_mod.SearchCandidateKey = null,
     references: std.atomic.Value(usize) = .init(1),
+
+    /// The corpus of `inputs`, which is `previous` when equal inputs built it.
+    /// The caller owns one reference to the result.
+    fn reuseOrBuild(previous: ?*BufferSearchCorpus, scratch: Allocator, inputs: buffer_mod.SearchCandidateInputs) !*BufferSearchCorpus {
+        const key = inputs.key();
+        if (previous) |corpus| if (corpus.key) |built| if (built == key) {
+            corpus.retain();
+            return corpus;
+        };
+        const corpus = try create(try buffer_mod.buildSearchCandidates(scratch, inputs));
+        corpus.key = key;
+        return corpus;
+    }
 
     fn create(candidates: []const search.Candidate) !*BufferSearchCorpus {
         const backing = std.heap.page_allocator;
@@ -2783,6 +2799,14 @@ pub const DisclosureBuild = struct {
                 .general, .open_input, .view, .enrichment, .cache_update, .draft_save, .draft_mutation, .review_destination, .card_destination => false,
             };
         }
+
+        /// Whether a build of this kind publishes a new Buffer Search corpus.
+        fn buildsSearchCorpus(kind: Kind) bool {
+            return switch (kind) {
+                .view, .enrichment, .cache_update, .draft_save, .draft_mutation, .review_destination, .card_destination => true,
+                .input, .accepted, .restore, .general, .clear_input, .open_input => false,
+            };
+        }
     };
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
     evidence: ?bbr.diagnostic.Failure = null,
@@ -2872,6 +2896,9 @@ pub const DisclosureBuild = struct {
     accepted_navigation_rows: ?[]SearchNavigationRow = null,
     review_ranges: ?[]frame_mod.ProjectedSourceRange = null,
     search_corpus: ?*BufferSearchCorpus = null,
+    /// The published corpus when the build started. The build reuses it when
+    /// its candidate inputs are equal, and releases it before the visual rows.
+    previous_corpus: ?*BufferSearchCorpus = null,
     rebuilt_batch: ?search.Batch = null,
     navigation_policy: NavigationPolicy = .restore,
     navigation_file: ?usize = null,
@@ -2906,6 +2933,10 @@ pub const DisclosureBuild = struct {
         };
         job.inputs.retain();
         _ = job.target.base.retain();
+        if (published.search_corpus) |corpus| {
+            corpus.retain();
+            job.previous_corpus = corpus;
+        }
         errdefer job.destroy();
         const a = job.arena.allocator();
         job.blobs = job.inputs.blobs;
@@ -3090,26 +3121,8 @@ pub const DisclosureBuild = struct {
                 }
             }
         }
-        if (self.kind == .view or self.kind == .enrichment or self.kind == .cache_update or self.kind == .draft_save or self.kind == .draft_mutation or self.kind == .review_destination or self.kind == .card_destination) {
-            const candidates = try buffer_mod.buildSearchCandidates(a, self.session.diff, self.preferences.layout, self.session.threads, .{
-                .fold_context = self.preferences.scope == .changes,
-                .whole_file = self.preferences.scope == .whole,
-                .selected_version = self.preferences.selected_version,
-                .expanded_disclosures = self.disclosures,
-                .drafts = self.drafts,
-                .scope_projections = self.scopes,
-                .only_file = self.isolated_file,
-                .blobs = self.blobs,
-                .highlights = self.highlights,
-                .content_statuses = self.content_statuses,
-                .card_width = frame_mod.paneRects(self.geometry).diff_content.width,
-                .cell_metrics = self.cell_metrics,
-                .collapsed_rows = self.collapsed_rows,
-                .emphasis_cache = &self.session.emphasis_cache.?,
-                .side_by_side_plans = self.plans,
-                .mention_names = &self.session.mention_names,
-            }, self.epoch);
-            self.search_corpus = try BufferSearchCorpus.create(candidates);
+        if (self.kind.buildsSearchCorpus()) {
+            self.search_corpus = try BufferSearchCorpus.reuseOrBuild(self.previous_corpus, a, self.searchCandidateInputs());
             if (self.accepted_query_text) |text| {
                 const query = try search.Query.init(a, text);
                 const arena = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
@@ -3132,6 +3145,10 @@ pub const DisclosureBuild = struct {
                 };
                 self.input_rebuilt_batch.?.owner_arena = arena;
             }
+        }
+        if (self.previous_corpus) |corpus| {
+            corpus.release();
+            self.previous_corpus = null;
         }
         self.visual_rows = try frame_mod.buildVisualRowsWithOptions(a, self.buffer.rows, self.cell_metrics, .{
             .layout = self.preferences.layout,
@@ -3176,6 +3193,22 @@ pub const DisclosureBuild = struct {
     fn enrichedFile(self: *const DisclosureBuild, index: usize) ?*const EnrichedFile {
         for (self.enrichments.items) |*enriched| if (enriched.index == index) return enriched;
         return null;
+    }
+
+    fn searchCandidateInputs(self: *const DisclosureBuild) buffer_mod.SearchCandidateInputs {
+        return .{
+            .diff = self.session.diff,
+            .threads = self.session.threads,
+            .mention_names = &self.session.mention_names,
+            .session_epoch = self.epoch,
+            .layout = self.preferences.layout,
+            .scope = searchCandidateScope(self.preferences, self.blobs),
+            .only_file = self.isolated_file,
+            .drafts = self.drafts,
+            .scope_projections = self.scopes,
+            .emphasis_cache = &self.session.emphasis_cache.?,
+            .side_by_side_plans = self.plans,
+        };
     }
 
     fn buildBuffer(self: *DisclosureBuild) !buffer_mod.Buffer {
@@ -3228,6 +3261,7 @@ pub const DisclosureBuild = struct {
         if (self.input_ranges) |ranges| std.heap.page_allocator.free(ranges);
         if (self.input_navigation_rows) |rows| std.heap.page_allocator.free(rows);
         if (self.search_corpus) |corpus| corpus.release();
+        if (self.previous_corpus) |corpus| corpus.release();
         if (self.projection) |projection| projection.release();
         if (self.completed_inputs) |inputs| inputs.release();
         self.inputs.release();
@@ -3238,6 +3272,13 @@ pub const DisclosureBuild = struct {
         std.heap.page_allocator.destroy(self);
     }
 };
+
+fn searchCandidateScope(preferences: Preferences, blobs: []const bbr.diff.FileBlob) buffer_mod.SearchCandidateScope {
+    return switch (preferences.scope) {
+        .changes, .fetched => .hunks,
+        .whole => .{ .whole_file = .{ .selected_version = preferences.selected_version, .blobs = blobs } },
+    };
+}
 
 fn cloneDisclosureDraft(a: Allocator, draft: bbr.review.Draft) !bbr.review.Draft {
     var copy = draft;
@@ -4572,7 +4613,7 @@ const Published = struct {
             0,
             cell_metrics,
         );
-        published.search_corpus = published.bufferSearchCorpus(preferences, disclosures.items, published.isolated_file, geometry) catch |err| return switch (err) {
+        published.search_corpus = published.bufferSearchCorpus(preferences, published.isolated_file) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => error.BufferBuildFailed,
         };
@@ -4983,7 +5024,7 @@ const Published = struct {
                     accepted_navigation_rows = projected.navigation_rows;
                 }
             } else {
-                var batch = self.scanBufferSearchControl(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
+                var batch = self.scanBufferSearchControl(preferences, isolated_file, query) catch |err| return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.SearchFailed,
                 };
@@ -5016,7 +5057,7 @@ const Published = struct {
                     input_navigation_rows = projected.navigation_rows;
                 }
             } else {
-                var batch = self.scanBufferSearchControl(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
+                var batch = self.scanBufferSearchControl(preferences, isolated_file, query) catch |err| return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.SearchFailed,
                 };
@@ -5044,7 +5085,7 @@ const Published = struct {
         const search_corpus = if (reuse_search_corpus)
             null
         else
-            self.bufferSearchCorpus(preferences, expanded_disclosures, isolated_file, geometry) catch |err| return switch (err) {
+            self.bufferSearchCorpus(preferences, isolated_file) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.LayoutUnsupported, error.InvalidSpan, error.InvalidEmphasis => error.SearchFailed,
             };
@@ -5088,76 +5129,39 @@ const Published = struct {
     fn scanBufferSearchControl(
         self: *Published,
         preferences: Preferences,
-        expanded_disclosures: []const buffer_mod.DisclosureKey,
         isolated_file: ?usize,
-        geometry: frame_mod.Geometry,
         query: search.Query,
     ) !search.Batch {
         if (!builtin.is_test and !@hasDecl(@import("root"), "buffer_search_benchmark"))
             @compileError("Synchronous Buffer Search scans cannot run in production dispatch. Queue a scan worker.");
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const enrichment = self.session.enrichment.projection();
-        const candidates = try buffer_mod.buildSearchCandidates(
-            arena.allocator(),
-            self.session.diff,
-            preferences.layout,
-            self.session.threads,
-            .{
-                .fold_context = preferences.scope == .changes,
-                .whole_file = preferences.scope == .whole,
-                .selected_version = preferences.selected_version,
-                .expanded_disclosures = expanded_disclosures,
-                .drafts = self.review.drafts.items,
-                .scope_projections = self.scope_projection.items,
-                .only_file = isolated_file,
-                .blobs = enrichment.blobs,
-                .highlights = enrichment.highlights,
-                .content_statuses = enrichment.content_statuses,
-                .card_width = frame_mod.paneRects(geometry).diff_content.width,
-                .cell_metrics = self.cell_metrics,
-                .collapsed_rows = self.commentsCollapsedRows(),
-                .emphasis_cache = &self.emphasis_cache,
-                .side_by_side_plans = self.session.side_by_side_plans,
-                .mention_names = &self.session.mention_names,
-            },
-            self.epoch,
-        );
+        const candidates = try buffer_mod.buildSearchCandidates(arena.allocator(), self.searchCandidateInputs(preferences, isolated_file));
         var batch = try search.scan(std.heap.page_allocator, query, candidates, .literal);
         batch.owner = std.heap.page_allocator;
         return batch;
     }
 
-    fn bufferSearchCorpus(self: *Published, preferences: Preferences, disclosures: []const buffer_mod.DisclosureKey, isolated_file: ?usize, geometry: frame_mod.Geometry) !*BufferSearchCorpus {
+    fn bufferSearchCorpus(self: *Published, preferences: Preferences, isolated_file: ?usize) !*BufferSearchCorpus {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const enrichment = self.session.enrichment.projection();
-        const candidates = try buffer_mod.buildSearchCandidates(
-            arena.allocator(),
-            self.session.diff,
-            preferences.layout,
-            self.session.threads,
-            .{
-                .fold_context = preferences.scope == .changes,
-                .whole_file = preferences.scope == .whole,
-                .selected_version = preferences.selected_version,
-                .expanded_disclosures = disclosures,
-                .drafts = self.review.drafts.items,
-                .scope_projections = self.scope_projection.items,
-                .only_file = isolated_file,
-                .blobs = enrichment.blobs,
-                .highlights = enrichment.highlights,
-                .content_statuses = enrichment.content_statuses,
-                .card_width = frame_mod.paneRects(geometry).diff_content.width,
-                .cell_metrics = self.cell_metrics,
-                .collapsed_rows = self.commentsCollapsedRows(),
-                .emphasis_cache = &self.emphasis_cache,
-                .side_by_side_plans = self.session.side_by_side_plans,
-                .mention_names = &self.session.mention_names,
-            },
-            self.epoch,
-        );
-        return BufferSearchCorpus.create(candidates);
+        return BufferSearchCorpus.reuseOrBuild(null, arena.allocator(), self.searchCandidateInputs(preferences, isolated_file));
+    }
+
+    fn searchCandidateInputs(self: *Published, preferences: Preferences, isolated_file: ?usize) buffer_mod.SearchCandidateInputs {
+        return .{
+            .diff = self.session.diff,
+            .threads = self.session.threads,
+            .mention_names = &self.session.mention_names,
+            .session_epoch = self.epoch,
+            .layout = preferences.layout,
+            .scope = searchCandidateScope(preferences, self.session.enrichment.projection().blobs),
+            .only_file = isolated_file,
+            .drafts = self.review.drafts.items,
+            .scope_projections = self.scope_projection.items,
+            .emphasis_cache = &self.emphasis_cache,
+            .side_by_side_plans = self.session.side_by_side_plans,
+        };
     }
 
     fn reviewSearchCorpus(self: *Published) !*BufferSearchCorpus {
@@ -9606,7 +9610,7 @@ pub const Presentation = struct {
         if (!self.consumeCommand(job.command_id, .build_buffer_disclosure)) return;
         const published = self.published orelse return;
         if (self.shutdown_requested or published.epoch != job.epoch) return;
-        if (job.kind == .view or job.kind == .enrichment or job.kind == .cache_update or job.kind == .draft_save or job.kind == .draft_mutation or job.kind == .review_destination or job.kind == .card_destination) {
+        if (job.kind.buildsSearchCorpus()) {
             self.acceptViewBuild(published, job, &owned);
             return;
         }
@@ -21936,7 +21940,7 @@ test "mention display survives reprojection and both searches while yank keeps a
             }
             try testing.expectEqualStrings("@Stefan von der Krone", label.items);
             try testing.expectEqual(@as(usize, 1), emoji_count);
-            const buffer_corpus = try published.bufferSearchCorpus(state.preferences, &.{}, null, state.geometry);
+            const buffer_corpus = try published.bufferSearchCorpus(state.preferences, null);
             defer buffer_corpus.release();
             const review_corpus = try published.reviewSearchCorpus();
             defer review_corpus.release();
@@ -35142,4 +35146,31 @@ test "the Buffer Search candidates do not depend on the width, the cell metrics,
     try completeQueuedTestWork(&other);
     try testing.expectEqual(buffer_mod.Layout.unified, published.buffer.layout);
     try expectSameTestCandidates(plain.published.?.search_corpus.?.candidates, published.search_corpus.?.candidates);
+}
+
+test "a resize, a Changes-scope File Enrichment, and the fetched scope reuse the Buffer Search corpus" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testBufferSearchStartSession(false) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try acceptTestBufferSearch(&presentation, "zz");
+    const corpus = published.search_corpus.?;
+    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 40 } });
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(corpus, published.search_corpus.?);
+    try deliverTestBufferSearchStartEnrichment(&presentation, 0, "a\nzz1\nzz2\nzz3\nzz4\nb\n", "A\nzz1\nzz2\nzz3\nzz4\nB\n");
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(corpus, published.search_corpus.?);
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(Scope.fetched, presentation.preferences.scope);
+    try testing.expectEqual(corpus, published.search_corpus.?);
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try completeQueuedTestWork(&presentation);
+    try testing.expect(corpus != published.search_corpus.?);
+    try testing.expectEqual(@as(usize, 6), acceptedTestOccurrences(&presentation).len);
 }
