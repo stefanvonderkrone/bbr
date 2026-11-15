@@ -139,13 +139,13 @@ pub const HitTarget = union(enum) {
 /// makes its own Whole File gap Lines, so a gap Line is its File, side, and
 /// line number.
 pub const LineOwner = union(enum) {
-    hunk: *const bbr.diff.Line,
+    hunk_line: *const bbr.diff.Line,
     gap: struct { file: *const bbr.diff.File, side: SelectedVersion, number: u32 },
 
     /// `file` is the File of the row. Only a gap Line reads it, and every gap
     /// Line row follows the header of its File.
     pub fn of(file: ?*const bbr.diff.File, line: *const bbr.diff.Line) LineOwner {
-        if (line.in_hunk) return .{ .hunk = line };
+        if (line.in_hunk) return .{ .hunk_line = line };
         std.debug.assert((line.old_no == 0) != (line.new_no == 0));
         return .{ .gap = .{
             .file = file.?,
@@ -158,21 +158,21 @@ pub const LineOwner = union(enum) {
     /// Hunk Lines or two gap Lines of one File.
     fn sibling(self: LineOwner, line: *const bbr.diff.Line) LineOwner {
         return of(switch (self) {
-            .hunk => null,
+            .hunk_line => null,
             .gap => |gap| gap.file,
         }, line);
     }
 
     pub fn oldNo(self: LineOwner) ?u32 {
         return switch (self) {
-            .hunk => |line| line.oldNo(),
+            .hunk_line => |line| line.oldNo(),
             .gap => |gap| if (gap.side == .old) gap.number else null,
         };
     }
 
     pub fn newNo(self: LineOwner) ?u32 {
         return switch (self) {
-            .hunk => |line| line.newNo(),
+            .hunk_line => |line| line.newNo(),
             .gap => |gap| if (gap.side == .new) gap.number else null,
         };
     }
@@ -923,11 +923,11 @@ test "Presentation Frame projects Diff Lines as complete visual rows" {
     defer testing.allocator.free(visual_rows);
 
     try testing.expectEqual(rows.len, visual_rows.len);
-    try testing.expect(visual_rows[0].owner.eql(.{ .line = .{ .hunk = &line } }));
+    try testing.expect(visual_rows[0].owner.eql(.{ .line = .{ .hunk_line = &line } }));
     try testing.expectEqual(@as(usize, 0), visual_rows[0].source_start);
     try testing.expectEqual(line.text.len, visual_rows[0].source_end);
     try testing.expectEqual(@as(usize, 0), visual_rows[0].buffer_index);
-    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk = &line } }));
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk_line = &line } }));
     try testing.expectEqual(line.text.len, visual_rows[1].source_end);
     try testing.expectEqual(@as(usize, 1), visual_rows[1].buffer_index);
     try testing.expectEqual(@as(usize, 2), visual_rows[2].buffer_index);
@@ -945,10 +945,10 @@ test "semantic row ownership exposes old and new yank candidates without changin
     const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .side_by_side, .width = 80 });
     defer testing.allocator.free(visual_rows);
 
-    try testing.expect(visual_rows[0].owner.eql(.{ .line = .{ .hunk = &new_line } }));
+    try testing.expect(visual_rows[0].owner.eql(.{ .line = .{ .hunk_line = &new_line } }));
     try testing.expectEqual(&old_line, visual_rows[0].yank_candidates.old.?);
     try testing.expectEqual(&new_line, visual_rows[0].yank_candidates.new.?);
-    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk = &context } }));
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk_line = &context } }));
     try testing.expectEqual(&context, visual_rows[1].yank_candidates.old.?);
     try testing.expectEqual(&context, visual_rows[1].yank_candidates.new.?);
 }
@@ -1168,7 +1168,7 @@ test "SideBySide halves wrap independently and align absent continuations" {
     try testing.expectEqualStrings("new", right.text[first_right.source_start..first_right.source_end]);
     try testing.expect(visual_rows[1].halves.?.left.?.continuation);
     try testing.expect(visual_rows[1].halves.?.right == null);
-    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk = &left } }));
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk_line = &left } }));
     try testing.expectEqual(@as(usize, 8), visual_rows[1].source_start);
 }
 

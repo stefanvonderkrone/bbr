@@ -20656,9 +20656,9 @@ test "Unconditional Unified wrapping keeps semantic Anchors" {
     var first: ?usize = null;
     var second: ?usize = null;
     for (wrapped.frame.visual_rows, 0..) |visual_row, index| {
-        if (visual_row.owner != .line or visual_row.owner.line.hunk.kind != .added) continue;
-        if (visual_row.owner.line.hunk.new_no == 1 and first == null) first = index;
-        if (visual_row.owner.line.hunk.new_no == 2 and second == null) second = index;
+        if (visual_row.owner != .line or visual_row.owner.line.hunk_line.kind != .added) continue;
+        if (visual_row.owner.line.hunk_line.new_no == 1 and first == null) first = index;
+        if (visual_row.owner.line.hunk_line.new_no == 2 and second == null) second = index;
     }
     presentation.published.?.navigation.jumpTo(first.?);
     try presentation.dispatch(.{ .action = .down });
@@ -34827,7 +34827,7 @@ test "M21 kernel no Line row identity of a Whole File Frame holds a gap Line poi
         const published = presentation.published.?;
         var gaps: usize = 0;
         for (published.visual_rows) |row| if (row.owner == .line) switch (row.owner.line) {
-            .hunk => |line| try testing.expect(line.in_hunk),
+            .hunk_line => |line| try testing.expect(line.in_hunk),
             .gap => |gap| {
                 try testing.expectEqual(&published.session.diff.files[2], gap.file);
                 gaps += 1;
