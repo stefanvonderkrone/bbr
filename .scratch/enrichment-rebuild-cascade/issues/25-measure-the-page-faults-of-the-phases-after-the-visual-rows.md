@@ -1,6 +1,6 @@
 # 25: Size the search projection indexes and the visual rows before their builds
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -135,15 +135,15 @@ Alternate the baseline and the change, at least 3 runs per side. Record the proc
 
 ## Acceptance criteria
 
-- [ ] A test builds the projection of Unified and SideBySide Buffers with wrapped Lines, ReviewCards, Drafts, folds, and disclosures. For every source key, body owner, and visual row, `occurrenceRows`, `NavigationIndex.find`, the `owners` lookups, `requiredDisclosures`, and `disclosure_rows` give the same result as before the change.
-- [ ] A test builds the visual rows of a Buffer at two widths in each Layout and gets the same rows as before the change.
-- [ ] On the workload, the projection phase of a Unified resize is at least 25 percent lower than the baseline of the same run, and its minor faults go from about 10,970 to about 6,050. The baseline of the triage is 52.0 ms.
-- [ ] On the workload, the visual row phase of a Unified resize makes one allocation and no failed remap, and a switch to SideBySide makes one allocation for its visual rows.
-- [ ] On the workload, the process CPU of 8 Unified resizes is at least 10 percent lower than the baseline of the same run. The baseline of the triage is 0.93 s.
-- [ ] No other phase grows by more than the run-to-run range, and the RSS after the resizes does not grow.
-- [ ] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
-- [ ] No `[DEBUG-25]` or `[DEBUG-t25]` line stays in the repository.
-- [ ] `zig build test` passes.
+- [x] A test builds the projection of Unified and SideBySide Buffers with wrapped Lines, ReviewCards, Drafts, folds, and disclosures. For every source key, body owner, and visual row, `occurrenceRows`, `NavigationIndex.find`, the `owners` lookups, `requiredDisclosures`, and `disclosure_rows` give the same result as before the change.
+- [x] A test builds the visual rows of a Buffer at two widths in each Layout and gets the same rows as before the change.
+- [x] On the workload, the projection phase of a Unified resize is at least 25 percent lower than the baseline of the same run, and its minor faults go from about 10,970 to about 6,050. The baseline of the triage is 52.0 ms.
+- [x] On the workload, the visual row phase of a Unified resize makes one allocation and no failed remap, and a switch to SideBySide makes one allocation for its visual rows.
+- [x] On the workload, the process CPU of 8 Unified resizes is at least 10 percent lower than the baseline of the same run. The baseline of the triage is 0.93 s.
+- [x] No other phase grows by more than the run-to-run range, and the RSS after the resizes does not grow.
+- [x] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
+- [x] No `[DEBUG-25]` or `[DEBUG-t25]` line stays in the repository.
+- [x] `zig build test` passes.
 
 ## Comments
 
@@ -160,3 +160,60 @@ Alternate the baseline and the change, at least 3 runs per side. Record the proc
 **Overlap.** [Ticket 09](09-make-the-search-projection-cheaper.md) owns the same phase. Steps 1 to 3 of this ticket are its step 1 and part of its step 3. Ticket 09 should be blocked by this ticket and take a new baseline after it: its step 2 (no `.line` owners) and the flat entry layout of its step 3 remain, and they also remove the SideBySide growths above. Do not merge the two: this ticket is small, measured, and lands the reservation of ticket 21. [Ticket 12](12-grow-the-search-projection-ranges-without-copies.md) is the projected ranges of an active search. The workload has no search, so this triage measured nothing of it, and it stays separate.
 
 **Decision.** `ready-for-agent`. The faults are not inherent. About 45 percent of the bytes of the projection are capacity with no data in it, and the fresh mapping of each rebuild makes every page fault. The sizing removes the empty capacity. The retained arena would remove the rest of the faults, but its memory cost is larger than its saving now.
+
+## Completion
+
+### Change
+
+- `1c21725` pins the projection lookups and the visual rows of 9601be3. The test "search projection lookups match the 9601be3 baseline in both Layouts" builds collapsed and expanded Buffers with wrapped Lines, ReviewCards, a Draft chain, folds, and disclosures, in Unified and SideBySide at widths 24 and 40, and an empty Buffer. It hashes `occurrenceRows`, `source_rows`, `NavigationIndex.find`, the `owners` lookups, `requiredDisclosures`, and `disclosure_rows` for every source key and visual row, and compares each digest with the value of 9601be3. It also checks with a plain row scan that each source row list is ascending, shows its key, and covers every shown Line. Every SideBySide fixture has keys with two rows. The test "visual rows match the 9601be3 baseline at two widths in both Layouts" does the same for the visual rows.
+- `9d786d8` is steps 1 to 4. The visual row array reserves `rows.len + rows.len / 2`, because a switch to SideBySide has 1.44 times the Buffer rows. A new per-key list in `NavigationIndex.add`, `addSourceRow`, and `body_rows` reserves one entry. The tests "a narrow Unified Line grows beyond the visual row capacity hint without leaks" and "a SideBySide replacement grows beyond the source key capacity hint without leaks" exceed each hint under `checkAllAllocationFailures`. The test "source row lists grow and release every failed allocation outside an arena" covers the non-arena caller of `addSourceRow`.
+- `dd5e550` adds the growth tests "visual rows build in one allocation without a growth copy in both Layouts" and "a NavigationIndex whose keys each have one span grows nothing" in `src/tui/frame.zig`, and extends the Buffer row rule in `AGENTS.md`. At 9601be3 the first test fails with 2 allocations and the second with 20 replaced tables.
+
+### Measurement
+
+Method of this ticket, ReleaseFast, `[DEBUG-t25]` marks in detached worktrees that are now removed. 6 runs for each side, alternated base, change, base, change, with 8 resizes, 8 toggles, and 8 Layout switches in each run. Thread CPU of the worker per rebuild, median [range], in ms. The 1-minute load average was 1.4 to 9.9 from other work (an Android emulator and other sessions) on the Apple M5 Pro with 18 cores.
+
+| Rebuild | Side | n | Total | Projection | Visual rows | Faults in the job | Visual row allocations / failed remaps |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Resize, Unified | baseline | 48 | 108.6 [82.7, 116.3] | 53.0 [50.3, 59.0] | 26.2 [18.2, 30.5] | 19,562 | 2 / 1 |
+| | change | 48 | 93.9 [66.1, 103.2] | 39.7 [36.1, 46.4] | 23.5 [16.1, 26.0] | 12,998 | 1 / 0 |
+| Disclosure toggle | baseline | 48 | 105.5 [83.7, 110.7] | 51.8 [50.0, 61.2] | 24.9 [18.6, 27.6] | 19,523 | 2 / 1 |
+| | change | 48 | 90.5 [66.6, 100.1] | 38.7 [36.2, 48.9] | 22.4 [16.1, 24.8] | 12,929 | 1 / 0 |
+| Switch to SideBySide | baseline | 24 | 143.0 [110.3, 227.4] | 55.7 [52.6, 61.5] | 19.9 [17.9, 22.6] | 27,999 | 1 / 0 |
+| | change | 24 | 133.9 [108.2, 224.1] | 52.0 [48.0, 65.6] | 19.0 [17.2, 21.0] | 26,122 | 1 / 0 |
+| Switch to Unified | baseline | 24 | 133.3 [106.4, 147.7] | 51.6 [48.1, 58.1] | 17.1 [16.3, 18.8] | 26,883 | 1 / 0 |
+| | change | 24 | 119.3 [93.1, 130.5] | 39.9 [35.6, 44.7] | 16.8 [15.7, 19.6] | 21,930 | 1 / 0 |
+
+The projection faults of a resize went from 10,974 to 6,050. In SideBySide they went from 11,645 to 9,768, and the saving is smaller because most keys have two rows, as the triage found.
+
+Process CPU (`ps -o time=`) for 8 actions, sorted:
+
+| Side | 8 resizes | 8 toggles | 8 Layout switches | RSS after the resizes | RSS after the switches |
+| --- | --- | --- | --- | --- | --- |
+| Baseline | 0.79, 0.83, 0.93, 0.94, 0.95, 0.97 s | 0.85, 0.88, 0.97, 0.98, 0.99, 1.00 s | 1.14, 1.17, 1.21, 1.27, 1.28, 1.31 s | 538 to 539 MB | 613 to 615 MB |
+| Change | 0.64, 0.79, 0.79, 0.80, 0.80, 0.81 s | 0.67, 0.73, 0.80, 0.83, 0.88, 0.90 s | 1.04, 1.06, 1.11, 1.17, 1.19, 1.20 s | 404 to 411 MB | 505 to 512 MB |
+
+The median process CPU of 8 resizes went from 0.935 to 0.795 s, 15 percent lower.
+
+Checks on the numbers:
+
+- The Buffer phase is bimodal on both sides, about 13 ms or about 30 ms for each build, by the clock state of the core. Its medians are equal (29.4 and 29.7 ms for a resize), so the change moves no cost into it. The whole resize saves 14.7 ms, and the projection and the visual rows save 13.3 and 2.7 ms, so the saving does not move into another phase of the job.
+- The release of the projection on the Presentation thread went from 3.7 [1.4, 5.3] to 2.2 [1.0, 4.7] ms (n = 156), so the saving does not move into the free path.
+- One diagnostic run for each side ran the fixed loop of 2 million xorshift steps before the projection. It took 2.6 to 3.5 ms on the baseline and 2.6 to 3.7 ms with the change, so the clock before the projection is the same on both sides.
+- Each measured rebuild logged a digest of its Buffer row tags and its visual rows. Every rebuild kind and width had the same row counts and the same digest on both sides.
+- Limiter, inferred from the per-part probe of the triage and not profiled again: the remaining 6,050 faults of fresh projection memory (about 4.6 ms at 0.76 µs per fault), the about 380,000 per-key list allocations, and their hashing. Ticket 09 owns that layout.
+
+### Checks
+
+- `zig build test --summary all`: exit 0, 56 of 56 steps, 1,672 of 1,672 tests.
+- `zig fmt --check src build.zig tests`: exit 0.
+- `python3 tools/check_agent_docs.py`, `check_benchmark_metrics.py`, `check_diagnostics.py`, `check_search_index.py`, `check_navigation_fields.py`: exit 0.
+- `git grep "DEBUG-"` in `src`, `tools`, `tests`, and `build.zig`: no match.
+
+### Review
+
+The two-axis review (standards and spec) found no wrong behavior. Commit `0f7835e` adds the why-comments it asked for. Kept as they are: the three short get-or-create blocks (one helper across two files and two map types is not simpler), the 9601be3 digest pins, and the one-entry reservation of `body_rows`, which follows the same rule. The empty Buffer fixture is Unified only.
+
+### Follow-up
+
+[Ticket 27](27-find-the-other-rebuild-lists-that-grow-from-empty.md) lists the other rebuild lists and maps that grow from empty, for triage.
