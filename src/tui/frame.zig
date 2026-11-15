@@ -354,6 +354,7 @@ pub fn buildVisualRowsWithOptions(
 
     var visual_rows: std.ArrayList(VisualRow) = .empty;
     errdefer visual_rows.deinit(allocator);
+    // SideBySide makes about 1.44 visual rows per Buffer row. The unused tail is never touched.
     try visual_rows.ensureTotalCapacityPrecise(allocator, rows.len + rows.len / 2);
     if (options.layout == .side_by_side) {
         const widths = sideBodyWidths(options.width).?;
@@ -639,6 +640,7 @@ pub const NavigationIndex = struct {
         const group = try self.spans.getOrPut(a, key);
         if (!group.found_existing) {
             group.value_ptr.* = .empty;
+            // Most keys keep one entry. A first append would reserve a whole cache line.
             try group.value_ptr.ensureTotalCapacityPrecise(a, 1);
         }
         try group.value_ptr.append(a, .{ .start = start, .end = end, .row = row });

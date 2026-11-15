@@ -14109,6 +14109,7 @@ fn addSourceRow(allocator: Allocator, index: *std.AutoHashMapUnmanaged(SourceRow
     const entry = try index.getOrPut(allocator, key);
     if (!entry.found_existing) {
         entry.value_ptr.* = .empty;
+        // Most keys keep one entry. A first append would reserve a whole cache line.
         try entry.value_ptr.ensureTotalCapacityPrecise(allocator, 1);
     }
     try entry.value_ptr.append(allocator, row);
