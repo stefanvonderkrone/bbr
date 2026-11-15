@@ -1156,6 +1156,95 @@ test "a narrow Unified Line grows beyond the visual row capacity hint without le
     try testing.checkAllAllocationFailures(testing.allocator, exerciseVisualRowCapacityHint, .{});
 }
 
+/// Counts what a build asks of its arena. A failed remap is a growth that
+/// copies the list into new memory.
+const GrowthCount = struct {
+    child: std.mem.Allocator,
+    allocations: usize = 0,
+    failed_remaps: usize = 0,
+    frees: usize = 0,
+
+    fn allocator(self: *GrowthCount) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *GrowthCount = @ptrCast(@alignCast(ptr));
+        self.allocations += 1;
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *GrowthCount = @ptrCast(@alignCast(ptr));
+        const resized = self.child.rawResize(memory, alignment, new_len, ret_addr);
+        if (!resized and new_len > memory.len) self.failed_remaps += 1;
+        return resized;
+    }
+
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *GrowthCount = @ptrCast(@alignCast(ptr));
+        const result = self.child.rawRemap(memory, alignment, new_len, ret_addr);
+        if (result == null and new_len > memory.len) self.failed_remaps += 1;
+        return result;
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *GrowthCount = @ptrCast(@alignCast(ptr));
+        self.frees += 1;
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "visual rows build in one allocation without a growth copy in both Layouts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = 4096;
+    const lines = try a.alloc(bbr.diff.Line, 2 * count);
+    const rows = try a.alloc(buffer_mod.Row, count);
+    for (rows, 0..) |*row, index| {
+        const text = if (index % 8 < 2) "alpha beta gamma delta epsilon zeta" else "short";
+        lines[2 * index] = .{ .old_no = @intCast(index + 1), .new_no = 0, .kind = .removed, .text = text };
+        lines[2 * index + 1] = .{ .old_no = 0, .new_no = @intCast(index + 1), .kind = .added, .text = text };
+        row.* = if (index % 2 == 0)
+            .{ .line = .{ .line = &lines[2 * index + 1], .decoration = .{ .runs = &.{} } } }
+        else
+            .{ .line_pair = .{
+                .left = .{ .line = &lines[2 * index], .decoration = .{ .runs = &.{} } },
+                .right = .{ .line = &lines[2 * index + 1], .decoration = .{ .runs = &.{} } },
+            } };
+    }
+    for ([_]VisualRowOptions{
+        .{ .layout = .unified, .width = unified_gutter_cols + 12 },
+        .{ .layout = .side_by_side, .width = 2 * (side_gutter_cols + 12) + side_divider_cols },
+    }) |options| {
+        var growth: GrowthCount = .{ .child = a };
+        const visual_rows = try buildVisualRowsWithOptions(growth.allocator(), rows, .bytes, options);
+        try testing.expect(visual_rows.len > rows.len);
+        try testing.expectEqual(@as(usize, 1), growth.allocations);
+        try testing.expectEqual(@as(usize, 0), growth.failed_remaps);
+    }
+}
+
+test "a NavigationIndex whose keys each have one span grows nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = 4096;
+    const lines = try a.alloc(bbr.diff.Line, count);
+    const rows = try a.alloc(buffer_mod.Row, count);
+    for (rows, lines, 0..) |*row, *line, index| {
+        line.* = .{ .old_no = 0, .new_no = @intCast(index + 1), .kind = .added, .text = "short" };
+        row.* = .{ .line = .{ .line = line, .decoration = .{ .runs = &.{} } } };
+    }
+    const visual_rows = try buildVisualRowsWithOptions(a, rows, .bytes, .{ .layout = .unified, .width = unified_gutter_cols + 12 });
+    var growth: GrowthCount = .{ .child = a };
+    const index = try NavigationIndex.build(growth.allocator(), visual_rows);
+    try testing.expectEqual(@as(usize, 0), growth.frees);
+    try testing.expectEqual(@as(usize, 0), growth.failed_remaps);
+    for (visual_rows, 0..) |row, expected| try testing.expectEqual(@as(?usize, expected), index.find(row));
+}
+
 test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {
     const file: bbr.diff.File = .{ .old_path = "a.txt", .new_path = "a.txt", .status = .modified, .hunks = &.{} };
     const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "long source" };
