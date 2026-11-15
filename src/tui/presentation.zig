@@ -34679,3 +34679,139 @@ test "Buffer Search rejects and retries an enrichment rebuild after its accepted
     try testing.expect(published.session.enrichment.file(0).new == .content);
     try testing.expect(published.visual_rows.ptr != visual_rows);
 }
+
+/// The first visual row of the Whole File gap Line with `text` and the line
+/// `number` in File `file_index` of the published Frame.
+fn wholeFileGapRow(published: *const Published, file_index: usize, text: []const u8, number: u32) !usize {
+    for (published.visual_rows, 0..) |row, index| {
+        if (row.owner != .line or row.continuation) continue;
+        if (published.buffer.fileIndexForRow(row.buffer_index) != file_index) continue;
+        const line = row.yank_candidates.new orelse row.yank_candidates.old orelse continue;
+        if (line.in_hunk or !std.mem.eql(u8, line.text, text)) continue;
+        if ((line.newNo() orelse line.oldNo()) == number) return index;
+    }
+    return error.GapLineNotFound;
+}
+
+/// Three Files in the Whole File scope with the content of the last File
+/// loaded, so `b.txt` has the gap Lines `yy1` to `yy3` after its Hunk. The
+/// Buffer is taller than the DiffPane, so a restore can keep the viewport
+/// offset of a gap Line.
+fn initWholeFileGapPresentation(store: *bbr.review.InMemoryStore, key: OwnedReviewIdentity, cols: u16, side_by_side: bool) !Presentation {
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testBufferSearchStartSession(true) },
+        .geometry = .{ .cols = cols, .rows = 10 },
+    });
+    errdefer presentation.deinit();
+    if (side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try deliverTestBufferSearchStartEnrichment(&presentation, 2, "a\nyy1\nyy2\nyy3\n", "A\nyy1\nyy2\nyy3\n");
+    try completeQueuedTestWork(&presentation);
+    return presentation;
+}
+
+fn expectCursorOnWholeFileGapLine(presentation: *const Presentation, text: []const u8, number: u32, viewport_offset: ?usize) !void {
+    const published = presentation.published.?;
+    try testing.expect(presentation.action_error == null);
+    try testing.expectEqual(try wholeFileGapRow(published, 2, text, number), published.navigation.cursor);
+    try testing.expectEqual(@as(?usize, 2), published.activeFile());
+    if (viewport_offset) |offset| {
+        try testing.expect(published.navigation.scroll > 0);
+        try testing.expectEqual(offset, published.navigation.cursor - published.navigation.scroll);
+    }
+}
+
+test "M21 kernel the cursor on a Whole File gap Line stays after a File Enrichment of another File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try initWholeFileGapPresentation(&store, try OwnedReviewIdentity.init("workspace", "repo", 1), 100, false);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try moveToRow(&presentation, try wholeFileGapRow(published, 2, "yy2", 3));
+    const offset = published.navigation.cursor - published.navigation.scroll;
+
+    try deliverTestBufferSearchStartEnrichment(&presentation, 1, "a\nq\n", "A\nq\n");
+    try completeQueuedTestWork(&presentation);
+
+    try expectCursorOnWholeFileGapLine(&presentation, "yy2", 3, offset);
+}
+
+test "M21 kernel the cursor on a Whole File gap Line stays after a width resize" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try initWholeFileGapPresentation(&store, try OwnedReviewIdentity.init("workspace", "repo", 1), 100, false);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try moveToRow(&presentation, try wholeFileGapRow(published, 2, "yy2", 3));
+    const offset = published.navigation.cursor - published.navigation.scroll;
+
+    try presentation.dispatch(.{ .resize = .{ .cols = 90, .rows = 10 } });
+    try completeQueuedTestWork(&presentation);
+
+    try expectCursorOnWholeFileGapLine(&presentation, "yy2", 3, offset);
+}
+
+test "M21 kernel the cursor on a SideBySide Whole File gap Line stays after a File Enrichment of another File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try initWholeFileGapPresentation(&store, try OwnedReviewIdentity.init("workspace", "repo", 1), 140, true);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try testing.expectEqual(buffer_mod.Layout.side_by_side, published.buffer.layout);
+    try moveToRow(&presentation, try wholeFileGapRow(published, 2, "yy2", 3));
+    const offset = published.navigation.cursor - published.navigation.scroll;
+
+    try deliverTestBufferSearchStartEnrichment(&presentation, 1, "a\nq\n", "A\nq\n");
+    try completeQueuedTestWork(&presentation);
+
+    try expectCursorOnWholeFileGapLine(&presentation, "yy2", 3, offset);
+}
+
+test "M21 kernel Buffer Search input Escape returns to its start on a Whole File gap Line after rebuilds" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try initWholeFileGapPresentation(&store, try OwnedReviewIdentity.init("workspace", "repo", 1), 100, false);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try moveToRow(&presentation, try wholeFileGapRow(published, 2, "yy2", 3));
+    const offset = published.navigation.cursor - published.navigation.scroll;
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'z', .text = "zz" } });
+    try completeBufferSearchScan(&presentation);
+
+    try deliverTestBufferSearchStartEnrichment(&presentation, 1, "a\nq\n", "A\nq\n");
+    try completeQueuedTestWork(&presentation);
+    for ([_]u16{ 99, 98, 97 }) |cols| {
+        try presentation.dispatch(.{ .resize = .{ .cols = cols, .rows = 10 } });
+        try completeQueuedTestWork(&presentation);
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try completeQueuedTestWork(&presentation);
+
+    try testing.expect(published.buffer_search.input == null);
+    try expectCursorOnWholeFileGapLine(&presentation, "yy2", 3, offset);
+}
+
+test "M21 kernel a Draft deletion puts the cursor on the next Whole File gap Line" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "b.txt", .to = 1, .commit = "source" } },
+        .body = "draft body",
+    });
+    var presentation = try initWholeFileGapPresentation(&store, key, 100, false);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try cursorToDraftCard(&presentation, 1);
+    try testing.expectEqual(@as(?usize, 2), published.activeFile());
+
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+    try completeQueuedTestWork(&presentation);
+
+    try expectCursorOnWholeFileGapLine(&presentation, "yy1", 2, null);
+}
