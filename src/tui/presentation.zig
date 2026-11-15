@@ -34836,3 +34836,310 @@ test "M21 kernel no Line row identity of a Whole File Frame holds a gap Line poi
         try testing.expect(gaps >= 3);
     }
 }
+
+fn testCandidateSession(diff: []const u8) !*Session {
+    const session = try testDisclosureSession(testing.allocator, 1);
+    errdefer session.destroy();
+    session.diff = try bbr.diff.parse(session.arena.allocator(), diff);
+    session.threads = &.{};
+    try session.initializeEnrichment();
+    return session;
+}
+
+fn acceptTestBufferSearch(presentation: *Presentation, text: []const u8) !void {
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = text[0], .text = text } });
+    try completeBufferSearchScan(presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeQueuedTestWork(presentation);
+}
+
+fn acceptedTestOccurrences(presentation: *Presentation) []const search.Occurrence {
+    return presentation.published.?.buffer_search.accepted_batch.?.occurrences;
+}
+
+fn expectTestRelations(presentation: *Presentation, expected: []const search.VersionRelation) !void {
+    const occurrences = acceptedTestOccurrences(presentation);
+    try testing.expectEqual(expected.len, occurrences.len);
+    for (expected, occurrences) |relation, occurrence| try testing.expectEqual(relation, occurrence.location.source.relation);
+}
+
+fn expectSameTestOccurrences(expected: []const search.Occurrence, actual: []const search.Occurrence) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try testing.expect(searchOccurrenceEql(want, got));
+}
+
+test "a Layout switch builds the Buffer Search candidates in the order of the new Layout" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCandidateSession(
+            \\diff --git a/p.txt b/p.txt
+            \\--- a/p.txt
+            \\+++ b/p.txt
+            \\@@ -1,2 +1,2 @@
+            \\-alpha one
+            \\-alpha two
+            \\+alpha one!
+            \\+alpha two!
+        ) },
+        .geometry = .{ .cols = 140, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try acceptTestBufferSearch(&presentation, "alpha");
+    try expectTestRelations(&presentation, &.{ .old, .old, .new, .new });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
+    try completeQueuedTestWork(&presentation);
+    try expectTestRelations(&presentation, &.{ .old, .new, .old, .new });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
+    try completeQueuedTestWork(&presentation);
+    try expectTestRelations(&presentation, &.{ .old, .old, .new, .new });
+}
+
+test "a Selected Version switch in the whole-file scope builds the Buffer Search candidates of that version" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testBufferSearchStartSession(false) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try testing.expectEqual(Scope.whole, presentation.preferences.scope);
+    try deliverTestBufferSearchStartEnrichment(&presentation, 0, "a\nzz1\nzz2\nzz3\nzz4\nb\n", "A\nzz1\nzz2\nzz3\nzz4\nB\n");
+    try completeQueuedTestWork(&presentation);
+    try acceptTestBufferSearch(&presentation, "zz1");
+    try expectTestRelations(&presentation, &.{.new});
+    try dispatchView(&presentation, .{ .action = .select_old_version });
+    try completeQueuedTestWork(&presentation);
+    try expectTestRelations(&presentation, &.{.old});
+}
+
+test "only the whole-file scope adds File blob text to the Buffer Search candidates" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testBufferSearchStartSession(false) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try acceptTestBufferSearch(&presentation, "zz");
+    try testing.expectEqual(@as(usize, 2), acceptedTestOccurrences(&presentation).len);
+    try deliverTestBufferSearchStartEnrichment(&presentation, 0, "a\nzz1\nzz2\nzz3\nzz4\nb\n", "A\nzz1\nzz2\nzz3\nzz4\nB\n");
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(@as(usize, 2), acceptedTestOccurrences(&presentation).len);
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(Scope.fetched, presentation.preferences.scope);
+    try testing.expectEqual(@as(usize, 2), acceptedTestOccurrences(&presentation).len);
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(Scope.whole, presentation.preferences.scope);
+    try testing.expectEqual(@as(usize, 6), acceptedTestOccurrences(&presentation).len);
+}
+
+test "a File blob eviction in the whole-file scope removes its text from the Buffer Search candidates" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try acceptTestBufferSearch(&presentation, "needle");
+    try testing.expectEqual(@as(usize, 1), acceptedTestOccurrences(&presentation).len);
+    try presentation.dispatch(.{ .action = .to_bottom });
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(published.disclosure_inputs.blobs[0].new == null);
+    try testing.expectEqual(@as(usize, 0), acceptedTestOccurrences(&presentation).len);
+}
+
+test "an isolated File keeps only its own Buffer Search candidates" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testBufferSearchStartSession(false) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try acceptTestBufferSearch(&presentation, "A");
+    try testing.expectEqual(@as(usize, 2), acceptedTestOccurrences(&presentation).len);
+    try dispatchView(&presentation, .{ .action = .isolate });
+    try completeQueuedTestWork(&presentation);
+    try testing.expectEqual(@as(?usize, 0), presentation.published.?.isolated_file);
+    try testing.expectEqual(@as(usize, 1), acceptedTestOccurrences(&presentation).len);
+}
+
+test "each Draft change changes the Buffer Search candidates" {
+    for ([_]enum { add, delete, body, reanchor }{ .add, .delete, .body, .reanchor }) |change| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        var presentation = try testDraftMutationPresentation(testing.allocator, store.store(), key, .body);
+        defer presentation.deinit();
+        const query = switch (change) {
+            .add => "ship",
+            .delete, .reanchor => "r",
+            .body => "changed",
+        };
+        try acceptTestBufferSearch(&presentation, query);
+        const before = acceptedTestOccurrences(&presentation).len;
+        switch (change) {
+            .add, .body => try testing.expectEqual(@as(usize, 0), before),
+            .delete, .reanchor => try testing.expectEqual(search.ReviewBodyOwner{ .draft = 4 }, acceptedTestOccurrences(&presentation)[before - 1].location.review_body.owner),
+        }
+        switch (change) {
+            .add => {
+                try moveToRow(&presentation, 6);
+                try presentation.dispatch(.{ .action = .review_comment });
+                try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("ship it") } });
+                try presentation.dispatch(.{ .composer = .save });
+            },
+            .delete => try startTestDraftMutation(&presentation, .delete),
+            .body => try startTestDraftMutation(&presentation, .body),
+            .reanchor => try startTestDraftMutation(&presentation, .reanchor),
+        }
+        try completeQueuedTestWork(&presentation);
+        try testing.expect(presentation.action_error == null);
+        const after = acceptedTestOccurrences(&presentation);
+        switch (change) {
+            .add, .body => try testing.expectEqual(@as(usize, 1), after.len),
+            .delete => try testing.expectEqual(before - 3, after.len),
+            .reanchor => {
+                try testing.expectEqual(before, after.len);
+                try testing.expect(after[after.len - 1].location.review_body.owner.draft != 4);
+            },
+        }
+    }
+}
+
+test "a Refresh with a changed Comment builds the Buffer Search candidates of the new Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try acceptTestBufferSearch(&presentation, "renamed");
+    try testing.expectEqual(@as(usize, 0), acceptedTestOccurrences(&presentation).len);
+    try presentation.dispatch(.{ .action = .refresh });
+    const load = while (presentation.takeCommand()) |command| switch (command) {
+        .load_session => |load| break load,
+        .build_buffer_disclosure => |job| {
+            job.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        },
+        else => return error.UnexpectedCommand,
+    } else return error.MissingSessionLoad;
+    const refreshed = try testDisclosureSession(testing.allocator, 1);
+    const comments = try refreshed.arena.allocator().alloc(bbr.review.Comment, 1);
+    comments[0] = .{ .id = 9, .author = "Ada", .body = "renamed note", .anchor = .{ .path = "a.txt", .to = 1 } };
+    refreshed.threads = try bbr.review.buildThreads(refreshed.arena.allocator(), comments);
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = refreshed },
+    } });
+    try completeQueuedTestWork(&presentation);
+    try acceptTestBufferSearch(&presentation, "renamed");
+    try testing.expectEqual(@as(usize, 1), acceptedTestOccurrences(&presentation).len);
+}
+
+test "Buffer Search finds the same matches after a resize, with an accepted and a typed Query" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try acceptTestBufferSearch(&presentation, "e");
+    var accepted = try published.buffer_search.accepted_batch.?.clone(testing.allocator);
+    defer accepted.deinit(testing.allocator);
+    try testing.expect(accepted.occurrences.len > 4);
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 't', .text = "t" } });
+    try completeBufferSearchScan(&presentation);
+    var typed = try published.buffer_search.input.?.batch.?.clone(testing.allocator);
+    defer typed.deinit(testing.allocator);
+    try testing.expect(typed.occurrences.len > 2);
+
+    for ([_]u16{ 60, 100 }) |cols| {
+        try presentation.dispatch(.{ .resize = .{ .cols = cols, .rows = 40 } });
+        try completeQueuedTestWork(&presentation);
+        try expectSameTestOccurrences(accepted.occurrences, published.buffer_search.accepted_batch.?.occurrences);
+        try expectSameTestOccurrences(typed.occurrences, published.buffer_search.input.?.batch.?.occurrences);
+    }
+}
+
+const TestDoubleCells = struct {
+    const context: u8 = 0;
+    const vtable: frame_mod.CellMetrics.VTable = .{ .next = next };
+    const metrics: frame_mod.CellMetrics = .{ .ptr = &context, .vtable = &vtable, .ascii_is_narrow = false };
+    fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+        return .{ .byte_len = if (text.len == 0) 0 else 1, .cell_width = if (text.len == 0) 0 else 2 };
+    }
+};
+
+fn expectSameTestCandidates(expected: []const search.Candidate, actual: []const search.Candidate) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| {
+        try testing.expectEqualStrings(want.text, got.text);
+        try testing.expectEqual(want.corpus_order, got.corpus_order);
+        try testing.expectEqualSlices(usize, want.boundaries, got.boundaries);
+        try testing.expectEqual(want.mapping.len, got.mapping.len);
+        for (want.mapping, got.mapping) |a, b| {
+            try testing.expectEqual(a.semantic, b.semantic);
+            try testing.expectEqual(a.authored, b.authored);
+            try testing.expectEqual(a.authored_column, b.authored_column);
+            try testing.expectEqual(a.authored_line, b.authored_line);
+            try testing.expectEqual(a.definition_source, b.definition_source);
+            try testing.expectEqualStrings(a.alternative, b.alternative);
+        }
+        try testing.expectEqual(std.meta.activeTag(want.location), std.meta.activeTag(got.location));
+        switch (want.location) {
+            .source => |source| {
+                try testing.expectEqual(source.file_index, got.location.source.file_index);
+                try testing.expectEqual(source.relation, got.location.source.relation);
+                try testing.expectEqualStrings(source.old_path, got.location.source.old_path);
+                try testing.expectEqualStrings(source.new_path, got.location.source.new_path);
+                try testing.expectEqual(source.old_line, got.location.source.old_line);
+                try testing.expectEqual(source.new_line, got.location.source.new_line);
+            },
+            .review_body => |body| try testing.expect(std.meta.eql(body, got.location.review_body)),
+        }
+    }
+}
+
+test "the Buffer Search candidates do not depend on the width, the cell metrics, or the expanded disclosures" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var plain = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer plain.deinit();
+    var other = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2, .cell_metrics = TestDoubleCells.metrics }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 60, .rows = 40 },
+    });
+    defer other.deinit();
+    const published = other.published.?;
+    const disclosure = findDisclosureRow(published.buffer.rows, .{ .resolved_thread = 1 }).?;
+    try moveToRow(&other, published.visualIndexForBufferIndex(disclosure).?);
+    try other.dispatch(.{ .action = .toggle_disclosure });
+    try completeQueuedTestWork(&other);
+    try testing.expect(findDisclosureRow(published.buffer.rows, .{ .resolved_thread = 1 }) != null);
+    try testing.expect(published.expanded_disclosures.items.len > 0);
+    try dispatchView(&other, .{ .action = .toggle_layout });
+    try dispatchView(&other, .{ .action = .toggle_layout });
+    try completeQueuedTestWork(&other);
+    try testing.expectEqual(buffer_mod.Layout.unified, published.buffer.layout);
+    try expectSameTestCandidates(plain.published.?.search_corpus.?.candidates, published.search_corpus.?.candidates);
+}
