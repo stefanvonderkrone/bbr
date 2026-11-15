@@ -1,7 +1,6 @@
 # 07: Build the search candidates without a second Buffer
 
-Status: claimed
-Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade
+Status: ready-for-human
 Blocked by: none
 
 ## Summary
@@ -62,16 +61,16 @@ Report the machine load.
 
 ## Acceptance criteria
 
-- [ ] A test builds the candidates of one Session with two different card widths, two different cell metrics, and two different sets of expanded disclosures, and gets the same count, order, text, mappings, and locations.
-- [ ] A test builds the candidates of a Changes-scope Session with and without File blobs and gets the same candidates. In the whole-file scope, a blob change changes the key.
-- [ ] A test shows that a Draft add, delete, body change, and re-anchor each change the key, and that the next build makes new candidates.
-- [ ] After a resize, Buffer Search finds the same matches in the same order as before the resize, with an accepted query and with a typed query.
-- [ ] On the workload, the median of the candidates and corpus phases of a Unified resize is at most 1 ms. The baseline of the same run is about 50 ms.
+- [x] A test builds the candidates of one Session with two different card widths, two different cell metrics, and two different sets of expanded disclosures, and gets the same count, order, text, mappings, and locations.
+- [x] A test builds the candidates of a Changes-scope Session with and without File blobs and gets the same candidates. In the whole-file scope, a blob change changes the key.
+- [x] A test shows that a Draft add, delete, body change, and re-anchor each change the key, and that the next build makes new candidates.
+- [x] After a resize, Buffer Search finds the same matches in the same order as before the resize, with an accepted query and with a typed query.
+- [x] On the workload, the median of the candidates and corpus phases of a Unified resize is at most 1 ms. The baseline of the same run is about 50 ms.
 - [ ] On the workload, the median worker CPU of a Unified resize is at least 25 percent lower than the baseline of the same run.
-- [ ] The phases of a Layout switch and a disclosure toggle do not change by more than the run-to-run spread.
-- [ ] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
-- [ ] No `[DEBUG-07]` or `[DEBUG-t07]` line stays in the repository.
-- [ ] `zig build test` passes.
+- [x] The phases of a Layout switch and a disclosure toggle do not change by more than the run-to-run spread.
+- [x] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
+- [x] No `[DEBUG-07]` or `[DEBUG-t07]` line stays in the repository.
+- [x] `zig build test` passes.
 
 ## Comments
 
@@ -119,3 +118,95 @@ Both Buffer builds of a rebuild pay this. The row prototype reserves the array o
 [Ticket 13](13-find-why-a-switch-to-side-by-side-costs-three-times-more.md) found that the matching is about 100 ms of the SideBySide candidates phase, and that a SideBySide resize costs as much as a switch.
 With the change block plans kept in the Session, the candidates and corpus phases of a SideBySide rebuild fall from about 127 ms to about 36 ms.
 So the saving of this ticket on a SideBySide resize shrinks to about 36 ms. The Unified targets of this ticket do not change.
+
+## Completion
+
+The change is complete, but one acceptance criterion is not met. The worker CPU of a Unified resize is 16.7 percent lower, not 25 percent. See the measurement. A human decides whether the ticket resolves with this result or waits for [ticket 21](21-find-why-the-visual-rows-cost-more-without-a-candidate-build.md).
+
+### Change
+
+- `e1f9659` adds Presentation tests that change one candidate input at a time and check the accepted Buffer Search matches: the Layout (pair order), the Selected Version in the whole-file scope, the scope (only the whole-file scope reads File blobs), a File blob eviction, the isolated File, a Draft add, delete, body change, and re-anchor, and a Refresh with a changed Comment. Two more tests check that a resize keeps the accepted and the typed matches, and that the candidates do not depend on the width, the cell metrics, or the expanded disclosures.
+- `1009d8f` adds `SearchCandidateInputs`, `SearchCandidateScope`, and `SearchCandidateKey` to `src/tui/buffer.zig`. `buildSearchCandidates` reads only that struct. The width, the cell metrics, the highlights, the content statuses, the folds, and the expanded disclosures of the user are no longer inputs, because no candidate reads them. The Selected Version and the File blobs are in the whole-file arm of the scope, the only scope that reads them. `key` switches exhaustively over the fields of the struct, so a new input does not compile until it says how the key covers it. `BufferSearchCorpus` stores its key. `DisclosureBuild.create` retains the published corpus, and `BufferSearchCorpus.reuseOrBuild` returns it when the keys are equal. The build releases that reference before its visual rows, so a missed reuse keeps no second corpus. `Kind.buildsSearchCorpus` replaces two copies of the list of corpus kinds.
+- `97c2473` adds a unit test of the key for the Session epoch, a Draft parent, a Draft state, a blob eviction, and the scope, and updates `src/tui/IMPLEMENTATION.md` and the Buffer Search entry of `src/tui/GLOSSARY.md`.
+
+### Key coverage
+
+| Input | How the key covers it |
+| --- | --- |
+| Diff, Threads, mention names | Pointer and length, and the Session epoch. A published Session never changes them, and each Session publication takes a new epoch. |
+| Session epoch, Layout, isolated File | Value. |
+| Drafts, scope projections | Content of every field, with the presence of each optional and the length of each slice. A Draft add, delete, re-anchor, body, parent, or state change changes the key. |
+| Scope | `hunks` for the Changes and fetched scopes, which differ only in folds. `whole_file` holds the Selected Version and the identity (presence, pointer, length) of each File blob side. A side holds the same text whenever it is loaded. |
+| Emphasis cache, change block plans | Not in the key. They make the build faster and leave its candidates the same. |
+
+A key that left out one input made a test fail. A temporary edit removed each part of the key in turn and ran `zig build test`:
+
+| Removed from the key | Failing tests |
+| --- | --- |
+| Layout | "a Layout switch builds the Buffer Search candidates in the order of the new Layout" |
+| isolated File | "an isolated File keeps only its own Buffer Search candidates" and two older isolation tests |
+| Drafts | "each Draft change changes the Buffer Search candidates" |
+| Selected Version | "a Selected Version switch in the whole-file scope builds the Buffer Search candidates of that version" |
+| File blob identity | "a File blob eviction in the whole-file scope removes its text from the Buffer Search candidates", the Selected Version test, and two older whole-file tests |
+| scope tag alone | none, because the whole-file arm hashes more fields than `hunks` |
+
+The Session epoch, a Draft parent, and a Draft state are covered by the key unit test of `97c2473`. The reuse test "a resize, a Changes-scope File Enrichment, and the fetched scope reuse the Buffer Search corpus" checks the identity of the published corpus. Before `1009d8f` every build made a new corpus while the old one was still published, so the identity always changed.
+
+### Measurement
+
+The workload and method are the ones of ticket 05 and this ticket: `bbr local fb701b1 1836261` from this checkout, ReleaseFast, tmux at 160 × 80, a separate `XDG_STATE_HOME` with mode `700`, one Draft with 14 paragraphs.
+Temporary `[DEBUG-07]` marks in `DisclosureBuild.buildFallible` read the thread CPU clock in detached worktrees at `c0acc46` (baseline) and `1009d8f` (result). The worktrees are removed.
+One warmup baseline run was discarded. Then three baseline runs and three result runs alternated. Each run did 8 disclosure toggles, 8 resizes (150 and 160 columns), and 8 Layout switches.
+The machine has 18 cores. The 1-minute load average was 1.9 to 3.6 from other work.
+Wall time and thread CPU time agree within 1.5 ms, except one baseline resize that waited 21.6 ms.
+
+Target, written before the runs: the candidates and corpus phases of a Unified resize go from about 30 ms to under 1 ms, the whole resize drops by that amount, and the toggle and the Layout switches do not change.
+
+Worker CPU per rebuild, median (range), in ms:
+
+| Rebuild | n per side | Baseline | Result | candidates + corpus |
+| --- | --- | --- | --- | --- |
+| Disclosure toggle | 24 | 109.8 (90.8 to 116.9) | 109.9 (88.7 to 115.8) | none → none |
+| Resize, Unified | 24 | 132.9 (108.3 to 138.9) | 110.7 (88.1 to 113.9) | 34.1 → 0.00 |
+| Switch to SideBySide | 12 | 140.7 (138.4 to 219.1) | 140.9 (110.7 to 227.4) | 34.1 → 33.0 |
+| Switch to Unified | 12 | 134.3 (126.2 to 140.7) | 135.1 (118.3 to 140.9) | 35.9 → 35.7 |
+
+Every result resize reused the corpus (24 of 24), and no Layout switch did, because the Layout is in the key.
+The resize lost 22.2 ms (−16.7 %), less than the 34.1 ms of the skipped phases. In the same resizes the visual row phase went from 17.2 to 26.5 ms. A toggle, which never builds candidates, has a visual row phase of 26.3 and 26.9 ms on the two sides. So the visual row build costs about 9 ms more when no candidate build runs before it in the job. The cause is not profiled. [Ticket 21](21-find-why-the-visual-rows-cost-more-without-a-candidate-build.md) holds it.
+The 25 percent criterion was set against `60d7553`, where the two phases were 29 percent of a resize. After tickets 11 and 14 they are 26 percent of the baseline resize, so the criterion was only reachable if no other phase grew.
+
+Process CPU for 8 actions (`ps -o time=`), three runs each:
+
+| Action | Baseline | Result |
+| --- | --- | --- |
+| Disclosure toggle | 0.93, 0.91, 0.91 s | 0.94, 0.91, 0.90 s |
+| Resize | 1.10, 1.14, 1.13 s | 0.94, 0.90, 0.92 s |
+| Layout switch | 1.25, 1.25, 1.26 s | 1.26, 1.26, 1.22 s |
+
+Buffer rows and visual rows were the same on both sides: 187,839 and 206,104 for Unified, 187,856 and 206,121 with the Draft expanded, 209,672 visual rows at 150 columns, and 183,464 and 264,856 for SideBySide.
+Only the expected build kinds ran: `general` for a toggle and `view` for a resize and a Layout switch.
+
+### Mistake class
+
+The candidate class is a cached derived value whose key or invalidation misses an input, so a stale value is published with no error.
+The history has one real case: `e6ab685` fixed a disclosure input snapshot that kept a Draft state after another path changed it. `8df6955` added tests for the Overview Index stale marks because no test failed when a mark was removed, but no stale value shipped.
+The other caches are keyed on inputs that cannot change inside a Session: the change block plans of ticket 14 and the emphasis cache depend only on the Diff.
+One real case does not make a class, so this ticket adds no rule. The new key is enforced at the type level: its exhaustive switch over the fields of `SearchCandidateInputs` fails to compile for a new input, and the build reads nothing outside that struct.
+
+### Checks
+
+- `zig build test --summary all`: exit 0, 56 of 56 steps, 1,665 of 1,665 tests.
+- `zig fmt --check src build.zig tests`: exit 0.
+- `python3 tools/check_agent_docs.py`, `check_benchmark_metrics.py`, `check_diagnostics.py`, `check_search_index.py`, `check_navigation_fields.py`: pass.
+- No `[DEBUG-07]` or `[DEBUG-t07]` line in the repository.
+
+### Review
+
+A design check before the change found two problems that the change avoids: a job that kept the previous corpus until its own destruction would keep two corpora in memory, and a hash without slice lengths and optional presence could give two inputs the same key.
+The two-axis code review found no hard violation and no wrong behavior. `97c2473` fixes its findings: the missing key test for the epoch, parent, and state, the import of `MentionNames`, the key comment about digest collisions, and the stale owner line in `IMPLEMENTATION.md`.
+Open judgment calls: the two `searchCandidateInputs` builders read different owners and stay separate, and the Diff, Threads, and mention names rely on the rule that a published Session never changes them, which no check enforces.
+
+### Follow-up tickets
+
+- [21](21-find-why-the-visual-rows-cost-more-without-a-candidate-build.md): find why the visual rows cost more without a candidate build.
+- [22](22-find-each-card-search-owner-without-a-scan-of-all-candidates.md): find each card search owner without a scan of all candidates.
