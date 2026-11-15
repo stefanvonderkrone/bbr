@@ -1,6 +1,7 @@
 # 07: Build the search candidates without a second Buffer
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade
 Blocked by: none
 
 ## Summary
