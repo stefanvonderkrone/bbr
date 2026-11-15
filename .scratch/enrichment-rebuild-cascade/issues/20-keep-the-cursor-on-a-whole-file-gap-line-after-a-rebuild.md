@@ -1,7 +1,6 @@
 # 20: Keep the cursor on a Whole File gap Line after a rebuild
 
-Status: claimed
-Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -129,7 +128,7 @@ With the sketch, the 6 reproducing cases of the Evidence table kept the cursor o
 
 ## Acceptance criteria
 
-- [ ] Tests through `Presentation` in the `M21 kernel` group reproduce these cases. Each test puts the gap Line in a File after the first File, so that a fall back to the top of the Buffer changes the active File:
+- [x] Tests through `Presentation` in the `M21 kernel` group reproduce these cases. Each test puts the gap Line in a File after the first File, so that a fall back to the top of the Buffer changes the active File:
   - "M21 kernel the cursor on a Whole File gap Line stays after a File Enrichment of another File"
   - "M21 kernel the cursor on a Whole File gap Line stays after a width resize"
   - "M21 kernel the cursor on a SideBySide Whole File gap Line stays after a File Enrichment of another File"
@@ -139,9 +138,38 @@ With the sketch, the 6 reproducing cases of the Evidence table kept the cursor o
   Each test finds the expected row by its text and line number in the current Frame, not by a fixed number.
   After the rebuild and the queued work, the cursor is on that row, `activeFile()` is its File, and `action_error` is null.
   Each test fails at `e4c7d46`.
-- [ ] No `RowOwner` built from a Buffer row holds a pointer to a gap Line.
-- [ ] The `Review recovery` tests, the ticket 16 to 19 tests, and the Selected Version tests pass.
-- [ ] `zig build test` passes. `zig fmt --check build.zig src tests` passes. `python3 tools/check_agent_docs.py` passes.
+- [x] No `RowOwner` built from a Buffer row holds a pointer to a gap Line.
+- [x] The `Review recovery` tests, the ticket 16 to 19 tests, and the Selected Version tests pass.
+- [x] `zig build test` passes. `zig fmt --check build.zig src tests` passes. `python3 tools/check_agent_docs.py` passes.
+
+## Completion
+
+Commits:
+
+- `8797020` adds the five acceptance tests. Each test fails at that commit with the cursor on row 0 of the first File.
+- `d3852da` deletes `frame.SourceMatch` and `frame.projectSourceRanges`. No production code called them, and they keyed search ranges by Line pointer.
+- `8975b16` adds `frame.LineOwner` and makes `RowOwner.line` and `SurvivingRow.line` hold it. It also updates the glossary and the `AGENTS.md` rules table, and adds the invariant test "M21 kernel no Line row identity of a Whole File Frame holds a gap Line pointer".
+- `e854626` renames the Hunk Line arm to `hunk_line` and splits long sentences in the documents.
+
+The change differs from the sketch in these points:
+
+- The gap arm is `{ file, side, number }`. A gap Line has exactly one line number, so the sketch's `{ old_no, new_no }` could hold states that cannot occur. `LineOwner.of` asserts the one-sided number.
+- The Hunk Line arm is `hunk_line`, because `RowOwner.hunk` already names a Hunk header.
+- `RowOwner.eql` compares the arm with `std.meta.eql`, so `LineOwner` has no `eql`.
+- The Selection mark has no test. `canStartSelection` refuses a Selection on a gap Line in the Whole File scope, so a user cannot put the mark there with `select_down`. The mark resolves through the same `findRow` as the cursor.
+- The tests use 10 terminal rows. A Buffer that fits in the DiffPane has scroll 0, so a test at 40 rows cannot see the viewport offset.
+
+The `File` pointer is a stable File identity in one Session. File isolation filters `diff.files` by index and does not copy a File. File Enrichment and its cache eviction change only the enrichment storage. `spliceSide` is the only per-build `model.Line` allocation, and it sets `in_hunk = false`, so a Hunk Line pointer is stable across a File Enrichment.
+
+Checks, all with exit 0:
+
+- `zig build test --summary all`: 56/56 steps, 1654/1654 tests. The count is 1651 existing tests, minus 3 deleted `SourceMatch` tests, plus 6 new tests.
+- `zig fmt --check src build.zig tests`
+- `python3 tools/check_agent_docs.py`, `check_benchmark_metrics.py`, `check_diagnostics.py`, `check_search_index.py`, and `check_navigation_fields.py`
+
+A live check ran in tmux at 160 × 80 with `bbr local` on a local review. The cursor was on line 6 of `docs/agents/triage-labels.md`, a gap Line in the Whole File scope. Then a background File Enrichment of `src/tui/presentation.zig` arrived, and a width resize ran. A ReleaseSafe build of `dde803e` moved the cursor to `1/41000` on the first File after the File Enrichment, and to `1/4546` after the resize. The build of this branch kept the cursor on line 6 in the same screen row in both cases.
+
+Review: the Standards review found long sentences in the new document text and the arm name `hunk`. Commit `e854626` fixes both. It also noted that four loops track the File of the last File header. That stays, because the visual row projection gets only the Buffer rows. The Spec review found no missing requirement. It noted that the invariant test reads only the visual row owners, and the `AGENTS.md` row now says so.
 
 ## Comments
 
