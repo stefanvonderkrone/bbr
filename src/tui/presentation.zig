@@ -2219,6 +2219,7 @@ const SearchProjection = struct {
             };
         }
         snapshot.deletion_rows = deletion_rows;
+        try snapshot.source_rows.ensureTotalCapacity(a, @intCast(visual_rows.len));
         for (rows, visual_rows, 0..) |row, visual, index| {
             if (visual.owner == .disclosure) switch (buffer.rows[visual.buffer_index]) {
                 .comment => |card| if (card.part == .header) {
@@ -2239,7 +2240,10 @@ const SearchProjection = struct {
                     .comment => |id| .{ .comment = id },
                     .draft => |id| .{ .draft = id },
                 });
-                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = .empty;
+                    try entry.value_ptr.ensureTotalCapacityPrecise(a, 1);
+                }
                 try entry.value_ptr.append(a, index);
             }
             if (buffer_mod.disclosureKey(buffer.rows[visual.buffer_index])) |key| {
@@ -14103,7 +14107,10 @@ fn sourceRowKey(source: search.SourceLocation) ?SourceRowKey {
 
 fn addSourceRow(allocator: Allocator, index: *std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)), key: SourceRowKey, row: usize) !void {
     const entry = try index.getOrPut(allocator, key);
-    if (!entry.found_existing) entry.value_ptr.* = .empty;
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .empty;
+        try entry.value_ptr.ensureTotalCapacityPrecise(allocator, 1);
+    }
     try entry.value_ptr.append(allocator, row);
 }
 
@@ -25713,6 +25720,72 @@ test "visual rows match the 9601be3 baseline at two widths in both Layouts" {
         try testing.expectEqual(baseline.visual, value.visual);
         try testing.expectEqual(baseline.rows, value.rows);
     }
+}
+
+fn exerciseSourceRowCapacityHint(allocator: Allocator, session: *const Session) !void {
+    var old: [4]bbr.diff.Line = undefined;
+    var new: [4]bbr.diff.Line = undefined;
+    var rows: [4]buffer_mod.Row = undefined;
+    for (&old, &new, &rows, 0..) |*left, *right, *row, index| {
+        left.* = .{ .old_no = @intCast(index + 1), .new_no = 0, .kind = .removed, .text = "old" };
+        right.* = .{ .old_no = 0, .new_no = @intCast(index + 1), .kind = .added, .text = "new" };
+        row.* = .{ .line_pair = .{
+            .left = .{ .line = left, .decoration = .{ .runs = &.{} } },
+            .right = .{ .line = right, .decoration = .{ .runs = &.{} } },
+        } };
+    }
+    const buffer: buffer_mod.Buffer = .{
+        .rows = &rows,
+        .layout = .side_by_side,
+        .file_rows = &.{.{ .file_index = 0, .first_row = 0 }},
+        .file_rows_end = rows.len,
+    };
+    const visual = try frame_mod.buildVisualRowsWithOptions(allocator, buffer.rows, .bytes, .{ .layout = .side_by_side, .width = 40 });
+    defer allocator.free(visual);
+    const projection = try SearchProjection.createWithAllocator(allocator, buffer, visual, .{
+        .session = session,
+        .drafts = &.{},
+        .scopes = &.{},
+        .selected_version = .new,
+    });
+    defer projection.release();
+    try testing.expectEqual(@as(usize, 4), visual.len);
+    try testing.expectEqual(@as(u32, 8), projection.source_rows.count());
+    try testing.expect(projection.source_rows.count() > visual.len);
+    for (0..4) |index| {
+        for ([_]search.VersionRelation{ .old, .new }) |relation| {
+            const occurrence = baselineOccurrence(.{ .source = .{
+                .file_index = 0,
+                .relation = relation,
+                .old_line = if (relation == .old) @intCast(index + 1) else null,
+                .new_line = if (relation == .new) @intCast(index + 1) else null,
+            } });
+            try testing.expectEqualSlices(usize, &.{index}, projection.occurrenceRows(occurrence));
+        }
+    }
+}
+
+test "a SideBySide replacement grows beyond the source key capacity hint without leaks" {
+    const session = try testDisclosureSession(testing.allocator, 1);
+    defer session.destroy();
+    try testing.checkAllAllocationFailures(testing.allocator, exerciseSourceRowCapacityHint, .{session});
+}
+
+fn exerciseSourceRowListAllocationFailure(allocator: Allocator) !void {
+    var index: std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)) = .empty;
+    defer {
+        var lists = index.valueIterator();
+        while (lists.next()) |list| list.deinit(allocator);
+        index.deinit(allocator);
+    }
+    const key: SourceRowKey = .{ .file_index = 0, .line = 1, .side = .new };
+    try addSourceRow(allocator, &index, key, 3);
+    try addSourceRow(allocator, &index, key, 4);
+    try testing.expectEqualSlices(usize, &.{ 3, 4 }, index.get(key).?.items);
+}
+
+test "source row lists grow and release every failed allocation outside an arena" {
+    try testing.checkAllAllocationFailures(testing.allocator, exerciseSourceRowListAllocationFailure, .{});
 }
 
 fn exerciseSearchIndexAllocationFailure(allocator: Allocator, published: *const Published) !void {

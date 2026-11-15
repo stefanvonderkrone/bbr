@@ -354,6 +354,7 @@ pub fn buildVisualRowsWithOptions(
 
     var visual_rows: std.ArrayList(VisualRow) = .empty;
     errdefer visual_rows.deinit(allocator);
+    try visual_rows.ensureTotalCapacityPrecise(allocator, rows.len + rows.len / 2);
     if (options.layout == .side_by_side) {
         const widths = sideBodyWidths(options.width).?;
         var file: ?*const bbr.diff.File = null;
@@ -600,6 +601,8 @@ pub const NavigationIndex = struct {
     /// The caller owns all allocations through its Frame arena.
     pub fn build(a: std.mem.Allocator, rows: []const VisualRow) !NavigationIndex {
         var result: NavigationIndex = .{};
+        try result.owners.ensureTotalCapacity(a, @intCast(rows.len));
+        try result.spans.ensureTotalCapacity(a, @intCast(rows.len));
         for (rows, 0..) |row, index| {
             var key = row.owner;
             if (key == .section) key.section.path = try a.dupe(u8, key.section.path);
@@ -634,7 +637,10 @@ pub const NavigationIndex = struct {
 
     fn add(self: *NavigationIndex, a: std.mem.Allocator, key: RowOwner, start: usize, end: usize, row: usize) !void {
         const group = try self.spans.getOrPut(a, key);
-        if (!group.found_existing) group.value_ptr.* = .empty;
+        if (!group.found_existing) {
+            group.value_ptr.* = .empty;
+            try group.value_ptr.ensureTotalCapacityPrecise(a, 1);
+        }
         try group.value_ptr.append(a, .{ .start = start, .end = end, .row = row });
     }
 
@@ -1124,6 +1130,30 @@ fn expectSameVisualRows(rows: []const buffer_mod.Row, fast: CellMetrics, graphem
         try testing.expectEqual(want.continuation, got.continuation);
         try testing.expectEqual(want.halves, got.halves);
     }
+}
+
+fn exerciseVisualRowCapacityHint(allocator: std.mem.Allocator) !void {
+    const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "abcdefghij" };
+    const rows = [_]buffer_mod.Row{.{ .line = .{
+        .line = &line,
+        .decoration = .{ .runs = &.{.{ .text = line.text }} },
+    } }};
+    const visual = try buildVisualRowsWithOptions(allocator, &rows, .bytes, .{
+        .layout = .unified,
+        .width = unified_gutter_cols + 2,
+    });
+    defer allocator.free(visual);
+    try testing.expectEqual(@as(usize, 5), visual.len);
+    try testing.expect(visual.len > rows.len + rows.len / 2);
+    for (visual, 0..) |row, index| {
+        try testing.expectEqual(@as(usize, 0), row.buffer_index);
+        try testing.expectEqual(index * 2, row.source_start);
+        try testing.expectEqual(index * 2 + 2, row.source_end);
+    }
+}
+
+test "a narrow Unified Line grows beyond the visual row capacity hint without leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, exerciseVisualRowCapacityHint, .{});
 }
 
 test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {
