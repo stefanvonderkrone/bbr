@@ -2190,14 +2190,18 @@ const SearchProjection = struct {
         const a = snapshot.arena.allocator();
         snapshot.navigation = try frame_mod.NavigationIndex.build(a, visual_rows);
         const deletion_rows = try a.alloc(DeletionRow, buffer.rows.len);
-        for (buffer.rows, deletion_rows) |row, *entry| entry.* = .{
-            .draft = switch (row) {
-                .draft => |card| card.owner.draft,
-                .snapshot => |value| value.draft.local_id,
-                else => null,
-            },
-            .identity = survivingRowIdentity(row),
-        };
+        var deletion_file: ?*const bbr.diff.File = null;
+        for (buffer.rows, deletion_rows) |row, *entry| {
+            if (row == .file_header) deletion_file = row.file_header.file;
+            entry.* = .{
+                .draft = switch (row) {
+                    .draft => |card| card.owner.draft,
+                    .snapshot => |value| value.draft.local_id,
+                    else => null,
+                },
+                .identity = survivingRowIdentity(row, deletion_file),
+            };
+        }
         snapshot.deletion_rows = deletion_rows;
         for (rows, visual_rows, 0..) |row, visual, index| {
             if (visual.owner == .disclosure) switch (buffer.rows[visual.buffer_index]) {
@@ -5508,7 +5512,7 @@ const DeleteConfirmation = struct {
 const SurvivingRow = union(enum) {
     draft: bbr.review.TempId,
     comment: bbr.review.CommentId,
-    line: *const bbr.diff.Line,
+    line: frame_mod.LineOwner,
 };
 
 const UnknownResolutionEditor = struct {
@@ -13761,11 +13765,11 @@ fn survivingRowAfterDeletion(rows: []const SearchProjection.DeletionRow, cascade
     return null;
 }
 
-fn survivingRowIdentity(row: buffer_mod.Row) ?SurvivingRow {
+fn survivingRowIdentity(row: buffer_mod.Row, file: ?*const bbr.diff.File) ?SurvivingRow {
     return switch (row) {
         .draft => |card| .{ .draft = card.owner.draft },
         .comment => |card| .{ .comment = card.owner.comment },
-        else => if (lineAtRow(row)) |line| .{ .line = line } else null,
+        else => if (lineAtRow(row)) |line| .{ .line = .of(file, line) } else null,
     };
 }
 
@@ -13850,10 +13854,8 @@ fn sourceLineForVisual(row: frame_mod.VisualRow, source: search.SourceLocation) 
         else
             null,
     };
-    const line = switch (row.owner) {
-        .line => |value| value,
-        else => return null,
-    };
+    if (row.owner != .line) return null;
+    const line = row.yank_candidates.new orelse row.yank_candidates.old orelse return null;
     return switch (source.relation) {
         .old => if (line.oldNo() == source.old_line) line else null,
         .new => if (line.newNo() == source.new_line) line else null,
@@ -20654,9 +20656,9 @@ test "Unconditional Unified wrapping keeps semantic Anchors" {
     var first: ?usize = null;
     var second: ?usize = null;
     for (wrapped.frame.visual_rows, 0..) |visual_row, index| {
-        if (visual_row.owner != .line or visual_row.owner.line.kind != .added) continue;
-        if (visual_row.owner.line.new_no == 1 and first == null) first = index;
-        if (visual_row.owner.line.new_no == 2 and second == null) second = index;
+        if (visual_row.owner != .line or visual_row.owner.line.hunk.kind != .added) continue;
+        if (visual_row.owner.line.hunk.new_no == 1 and first == null) first = index;
+        if (visual_row.owner.line.hunk.new_no == 2 and second == null) second = index;
     }
     presentation.published.?.navigation.jumpTo(first.?);
     try presentation.dispatch(.{ .action = .down });
@@ -34814,4 +34816,23 @@ test "M21 kernel a Draft deletion puts the cursor on the next Whole File gap Lin
     try completeQueuedTestWork(&presentation);
 
     try expectCursorOnWholeFileGapLine(&presentation, "yy1", 2, null);
+}
+
+test "M21 kernel no Line row identity of a Whole File Frame holds a gap Line pointer" {
+    for ([_]struct { cols: u16, side_by_side: bool }{ .{ .cols = 100, .side_by_side = false }, .{ .cols = 140, .side_by_side = true } }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try initWholeFileGapPresentation(&store, try OwnedReviewIdentity.init("workspace", "repo", 1), case.cols, case.side_by_side);
+        defer presentation.deinit();
+        const published = presentation.published.?;
+        var gaps: usize = 0;
+        for (published.visual_rows) |row| if (row.owner == .line) switch (row.owner.line) {
+            .hunk => |line| try testing.expect(line.in_hunk),
+            .gap => |gap| {
+                try testing.expectEqual(&published.session.diff.files[2], gap.file);
+                gaps += 1;
+            },
+        };
+        try testing.expect(gaps >= 3);
+    }
 }

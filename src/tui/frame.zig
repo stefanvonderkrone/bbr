@@ -134,11 +134,55 @@ pub const HitTarget = union(enum) {
     review_search_preview,
 };
 
+/// The identity of a Line row in every Frame of a Session. A Hunk Line lives
+/// as long as the Session, so its pointer is the identity. Each Buffer build
+/// makes its own Whole File gap Lines, so a gap Line is its File, side, and
+/// line number.
+pub const LineOwner = union(enum) {
+    hunk: *const bbr.diff.Line,
+    gap: struct { file: *const bbr.diff.File, side: SelectedVersion, number: u32 },
+
+    /// `file` is the File of the row. Only a gap Line reads it, and every gap
+    /// Line row follows the header of its File.
+    pub fn of(file: ?*const bbr.diff.File, line: *const bbr.diff.Line) LineOwner {
+        if (line.in_hunk) return .{ .hunk = line };
+        std.debug.assert((line.old_no == 0) != (line.new_no == 0));
+        return .{ .gap = .{
+            .file = file.?,
+            .side = if (line.old_no != 0) .old else .new,
+            .number = @max(line.old_no, line.new_no),
+        } };
+    }
+
+    /// The owner of the other half of a SideBySide pair. A pair holds two
+    /// Hunk Lines or two gap Lines of one File.
+    fn sibling(self: LineOwner, line: *const bbr.diff.Line) LineOwner {
+        return of(switch (self) {
+            .hunk => null,
+            .gap => |gap| gap.file,
+        }, line);
+    }
+
+    pub fn oldNo(self: LineOwner) ?u32 {
+        return switch (self) {
+            .hunk => |line| line.oldNo(),
+            .gap => |gap| if (gap.side == .old) gap.number else null,
+        };
+    }
+
+    pub fn newNo(self: LineOwner) ?u32 {
+        return switch (self) {
+            .hunk => |line| line.newNo(),
+            .gap => |gap| if (gap.side == .new) gap.number else null,
+        };
+    }
+};
+
 pub const RowOwner = union(enum) {
     file: *const bbr.diff.File,
     hunk: *const bbr.diff.model.Hunk,
     status_placeholder: struct { file: *const bbr.diff.File, old: bool, new: bool },
-    line: *const bbr.diff.Line,
+    line: LineOwner,
     disclosure: buffer_mod.DisclosureKey,
     comment: struct { id: bbr.review.CommentId, source_offset: usize, part: ?@import("review_card.zig").Part = null },
     draft: struct { id: bbr.review.TempId, source_offset: usize, part: ?@import("review_card.zig").Part = null },
@@ -151,7 +195,7 @@ pub const RowOwner = union(enum) {
             .file => |value| value == b.file,
             .hunk => |value| value == b.hunk,
             .status_placeholder => |value| value.file == b.status_placeholder.file and value.old == b.status_placeholder.old and value.new == b.status_placeholder.new,
-            .line => |value| value == b.line,
+            .line => |value| std.meta.eql(value, b.line),
             .disclosure => |value| std.meta.eql(value, b.disclosure),
             .comment => |value| value.id == b.comment.id and value.source_offset == b.comment.source_offset and value.part == b.comment.part,
             .draft => |value| value.id == b.draft.id and value.source_offset == b.draft.source_offset and value.part == b.draft.part,
@@ -312,29 +356,37 @@ pub fn buildVisualRowsWithOptions(
     errdefer visual_rows.deinit(allocator);
     if (options.layout == .side_by_side) {
         const widths = sideBodyWidths(options.width).?;
+        var file: ?*const bbr.diff.File = null;
         for (rows, 0..) |row, buffer_index| switch (row) {
-            .line_pair => |pair| try appendWrappedLinePair(allocator, &visual_rows, buffer_index, pair, widths, metrics),
-            else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index)),
+            .line_pair => |pair| try appendWrappedLinePair(allocator, &visual_rows, buffer_index, pair, widths, metrics, file),
+            else => {
+                if (row == .file_header) file = row.file_header.file;
+                try visual_rows.append(allocator, makeVisualRow(row, buffer_index, file));
+            },
         };
         return visual_rows.toOwnedSlice(allocator);
     }
 
     const body_width = options.width - unified_gutter_cols;
+    var file: ?*const bbr.diff.File = null;
     for (rows, 0..) |row, buffer_index| switch (row) {
         .line => |line_row| {
             if (line_row.line.text.len == 0) {
-                try visual_rows.append(allocator, makeVisualRow(row, buffer_index));
+                try visual_rows.append(allocator, makeVisualRow(row, buffer_index, file));
                 continue;
             }
             const wrap: WrapLine = .init(line_row.line.text, metrics);
             var start: usize = 0;
             while (start < line_row.line.text.len) {
                 const end = wrap.end(start, body_width);
-                try appendWrappedVisualRow(allocator, &visual_rows, row, buffer_index, start, end);
+                try appendWrappedVisualRow(allocator, &visual_rows, row, buffer_index, start, end, file);
                 start = end;
             }
         },
-        else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index)),
+        else => {
+            if (row == .file_header) file = row.file_header.file;
+            try visual_rows.append(allocator, makeVisualRow(row, buffer_index, file));
+        },
     };
     return visual_rows.toOwnedSlice(allocator);
 }
@@ -362,6 +414,7 @@ fn appendWrappedLinePair(
     pair: buffer_mod.LinePair,
     widths: SideBodyWidths,
     metrics: CellMetrics,
+    file: ?*const bbr.diff.File,
 ) !void {
     var left_start: usize = 0;
     var right_start: usize = 0;
@@ -376,7 +429,7 @@ fn appendWrappedLinePair(
         try visual_rows.append(allocator, .{
             .buffer_index = buffer_index,
             .kind = .line_pair,
-            .owner = .{ .line = target.line },
+            .owner = .{ .line = .of(file, target.line) },
             .source_start = target.source_start,
             .source_end = target.source_end,
             .continuation = target.continuation,
@@ -414,11 +467,12 @@ fn appendWrappedVisualRow(
     buffer_index: usize,
     start: usize,
     end: usize,
+    file: ?*const bbr.diff.File,
 ) !void {
     try visual_rows.append(allocator, .{
         .buffer_index = buffer_index,
         .kind = .line,
-        .owner = owner(row),
+        .owner = owner(row, file),
         .source_start = start,
         .source_end = end,
         .continuation = start != 0,
@@ -428,15 +482,19 @@ fn appendWrappedVisualRow(
 
 fn buildUnwrappedVisualRows(allocator: std.mem.Allocator, rows: []const buffer_mod.Row) ![]const VisualRow {
     const visual_rows = try allocator.alloc(VisualRow, rows.len);
-    for (rows, visual_rows, 0..) |row, *visual_row, buffer_index| visual_row.* = makeVisualRow(row, buffer_index);
+    var file: ?*const bbr.diff.File = null;
+    for (rows, visual_rows, 0..) |row, *visual_row, buffer_index| {
+        if (row == .file_header) file = row.file_header.file;
+        visual_row.* = makeVisualRow(row, buffer_index, file);
+    }
     return visual_rows;
 }
 
-fn makeVisualRow(row: buffer_mod.Row, buffer_index: usize) VisualRow {
+fn makeVisualRow(row: buffer_mod.Row, buffer_index: usize, file: ?*const bbr.diff.File) VisualRow {
     return .{
         .buffer_index = buffer_index,
         .kind = std.meta.activeTag(row),
-        .owner = owner(row),
+        .owner = owner(row, file),
         .source_start = rowSourceStart(row),
         .source_end = rowSourceEnd(row),
         .yank_candidates = yankCandidates(row),
@@ -548,9 +606,9 @@ pub const NavigationIndex = struct {
             const exact = try result.owners.getOrPut(a, key);
             if (!exact.found_existing) exact.value_ptr.* = index;
             if (row.halves) |halves| {
-                if (halves.right) |half| try result.add(a, .{ .line = half.line }, half.source_start, half.source_end, index);
+                if (halves.right) |half| try result.add(a, .{ .line = row.owner.line.sibling(half.line) }, half.source_start, half.source_end, index);
                 if (halves.left) |half| if (halves.right == null or halves.right.?.line != half.line)
-                    try result.add(a, .{ .line = half.line }, half.source_start, half.source_end, index);
+                    try result.add(a, .{ .line = row.owner.line.sibling(half.line) }, half.source_start, half.source_end, index);
             } else switch (row.owner) {
                 .line => try result.add(a, row.owner, row.source_start, row.source_end, index),
                 .comment => |value| if (value.part != .header) {
@@ -729,10 +787,11 @@ fn findVisualRow(visual_rows: []const VisualRow, wanted: VisualRow) ?usize {
 
 const SourceRange = struct { start: usize, end: usize };
 
-fn lineRangeForOwner(visual_row: VisualRow, line: *const bbr.diff.Line) ?SourceRange {
+fn lineRangeForOwner(visual_row: VisualRow, line: LineOwner) ?SourceRange {
     if (visual_row.halves) |halves| {
-        if (halves.right) |half| if (half.line == line) return .{ .start = half.source_start, .end = half.source_end };
-        if (halves.left) |half| if (half.line == line) return .{ .start = half.source_start, .end = half.source_end };
+        const row_line = visual_row.owner.line;
+        if (halves.right) |half| if (std.meta.eql(row_line.sibling(half.line), line)) return .{ .start = half.source_start, .end = half.source_end };
+        if (halves.left) |half| if (std.meta.eql(row_line.sibling(half.line), line)) return .{ .start = half.source_start, .end = half.source_end };
         return null;
     }
     if (!visual_row.owner.eql(.{ .line = line })) return null;
@@ -767,14 +826,14 @@ fn visualRowAt(visual_rows: []const VisualRow, index: usize) ?VisualRow {
     return visual_rows[index];
 }
 
-fn owner(row: buffer_mod.Row) RowOwner {
+fn owner(row: buffer_mod.Row, file: ?*const bbr.diff.File) RowOwner {
     if (buffer_mod.disclosureKey(row)) |key| if (key == .resolved_thread) return .{ .disclosure = key };
     return switch (row) {
         .file_header => |header| .{ .file = header.file },
         .hunk_header => |hunk| .{ .hunk = hunk },
         .status_placeholder => |value| .{ .status_placeholder = .{ .file = value.file, .old = value.old != null, .new = value.new != null } },
-        .line => |line| .{ .line = line.line },
-        .line_pair => |pair| .{ .line = if (pair.right) |right| right.line else pair.left.?.line },
+        .line => |line| .{ .line = .of(file, line.line) },
+        .line_pair => |pair| .{ .line = .of(file, if (pair.right) |right| right.line else pair.left.?.line) },
         .disclosure => |value| .{ .disclosure = value.key },
         .comment => |card| switch (card.owner) {
             .comment => |id| .{ .comment = .{ .id = id, .source_offset = card.source_range.start, .part = anchorPart(card.part) } },
@@ -864,11 +923,11 @@ test "Presentation Frame projects Diff Lines as complete visual rows" {
     defer testing.allocator.free(visual_rows);
 
     try testing.expectEqual(rows.len, visual_rows.len);
-    try testing.expect(visual_rows[0].owner.eql(.{ .line = &line }));
+    try testing.expect(visual_rows[0].owner.eql(.{ .line = .{ .hunk = &line } }));
     try testing.expectEqual(@as(usize, 0), visual_rows[0].source_start);
     try testing.expectEqual(line.text.len, visual_rows[0].source_end);
     try testing.expectEqual(@as(usize, 0), visual_rows[0].buffer_index);
-    try testing.expect(visual_rows[1].owner.eql(.{ .line = &line }));
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk = &line } }));
     try testing.expectEqual(line.text.len, visual_rows[1].source_end);
     try testing.expectEqual(@as(usize, 1), visual_rows[1].buffer_index);
     try testing.expectEqual(@as(usize, 2), visual_rows[2].buffer_index);
@@ -886,10 +945,10 @@ test "semantic row ownership exposes old and new yank candidates without changin
     const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .side_by_side, .width = 80 });
     defer testing.allocator.free(visual_rows);
 
-    try testing.expect(visual_rows[0].owner.eql(.{ .line = &new_line }));
+    try testing.expect(visual_rows[0].owner.eql(.{ .line = .{ .hunk = &new_line } }));
     try testing.expectEqual(&old_line, visual_rows[0].yank_candidates.old.?);
     try testing.expectEqual(&new_line, visual_rows[0].yank_candidates.new.?);
-    try testing.expect(visual_rows[1].owner.eql(.{ .line = &context }));
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk = &context } }));
     try testing.expectEqual(&context, visual_rows[1].yank_candidates.old.?);
     try testing.expectEqual(&context, visual_rows[1].yank_candidates.new.?);
 }
@@ -1109,7 +1168,7 @@ test "SideBySide halves wrap independently and align absent continuations" {
     try testing.expectEqualStrings("new", right.text[first_right.source_start..first_right.source_end]);
     try testing.expect(visual_rows[1].halves.?.left.?.continuation);
     try testing.expect(visual_rows[1].halves.?.right == null);
-    try testing.expect(visual_rows[1].owner.eql(.{ .line = &left }));
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk = &left } }));
     try testing.expectEqual(@as(usize, 8), visual_rows[1].source_start);
 }
 

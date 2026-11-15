@@ -2919,8 +2919,8 @@ test "an added or removed Line paints its band from the first gutter cell of eve
                     try testing.expectEqual(theme.lineStyle(value.line.kind).bg, win.readCell(x, row).?.style.bg);
                     banded += 1;
                 }
-            } else if (visual.owner == .line and visual.owner.line.kind != .context) {
-                try testing.expectEqual(theme.lineStyle(visual.owner.line.kind).bg, win.readCell(0, row).?.style.bg);
+            } else if (visual.owner == .line and visual.owner.line.hunk.kind != .context) {
+                try testing.expectEqual(theme.lineStyle(visual.owner.line.hunk.kind).bg, win.readCell(0, row).?.style.bg);
                 banded += 1;
             }
         }
@@ -3238,7 +3238,7 @@ test "cursor and Selection paint only Selected Version across complete wrapped s
             for (visual_rows, 0..) |row, index| {
                 if (row.owner != .line) continue;
                 if (layout == .unified) {
-                    const candidate = row.owner.line;
+                    const candidate = row.owner.line.hunk;
                     const band = backgrounds[index][0];
                     const expected = if (candidate == line) theme_dark.cursorBg(band) else band;
                     try testing.expectEqual(expected, win.readCell(gutter_cols, @intCast(index)).?.style.bg);
