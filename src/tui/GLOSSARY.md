@@ -95,7 +95,7 @@ The List Overlay that lists the built-in Themes and paints the selected Theme as
 _Avoid_: theme picker, theme palette, theme switcher.
 
 **Buffer Search**:
-The `/`-initiated search over semantic text owned by the current DiffPane Buffer. Layout, Scope, and File isolation define its corpus, but a Fold or authored-content disclosure does not remove hidden text. Buffer Search never starts File Enrichment. It highlights every Search Occurrence and gives `n` and `N` a current occurrence to traverse.
+The `/`-initiated search over semantic text owned by the current DiffPane Buffer. Layout, Scope, File isolation, the Drafts, and in the whole-file Scope the Selected Version and the loaded File text define its corpus, but a Fold or authored-content disclosure does not remove hidden text. Buffer Search never starts File Enrichment. It highlights every Search Occurrence and gives `n` and `N` a current occurrence to traverse.
 _Avoid_: Review Search (crosses File boundaries), find (the Action has defined search semantics).
 
 **Review Search**:

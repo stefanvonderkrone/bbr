@@ -22,6 +22,7 @@ const Parent = bbr.review.draft.Parent;
 const anchor_projection = bbr.review.anchor;
 const review_card = @import("review_card.zig");
 const search = @import("search.zig");
+const MentionNames = @import("review_body.zig").MentionNames;
 const anchor_cols = @import("frame.zig").anchor_cols;
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 pub const CellMeasurement = @import("cell_metrics.zig").Measurement;
@@ -255,7 +256,7 @@ pub const BuildOptions = struct {
     emphasis_cache: ?*const EmphasisCache = null,
     /// A block without a plan here plans itself, as without plans.
     side_by_side_plans: ?*const SideBySidePlans = null,
-    mention_names: *const @import("review_body.zig").MentionNames = &.empty,
+    mention_names: *const MentionNames = &.empty,
 };
 
 /// One SideBySide row of a change block. A pair row holds the emphasis of
@@ -1234,7 +1235,8 @@ fn cardRowCapacity(body: []const u8, content_width: usize) usize {
 }
 
 /// Everything that decides the Buffer Search candidates. `key` reads every
-/// field, so two builds with the same key make the same candidates. The width,
+/// field, so two builds with the same key make the same candidates, unless
+/// two different inputs give the same 64-bit digest. The width,
 /// the cell metrics, the highlights, the folds, and the expanded disclosures
 /// are not inputs: the build wraps nothing that a candidate reads, and it
 /// expands every disclosure itself.
@@ -1298,8 +1300,6 @@ pub const SearchCandidateScope = union(enum) {
 };
 
 pub const SearchCandidateKey = enum(u64) { _ };
-
-const MentionNames = @import("review_body.zig").MentionNames;
 
 fn hashIdentity(hasher: *std.hash.Wyhash, value: anytype) void {
     switch (@typeInfo(@TypeOf(value))) {
@@ -5150,4 +5150,54 @@ test "M21 kernel Buffer Candidate corpus follows Layout Scope and File isolation
         try testing.expectEqual(only_file == null, saw_second_file);
         try testing.expectEqual(scope == .whole_file, saw_whole_file_gap);
     };
+}
+
+test "the search candidate key changes with each input that the candidates read" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const diff = try parse(arena.allocator(), two_file_diff);
+    const anchored: Draft = .{ .local_id = 1, .kind = .comment, .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } }, .body = "root" };
+    const reply: Draft = .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" };
+    const drafts = [_]Draft{ anchored, reply };
+    const blobs = [_]model.FileBlob{ .{ .new = "one\n" }, .{} };
+    const base: SearchCandidateInputs = .{
+        .diff = diff,
+        .threads = &.{},
+        .mention_names = &.empty,
+        .session_epoch = 1,
+        .layout = .unified,
+        .scope = .{ .whole_file = .{ .selected_version = .new, .blobs = &blobs } },
+        .only_file = null,
+        .drafts = &drafts,
+        .scope_projections = &.{},
+    };
+    const key = base.key();
+
+    var same = base;
+    const copied = [_]Draft{ anchored, reply };
+    same.drafts = &copied;
+    try testing.expectEqual(key, same.key());
+
+    var changed = base;
+    changed.session_epoch = 2;
+    try testing.expect(changed.key() != key);
+
+    const reparented = [_]Draft{ anchored, .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 1 }, .body = "reply" } };
+    changed = base;
+    changed.drafts = &reparented;
+    try testing.expect(changed.key() != key);
+
+    const submitting = [_]Draft{ anchored, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply", .state = .submitting } };
+    changed = base;
+    changed.drafts = &submitting;
+    try testing.expect(changed.key() != key);
+
+    const evicted = [_]model.FileBlob{ .{}, .{} };
+    changed = base;
+    changed.scope = .{ .whole_file = .{ .selected_version = .new, .blobs = &evicted } };
+    try testing.expect(changed.key() != key);
+
+    var hunks = base;
+    hunks.scope = .hunks;
+    try testing.expect(hunks.key() != key);
 }
