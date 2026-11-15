@@ -25499,6 +25499,222 @@ test "M21 kernel indexed hidden navigation keeps Count direction and disclosure 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
 }
 
+fn baselineOccurrence(location: search.Location) search.Occurrence {
+    return .{ .location = location, .ranges = &.{}, .column = 0, .candidate_scalars = 0, .corpus_order = 0, .session_epoch = 0 };
+}
+
+fn hashBaselineRows(hash: *std.hash.Wyhash, rows: []const usize) void {
+    std.hash.autoHash(hash, rows.len);
+    for (rows) |row| std.hash.autoHash(hash, row);
+}
+
+fn hashBaselineDisclosures(hash: *std.hash.Wyhash, projection: *const SearchProjection, occurrence: search.Occurrence) void {
+    const required = projection.requiredDisclosures(occurrence);
+    std.hash.autoHash(hash, required.len);
+    for (required.items[0..required.len]) |key| {
+        std.hash.autoHash(hash, std.meta.activeTag(key));
+        std.hash.autoHash(hash, projection.disclosure_rows.get(key));
+    }
+}
+
+fn baselineRowShows(buffer: buffer_mod.Buffer, row: frame_mod.VisualRow, key: SourceRowKey) bool {
+    if (buffer.fileIndexForRow(row.buffer_index) != key.file_index) return false;
+    if (row.halves) |halves| {
+        return switch (key.side) {
+            .old => if (halves.left) |half| half.line.oldNo() == key.line else false,
+            .new => if (halves.right) |half| half.line.newNo() == key.line else false,
+        };
+    }
+    if (row.owner != .line) return false;
+    return (if (key.side == .old) row.owner.line.oldNo() else row.owner.line.newNo()) == key.line;
+}
+
+const SearchBaseline = struct { projection: u64, visual: u64, rows: usize };
+
+fn searchProjectionBaselines() ![8]SearchBaseline {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 11, .kind = .comment, .scope = .review, .body = "Draft body\n\nsecond paragraph" });
+    try store.store().put(key.storeKey(), .{ .local_id = 12, .kind = .comment, .parent = .{ .draft = 11 }, .body = "Draft reply" });
+    const session = try testDisclosureSession(testing.allocator, 1);
+    @constCast(session.diff.files[0].hunks[0].lines)[2].text = "c1 " ++ "long context " ** 12;
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = key, .session = session },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const expanded = [_]buffer_mod.DisclosureKey{
+        .{ .resolved_thread = 1 },            .{ .review_card = .{ .comment = 1 } },
+        .{ .review_card = .{ .draft = 11 } }, .{ .outdated_file = &session.diff.files[0] },
+    };
+    var result: [8]SearchBaseline = undefined;
+    var fixture: usize = 0;
+    for ([_]bool{ false, true }) |open| {
+        for ([_]Layout{ .unified, .side_by_side }) |layout| {
+            for ([_]usize{ 24, 40 }) |width| {
+                var preferences = presentation.preferences;
+                preferences.layout = layout;
+                try published.rebuildBufferControl(preferences, if (open) &expanded else &.{}, null);
+                const buffer = published.buffer;
+                const visual = try frame_mod.buildVisualRowsWithOptions(testing.allocator, buffer.rows, .bytes, .{ .layout = layout, .width = width });
+                defer testing.allocator.free(visual);
+                try testing.expect(visual.len > buffer.rows.len);
+                const projection = try SearchProjection.createWithAllocator(testing.allocator, buffer, visual, .{
+                    .session = session,
+                    .drafts = published.review.drafts.items,
+                    .scopes = published.scope_projection.items,
+                    .selected_version = published.selected_version,
+                });
+                defer projection.release();
+                var ph = std.hash.Wyhash.init(0);
+                var vh = std.hash.Wyhash.init(0);
+                var scanned_entries: usize = 0;
+                for (visual) |row| {
+                    std.hash.autoHash(&vh, row.buffer_index);
+                    std.hash.autoHash(&vh, row.source_start);
+                    std.hash.autoHash(&vh, row.source_end);
+                    std.hash.autoHash(&vh, std.meta.activeTag(row.owner));
+                    std.hash.autoHash(&vh, row.halves != null);
+                    if (row.halves) |halves| {
+                        for ([_]?frame_mod.VisualHalf{ halves.left, halves.right }) |half| {
+                            std.hash.autoHash(&vh, half != null);
+                            if (half) |value| {
+                                std.hash.autoHash(&vh, value.source_start);
+                                std.hash.autoHash(&vh, value.source_end);
+                                std.hash.autoHash(&vh, value.line.oldNo());
+                                std.hash.autoHash(&vh, value.line.newNo());
+                            }
+                        }
+                        if (halves.left) |half| scanned_entries += @intFromBool(half.line.oldNo() != null);
+                        if (halves.right) |half| scanned_entries += @intFromBool(half.line.newNo() != null);
+                    } else if (row.owner == .line) {
+                        std.hash.autoHash(&vh, row.owner.line.oldNo());
+                        std.hash.autoHash(&vh, row.owner.line.newNo());
+                        scanned_entries += @intFromBool(row.owner.line.oldNo() != null);
+                        scanned_entries += @intFromBool(row.owner.line.newNo() != null);
+                    }
+                    std.hash.autoHash(&ph, projection.navigation.find(row));
+                    std.hash.autoHash(&ph, projection.navigation.owners.get(row.owner));
+                    const disclosure = buffer_mod.disclosureKey(buffer.rows[row.buffer_index]);
+                    std.hash.autoHash(&ph, disclosure != null);
+                    if (disclosure) |value| {
+                        std.hash.autoHash(&ph, std.meta.activeTag(value));
+                        std.hash.autoHash(&ph, projection.disclosure_rows.get(value));
+                    }
+                }
+                var indexed_entries: usize = 0;
+                var multi_row_key = false;
+                for (session.diff.files, 0..) |file, file_index| {
+                    for (file.hunks) |hunk| for (hunk.lines) |line| {
+                        for ([_]SourceRowKey{
+                            .{ .file_index = file_index, .line = line.oldNo() orelse 0, .side = .old },
+                            .{ .file_index = file_index, .line = line.newNo() orelse 0, .side = .new },
+                        }) |source_key| {
+                            if (source_key.line == 0) continue;
+                            const occurrence = baselineOccurrence(.{ .source = .{
+                                .file_index = file_index,
+                                .relation = if (source_key.side == .old) .old else .new,
+                                .old_line = if (source_key.side == .old) source_key.line else null,
+                                .new_line = if (source_key.side == .new) source_key.line else null,
+                            } });
+                            const found = projection.occurrenceRows(occurrence);
+                            const direct = if (projection.source_rows.get(source_key)) |list| list.items else &.{};
+                            try testing.expectEqualSlices(usize, direct, found);
+                            hashBaselineRows(&ph, direct);
+                            hashBaselineRows(&ph, found);
+                            hashBaselineDisclosures(&ph, projection, occurrence);
+                            indexed_entries += found.len;
+                            multi_row_key = multi_row_key or found.len > 1;
+                            var previous: ?usize = null;
+                            for (found) |index| {
+                                if (previous) |prior| try testing.expect(prior < index);
+                                try testing.expect(baselineRowShows(buffer, visual[index], source_key));
+                                previous = index;
+                            }
+                        }
+                    };
+                }
+                try testing.expectEqual(scanned_entries, indexed_entries);
+                if (layout == .side_by_side) try testing.expect(multi_row_key);
+                for (session.threads) |thread| {
+                    const occurrence = baselineOccurrence(.{ .review_body = .{ .owner = .{ .comment = thread.root.id }, .logical_line = 0 } });
+                    hashBaselineRows(&ph, projection.occurrenceRows(occurrence));
+                    hashBaselineRows(&ph, if (projection.body_rows.get(occurrence.location.review_body.owner)) |list| list.items else &.{});
+                    hashBaselineDisclosures(&ph, projection, occurrence);
+                    for (thread.replies) |reply| {
+                        const reply_occurrence = baselineOccurrence(.{ .review_body = .{ .owner = .{ .comment = reply.id }, .logical_line = 0 } });
+                        hashBaselineRows(&ph, projection.occurrenceRows(reply_occurrence));
+                        hashBaselineRows(&ph, if (projection.body_rows.get(reply_occurrence.location.review_body.owner)) |list| list.items else &.{});
+                        hashBaselineDisclosures(&ph, projection, reply_occurrence);
+                    }
+                }
+                for (published.review.drafts.items) |draft| {
+                    const occurrence = baselineOccurrence(.{ .review_body = .{ .owner = .{ .draft = draft.local_id }, .logical_line = 0 } });
+                    hashBaselineRows(&ph, projection.occurrenceRows(occurrence));
+                    hashBaselineRows(&ph, if (projection.body_rows.get(occurrence.location.review_body.owner)) |list| list.items else &.{});
+                    hashBaselineDisclosures(&ph, projection, occurrence);
+                }
+                result[fixture] = .{ .projection = ph.final(), .visual = vh.final(), .rows = visual.len };
+                fixture += 1;
+            }
+        }
+    }
+    return result;
+}
+
+test "search projection lookups match the 9601be3 baseline in both Layouts" {
+    const actual = try searchProjectionBaselines();
+    const expected = [_]u64{
+        11736595582100757729, 2518425522605288483,  9014994094431836833,  11736595582100757729,
+        14311309471756834833, 14401948231105690527, 18171018725666854220, 14311309471756834833,
+    };
+    for (actual, expected) |value, digest| try testing.expectEqual(digest, value.projection);
+    const session = try testDisclosureSession(testing.allocator, 1);
+    defer session.destroy();
+    const empty: buffer_mod.Buffer = .{ .rows = &.{}, .layout = .unified };
+    const visual = try frame_mod.buildVisualRowsWithOptions(testing.allocator, empty.rows, .bytes, .{ .layout = .unified, .width = 24 });
+    defer testing.allocator.free(visual);
+    const projection = try SearchProjection.createWithAllocator(testing.allocator, empty, visual, .{
+        .session = session,
+        .drafts = &.{},
+        .scopes = &.{},
+        .selected_version = .new,
+    });
+    defer projection.release();
+    try testing.expectEqual(@as(usize, 0), projection.rows.len);
+    try testing.expectEqual(@as(usize, 0), projection.source_rows.count());
+    try testing.expectEqual(@as(usize, 0), projection.body_rows.count());
+    try testing.expectEqual(@as(usize, 0), projection.disclosure_rows.count());
+    for ([_]search.Location{
+        .{ .source = .{ .file_index = 0, .relation = .new, .new_line = 1 } },
+        .{ .review_body = .{ .owner = .{ .draft = 99 }, .logical_line = 0 } },
+    }) |location| {
+        const occurrence = baselineOccurrence(location);
+        try testing.expectEqual(@as(usize, 0), projection.occurrenceRows(occurrence).len);
+        try testing.expectEqual(@as(usize, 0), projection.requiredDisclosures(occurrence).len);
+    }
+    try testing.expect(projection.navigation.find(.{ .owner = .{ .draft = .{ .id = 99, .source_offset = 0 } } }) == null);
+}
+
+test "visual rows match the 9601be3 baseline at two widths in both Layouts" {
+    const actual = try searchProjectionBaselines();
+    const expected = [_]SearchBaseline{
+        .{ .projection = 0, .visual = 12149246188651799048, .rows = 36 },
+        .{ .projection = 0, .visual = 9662244187531087518, .rows = 29 },
+        .{ .projection = 0, .visual = 9573947097753452602, .rows = 60 },
+        .{ .projection = 0, .visual = 16254814862064387150, .rows = 36 },
+        .{ .projection = 0, .visual = 8415397415913536034, .rows = 58 },
+        .{ .projection = 0, .visual = 5306048518828272882, .rows = 51 },
+        .{ .projection = 0, .visual = 15397544635310334413, .rows = 82 },
+        .{ .projection = 0, .visual = 11114075354739377262, .rows = 58 },
+    };
+    for (actual, expected) |value, baseline| {
+        try testing.expectEqual(baseline.visual, value.visual);
+        try testing.expectEqual(baseline.rows, value.rows);
+    }
+}
+
 fn exerciseSearchIndexAllocationFailure(allocator: Allocator, published: *const Published) !void {
     const projection = try SearchProjection.createWithAllocator(allocator, published.buffer, published.visual_rows, .{
         .session = published.session,
