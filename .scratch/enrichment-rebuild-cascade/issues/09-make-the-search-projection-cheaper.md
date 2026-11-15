@@ -1,7 +1,7 @@
 # 09: Make SearchProjection.create cheaper
 
 Status: ready-for-agent
-Blocked by: none
+Blocked by: 25
 
 ## Summary
 
@@ -95,3 +95,9 @@ The first version of this ticket said that map growth was a small part and asked
 If step 3 does not reach the target, record the numbers and set the ticket to `needs-info`.
 
 **Dependencies.** None. Tickets 07 and 08 do not change this phase. The projection runs once on each rebuild, also when ticket 07 reuses the corpus.
+
+### 2026-11-15 blocked by ticket 25
+
+[Ticket 25](25-measure-the-page-faults-of-the-phases-after-the-visual-rows.md) sizes the `SearchProjection` indexes and gives each new key list room for one entry.
+That change covers step 1 of this ticket and part of step 3.
+After ticket 25 lands, this ticket takes a new baseline and keeps the flat entry layout, which removes the growth copies of SideBySide key lists that ticket 25 leaves.
