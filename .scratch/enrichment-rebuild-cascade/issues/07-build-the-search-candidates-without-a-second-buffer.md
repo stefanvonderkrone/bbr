@@ -1,6 +1,6 @@
 # 07: Build the search candidates without a second Buffer
 
-Status: ready-for-human
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -66,7 +66,7 @@ Report the machine load.
 - [x] A test shows that a Draft add, delete, body change, and re-anchor each change the key, and that the next build makes new candidates.
 - [x] After a resize, Buffer Search finds the same matches in the same order as before the resize, with an accepted query and with a typed query.
 - [x] On the workload, the median of the candidates and corpus phases of a Unified resize is at most 1 ms. The baseline of the same run is about 50 ms.
-- [ ] On the workload, the median worker CPU of a Unified resize is at least 25 percent lower than the baseline of the same run.
+- [ ] On the workload, the median worker CPU of a Unified resize is at least 25 percent lower than the baseline of the same run. Waived on 2026-11-15: the measured cut is 16.7 percent. See the comment of that date.
 - [x] The phases of a Layout switch and a disclosure toggle do not change by more than the run-to-run spread.
 - [x] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
 - [x] No `[DEBUG-07]` or `[DEBUG-t07]` line stays in the repository.
@@ -118,6 +118,17 @@ Both Buffer builds of a rebuild pay this. The row prototype reserves the array o
 [Ticket 13](13-find-why-a-switch-to-side-by-side-costs-three-times-more.md) found that the matching is about 100 ms of the SideBySide candidates phase, and that a SideBySide resize costs as much as a switch.
 With the change block plans kept in the Session, the candidates and corpus phases of a SideBySide rebuild fall from about 127 ms to about 36 ms.
 So the saving of this ticket on a SideBySide resize shrinks to about 36 ms. The Unified targets of this ticket do not change.
+
+### 2026-11-15 operator decision
+
+The operator accepted the measured result and resolved this ticket with one criterion not met.
+The median worker CPU of a Unified resize fell by 16.7 percent, not by 25 percent.
+The candidates and corpus phases fell from 34.1 ms to 0 ms, but the visual row phase of the same resize grew by about 9 ms.
+[Ticket 21](21-find-why-the-visual-rows-cost-more-without-a-candidate-build.md) owns that cost.
+The review left two open points of this change, and they have their own tickets:
+
+- [23](23-compare-the-search-candidate-inputs-without-a-digest-collision.md): a digest collision reuses a stale corpus.
+- [24](24-check-that-a-published-session-never-changes-its-diff-or-threads.md): no check enforces that a published Session keeps its Diff, Threads, and mention names.
 
 ## Completion
 
