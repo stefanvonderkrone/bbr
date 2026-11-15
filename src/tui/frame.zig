@@ -203,14 +203,6 @@ pub const VisualRowOptions = struct {
     width: usize,
 };
 
-pub const SourceMatch = struct {
-    old_line: ?*const bbr.diff.Line = null,
-    new_line: ?*const bbr.diff.Line = null,
-    relation: search.VersionRelation,
-    ranges: []const search.Range,
-    active: bool = false,
-};
-
 pub const ProjectedSourceRange = struct {
     visual_row: usize,
     relation: search.VersionRelation,
@@ -345,71 +337,6 @@ pub fn buildVisualRowsWithOptions(
         else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index)),
     };
     return visual_rows.toOwnedSlice(allocator);
-}
-
-pub fn projectSourceRanges(
-    allocator: std.mem.Allocator,
-    visual_rows: []const VisualRow,
-    matches: []const SourceMatch,
-) ![]ProjectedSourceRange {
-    var projected: std.ArrayList(ProjectedSourceRange) = .empty;
-    errdefer projected.deinit(allocator);
-    for (visual_rows, 0..) |visual_row, visual_index| {
-        if (visual_row.halves) |halves| {
-            if (halves.left) |half| try projectHalf(allocator, &projected, matches, visual_index, .old, half);
-            if (halves.right) |half| try projectHalf(allocator, &projected, matches, visual_index, .new, half);
-            continue;
-        }
-        for (matches) |match| {
-            const old_matches = match.old_line != null and visual_row.yank_candidates.old == match.old_line;
-            const new_matches = match.new_line != null and visual_row.yank_candidates.new == match.new_line;
-            const applicable = switch (match.relation) {
-                .neutral => old_matches or new_matches,
-                .old => old_matches,
-                .new => new_matches,
-            };
-            if (applicable) try appendRangeIntersections(allocator, &projected, match, visual_index, match.relation, visual_row.source_start, visual_row.source_end);
-        }
-    }
-    return projected.toOwnedSlice(allocator);
-}
-
-fn projectHalf(
-    allocator: std.mem.Allocator,
-    projected: *std.ArrayList(ProjectedSourceRange),
-    matches: []const SourceMatch,
-    visual_index: usize,
-    relation: search.VersionRelation,
-    half: VisualHalf,
-) !void {
-    for (matches) |match| {
-        const line = if (relation == .old) match.old_line else match.new_line;
-        if (line != half.line or (match.relation != .neutral and match.relation != relation)) continue;
-        try appendRangeIntersections(allocator, projected, match, visual_index, relation, half.source_start, half.source_end);
-    }
-}
-
-fn appendRangeIntersections(
-    allocator: std.mem.Allocator,
-    projected: *std.ArrayList(ProjectedSourceRange),
-    match: SourceMatch,
-    visual_index: usize,
-    relation: search.VersionRelation,
-    row_start: usize,
-    row_end: usize,
-) !void {
-    for (match.ranges) |range| {
-        const start = @max(range.start, row_start);
-        const end = @min(range.end, row_end);
-        if (start >= end) continue;
-        try projected.append(allocator, .{
-            .visual_row = visual_index,
-            .relation = relation,
-            .source = .{ .start = start, .end = end },
-            .row = .{ .start = start - row_start, .end = end - row_start },
-            .active = match.active,
-        });
-    }
 }
 
 const SideBodyWidths = struct { left: usize, right: usize };
@@ -1227,72 +1154,6 @@ test "SideBySide resize restores an old-only continuation by source offset" {
     };
 
     try testing.expectEqual(@as(usize, 0), restoreNavigation(previous, new_rows, .{ .cols = 35, .rows = 5 }).cursor);
-}
-
-test "M21 kernel source ranges project across every wrapped visual row without changing wrapping" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "abcdefgh" };
-    const rows = [_]buffer_mod.Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{.{ .text = line.text }} } } }};
-    const visual_rows = try buildVisualRowsWithOptions(allocator, &rows, .bytes, .{ .layout = .unified, .width = unified_gutter_cols + 4 });
-    const projected = try projectSourceRanges(allocator, visual_rows, &.{.{
-        .old_line = &line,
-        .new_line = &line,
-        .relation = .neutral,
-        .ranges = &.{.{ .start = 2, .end = 6 }},
-        .active = true,
-    }});
-
-    try testing.expectEqual(@as(usize, 2), visual_rows.len);
-    try testing.expectEqual(@as(usize, 2), projected.len);
-    try testing.expectEqual(search.Range{ .start = 2, .end = 4 }, projected[0].source);
-    try testing.expectEqual(search.Range{ .start = 2, .end = 4 }, projected[0].row);
-    try testing.expectEqual(search.Range{ .start = 4, .end = 6 }, projected[1].source);
-    try testing.expectEqual(search.Range{ .start = 0, .end = 2 }, projected[1].row);
-    try testing.expect(projected[0].active and projected[1].active);
-}
-
-test "M21 kernel neutral source ranges project onto distinct SideBySide context Lines" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const old: bbr.diff.Line = .{ .old_no = 3, .new_no = 3, .kind = .context, .text = "same" };
-    const new: bbr.diff.Line = .{ .old_no = 3, .new_no = 3, .kind = .context, .text = "same" };
-    const rows = [_]buffer_mod.Row{.{ .line_pair = .{
-        .left = .{ .line = &old, .decoration = .{ .runs = &.{.{ .text = old.text }} } },
-        .right = .{ .line = &new, .decoration = .{ .runs = &.{.{ .text = new.text }} } },
-    } }};
-    const visual_rows = try buildVisualRowsWithOptions(allocator, &rows, .bytes, .{ .layout = .side_by_side, .width = 40 });
-    const projected = try projectSourceRanges(allocator, visual_rows, &.{.{
-        .old_line = &old,
-        .new_line = &new,
-        .relation = .neutral,
-        .ranges = &.{.{ .start = 1, .end = 3 }},
-    }});
-
-    try testing.expectEqual(@as(usize, 2), projected.len);
-    try testing.expectEqual(search.VersionRelation.old, projected[0].relation);
-    try testing.expectEqual(search.VersionRelation.new, projected[1].relation);
-}
-
-test "source ranges do not match absent Line candidates" {
-    const matched: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "first" };
-    const other: bbr.diff.Line = .{ .old_no = 2, .new_no = 0, .kind = .removed, .text = "other" };
-    const visual_rows = [_]VisualRow{
-        .{ .owner = .{ .line = &matched }, .source_end = 5, .yank_candidates = .{ .old = &matched } },
-        .{ .owner = .{ .line = &other }, .source_end = 5, .yank_candidates = .{ .old = &other } },
-        .{ .kind = .comment, .owner = .{ .comment = .{ .id = 1, .source_offset = 0 } }, .source_end = 5 },
-    };
-    const projected = try projectSourceRanges(testing.allocator, &visual_rows, &.{.{
-        .old_line = &matched,
-        .relation = .neutral,
-        .ranges = &.{.{ .start = 1, .end = 3 }},
-    }});
-    defer testing.allocator.free(projected);
-
-    try testing.expectEqual(@as(usize, 1), projected.len);
-    try testing.expectEqual(@as(usize, 0), projected[0].visual_row);
 }
 
 test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {
