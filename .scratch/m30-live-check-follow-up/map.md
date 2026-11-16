@@ -8,7 +8,7 @@ The operator filed them on 2026-11-16.
 | Ticket | Finding | File |
 | --- | --- | --- |
 | 01 | 2 | [01-clear-an-accepted-buffer-search-query.md](issues/01-clear-an-accepted-buffer-search-query.md) |
-| 02 | 4 | [02-check-the-review-search-cpu-after-the-rebuild-cascade-merge.md](issues/02-check-the-review-search-cpu-after-the-rebuild-cascade-merge.md) |
+| 02 | 5 | [02-clear-the-review-search-input-with-ctrl-u.md](issues/02-clear-the-review-search-input-with-ctrl-u.md) |
 
 ## Decisions so far
 
