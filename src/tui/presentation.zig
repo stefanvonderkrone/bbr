@@ -2046,13 +2046,13 @@ pub const BufferSearchCorpus = struct {
     /// The corpus of `inputs`, which is `previous` when equal inputs built it.
     /// The caller owns one reference to the result.
     fn reuseOrBuild(previous: ?*BufferSearchCorpus, scratch: Allocator, inputs: buffer_mod.SearchCandidateInputs) !*BufferSearchCorpus {
-        const key = inputs.key();
-        if (previous) |corpus| if (corpus.key) |built| if (built == key) {
+        if (previous) |corpus| if (corpus.key) |built| if (built.eql(try inputs.key(scratch))) {
             corpus.retain();
             return corpus;
         };
         const corpus = try create(try buffer_mod.buildSearchCandidates(scratch, inputs));
-        corpus.key = key;
+        errdefer corpus.release();
+        corpus.key = try inputs.key(corpus.arena.allocator());
         return corpus;
     }
 

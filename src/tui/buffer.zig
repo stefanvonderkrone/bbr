@@ -1254,8 +1254,7 @@ fn cardRowCapacity(body: []const u8, content_width: usize) usize {
 }
 
 /// Everything that decides the Buffer Search candidates. `key` reads every
-/// field, so two builds with the same key make the same candidates, unless
-/// two different inputs give the same 64-bit digest. The width,
+/// field, so two builds with equal keys make the same candidates. The width,
 /// the cell metrics, the highlights, the folds, and the expanded disclosures
 /// are not inputs: the build wraps nothing that a candidate reads, and it
 /// expands every disclosure itself.
@@ -1281,36 +1280,37 @@ pub const SearchCandidateInputs = struct {
     emphasis_cache: ?*const EmphasisCache = null,
     side_by_side_plans: ?*const SideBySidePlans = null,
 
-    pub fn key(self: SearchCandidateInputs) SearchCandidateKey {
-        var hasher = std.hash.Wyhash.init(0);
+    pub fn key(self: SearchCandidateInputs, allocator: std.mem.Allocator) std.mem.Allocator.Error!SearchCandidateKey {
+        var result: SearchCandidateKey = undefined;
         inline for (comptime std.enums.values(std.meta.FieldEnum(SearchCandidateInputs))) |field| {
             const value = @field(self, @tagName(field));
             switch (field) {
-                .diff => hashIdentity(&hasher, value.files),
-                .threads => hashIdentity(&hasher, value),
-                .mention_names => std.hash.autoHash(&hasher, @intFromPtr(value)),
-                .session_epoch, .layout, .only_file, .drafts, .scope_projections => hashContent(&hasher, value),
-                .scope => {
-                    std.hash.autoHash(&hasher, std.meta.activeTag(value));
-                    switch (value) {
-                        .hunks => {},
-                        .whole_file => |whole| {
-                            std.hash.autoHash(&hasher, whole.selected_version);
-                            // A File side holds the same text whenever it is
-                            // loaded, so its identity changes only when it loads
-                            // or leaves.
-                            std.hash.autoHash(&hasher, whole.blobs.len);
-                            for (whole.blobs) |blob| {
-                                hashIdentity(&hasher, blob.old);
-                                hashIdentity(&hasher, blob.new);
-                            }
-                        },
-                    }
+                .diff => result.diff = .of(value.files),
+                .threads => result.threads = .of(value),
+                .mention_names => result.mention_names = @intFromPtr(value),
+                .session_epoch, .layout, .only_file => @field(result, @tagName(field)) = value,
+                .drafts, .scope_projections => {
+                    @field(result, @tagName(field)) = value;
+                    try copyContent(allocator, &@field(result, @tagName(field)));
                 },
-                .emphasis_cache, .side_by_side_plans => {},
+                .scope => result.scope = switch (value) {
+                    .hunks => .hunks,
+                    .whole_file => |whole| whole: {
+                        // A File side holds the same text whenever it is
+                        // loaded, so its identity changes only when it loads
+                        // or leaves.
+                        const blobs = try allocator.alloc(SearchCandidateKey.BlobIdentity, whole.blobs.len);
+                        for (whole.blobs, blobs) |blob, *identity| identity.* = .{
+                            .old = if (blob.old) |text| .of(text) else null,
+                            .new = if (blob.new) |text| .of(text) else null,
+                        };
+                        break :whole .{ .whole_file = .{ .selected_version = whole.selected_version, .blobs = blobs } };
+                    },
+                },
+                .emphasis_cache, .side_by_side_plans => comptime std.debug.assert(!@hasField(SearchCandidateKey, @tagName(field))),
             }
         }
-        return @enumFromInt(hasher.final());
+        return result;
     }
 };
 
@@ -1324,47 +1324,102 @@ pub const SearchCandidateScope = union(enum) {
     },
 };
 
-pub const SearchCandidateKey = enum(u64) { _ };
-
-fn hashIdentity(hasher: *std.hash.Wyhash, value: anytype) void {
-    switch (@typeInfo(@TypeOf(value))) {
-        .optional => if (value) |payload| {
-            hasher.update(&.{1});
-            hashIdentity(hasher, payload);
-        } else hasher.update(&.{0}),
-        else => {
-            std.hash.autoHash(hasher, @intFromPtr(value.ptr));
-            std.hash.autoHash(hasher, value.len);
+/// The inputs of one candidate build, compared exactly. The Diff, the
+/// Threads, the mention names, and the File blob sides are read-only data,
+/// so the key holds their identity. It holds a copy of every other input.
+pub const SearchCandidateKey = struct {
+    diff: Identity,
+    threads: Identity,
+    mention_names: usize,
+    session_epoch: u64,
+    layout: Layout,
+    scope: union(enum) {
+        hunks,
+        whole_file: struct {
+            selected_version: SelectedVersion,
+            blobs: []const BlobIdentity,
         },
+    },
+    only_file: ?usize,
+    drafts: []const Draft,
+    scope_projections: []const anchor_projection.ScopeProjectionEntry,
+
+    const Identity = struct {
+        address: usize,
+        len: usize,
+
+        fn of(slice: anytype) Identity {
+            return .{ .address = @intFromPtr(slice.ptr), .len = slice.len };
+        }
+    };
+
+    const BlobIdentity = struct { old: ?Identity, new: ?Identity };
+
+    pub fn eql(a: SearchCandidateKey, b: SearchCandidateKey) bool {
+        return eqlContent(a, b);
+    }
+
+    comptime {
+        // `SearchCandidateInputs.key` sets each field from the input of the
+        // same name, so a field with no input would stay undefined.
+        for (std.meta.fieldNames(SearchCandidateKey)) |name| std.debug.assert(@hasField(SearchCandidateInputs, name));
+    }
+};
+
+/// Replaces each slice behind `target` with a copy, so the value outlives the
+/// source of its slices.
+fn copyContent(allocator: std.mem.Allocator, target: anytype) std.mem.Allocator.Error!void {
+    const T = @TypeOf(target.*);
+    switch (@typeInfo(T)) {
+        .optional => if (target.*) |*payload| try copyContent(allocator, payload),
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => {
+                const copy = try allocator.dupe(pointer.child, target.*);
+                for (copy) |*item| try copyContent(allocator, item);
+                target.* = copy;
+            },
+            else => @compileError("copyContent cannot follow " ++ @typeName(T)),
+        },
+        .@"struct" => |info| inline for (info.fields) |field| try copyContent(allocator, &@field(target.*, field.name)),
+        .@"union" => switch (target.*) {
+            inline else => |*payload| try copyContent(allocator, payload),
+        },
+        .int, .bool, .@"enum", .error_set, .void => {},
+        else => @compileError("copyContent cannot copy " ++ @typeName(T)),
     }
 }
 
-/// Hashes the content behind slices, with the presence of each optional and
-/// the length of each slice, so that two different values never give the same
-/// byte stream.
-fn hashContent(hasher: *std.hash.Wyhash, value: anytype) void {
-    const T = @TypeOf(value);
+/// Compares the content behind slices, with the presence of each optional,
+/// the length of each slice, and the tag of each union.
+fn eqlContent(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
     switch (@typeInfo(T)) {
-        .optional => if (value) |payload| {
-            hasher.update(&.{1});
-            hashContent(hasher, payload);
-        } else hasher.update(&.{0}),
+        .optional => {
+            const left = a orelse return b == null;
+            const right = b orelse return false;
+            return eqlContent(left, right);
+        },
         .pointer => |pointer| switch (pointer.size) {
             .slice => {
-                std.hash.autoHash(hasher, value.len);
-                if (pointer.child == u8) hasher.update(value) else for (value) |item| hashContent(hasher, item);
+                if (pointer.child == u8) return std.mem.eql(u8, a, b);
+                if (a.len != b.len) return false;
+                for (a, b) |left, right| if (!eqlContent(left, right)) return false;
+                return true;
             },
-            .one => hashContent(hasher, value.*),
-            else => @compileError("hashContent cannot follow " ++ @typeName(T)),
+            else => @compileError("eqlContent cannot follow " ++ @typeName(T)),
         },
-        .@"struct" => |info| inline for (info.fields) |field| hashContent(hasher, @field(value, field.name)),
+        .@"struct" => |info| {
+            inline for (info.fields) |field| if (!eqlContent(@field(a, field.name), @field(b, field.name))) return false;
+            return true;
+        },
         .@"union" => {
-            std.hash.autoHash(hasher, std.meta.activeTag(value));
-            switch (value) {
-                inline else => |payload| hashContent(hasher, payload),
-            }
+            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+            return switch (a) {
+                inline else => |payload, tag| eqlContent(payload, @field(b, @tagName(tag))),
+            };
         },
-        else => std.hash.autoHash(hasher, value),
+        .int, .bool, .@"enum", .error_set, .void => return a == b,
+        else => @compileError("eqlContent cannot compare " ++ @typeName(T)),
     }
 }
 
@@ -5219,33 +5274,33 @@ test "the search candidate key changes with each input that the candidates read"
         .drafts = &drafts,
         .scope_projections = &.{},
     };
-    const key = base.key();
+    const key = try base.key(arena.allocator());
 
     var same = base;
     const copied = [_]Draft{ anchored, reply };
     same.drafts = &copied;
-    try testing.expectEqual(key, same.key());
+    try testing.expect(key.eql(try same.key(arena.allocator())));
 
     var changed = base;
     changed.session_epoch = 2;
-    try testing.expect(changed.key() != key);
+    try testing.expect(!key.eql(try changed.key(arena.allocator())));
 
     const reparented = [_]Draft{ anchored, .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 1 }, .body = "reply" } };
     changed = base;
     changed.drafts = &reparented;
-    try testing.expect(changed.key() != key);
+    try testing.expect(!key.eql(try changed.key(arena.allocator())));
 
     const submitting = [_]Draft{ anchored, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply", .state = .submitting } };
     changed = base;
     changed.drafts = &submitting;
-    try testing.expect(changed.key() != key);
+    try testing.expect(!key.eql(try changed.key(arena.allocator())));
 
     const evicted = [_]model.FileBlob{ .{}, .{} };
     changed = base;
     changed.scope = .{ .whole_file = .{ .selected_version = .new, .blobs = &evicted } };
-    try testing.expect(changed.key() != key);
+    try testing.expect(!key.eql(try changed.key(arena.allocator())));
 
     var hunks = base;
     hunks.scope = .hunks;
-    try testing.expect(hunks.key() != key);
+    try testing.expect(!key.eql(try hunks.key(arena.allocator())));
 }
