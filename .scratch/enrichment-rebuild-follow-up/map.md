@@ -21,8 +21,6 @@ The text of a moved ticket still uses the numbers of the cascade. The table maps
 | 10 | none | [10-accept-a-code-highlighting-result-only-for-the-same-source.md](issues/10-accept-a-code-highlighting-result-only-for-the-same-source.md) |
 | 11 | none | [11-check-that-a-file-blob-side-always-holds-the-same-text.md](issues/11-check-that-a-file-blob-side-always-holds-the-same-text.md) |
 | 12 | none | [12-reject-a-digest-that-stands-in-for-an-equality-check.md](issues/12-reject-a-digest-that-stands-in-for-an-equality-check.md) |
-| 13 | none | [13-finish-the-schema-migration-when-two-bbr-processes-start-on-a-new-store.md](issues/13-finish-the-schema-migration-when-two-bbr-processes-start-on-a-new-store.md) |
-| 14 | none | [14-find-why-a-real-pending-draft-store-is-at-version-10-without-posted-drafts.md](issues/14-find-why-a-real-pending-draft-store-is-at-version-10-without-posted-drafts.md) |
 | 15 | none | [15-reload-with-r-after-a-failed-session-load.md](issues/15-reload-with-r-after-a-failed-session-load.md) |
 
 The cascade tickets are in [the enrichment rebuild cascade](../enrichment-rebuild-cascade/issues/).
