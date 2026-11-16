@@ -6,7 +6,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// `source.each(sink)` calls `sink.add(key, value)` for every entry, in the
-/// same order on each call. `build` calls it twice. The first pass finds the
+/// same order and with the same keys on each call. `build` calls it twice,
+/// and fails when the number of calls differs. The first pass finds the
 /// keys and counts their entries, and the second pass places each value.
 /// A list keeps its entries in the order of the calls.
 pub fn KeyLists(comptime K: type, comptime V: type, comptime Context: type) type {
@@ -59,7 +60,8 @@ pub fn KeyLists(comptime K: type, comptime V: type, comptime Context: type) type
             return self.map.count();
         }
 
-        pub fn lists(self: *const Self) ListIterator {
+        /// The caller can reorder the entries of each list.
+        pub fn lists(self: *Self) ListIterator {
             return .{ .ranges = self.map.valueIterator(), .entries = self.entries };
         }
 

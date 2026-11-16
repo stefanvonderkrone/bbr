@@ -25879,6 +25879,7 @@ test "search projection lookups match the 6f9f09f baseline in both Layouts" {
         try testing.expectEqual(@as(usize, 0), projection.requiredDisclosures(occurrence).len);
     }
     try testing.expect(projection.navigation.find(.{ .owner = .{ .draft = .{ .id = 99, .source_offset = 0 } } }) == null);
+    try testing.expect(projection.navigation.find(.{ .owner = .{ .line = .{ .gap = .{ .file = &session.diff.files[0], .side = .new, .number = 1 } } } }) == null);
 }
 
 test "visual rows match the 9601be3 baseline at two widths in both Layouts" {
