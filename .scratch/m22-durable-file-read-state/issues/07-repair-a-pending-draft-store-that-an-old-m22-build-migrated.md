@@ -1,6 +1,7 @@
 # 07: Repair a pending Draft store that an old M22 build migrated
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: delegate session in /Volumes/Work/t3-code/m22-durable-file-read-state
 Blocked by: none
 
 ## Summary
