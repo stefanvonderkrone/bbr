@@ -101,7 +101,7 @@ Derived facts:
 - `low_samples=true` because S1 had no refetch sample. With no eviction, no refetch was possible.
 - `peak_rss_bytes` is 855,785,472 bytes, which is 816 MiB.
   The File cache explains at most 33.7 MiB of it.
-  [Ticket 05](05-explain-the-peak-rss-of-the-footprint-run.md) asks for a measurement.
+  [The peak RSS research ticket](../../peak-rss-of-a-large-review/issues/01-explain-the-peak-rss-of-the-footprint-run.md) asks for a measurement.
 
 Changed paths: this ticket and [the M28 spec](../SPEC.md).
 No code changed.

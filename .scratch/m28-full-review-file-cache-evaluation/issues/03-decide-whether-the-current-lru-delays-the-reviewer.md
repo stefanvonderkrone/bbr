@@ -47,7 +47,7 @@ If the outcome is `Delay`:
       Not needed, because the outcome is `No delay`.
 - [x] With `Delay`, the new tickets exist from 05, and ticket 04 lists them in `Blocked by:`.
       Not needed, because the outcome is `No delay`.
-      Ticket 05 is a research ticket about the peak RSS, not a comparison ticket.
+      Ticket 05 asked about the peak RSS and was not a comparison ticket. On 2026-11-16 it moved out of M28.
 - [x] `python3 tools/check_agent_docs.py` passes.
 
 ## Answer

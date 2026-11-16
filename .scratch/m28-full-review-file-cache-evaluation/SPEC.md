@@ -791,7 +791,7 @@ Every ticket of this spec that counts toward completion is resolved on 2026-11-0
 - [Ticket 02](issues/02-run-the-baseline-on-the-five-pullrequests.md) holds the footprint run on PullRequest A.
 - [Ticket 03](issues/03-decide-whether-the-current-lru-delays-the-reviewer.md) records the outcome `No delay` and the decision "no change".
 - [Ticket 04](issues/04-record-the-m28-decision-in-an-adr.md) wrote [ADR-0016](../../docs/adr/0016-file-cache-stays-a-session-only-lru.md).
-- [Ticket 05](issues/05-explain-the-peak-rss-of-the-footprint-run.md) is a research ticket about the peak RSS. It does not block this spec.
+- [The peak RSS research ticket](../peak-rss-of-a-large-review/issues/01-explain-the-peak-rss-of-the-footprint-run.md) asks about the peak RSS. It was ticket 05 and moved out of M28 on 2026-11-16. It does not block this spec.
 
 The footprint rule decides.
 A full Review of PullRequest A needs 35,373,616 bytes, which is 13% of the 256 MiB budget.

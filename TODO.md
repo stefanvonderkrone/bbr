@@ -356,7 +356,7 @@ the memory, storage, and invalidation cost of a replacement.
 - [x] Choose the smallest policy that removes measured user delay without unsafe or unbounded retention. The valid decision is a full-Review memory cache, an opt-in disk cache, a revised LRU, or no change. The decision is no change.
 - [x] Record the decision and evidence in an ADR. If the decision changes the cache, implement the policy behind `[files.cache]` and add deterministic eviction, invalidation, corruption, failure, and Session Epoch tests. ADR-0016 records no change, so no policy work follows.
 
-M28 verification: the operator replaced the full baseline with one S1 footprint run on 2026-11-02. A full Review of the largest PullRequest needs 13% of the 256 MiB budget, so the LRU never evicts a File of that Review. `.scratch/m28-full-review-file-cache-evaluation/` holds the evidence. Ticket 05 asks why the peak RSS was 816 MiB.
+M28 verification: the operator replaced the full baseline with one S1 footprint run on 2026-11-02. A full Review of the largest PullRequest needs 13% of the 256 MiB budget, so the LRU never evicts a File of that Review. `.scratch/m28-full-review-file-cache-evaluation/` holds the evidence. `.scratch/peak-rss-of-a-large-review/` asks why the peak RSS was 816 MiB. M28 does not depend on the answer.
 
 ## M29 - Comment Overview  ·  M  ·  needs M15/M21
 Add one place to inspect and navigate every authored item in the current Review with its scope

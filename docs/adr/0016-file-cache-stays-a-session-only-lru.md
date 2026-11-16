@@ -37,4 +37,4 @@ Then run the scenarios of the M28 spec that match the condition, and apply its d
 
 ## Consequences
 
-The peak RSS of the run was 816 MiB, and the File cache held at most 33.7 MiB. The File cache does not explain the peak. [Ticket 05](../../.scratch/m28-full-review-file-cache-evaluation/issues/05-explain-the-peak-rss-of-the-footprint-run.md) asks for a measurement that splits the RSS by owner. ADR-0010 stays unchanged, because the cache policy does not change.
+The peak RSS of the run was 816 MiB, and the File cache held at most 33.7 MiB. The File cache does not explain the peak. [A research ticket](../../.scratch/peak-rss-of-a-large-review/issues/01-explain-the-peak-rss-of-the-footprint-run.md) asks for a measurement that splits the RSS by owner. ADR-0010 stays unchanged, because the cache policy does not change.
