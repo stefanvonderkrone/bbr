@@ -234,6 +234,7 @@ The branch changes no production wheel code.
    The last row comes only when the pointer goes past the track, onto the border or further.
    The 30-row File Tree shows the same behavior. A longer thumb, as in the 80-row File Tree and in an isolated File, reaches the last row.
    Ticket [12](12-drag-a-one-cell-thumb-to-the-last-row.md) fixes this finding.
+   2026-11-16: Ticket 12 is resolved. `view.dragOffset` maps the pointer of every Scroll Drag through `view.thumbOffset`, the inverse of `view.thumb`. A drag to the last track cell of a one-cell DiffPane thumb at 30 rows on a large local Review now shows the last row.
 2. No input clears an accepted Buffer Search query.
    `/`, `Ctrl-U`, and `Enter` repeat the accepted query. `Esc` and a motion keep the highlights.
    The hit marks follow the highlights in every case, as the SPEC asks.
