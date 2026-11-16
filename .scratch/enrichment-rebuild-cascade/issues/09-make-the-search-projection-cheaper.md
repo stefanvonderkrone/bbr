@@ -1,6 +1,6 @@
 # 09: Make SearchProjection.create cheaper
 
-Status: needs-info
+Status: resolved
 Blocked by: 25
 
 ## Summary
@@ -100,7 +100,7 @@ Use the method of ticket 07 with `[DEBUG-09]` marks.
 - [x] Buffer Search results and the cursor restoration after a resize are the same as before the change.
 - [x] On the workload, the median of the projection phase of a Unified disclosure toggle and of a Unified resize is at least 20 percent lower than the baseline at `6f9f09f` of the same run.
 - [x] The median of the projection phase of a Layout switch to SideBySide is at least 20 percent lower than the baseline at `6f9f09f` of the same run.
-- [ ] The process CPU of 8 resizes is lower than the baseline by more than the range of the runs.
+- [ ] The process CPU of 8 resizes is lower than the baseline by more than the range of the runs. Waived on 2026-11-16: the median fell from 0.79 to 0.72 s, inside the run-to-run range. See the operator decision of that date.
 - [x] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
 - [x] No `[DEBUG-09]` or `[DEBUG-t07]` line stays in the repository.
 - [x] `zig build test` passes.
@@ -184,3 +184,18 @@ Checks on the numbers:
 **Review.** The two-axis review (standards and spec) found no wrong lookup. `027f456` fixes the dropped free count and adds the missing Line key check. Kept as they are: the release-build panic in `KeyLists` when a source changes its call count (an unchecked index would corrupt memory instead), the repeated `sink.add` pairs of the production and oracle sources, and the move of `body_rows` and the oracle to `KeyLists`, so no per-key list remains in the projection.
 
 **Open question.** Accept the result on the projection targets and the RSS, or run more alternating runs to settle the process CPU of 8 resizes?
+
+### 2026-11-16 operator decision
+
+The operator accepted the measured result and resolved this ticket with the process CPU criterion waived.
+The three projection targets are met.
+The median process CPU of 8 resizes fell by 0.07 s, which matches the expected saving of about 0.1 s but stays inside the run-to-run range of a busy machine.
+[Ticket 30](30-find-what-bounds-the-remaining-search-projection-cost.md) owns the remaining projection cost.
+
+## Completion
+
+- Change: `30afd1d` pins the projection lookups, `38445a9` keeps Line owners out of `NavigationIndex.owners`, `d9947f0` stores the key lists of `spans`, `source_rows`, and `body_rows` in one shared array through `KeyLists`, `65c44b6` adds the Line owner check and its AGENTS.md row, and `027f456` applies the review fixes.
+- Result: the projection phase is 30 percent lower for a Unified resize, 32 percent lower for a disclosure toggle, and 24 percent lower for a switch to SideBySide, against a fresh baseline at `6f9f09f`. The table in the comment of 2026-11-16 has the full numbers.
+- Checks: `zig build test` exits 0, `zig fmt --check src build.zig tests` passes, and every `tools/check_*.py` that `build.zig` runs passes.
+- Review: the two-axis code review found no wrong lookup. `027f456` fixes its findings.
+
