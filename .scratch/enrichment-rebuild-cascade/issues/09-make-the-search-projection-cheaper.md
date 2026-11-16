@@ -1,6 +1,7 @@
 # 09: Make SearchProjection.create cheaper
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade
 Blocked by: 25
 
 ## Summary
@@ -14,7 +15,27 @@ The `owners` map gets an entry for each visual row, also for each `.line` owner.
 No code reads a `.line` entry: `NavigationIndex.find` reads `owners` only when the owner is not `.line`, and every other `owners.get` caller asks for a ReviewCard header, a Draft header, or a disclosure.
 So most of the `owners` work has no reader.
 
-## Baseline at `60d7553`
+## Baseline at `6f9f09f`
+
+Ticket 25 already reserves the map capacity and gives each new key list room for one entry, so step 2 of [What to build](#what-to-build) is done.
+This baseline replaces the baseline at `60d7553` below.
+
+Method of ticket 25, ReleaseFast, `[DEBUG-09]` marks in a detached worktree. 3 runs, each with 8 resizes, 8 disclosure toggles, and 8 Layout switches. Thread CPU of the worker per rebuild, median [range], in ms. The 1-minute load average was 3.1 to 4.7 on the Apple M5 Pro with 18 cores.
+
+| Rebuild | n | Whole rebuild | Projection | Projection faults | Allocations in the projection |
+| --- | --- | --- | --- | --- | --- |
+| Resize, Unified | 24 | 91.7 [69.8, 101.5] | 40.7 [36.9, 48.0] | 6,051 | 382,339 |
+| Disclosure toggle, Unified | 24 | 88.1 [65.3, 96.4] | 38.8 [36.4, 43.3] | 6,001 | 382,265 |
+| Switch to Unified | 12 | 122.3 [106.0, 127.3] | 37.4 [36.2, 41.1] | 6,000 | 382,265 |
+| Switch to SideBySide | 12 | 135.2 [120.1, 237.8] | 50.1 [49.0, 61.4] | 9,768 | 394,249 |
+
+The allocations are the calls through the projection arena of `SearchProjection.createWithAllocator` before `indexDisclosures`. A SideBySide projection also has 12,362 failed remaps, which are growth copies of key lists.
+Process CPU (`ps -o time=`) for 8 resizes was 0.79, 0.80, and 0.82 s. For 8 toggles it was 0.79, 0.81, and 0.82 s, and for 8 Layout switches 1.16, 1.17, and 1.23 s. The RSS was 410 MB after the resizes and 512 MB after the Layout switches.
+
+## Old baseline at `60d7553`
+
+This baseline is obsolete. Ticket 25 changed the projection after it.
+
 
 The workload, method, and full table are in the triage comment of [ticket 07](07-build-the-search-candidates-without-a-second-buffer.md).
 
@@ -78,8 +99,9 @@ Use the method of ticket 07 with `[DEBUG-09]` marks.
 
 - [ ] A test builds the projection of Unified and SideBySide Buffers with wrapped Lines, context Lines on both sides, ReviewCards, Drafts, folds, and disclosures. For every source key, body owner, and visual row, `occurrenceRows`, `NavigationIndex.find`, the `owners` lookups of ReviewCard headers, Draft headers, and disclosures, `requiredDisclosures`, and `disclosure_rows` give the same result as the code before this change.
 - [ ] Buffer Search results and the cursor restoration after a resize are the same as before the change.
-- [ ] On the workload, the median of the projection phase of a Unified disclosure toggle is at least 30 percent lower than the baseline of the same run.
-- [ ] The projection phase of a Layout switch to SideBySide is at least 15 percent lower than the baseline of the same run.
+- [ ] On the workload, the median of the projection phase of a Unified disclosure toggle and of a Unified resize is at least 20 percent lower than the baseline at `6f9f09f` of the same run.
+- [ ] The median of the projection phase of a Layout switch to SideBySide is at least 20 percent lower than the baseline at `6f9f09f` of the same run.
+- [ ] The process CPU of 8 resizes is lower than the baseline by more than the range of the runs.
 - [ ] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
 - [ ] No `[DEBUG-09]` or `[DEBUG-t07]` line stays in the repository.
 - [ ] `zig build test` passes.
@@ -101,3 +123,10 @@ If step 3 does not reach the target, record the numbers and set the ticket to `n
 [Ticket 25](25-measure-the-page-faults-of-the-phases-after-the-visual-rows.md) sizes the `SearchProjection` indexes and gives each new key list room for one entry.
 That change covers step 1 of this ticket and part of step 3.
 After ticket 25 lands, this ticket takes a new baseline and keeps the flat entry layout, which removes the growth copies of SideBySide key lists that ticket 25 leaves.
+
+### 2026-11-16 new baseline and targets
+
+Ticket 25 is resolved. It made the projection about 25 percent cheaper in Unified with step 2 of What to build and part of step 3. The old targets compared against `60d7553` and counted that saving, so they no longer apply.
+The user approved this plan: take a fresh baseline at `6f9f09f`, do step 1 (no `.line` owners) and step 3 (key lists without one list per key) in separate commits, and measure each step against the fresh baseline in the same alternating run.
+The new targets are in the acceptance criteria: the projection phase at least 20 percent lower for a Unified toggle, a Unified resize, and a switch to SideBySide, and lower process CPU for 8 resizes by more than the run-to-run range.
+If step 3 misses its target, record the numbers and set this ticket to `needs-info`. Ticket 12 (projected search ranges) stays out of scope.
