@@ -33524,7 +33524,7 @@ fn m30DragOneCellThumbToLastCell(presentation: *Presentation, bar: frame_mod.Scr
     const track = start.track;
     const thumb = start.thumb().?;
     try testing.expectEqual(@as(u16, 1), thumb.len);
-    try testing.expect(start.total > @as(usize, track.height) * track.height);
+    try testing.expect(start.total >= @as(usize, track.height) * track.height + track.height);
     try m30Left(presentation, track.x, track.y + thumb.first, .press);
     try m30Left(presentation, track.x, track.y + track.height - 1, .drag);
     const end = m30Scroll(presentation, bar);
@@ -33553,6 +33553,42 @@ test "M30 scrollbar a drag of a one-cell thumb to the last track cell shows the 
         try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 7 } });
         try presentation.dispatch(.{ .action = .help });
         try m30DragOneCellThumbToLastCell(&presentation, .help);
+    }
+}
+
+/// Presses the last track cell of `bar` off the thumb and drags on that cell.
+fn m30PressAndDragOnLastCell(presentation: *Presentation, bar: frame_mod.ScrollBar) !void {
+    const start = m30Scroll(presentation, bar);
+    const track = start.track;
+    try testing.expect(start.thumb().?.first + start.thumb().?.len < track.height);
+    try m30Left(presentation, track.x, track.y + track.height - 1, .press);
+    try m30Left(presentation, track.x, track.y + track.height - 1, .drag);
+    try testing.expectEqual(start.total - track.height, m30Scroll(presentation, bar).offset);
+    try m30Left(presentation, track.x, track.y + track.height - 1, .release);
+}
+
+test "M30 scrollbar a press and a drag on the last track cell show the last row on every scroll bar" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    for ([_]u16{ 7, 9, 12, 20 }) |rows| {
+        for (m30_pane_bars) |bar| {
+            var presentation = try m30DragState(&store, true);
+            defer presentation.deinit();
+            try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = rows } });
+            try m30PressAndDragOnLastCell(&presentation, bar);
+        }
+        {
+            var presentation = try m30DragState(&store, true);
+            defer presentation.deinit();
+            try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = rows } });
+            try presentation.dispatch(.{ .action = .help });
+            try m30PressAndDragOnLastCell(&presentation, .help);
+        }
+    }
+    for ([_]u16{ 11, 14, 24 }) |rows| {
+        var presentation = try m30ReviewSearchState(&store, .{ .cols = 100, .rows = rows }, false);
+        defer presentation.deinit();
+        try m30PressAndDragOnLastCell(&presentation, .review_search_list);
     }
 }
 
