@@ -1,6 +1,7 @@
 # 26: Check the Selected Version availability without a scan of all rows
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade (poteto-mode run 2026-11-16)
 Blocked by: none
 
 ## Summary
