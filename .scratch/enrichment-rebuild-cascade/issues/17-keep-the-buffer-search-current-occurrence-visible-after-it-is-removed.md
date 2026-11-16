@@ -162,7 +162,7 @@ With the sketch, `zig build test --summary all` passed: 52/52 steps and 1646/164
 
 ## Overlap with ticket 15
 
-[Ticket 15](15-carry-the-search-destination-in-the-build-kind.md) asks whether `DisclosureBuild.Kind` should carry its destination.
+[Ticket 15](../../enrichment-rebuild-follow-up/issues/05-carry-the-search-destination-in-the-build-kind.md) asks whether `DisclosureBuild.Kind` should carry its destination.
 This fix does not need ticket 15.
 Step 2 adds `job.destination_active != null` to the test that tells a traversal move from other kinds, so that test now reads three fields.
 A Kind with a traversal arm that carries its occurrence would replace all three.
@@ -210,7 +210,7 @@ Each caller of the nearest rule and its rule:
 The fix renames the nearest functions to `nearestSearchIndex` and `nearestProjectedSearchIndex`.
 `tools/check_search_index.py` rejects a nearest call in a function that its `NEAREST` table does not list with a reason.
 It fails on the old `acceptViewBuild` line of `7e1930b` under the new name, and on that whole file with the names replaced.
-A type that pairs an index with its batch would be a higher level, but it overlaps [ticket 15](15-carry-the-search-destination-in-the-build-kind.md), so this ticket does not build it.
+A type that pairs an index with its batch would be a higher level, but it overlaps [ticket 15](../../enrichment-rebuild-follow-up/issues/05-carry-the-search-destination-in-the-build-kind.md), so this ticket does not build it.
 `AGENTS.md` has a new rules row.
 
 ### Checks

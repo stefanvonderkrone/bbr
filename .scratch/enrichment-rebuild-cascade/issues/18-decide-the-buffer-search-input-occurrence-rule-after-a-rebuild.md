@@ -130,7 +130,7 @@ With the sketch, `zig build test --summary all` passed with exit 0: 54/54 steps 
 
 ## Overlap with ticket 15
 
-[Ticket 15](15-carry-the-search-destination-in-the-build-kind.md) asks for a type that pairs an occurrence with its batch, or a Kind that carries its destination.
+[Ticket 15](../../enrichment-rebuild-follow-up/issues/05-carry-the-search-destination-in-the-build-kind.md) asks for a type that pairs an occurrence with its batch, or a Kind that carries its destination.
 This fix does not need ticket 15.
 After this fix, every rebuild of a Buffer Search index uses a `same…` rule, and only a user move and a list selection use the nearest rule.
 A type that pairs an index with its batch would make that choice part of the mapping, and the `NEAREST` table could go away.

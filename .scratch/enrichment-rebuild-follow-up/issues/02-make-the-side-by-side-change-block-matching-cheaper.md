@@ -1,15 +1,15 @@
-# 08: Make the SideBySide change block matching cheaper
+# 02: Make the SideBySide change block matching cheaper
 
 Status: ready-for-agent
 Blocked by: none
 
 ## Summary
 
-This is win 3 of [ticket 05](05-make-a-buffer-rebuild-faster.md).
+This is win 3 of [ticket 05](../../enrichment-rebuild-cascade/issues/05-make-a-buffer-rebuild-faster.md).
 A SideBySide Buffer build matches the removed and added Lines of each change block in `emitSideBySideChangeBlock` in `src/tui/buffer.zig`, which the compiler inlines into `Weave.emitSideBySideHunk`.
 For each pair of a removed and an added Line, it calls `intraline.matchingSimilarity`, which tokenizes both Lines again and fills a byte-weighted common subsequence table (`commonTable`).
 Then it calls `intraline.diff` for each matched pair.
-A SideBySide rebuild runs this twice, once for the Buffer and once for the search candidates of [ticket 07](07-build-the-search-candidates-without-a-second-buffer.md).
+A SideBySide rebuild runs this twice, once for the Buffer and once for the search candidates of [ticket 07](../../enrichment-rebuild-cascade/issues/07-build-the-search-candidates-without-a-second-buffer.md).
 
 The match uses a similarity only when it is at least `emphasis_threshold` (0.5).
 The similarity is `2 * common / (old.len + new.len)`, and the common bytes can never be more than the bytes of the tokens that both Lines contain.
@@ -82,7 +82,7 @@ In `synthetic.replacementBlock`, a removed and an added Line with different numb
 ### 2026-11-13 triage
 
 The runner asked for a triage of tickets 07, 08, and 09 together, and set this ticket to `ready-for-agent`.
-The measurement, the load, and the full phase table are in the triage comment of [ticket 07](07-build-the-search-candidates-without-a-second-buffer.md).
+The measurement, the load, and the full phase table are in the triage comment of [ticket 07](../../enrichment-rebuild-cascade/issues/07-build-the-search-candidates-without-a-second-buffer.md).
 
 The first version of this ticket asked for a cache in the Session or a cheaper match. The profile shows that the cost is the table of pairs that the threshold rejects, and the page mapping of the arenas. Both go away without state, so this version chooses the stateless steps.
 The prototype measured only the bound. Steps 1 and 3 have no prototype. The profile of the prototype supports them: `mmap` and `munmap` are 17 percent and the slow bound is 12.9 percent of its samples.
@@ -91,7 +91,7 @@ The prototype measured only the bound. Steps 1 and 3 have no prototype. The prof
 
 ### 2026-11-13 note from ticket 13
 
-[Ticket 13](13-find-why-a-switch-to-side-by-side-costs-three-times-more.md) measured the rejected direction of this ticket.
+[Ticket 13](../../enrichment-rebuild-cascade/issues/13-find-why-a-switch-to-side-by-side-costs-three-times-more.md) measured the rejected direction of this ticket.
 The plans of the change blocks, kept in the Session and built in `Session.prepareEmphasis` next to `EmphasisCache`, need no hand-back from the worker, because the Session load builds them before the Session is published.
 The prototype cut a switch to SideBySide from 331.5 ms to 144.7 ms and a SideBySide resize from 332.6 ms to 139.9 ms, against about 85 ms for the bound of this ticket.
 It costs about 100 ms of CPU once per Session load.
@@ -99,9 +99,16 @@ If the plan store of ticket 13 is built, this ticket only makes that one-time bu
 
 ### 2026-11-14 note from ticket 14
 
-[Ticket 14](14-keep-the-side-by-side-change-block-plans-after-first-use.md) keeps the change block plans in the Session after the first SideBySide build.
+[Ticket 14](../../enrichment-rebuild-cascade/issues/14-keep-the-side-by-side-change-block-plans-after-first-use.md) keeps the change block plans in the Session after the first SideBySide build.
 A later SideBySide rebuild, such as a second switch or a resize, runs no matching.
 The plans also cover the blocks above `side_by_side_work_limit`.
 The matching now runs once for each Session, in `SideBySidePlans.build`, on the first SideBySide build. On the workload of ticket 05, that build costs 108 to 112 ms of worker CPU, inside a first switch of 221 ms.
 A SideBySide build of one isolated File keeps no plans, so it still matches the blocks of that File once per rebuild.
 So the target of this ticket applies only to the one-time plan build and to isolated-File SideBySide builds. The re-triage must set a new target for these two cases.
+
+### 2026-11-16 moved for a later PullRequest
+
+The operator moved this ticket out of the enrichment rebuild cascade, where it was ticket 08, so that a later PullRequest owns it.
+Ticket numbers in the text above are the numbers of the enrichment rebuild cascade. [The map](../map.md) lists the new numbers.
+Take a new baseline at the head of the branch that starts this work.
+

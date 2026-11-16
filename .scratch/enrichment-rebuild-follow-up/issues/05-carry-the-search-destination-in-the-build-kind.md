@@ -1,4 +1,4 @@
-# 15: Carry the search destination in the build kind
+# 05: Carry the search destination in the build kind
 
 Status: needs-triage
 Blocked by: none
@@ -6,9 +6,9 @@ Blocked by: none
 ## Summary
 
 A cheap search selection change started expensive work three times on this branch.
-[Ticket 03](03-move-the-review-search-selection-without-a-full-projection.md) stopped a full projection of every occurrence for each Review Search selection move.
-[Ticket 04](04-keep-a-buffer-rebuild-after-a-review-search-selection-move.md) removed the Review Search selection from `DisclosureBuild`.
-[Ticket 06](06-keep-a-buffer-rebuild-after-a-buffer-search-active-move.md) removed the Buffer Search current occurrence from `DisclosureBuild`.
+[Ticket 03](../../enrichment-rebuild-cascade/issues/03-move-the-review-search-selection-without-a-full-projection.md) stopped a full projection of every occurrence for each Review Search selection move.
+[Ticket 04](../../enrichment-rebuild-cascade/issues/04-keep-a-buffer-rebuild-after-a-review-search-selection-move.md) removed the Review Search selection from `DisclosureBuild`.
+[Ticket 06](../../enrichment-rebuild-cascade/issues/06-keep-a-buffer-rebuild-after-a-buffer-search-active-move.md) removed the Buffer Search current occurrence from `DisclosureBuild`.
 
 After ticket 06, a build keeps an occurrence only in two optional fields.
 `destination_occurrence` serves a `.review_destination` build.
@@ -34,9 +34,16 @@ One rule for both would remove the flag marking of Review Search ranges.
 
 ### 2026-11-14, from ticket 16
 
-[Ticket 16](16-keep-a-buffer-search-move-into-hidden-text-after-a-rebuild.md) found that `retryAcceptedDisclosure` reused `destination_active` against a newer accepted batch.
+[Ticket 16](../../enrichment-rebuild-cascade/issues/16-keep-a-buffer-search-move-into-hidden-text-after-a-rebuild.md) found that `retryAcceptedDisclosure` reused `destination_active` against a newer accepted batch.
 The fix maps it with `retainedSearchIndex` and tells a traversal move from other kinds by `job.restore_navigation == null`.
 A Kind that carries the destination as the occurrence identity, or as an index together with its batch, would make an unmapped read of another batch impossible.
 It would also replace the `restore_navigation == null` test.
 A survey of the branch found six places that map a stored occurrence index into a new batch correctly, and only this retry did not.
 So the mistake does not count as a repeated class yet, and ticket 16 adds no check for it.
+
+### 2026-11-16 moved for a later PullRequest
+
+The operator moved this ticket out of the enrichment rebuild cascade, where it was ticket 15, so that a later PullRequest owns it.
+Ticket numbers in the text above are the numbers of the enrichment rebuild cascade. [The map](../map.md) lists the new numbers.
+Take a new baseline at the head of the branch that starts this work.
+

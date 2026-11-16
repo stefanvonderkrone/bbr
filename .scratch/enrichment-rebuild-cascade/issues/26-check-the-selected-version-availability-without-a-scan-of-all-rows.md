@@ -149,5 +149,5 @@ The two-axis review (standards and spec) found no wrong behavior and no placehol
 
 ### Follow-up
 
-- [Ticket 28](28-ask-the-buffer-about-one-file-in-the-worker-searches.md): the worker searches that remain in the baseline.
-- [Ticket 29](29-compute-the-action-availability-once-for-each-event.md): the 5 or 6 availability calls for each event, which matter only with a large Selection now.
+- [Ticket 28](../../enrichment-rebuild-follow-up/issues/08-ask-the-buffer-about-one-file-in-the-worker-searches.md): the worker searches that remain in the baseline.
+- [Ticket 29](../../enrichment-rebuild-follow-up/issues/09-compute-the-action-availability-once-for-each-event.md): the 5 or 6 availability calls for each event, which matter only with a large Selection now.

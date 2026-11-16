@@ -22,7 +22,7 @@ The SideBySide rebuild now costs about 213 ms more than the Unified rebuild.
 
 The known parts of the gap:
 
-- The SideBySide change block matching is about 55 % of a SideBySide switch, according to the triage of [ticket 08](08-make-the-side-by-side-change-block-matching-cheaper.md).
+- The SideBySide change block matching is about 55 % of a SideBySide switch, according to the triage of [ticket 08](../../enrichment-rebuild-follow-up/issues/02-make-the-side-by-side-change-block-matching-cheaper.md).
 - A SideBySide rebuild runs the matching twice: once for the Buffer and once for the search candidate Buffer of [ticket 07](07-build-the-search-candidates-without-a-second-buffer.md).
 
 Nobody measured the rest of the gap at the current commit.
@@ -164,7 +164,7 @@ The 108 indexed blocks run `intraline.diff` for each index pair in both builds. 
 
 #### What tickets 07 and 08 remove
 
-- [Ticket 08](08-make-the-side-by-side-change-block-matching-cheaper.md): its bound prototype at `60d7553` cut a switch to SideBySide by 84.6 ms, 42 ms in each Buffer build. That is about 40 % of the gap (measured at an earlier commit with the same phase sizes). That prototype also held two steps of ticket 09, which did not lower the SideBySide projection phase. Its steps 1 and 3 have no prototype. The `mmap` share above says that step 3 can save up to about 28 ms per rebuild (guess). Without a cache, ticket 08 keeps the matching on every SideBySide rebuild.
+- [Ticket 08](../../enrichment-rebuild-follow-up/issues/02-make-the-side-by-side-change-block-matching-cheaper.md): its bound prototype at `60d7553` cut a switch to SideBySide by 84.6 ms, 42 ms in each Buffer build. That is about 40 % of the gap (measured at an earlier commit with the same phase sizes). That prototype also held two steps of ticket 09, which did not lower the SideBySide projection phase. Its steps 1 and 3 have no prototype. The `mmap` share above says that step 3 can save up to about 28 ms per rebuild (guess). Without a cache, ticket 08 keeps the matching on every SideBySide rebuild.
 - [Ticket 07](07-build-the-search-candidates-without-a-second-buffer.md): a switch changes its key, so it saves nothing on a switch. On a SideBySide resize it saves the candidates and corpus phases: about 127 ms at `34f6045`, or about 36 ms after the plan cache (measured phases of the two binaries; the reuse itself has no prototype).
 
 #### Ranked changes

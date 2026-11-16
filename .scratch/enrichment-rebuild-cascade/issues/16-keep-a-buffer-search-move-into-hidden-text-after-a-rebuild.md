@@ -132,7 +132,7 @@ The throwaway test failed before the sketch and passed after it, and `zig build 
 
 ### Overlap with ticket 15
 
-[Ticket 15](15-carry-the-search-destination-in-the-build-kind.md) asks whether `DisclosureBuild.Kind` should carry its destination.
+[Ticket 15](../../enrichment-rebuild-follow-up/issues/05-carry-the-search-destination-in-the-build-kind.md) asks whether `DisclosureBuild.Kind` should carry its destination.
 This fix does not need ticket 15.
 But a Kind that carries the target occurrence, and that separates a traversal move from the `.restore` of a cancel, would replace the `restore_navigation == null` test of step 2.
 If ticket 15 lands first, step 2 uses that Kind instead.

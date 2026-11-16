@@ -27,7 +27,7 @@ The triage measured the workload and method of ticket 05 with `[DEBUG-t07]` mark
 
 The candidates and corpus phases are 29 percent of a Unified resize and 39 percent of a SideBySide switch.
 A `sample` profile of Unified resizes puts 85 percent of the candidates samples in the second `buildWithComments`, and 54 percent in `memcpy` from the growth and the copy of its row array.
-In SideBySide, 90 percent of the candidates samples are the change block matching of [ticket 08](08-make-the-side-by-side-change-block-matching-cheaper.md).
+In SideBySide, 90 percent of the candidates samples are the change block matching of [ticket 08](../../enrichment-rebuild-follow-up/issues/02-make-the-side-by-side-change-block-matching-cheaper.md).
 
 Two prototypes that are not part of this ticket make the second build cheaper but do not remove it:
 
@@ -220,4 +220,4 @@ Open judgment calls: the two `searchCandidateInputs` builders read different own
 ### Follow-up tickets
 
 - [21](21-find-why-the-visual-rows-cost-more-without-a-candidate-build.md): find why the visual rows cost more without a candidate build.
-- [22](22-find-each-card-search-owner-without-a-scan-of-all-candidates.md): find each card search owner without a scan of all candidates.
+- [22](../../enrichment-rebuild-follow-up/issues/06-find-each-card-search-owner-without-a-scan-of-all-candidates.md): find each card search owner without a scan of all candidates.

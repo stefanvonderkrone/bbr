@@ -197,5 +197,5 @@ The Spec review confirmed that the skipped `markActiveSearchRanges` call is corr
 It noted one older gap: a queued `.accepted` build stops without a retry when an earlier admission replaced the accepted batch.
 Each admitted rebuild replaces the batch, so the gap can occur more often now.
 In the live runs every press reached its match, so the runs did not show it.
-[Ticket 15](15-carry-the-search-destination-in-the-build-kind.md) asks whether the build kind should carry its destination.
+[Ticket 15](../../enrichment-rebuild-follow-up/issues/05-carry-the-search-destination-in-the-build-kind.md) asks whether the build kind should carry its destination.
 

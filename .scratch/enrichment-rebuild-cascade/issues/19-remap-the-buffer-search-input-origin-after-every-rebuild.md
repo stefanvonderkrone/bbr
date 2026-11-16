@@ -146,7 +146,7 @@ With the sketch, the 4 reproducing tests passed, and `zig build test --summary a
 
 ## Overlap with ticket 15
 
-[Ticket 15](15-carry-the-search-destination-in-the-build-kind.md) asks for a `DisclosureBuild.Kind` that carries its destination.
+[Ticket 15](../../enrichment-rebuild-follow-up/issues/05-carry-the-search-destination-in-the-build-kind.md) asks for a `DisclosureBuild.Kind` that carries its destination.
 This fix does not need ticket 15.
 Ticket 16 uses `restore_navigation == null` to tell a traversal move from the other `.accepted` and `.restore` builds. This fix keeps that meaning.
 If ticket 15 lands, the `.restore` and `.clear_input` payloads can carry the `NavigationAnchor`, and the null test goes away.

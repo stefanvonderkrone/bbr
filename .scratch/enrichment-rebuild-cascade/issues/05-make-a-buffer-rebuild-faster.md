@@ -258,16 +258,16 @@ The Unicode case shows that the grapheme loop did not get slower.
 A benchmark measured a proxy of the app path, so the cost that dominates a rebuild showed in no benchmark.
 `visual_rows_wide_50000`, `visual_rows_narrow_50000`, and `file_tree_tallies_2000` passed `CellMetrics.bytes` (`13c58b5`), `comment_anchors_*` took the `.bytes` default of `BuildOptions`, and `cell_width_ascii_1m` kept its own copy of the vaxis adapter (`f3ed2b3`).
 The architecture fix gives the adapter one owner that the benchmarks import.
-The type-level fix needs the `.bytes` defaults gone, which touches every test that builds a Buffer or a Presentation, so [ticket 10](10-require-the-cell-metrics-of-every-buffer-build.md) holds it.
+The type-level fix needs the `.bytes` defaults gone, which touches every test that builds a Buffer or a Presentation, so [ticket 10](../../enrichment-rebuild-follow-up/issues/03-require-the-cell-metrics-of-every-buffer-build.md) holds it.
 Until then, `tools/check_benchmark_metrics.py` rejects `.bytes` in the benchmark sources and names `tui.terminal_cell_metrics`. It fails on lines 83 and 116 of `src/benchmark/p1_actions.zig` at `a1d029a`.
 The second candidate class, a fast path that drifts from its slow path, has no past occurrence in the history, so it adds no rule. The wrap test covers this fast path.
 
 ### Child tickets
 
 - [07](07-build-the-search-candidates-without-a-second-buffer.md): build the search candidates without a second Buffer.
-- [08](08-make-the-side-by-side-change-block-matching-cheaper.md): make the SideBySide change block matching cheaper.
+- [08](../../enrichment-rebuild-follow-up/issues/02-make-the-side-by-side-change-block-matching-cheaper.md): make the SideBySide change block matching cheaper.
 - [09](09-make-the-search-projection-cheaper.md): make `SearchProjection.create` cheaper.
-- [10](10-require-the-cell-metrics-of-every-buffer-build.md): require the cell metrics of every Buffer build.
+- [10](../../enrichment-rebuild-follow-up/issues/03-require-the-cell-metrics-of-every-buffer-build.md): require the cell metrics of every Buffer build.
 
 ### Checks
 

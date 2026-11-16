@@ -190,7 +190,7 @@ Checks on the numbers:
 The operator accepted the measured result and resolved this ticket with the process CPU criterion waived.
 The three projection targets are met.
 The median process CPU of 8 resizes fell by 0.07 s, which matches the expected saving of about 0.1 s but stays inside the run-to-run range of a busy machine.
-[Ticket 01 of the search projection cost follow-up](../../search-projection-cost/issues/01-find-what-bounds-the-remaining-search-projection-cost.md) owns the remaining projection cost.
+[Ticket 01 of the enrichment rebuild follow-up](../../enrichment-rebuild-follow-up/issues/01-find-what-bounds-the-remaining-search-projection-cost.md) owns the remaining projection cost.
 
 ## Completion
 

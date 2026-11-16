@@ -132,7 +132,7 @@ Two classes have more than one real case.
 The fix for the Buffer build is in its structure: the result allocator owns the rows from the start, and the build reserves them once.
 The test "a Buffer build without ReviewCards builds its rows in the result storage" passes a failing allocator as scratch storage. With the scratch row list of `ea10317` it fails with `OutOfMemory` at `rows.append(opts.scratch_allocator, ...)`.
 A line check does not work for the class. The past growth came through a parameter default, so no `page_allocator` text was on the append line. A ban on `dupe` would also reject deliberate copies, such as the Span copy of the highlighter that lowers retained memory.
-`AGENTS.md` has a row for the rule and its tests. [Ticket 12](12-grow-the-search-projection-ranges-without-copies.md) holds the search projection cases, which nobody has measured.
+`AGENTS.md` has a row for the rule and its tests. [Ticket 12](../../enrichment-rebuild-follow-up/issues/04-grow-the-search-projection-ranges-without-copies.md) holds the search projection cases, which nobody has measured.
 
 ### Checks
 

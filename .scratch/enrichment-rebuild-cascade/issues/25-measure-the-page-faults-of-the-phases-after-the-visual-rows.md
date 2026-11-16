@@ -157,7 +157,7 @@ Alternate the baseline and the change, at least 3 runs per side. Record the proc
 
 **Profile.** One `sample` run during 8 resizes with the cursor on the File header row put 275 samples in `Presentation.actionAvailability` on the Presentation thread. Its `yankRefusal` calls `selectedVersionUnavailableForFile`, which scans every Buffer row with a binary search for each row when the cursor is on no source Line. `Presentation.projection` runs it about five times for each event. With the cursor on a Diff Line, the process CPU of 8 resizes fell from 1.20 to 1.28 s to 0.93 to 0.97 s. This cost is outside the rebuild and outside this ticket. It needs its own ticket.
 
-**Overlap.** [Ticket 09](09-make-the-search-projection-cheaper.md) owns the same phase. Steps 1 to 3 of this ticket are its step 1 and part of its step 3. Ticket 09 should be blocked by this ticket and take a new baseline after it: its step 2 (no `.line` owners) and the flat entry layout of its step 3 remain, and they also remove the SideBySide growths above. Do not merge the two: this ticket is small, measured, and lands the reservation of ticket 21. [Ticket 12](12-grow-the-search-projection-ranges-without-copies.md) is the projected ranges of an active search. The workload has no search, so this triage measured nothing of it, and it stays separate.
+**Overlap.** [Ticket 09](09-make-the-search-projection-cheaper.md) owns the same phase. Steps 1 to 3 of this ticket are its step 1 and part of its step 3. Ticket 09 should be blocked by this ticket and take a new baseline after it: its step 2 (no `.line` owners) and the flat entry layout of its step 3 remain, and they also remove the SideBySide growths above. Do not merge the two: this ticket is small, measured, and lands the reservation of ticket 21. [Ticket 12](../../enrichment-rebuild-follow-up/issues/04-grow-the-search-projection-ranges-without-copies.md) is the projected ranges of an active search. The workload has no search, so this triage measured nothing of it, and it stays separate.
 
 **Decision.** `ready-for-agent`. The faults are not inherent. About 45 percent of the bytes of the projection are capacity with no data in it, and the fresh mapping of each rebuild makes every page fault. The sizing removes the empty capacity. The retained arena would remove the rest of the faults, but its memory cost is larger than its saving now.
 
@@ -216,4 +216,4 @@ The two-axis review (standards and spec) found no wrong behavior. Commit `0f7835
 
 ### Follow-up
 
-[Ticket 27](27-find-the-other-rebuild-lists-that-grow-from-empty.md) lists the other rebuild lists and maps that grow from empty, for triage.
+[Ticket 27](../../enrichment-rebuild-follow-up/issues/07-find-the-other-rebuild-lists-that-grow-from-empty.md) lists the other rebuild lists and maps that grow from empty, for triage.

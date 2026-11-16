@@ -39,7 +39,7 @@ A user who never opens SideBySide must not pay the plan build, which costs about
 
 ## Follow-up
 
-Re-triage [ticket 08](08-make-the-side-by-side-change-block-matching-cheaper.md) after this ticket. Its target then applies only to the one-time plan build.
+Re-triage [ticket 08](../../enrichment-rebuild-follow-up/issues/02-make-the-side-by-side-change-block-matching-cheaper.md) after this ticket. Its target then applies only to the one-time plan build.
 
 ## Comments
 
@@ -113,4 +113,4 @@ These points stay open:
 - The terms "change block" and "plan" are not in `src/tui/GLOSSARY.md`.
 - An isolated-File SideBySide build keeps no plans, as described above.
 
-[Ticket 08](08-make-the-side-by-side-change-block-matching-cheaper.md) has a dated note: its target now applies only to the one-time plan build and to isolated-File SideBySide builds.
+[Ticket 08](../../enrichment-rebuild-follow-up/issues/02-make-the-side-by-side-change-block-matching-cheaper.md) has a dated note: its target now applies only to the one-time plan build and to isolated-File SideBySide builds.

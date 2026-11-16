@@ -1,4 +1,4 @@
-# 10: Require the cell metrics of every Buffer build
+# 03: Require the cell metrics of every Buffer build
 
 Status: ready-for-agent
 Blocked by: none
@@ -8,7 +8,7 @@ Blocked by: none
 `CellMetrics.bytes` counts one cell per byte. The app measures each grapheme through vaxis with `terminal_cell_metrics` in `src/tui/terminal_cell_metrics.zig`.
 A benchmark that measures with `CellMetrics.bytes` misses the vaxis cost.
 
-[Ticket 05](05-make-a-buffer-rebuild-faster.md) found three cases of this mistake in `src/benchmark/`.
+[Ticket 05](../../enrichment-rebuild-cascade/issues/05-make-a-buffer-rebuild-faster.md) found three cases of this mistake in `src/benchmark/`.
 It added `tools/check_benchmark_metrics.py`, which rejects `.bytes` in `src/benchmark/` and `src/benchmark_buffer_search.zig`.
 The check cannot see two other forms of the mistake:
 
@@ -87,3 +87,10 @@ A test-only `CellMetrics.bytes` makes the mistake a compile error in every built
 A test-only default was the cheaper design, but a Zig 0.16 experiment shows that such a default fails every executable build. So the defaults must go.
 A shared test helper does not reduce the edits, because each literal must change anyway.
 The edit count is large, about 590 call sites in about 15 files, but each edit is mechanical, so a codemod does the work.
+
+### 2026-11-16 moved for a later PullRequest
+
+The operator moved this ticket out of the enrichment rebuild cascade, where it was ticket 10, so that a later PullRequest owns it.
+Ticket numbers in the text above are the numbers of the enrichment rebuild cascade. [The map](../map.md) lists the new numbers.
+Take a new baseline at the head of the branch that starts this work.
+
