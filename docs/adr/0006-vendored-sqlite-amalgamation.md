@@ -29,4 +29,6 @@ only file that does `@cImport("sqlite3.h")`.
 - The amalgamation is compiled `SQLITE_THREADSAFE=0`: the store is touched only on the main
   thread (design §10/§11), never from a load worker. Revisit this flag if that ever changes.
 - Schema versioning uses SQLite's built-in `PRAGMA user_version`; migrations are a forward
-  switch in `SqliteStore.migrate`. The Bitbucket token is never written to the database (§12).
+  switch in `SqliteStore.migrate`. ADR 0018 replaces this: each migration step has a name that
+  the store records, and `user_version` stops at 11. The Bitbucket token is never written to the
+  database (§12).
