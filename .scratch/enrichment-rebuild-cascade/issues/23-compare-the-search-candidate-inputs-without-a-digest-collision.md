@@ -1,6 +1,7 @@
 # 23: Compare the search candidate inputs without a digest collision
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade (t23-24 runner)
 Blocked by: 24
 
 ## Summary

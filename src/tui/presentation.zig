@@ -2104,6 +2104,60 @@ pub const BufferSearchCorpus = struct {
     }
 };
 
+test "M21 kernel a Buffer Search corpus is reused only for equal inputs, also when a 64-bit digest of them collides" {
+    // In Zig 0.16.0 Wyhash, a 48-byte block whose words 0, 2, and 4 equal the
+    // secrets 1, 2, and 3 zeroes the whole state, so every earlier byte is lost.
+    const block = comptime block: {
+        var bytes: [48]u8 = @splat('w');
+        for ([_]u64{ 0xe7037ed1a0b428db, 0x8ebc6af09c88c6e3, 0x589965cc75374cc3 }, 0..) |word, index| {
+            std.mem.writeInt(u64, bytes[16 * index ..][0..8], word, .little);
+        }
+        break :block bytes;
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (0..block.len) |offset| {
+        const padding = try a.alloc(u8, offset);
+        @memset(padding, 'x');
+        const stale = try std.mem.concat(a, u8, &.{ "stale", padding, &block, " tail" });
+        const fresh = try std.mem.concat(a, u8, &.{ "fresh", padding, &block, " tail" });
+        const stale_drafts = [_]bbr.review.Draft{.{ .local_id = 1, .kind = .comment, .scope = .review, .body = stale }};
+        const fresh_drafts = [_]bbr.review.Draft{.{ .local_id = 1, .kind = .comment, .scope = .review, .body = fresh }};
+        const equal_drafts = [_]bbr.review.Draft{.{ .local_id = 1, .kind = .comment, .scope = .review, .body = try a.dupe(u8, stale) }};
+        var inputs: buffer_mod.SearchCandidateInputs = .{
+            .diff = .{ .files = &.{} },
+            .threads = &.{},
+            .mention_names = &.empty,
+            .session_epoch = 1,
+            .layout = .unified,
+            .scope = .hunks,
+            .only_file = null,
+            .drafts = &stale_drafts,
+            .scope_projections = &.{},
+        };
+        const previous = try BufferSearchCorpus.reuseOrBuild(null, a, inputs);
+        defer previous.release();
+        inputs.drafts = &equal_drafts;
+        const equal = try BufferSearchCorpus.reuseOrBuild(previous, a, inputs);
+        defer equal.release();
+        try testing.expectEqual(previous, equal);
+        inputs.drafts = &fresh_drafts;
+        const corpus = try BufferSearchCorpus.reuseOrBuild(previous, a, inputs);
+        defer corpus.release();
+        var stale_text = false;
+        var fresh_text = false;
+        for (corpus.candidates) |candidate| {
+            stale_text = stale_text or std.mem.indexOf(u8, candidate.text, "stale") != null;
+            fresh_text = fresh_text or std.mem.indexOf(u8, candidate.text, "fresh") != null;
+        }
+        if (stale_text or !fresh_text) {
+            std.debug.print("offset {d} reused the corpus of other inputs\n", .{offset});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 /// One allocation travels with the projected Batch. Prefix maxima and suffix
 /// minima preserve Batch order even when visual rows are not monotonic.
 const SearchNavigationRow = struct {
