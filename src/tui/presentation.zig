@@ -33519,6 +33519,45 @@ test "M30 scrollbar a Scroll Drag follows the pointer outside the track and past
     }
 }
 
+/// Drags the one-cell thumb of `bar` from its cell to the last track cell,
+/// where one cell holds more rows than the track has cells.
+fn m30DragOneCellThumbToLastCell(presentation: *Presentation, bar: frame_mod.ScrollBar) !void {
+    const start = m30Scroll(presentation, bar);
+    const track = start.track;
+    const thumb = start.thumb().?;
+    try testing.expectEqual(@as(u16, 1), thumb.len);
+    try testing.expect(start.total > @as(usize, track.height) * track.height);
+    try m30Left(presentation, track.x, track.y + thumb.first, .press);
+    try m30Left(presentation, track.x, track.y + track.height - 1, .drag);
+    const end = m30Scroll(presentation, bar);
+    try testing.expectEqual(start.total - track.height, end.offset);
+    try testing.expectEqual(track.height - 1, end.thumb().?.first);
+    try m30Left(presentation, track.x, track.y + track.height - 1, .release);
+}
+
+test "M30 scrollbar a drag of a one-cell thumb to the last track cell shows the last row on every scroll bar" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    for (m30_pane_bars) |bar| {
+        var presentation = try m30DragState(&store, true);
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 7 } });
+        try m30DragOneCellThumbToLastCell(&presentation, bar);
+    }
+    {
+        var presentation = try m30ReviewSearchState(&store, .{ .cols = 100, .rows = 11 }, false);
+        defer presentation.deinit();
+        try m30DragOneCellThumbToLastCell(&presentation, .review_search_list);
+    }
+    {
+        var presentation = try m30DragState(&store, true);
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 7 } });
+        try presentation.dispatch(.{ .action = .help });
+        try m30DragOneCellThumbToLastCell(&presentation, .help);
+    }
+}
+
 test "M30 scrollbar key input and a Session replacement end a Scroll Drag" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
