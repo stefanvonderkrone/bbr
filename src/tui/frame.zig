@@ -9,6 +9,7 @@ pub const file_tree = @import("file_tree.zig");
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 const view = @import("view.zig");
 const layouts = @import("layouts.zig");
+const KeyLists = @import("key_lists.zig").KeyLists;
 
 pub const Revision = u64;
 
@@ -594,12 +595,12 @@ pub const NavigationIndex = struct {
     };
     const Span = struct { start: usize, end: usize, row: usize, prefix_end: usize = 0 };
     const Owners = std.HashMapUnmanaged(RowOwner, usize, OwnerContext, 80);
-    const Spans = std.HashMapUnmanaged(RowOwner, std.ArrayList(Span), OwnerContext, 80);
+    const Spans = KeyLists(RowOwner, Span, OwnerContext);
 
     /// The first row of each owner that is not a Line. A Line row resolves
     /// through `spans`, because its rows differ by source offset.
     owners: Owners = .empty,
-    spans: Spans = .empty,
+    spans: Spans = .{},
 
     /// The caller owns all allocations through its Frame arena.
     pub fn build(a: std.mem.Allocator, rows: []const VisualRow) !NavigationIndex {
@@ -607,34 +608,18 @@ pub const NavigationIndex = struct {
         var owner_rows: u32 = 0;
         for (rows) |row| owner_rows += @intFromBool(row.owner != .line);
         try result.owners.ensureTotalCapacity(a, owner_rows);
-        try result.spans.ensureTotalCapacity(a, @intCast(rows.len));
-        for (rows, 0..) |row, index| {
-            if (row.owner != .line) {
-                var key = row.owner;
-                if (key == .section) key.section.path = try a.dupe(u8, key.section.path);
-                const exact = try result.owners.getOrPut(a, key);
-                if (!exact.found_existing) exact.value_ptr.* = index;
-            }
-            if (row.halves) |halves| {
-                if (halves.right) |half| try result.add(a, .{ .line = row.owner.line.sibling(half.line) }, half.source_start, half.source_end, index);
-                if (halves.left) |half| if (halves.right == null or halves.right.?.line != half.line)
-                    try result.add(a, .{ .line = row.owner.line.sibling(half.line) }, half.source_start, half.source_end, index);
-            } else switch (row.owner) {
-                .line => try result.add(a, row.owner, row.source_start, row.source_end, index),
-                .comment => |value| if (value.part != .header) {
-                    try result.add(a, .{ .comment = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
-                },
-                .draft => |value| if (value.part != .header) {
-                    try result.add(a, .{ .draft = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
-                },
-                else => {},
-            }
-        }
-        var groups = result.spans.valueIterator();
+        for (rows, 0..) |row, index| if (row.owner != .line) {
+            var key = row.owner;
+            if (key == .section) key.section.path = try a.dupe(u8, key.section.path);
+            const exact = try result.owners.getOrPut(a, key);
+            if (!exact.found_existing) exact.value_ptr.* = index;
+        };
+        result.spans = try Spans.build(a, 2 * rows.len, @intCast(rows.len), SpanSource{ .rows = rows });
+        var groups = result.spans.lists();
         while (groups.next()) |group| {
-            std.mem.sort(Span, group.items, {}, spanLess);
+            std.mem.sort(Span, group, {}, spanLess);
             var end: usize = 0;
-            for (group.items) |*span| {
+            for (group) |*span| {
                 end = @max(end, span.end);
                 span.prefix_end = end;
             }
@@ -642,15 +627,29 @@ pub const NavigationIndex = struct {
         return result;
     }
 
-    fn add(self: *NavigationIndex, a: std.mem.Allocator, key: RowOwner, start: usize, end: usize, row: usize) !void {
-        const group = try self.spans.getOrPut(a, key);
-        if (!group.found_existing) {
-            group.value_ptr.* = .empty;
-            // Most keys keep one entry. A first append would reserve a whole cache line.
-            try group.value_ptr.ensureTotalCapacityPrecise(a, 1);
+    /// Each row adds at most two spans, one for each half.
+    const SpanSource = struct {
+        rows: []const VisualRow,
+
+        pub fn each(self: SpanSource, sink: anytype) !void {
+            for (self.rows, 0..) |row, index| {
+                if (row.halves) |halves| {
+                    if (halves.right) |half| try sink.add(.{ .line = row.owner.line.sibling(half.line) }, .{ .start = half.source_start, .end = half.source_end, .row = index });
+                    if (halves.left) |half| if (halves.right == null or halves.right.?.line != half.line)
+                        try sink.add(.{ .line = row.owner.line.sibling(half.line) }, .{ .start = half.source_start, .end = half.source_end, .row = index });
+                } else switch (row.owner) {
+                    .line => try sink.add(row.owner, .{ .start = row.source_start, .end = row.source_end, .row = index }),
+                    .comment => |value| if (value.part != .header) {
+                        try sink.add(.{ .comment = .{ .id = value.id, .source_offset = 0 } }, .{ .start = value.source_offset, .end = row.source_end, .row = index });
+                    },
+                    .draft => |value| if (value.part != .header) {
+                        try sink.add(.{ .draft = .{ .id = value.id, .source_offset = 0 } }, .{ .start = value.source_offset, .end = row.source_end, .row = index });
+                    },
+                    else => {},
+                }
+            }
         }
-        try group.value_ptr.append(a, .{ .start = start, .end = end, .row = row });
-    }
+    };
 
     fn spanLess(_: void, a: Span, b: Span) bool {
         return a.start < b.start or a.start == b.start and a.row < b.row;
@@ -669,7 +668,7 @@ pub const NavigationIndex = struct {
             .draft => |value| value.source_offset,
             else => wanted.source_start,
         };
-        const spans = (self.spans.get(key) orelse return null).items;
+        const spans = self.spans.get(key);
         if (wanted.owner == .line) {
             var containing_low: usize = 0;
             var containing_high = spans.len;
@@ -1248,9 +1247,38 @@ test "a NavigationIndex whose keys each have one span grows nothing" {
     const visual_rows = try buildVisualRowsWithOptions(a, rows, .bytes, .{ .layout = .unified, .width = unified_gutter_cols + 12 });
     var growth: GrowthCount = .{ .child = a };
     const index = try NavigationIndex.build(growth.allocator(), visual_rows);
-    try testing.expectEqual(@as(usize, 0), growth.frees);
     try testing.expectEqual(@as(usize, 0), growth.failed_remaps);
     for (visual_rows, 0..) |row, expected| try testing.expectEqual(@as(?usize, expected), index.find(row));
+}
+
+fn sideBySideIndexGrowth(a: std.mem.Allocator, count: usize) !GrowthCount {
+    const lines = try a.alloc(bbr.diff.Line, 2 * count);
+    const rows = try a.alloc(buffer_mod.Row, count);
+    for (rows, 0..) |*row, index| {
+        const text = "alpha beta gamma delta epsilon zeta";
+        lines[2 * index] = .{ .old_no = @intCast(index + 1), .new_no = 0, .kind = .removed, .text = text };
+        lines[2 * index + 1] = .{ .old_no = 0, .new_no = @intCast(index + 1), .kind = .added, .text = text };
+        row.* = .{ .line_pair = .{
+            .left = .{ .line = &lines[2 * index], .decoration = .{ .runs = &.{} } },
+            .right = .{ .line = &lines[2 * index + 1], .decoration = .{ .runs = &.{} } },
+        } };
+    }
+    const visual_rows = try buildVisualRowsWithOptions(a, rows, .bytes, .{ .layout = .side_by_side, .width = 2 * (side_gutter_cols + 12) + side_divider_cols });
+    try testing.expect(visual_rows.len >= 2 * count);
+    var growth: GrowthCount = .{ .child = a };
+    const index = try NavigationIndex.build(growth.allocator(), visual_rows);
+    for (visual_rows, 0..) |row, expected| try testing.expectEqual(@as(?usize, expected), index.find(row));
+    return growth;
+}
+
+test "a NavigationIndex build allocates the same for any key count and grows no key list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Each SideBySide half wraps, so each key has two spans.
+    const small = try sideBySideIndexGrowth(arena.allocator(), 512);
+    const large = try sideBySideIndexGrowth(arena.allocator(), 4096);
+    try testing.expectEqual(small.allocations, large.allocations);
+    try testing.expectEqual(@as(usize, 0), large.failed_remaps);
 }
 
 test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {

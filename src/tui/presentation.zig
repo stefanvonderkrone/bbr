@@ -16,6 +16,7 @@ const list_overlay_mod = @import("list_overlay.zig");
 const ListOverlay = list_overlay_mod.ListOverlay;
 const ThemeId = @import("theme_id.zig").ThemeId;
 const frame_mod = @import("frame.zig");
+const KeyLists = @import("key_lists.zig").KeyLists;
 const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
 const search = @import("search.zig");
@@ -2140,11 +2141,40 @@ const SearchProjection = struct {
         reference_ranges: []const ReferenceRange = &.{},
     };
     const ReferenceRange = struct { use: review_card.SourceRange, definition: review_card.SourceRange };
+    const BodyRows = KeyLists(search.ReviewBodyOwner, usize, std.hash_map.AutoContext(search.ReviewBodyOwner));
+
+    /// Each row adds at most two source rows, one for each side.
+    const SourceRowSource = struct {
+        rows: []const Row,
+
+        pub fn each(self: SourceRowSource, sink: anytype) !void {
+            for (self.rows, 0..) |row, index| {
+                const file_index = row.file_index orelse continue;
+                if (row.left) |half| if (half.old_line) |number| try sink.add(.{ .file_index = file_index, .line = number, .side = .old }, index);
+                if (row.right) |half| if (half.new_line) |number| try sink.add(.{ .file_index = file_index, .line = number, .side = .new }, index);
+                if (row.single) |half| {
+                    if (half.old_line) |number| try sink.add(.{ .file_index = file_index, .line = number, .side = .old }, index);
+                    if (half.new_line) |number| try sink.add(.{ .file_index = file_index, .line = number, .side = .new }, index);
+                }
+            }
+        }
+    };
+
+    const BodyRowSource = struct {
+        rows: []const Row,
+
+        pub fn each(self: BodyRowSource, sink: anytype) !void {
+            for (self.rows, 0..) |row, index| if (row.owner) |owner| try sink.add(switch (owner) {
+                .comment => |id| .{ .comment = id },
+                .draft => |id| .{ .draft = id },
+            }, index);
+        }
+    };
 
     arena: std.heap.ArenaAllocator,
     rows: []const Row,
-    source_rows: std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)) = .empty,
-    body_rows: std.AutoHashMapUnmanaged(search.ReviewBodyOwner, std.ArrayList(usize)) = .empty,
+    source_rows: SourceRows = .{},
+    body_rows: BodyRows = .{},
     source_disclosures: std.AutoHashMapUnmanaged(SourceRowKey, buffer_mod.DisclosureKey) = .empty,
     body_disclosures: std.AutoHashMapUnmanaged(search.ReviewBodyOwner, SearchDisclosureSet) = .empty,
     disclosure_rows: std.AutoHashMapUnmanaged(buffer_mod.DisclosureKey, usize) = .empty,
@@ -2219,33 +2249,17 @@ const SearchProjection = struct {
             };
         }
         snapshot.deletion_rows = deletion_rows;
-        try snapshot.source_rows.ensureTotalCapacity(a, @intCast(visual_rows.len));
-        for (rows, visual_rows, 0..) |row, visual, index| {
+        snapshot.source_rows = try SourceRows.build(a, 2 * rows.len, @intCast(rows.len), SourceRowSource{ .rows = rows });
+        var body_owners = context.drafts.len;
+        for (context.session.threads) |thread| body_owners += 1 + thread.replies.len;
+        snapshot.body_rows = try BodyRows.build(a, rows.len, @intCast(body_owners), BodyRowSource{ .rows = rows });
+        for (visual_rows, 0..) |visual, index| {
             if (visual.owner == .disclosure) switch (buffer.rows[visual.buffer_index]) {
                 .comment => |card| if (card.part == .header) {
                     try snapshot.navigation.owners.put(a, cardHeaderOwner(.{ .comment = card.owner.comment }), index);
                 },
                 else => {},
             };
-            if (row.file_index) |file_index| {
-                if (row.left) |half| if (half.old_line) |number| try addSourceRow(a, &snapshot.source_rows, .{ .file_index = file_index, .line = number, .side = .old }, index);
-                if (row.right) |half| if (half.new_line) |number| try addSourceRow(a, &snapshot.source_rows, .{ .file_index = file_index, .line = number, .side = .new }, index);
-                if (row.single) |half| {
-                    if (half.old_line) |number| try addSourceRow(a, &snapshot.source_rows, .{ .file_index = file_index, .line = number, .side = .old }, index);
-                    if (half.new_line) |number| try addSourceRow(a, &snapshot.source_rows, .{ .file_index = file_index, .line = number, .side = .new }, index);
-                }
-            }
-            if (row.owner) |owner| {
-                const entry = try snapshot.body_rows.getOrPut(a, switch (owner) {
-                    .comment => |id| .{ .comment = id },
-                    .draft => |id| .{ .draft = id },
-                });
-                if (!entry.found_existing) {
-                    entry.value_ptr.* = .empty;
-                    try entry.value_ptr.ensureTotalCapacityPrecise(a, 1);
-                }
-                try entry.value_ptr.append(a, index);
-            }
             if (buffer_mod.disclosureKey(buffer.rows[visual.buffer_index])) |key| {
                 const entry = try snapshot.disclosure_rows.getOrPut(a, key);
                 if (!entry.found_existing) entry.value_ptr.* = index;
@@ -2344,11 +2358,10 @@ const SearchProjection = struct {
     }
 
     fn occurrenceRows(self: *const SearchProjection, occurrence: search.Occurrence) []const usize {
-        const rows = switch (occurrence.location) {
+        return switch (occurrence.location) {
             .source => |source| self.source_rows.get(sourceRowKey(source) orelse return &.{}),
             .review_body => |body| self.body_rows.get(body.owner),
         };
-        return if (rows) |value| value.items else &.{};
     }
 
     fn visibleRow(self: *const SearchProjection, occurrence: search.Occurrence) ?usize {
@@ -5249,6 +5262,27 @@ const Published = struct {
         return merged;
     }
 
+    const OracleSourceRows = struct {
+        buffer: buffer_mod.Buffer,
+        visual_rows: []const frame_mod.VisualRow,
+
+        pub fn each(self: OracleSourceRows, sink: anytype) !void {
+            for (self.visual_rows, 0..) |visual, visual_index| {
+                const file_index = self.buffer.fileIndexForRow(visual.buffer_index) orelse continue;
+                if (visual.halves) |halves| {
+                    if (halves.left) |half| if (half.line.oldNo()) |line| try sink.add(.{ .file_index = file_index, .line = line, .side = .old }, visual_index);
+                    if (halves.right) |half| if (half.line.newNo()) |line| try sink.add(.{ .file_index = file_index, .line = line, .side = .new }, visual_index);
+                } else switch (visual.owner) {
+                    .line => |line| {
+                        if (line.oldNo()) |number| try sink.add(.{ .file_index = file_index, .line = number, .side = .old }, visual_index);
+                        if (line.newNo()) |number| try sink.add(.{ .file_index = file_index, .line = number, .side = .new }, visual_index);
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+
     fn projectBufferSearchRangesFor(
         allocator: Allocator,
         buffer: buffer_mod.Buffer,
@@ -5259,33 +5293,15 @@ const Published = struct {
         if (!builtin.is_test) @compileError(full_projection_is_a_test_oracle);
         var projected: std.ArrayList(frame_mod.ProjectedSourceRange) = .empty;
         errdefer projected.deinit(allocator);
-        var source_rows: std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)) = .empty;
-        defer {
-            var values = source_rows.valueIterator();
-            while (values.next()) |rows| rows.deinit(allocator);
-            source_rows.deinit(allocator);
-        }
-        for (visual_rows, 0..) |visual, visual_index| {
-            const file_index = buffer.fileIndexForRow(visual.buffer_index) orelse continue;
-            if (visual.halves) |halves| {
-                if (halves.left) |half| if (half.line.oldNo()) |line| try addSourceRow(allocator, &source_rows, .{ .file_index = file_index, .line = line, .side = .old }, visual_index);
-                if (halves.right) |half| if (half.line.newNo()) |line| try addSourceRow(allocator, &source_rows, .{ .file_index = file_index, .line = line, .side = .new }, visual_index);
-            } else switch (visual.owner) {
-                .line => |line| {
-                    if (line.oldNo()) |number| try addSourceRow(allocator, &source_rows, .{ .file_index = file_index, .line = number, .side = .old }, visual_index);
-                    if (line.newNo()) |number| try addSourceRow(allocator, &source_rows, .{ .file_index = file_index, .line = number, .side = .new }, visual_index);
-                },
-                else => {},
-            }
-        }
+        var source_rows = try SourceRows.build(allocator, 2 * visual_rows.len, @intCast(visual_rows.len), OracleSourceRows{ .buffer = buffer, .visual_rows = visual_rows });
+        defer source_rows.deinit(allocator);
         for (batch.occurrences, 0..) |occurrence, occurrence_index| {
             const before = projected.items.len;
             switch (occurrence.location) {
                 .source => |source| {
                     const number = if (source.relation == .new) source.new_line else source.old_line;
                     const key: SourceRowKey = .{ .file_index = source.file_index, .line = number orelse continue, .side = if (source.relation == .new) .new else .old };
-                    const rows = source_rows.get(key) orelse continue;
-                    for (rows.items) |visual_index| {
+                    for (source_rows.get(key)) |visual_index| {
                         const visual = visual_rows[visual_index];
                         if (visual.halves) |halves| {
                             if (halves.left) |half| if ((source.relation == .old or source.relation == .neutral) and sourceLineMatches(half.line, source, .old))
@@ -14091,6 +14107,8 @@ fn anchorOpposesSelected(anchor: bbr.review.Anchor, selected: SelectedVersion) b
     return (anchor.to != null) != (selected == .new);
 }
 
+const SourceRows = KeyLists(SourceRowKey, usize, std.hash_map.AutoContext(SourceRowKey));
+
 const SourceRowKey = struct {
     file_index: usize,
     line: u32,
@@ -14103,16 +14121,6 @@ fn sourceRowKey(source: search.SourceLocation) ?SourceRowKey {
         .line = (if (source.relation == .new) source.new_line else source.old_line) orelse return null,
         .side = if (source.relation == .new) .new else .old,
     };
-}
-
-fn addSourceRow(allocator: Allocator, index: *std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)), key: SourceRowKey, row: usize) !void {
-    const entry = try index.getOrPut(allocator, key);
-    if (!entry.found_existing) {
-        entry.value_ptr.* = .empty;
-        // Most keys keep one entry. A first append would reserve a whole cache line.
-        try entry.value_ptr.ensureTotalCapacityPrecise(allocator, 1);
-    }
-    try entry.value_ptr.append(allocator, row);
 }
 
 fn cardReferenceMatches(card: review_card.ReviewCardRow, occurrence: search.Occurrence) bool {
@@ -14999,8 +15007,8 @@ fn reviewLocationExactRow(published: *const Published, location: ReviewLocation)
     switch (location.target) {
         .file => return frame_mod.visualIndexForBufferIndex(published.visual_rows, fileHeaderRow(published.buffer, reviewLocationFile(published.session.diff.files, location) orelse return null) orelse return null),
         .source => |target| {
-            const rows = published.search_projection.source_rows.get(reviewLocationSourceKey(published, location) orelse return null) orelse return null;
-            for (rows.items) |index| {
+            const rows = published.search_projection.source_rows.get(reviewLocationSourceKey(published, location) orelse return null);
+            for (rows) |index| {
                 const visual = published.visual_rows[index];
                 const start, const end = if (visual.halves) |halves| blk: {
                     const half = if (target.side == .old) halves.left.? else halves.right.?;
@@ -15008,7 +15016,7 @@ fn reviewLocationExactRow(published: *const Published, location: ReviewLocation)
                 } else .{ visual.source_start, visual.source_end };
                 if (target.source_offset >= start and (target.source_offset < end or start == end)) return index;
             }
-            return if (rows.items.len > 0) rows.items[rows.items.len - 1] else null;
+            return if (rows.len > 0) rows[rows.len - 1] else null;
         },
         .card => |target| {
             if (target.owner == .comment and target.part == .header) {
@@ -25938,23 +25946,6 @@ test "a SideBySide replacement grows beyond the source key capacity hint without
     const session = try testDisclosureSession(testing.allocator, 1);
     defer session.destroy();
     try testing.checkAllAllocationFailures(testing.allocator, exerciseSourceRowCapacityHint, .{session});
-}
-
-fn exerciseSourceRowListAllocationFailure(allocator: Allocator) !void {
-    var index: std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)) = .empty;
-    defer {
-        var lists = index.valueIterator();
-        while (lists.next()) |list| list.deinit(allocator);
-        index.deinit(allocator);
-    }
-    const key: SourceRowKey = .{ .file_index = 0, .line = 1, .side = .new };
-    try addSourceRow(allocator, &index, key, 3);
-    try addSourceRow(allocator, &index, key, 4);
-    try testing.expectEqualSlices(usize, &.{ 3, 4 }, index.get(key).?.items);
-}
-
-test "source row lists grow and release every failed allocation outside an arena" {
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseSourceRowListAllocationFailure, .{});
 }
 
 fn exerciseSearchIndexAllocationFailure(allocator: Allocator, published: *const Published) !void {
