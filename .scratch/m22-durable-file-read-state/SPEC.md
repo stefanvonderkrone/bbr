@@ -70,7 +70,8 @@ A failed receipt load shows every File unread and shows a warning.
 30. As a reviewer, I want an abandoned Candidate Session to change nothing on disk, so that a failed load is harmless.
 31. As a maintainer, I want the fingerprint to be a pure function of the parsed File, so that fixtures prove its behavior.
 32. As a maintainer, I want a narrow `FileReadStore` seam with an in-memory fake, so that Presentation tests need no SQLite.
-33. As a maintainer, I want a forward `PRAGMA user_version` migration, so that existing databases upgrade in place.
+33. As a maintainer, I want a forward migration of named steps, so that existing databases upgrade in place.
+34. As a maintainer, I want each store to record the name of each step that it applied, so that two branches that add a step at the same version never skip a step on a real store.
 
 ## Glossary changes
 
@@ -272,15 +273,18 @@ Tests that do not set it see every File unread and no warning.
 
 ### SQLite schema
 
-`SqliteStore.migrate` adds version 11 in one transaction:
+Each migration step in `SqliteStore.migrations` is a `Step` with a stable name and its SQL ([ADR-0018](../../docs/adr/0018-a-schema-migration-step-has-a-name-that-the-store-records.md)).
+The store records the name of each applied step in one table:
 
 ```sql
-CREATE TABLE IF NOT EXISTS posted_drafts (
-  workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
-  temp_id INTEGER NOT NULL, comment_id INTEGER NOT NULL,
-  PRIMARY KEY (workspace, repository, pr_id, temp_id)
-) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS file_read_receipts (
+CREATE TABLE schema_steps (name TEXT PRIMARY KEY) WITHOUT ROWID;
+```
+
+`SqliteStore.migrate` applies each step whose name is not recorded, in array order, each in its own `BEGIN IMMEDIATE` transaction.
+M22 adds the step `file_read_receipts`, the eleventh step:
+
+```sql
+CREATE TABLE file_read_receipts (
   review_kind   INTEGER NOT NULL,
   workspace     TEXT NOT NULL,
   repository    TEXT NOT NULL,
@@ -293,13 +297,16 @@ CREATE TABLE IF NOT EXISTS file_read_receipts (
   PRIMARY KEY (review_kind, workspace, repository, pr_id,
                repository_id, base_ref, source_ref, path)
 ) WITHOUT ROWID;
-PRAGMA user_version = 11;
 ```
 
-Version 10 on `main` creates `posted_drafts`.
+The first eleven steps also set `PRAGMA user_version`, which stops at 11.
+bbr builds without named steps read only that version.
+
+Version 10 has two meanings.
+On `main`, version 10 has `posted_drafts`.
 M22 builds before the merge `768977a8` set version 10 with `file_read_receipts` and without `posted_drafts`.
-So version 11 creates each of the two tables only when it is missing.
-A store of either shape reaches version 11 with every Draft and receipt.
+So each step transaction first records the names that a store without them already applied: steps 1 to `min(user_version, 9)`, `posted_drafts` when that table exists, and `file_read_receipts` when that table exists.
+A store of either shape then applies only the step that it lacks, and keeps every Draft and receipt.
 
 `review_kind` is `0` for a RemoteReview and `1` for a LocalReview.
 A RemoteReview row stores its Workspace, Repository, and PullRequestId, with `0` and empty text in the local columns.
@@ -324,7 +331,7 @@ M22 adds no new path and no new XDG read.
 | `src/git/client.zig` | Add `--full-index` to `ShellGitClient.diff`. |
 | `src/review/file_read.zig` (new) | `FileReviewFingerprint`, `fingerprint`, `FileReadReceipt`, `FileReadStore`, and `InMemoryFileReadStore`. |
 | `src/root.zig` | Export the new `bbr.review` names. |
-| `src/persist/sqlite_store.zig` | Migration to version 11 and `SqliteStore.fileReadStore()`. |
+| `src/persist/sqlite_store.zig` | Named migration steps in `schema_steps`, the `file_read_receipts` step, and `SqliteStore.fileReadStore()`. |
 | `src/tui/presentation.zig` | `Dependencies.file_reads`, `Published.file_reads`, receipt load in `Published.createInputs`, `Published.toggleFileRead`, and three `ActionError` values. |
 | `src/tui/file_tree.zig` | `Entry.unread`, File and Directory read state in `build`. |
 | `src/tui/render.zig` | Row weight in `drawFileTree`. |
@@ -422,6 +429,12 @@ Store round trips, against both stores:
 - A version 10 database migrates to version 11 and keeps its Drafts.
 - A version 10 database that an old M22 build migrated, with `file_read_receipts` and without `posted_drafts`, migrates to version 11 and keeps its Drafts and receipts.
 - A version 11 database reopens without a second migration.
+- A store from before named steps at each version 0 to 11 opens with every name recorded, `user_version` 11, and its Draft.
+- A store that one branch build migrated with its own step, opened by a build that puts another branch's step first, applies the missing step and keeps both names and every Draft.
+- Two connections that migrate the same store from before named steps both succeed, and each name is recorded once.
+- A store with every name recorded opens while another connection holds the write lock.
+- A step after step 11 leaves `user_version` at 11.
+- A repeated or empty step name fails to compile.
 
 Presentation:
 
