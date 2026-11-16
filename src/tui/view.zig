@@ -326,14 +326,25 @@ pub fn thumb(extent: u16, total: usize, offset: usize) ?Thumb {
 }
 
 /// The scroll offset whose thumb starts at `cell`, the inverse of `thumb`.
-/// The first cell gives the first offset. From the cell where the thumb of
-/// the last offset starts, it is the last offset, because that cell can hold
-/// rows above the last offset. Requires total > extent > 0.
+/// Cell 0 gives offset 0, also when the thumb of the last offset starts
+/// there. Every other cell from the cell where the thumb of the last offset
+/// starts gives the last offset, because that cell can hold rows above the
+/// last offset. Requires total > extent > 0.
 pub fn thumbOffset(extent: u16, total: usize, cell: u16) usize {
     if (cell == 0) return 0;
     const last = total - extent;
     if (cell >= trackCell(extent, total, last)) return last;
     return cellFirstRow(extent, total, cell);
+}
+
+/// The scroll offset of a Scroll Drag with the pointer on track cell
+/// `pointer`, signed and unbounded, and the thumb grabbed `grab` cells below
+/// its first cell. The last track cell and below give the last offset,
+/// because the thumb of the last offset can be shorter than the grabbed
+/// thumb. Requires total > extent > 0.
+pub fn dragOffset(extent: u16, total: usize, pointer: i32, grab: u16) usize {
+    if (pointer >= extent - 1) return total - extent;
+    return thumbOffset(extent, total, @intCast(@max(pointer - grab, 0)));
 }
 
 /// Visit `node` and then each descendant, in tree order, with its placed
@@ -797,6 +808,14 @@ test "M30 scrollbar thumbOffset puts the thumb on its cell and the last cell on 
         }
     }
     try testing.expectEqual(@as(usize, 25), thumbOffset(5, 30, 4));
+}
+
+test "M30 scrollbar dragOffset gives the last offset on the last track cell whatever the grab" {
+    try testing.expectEqual(@as(usize, 93), dragOffset(7, 100, 6, 1));
+    try testing.expectEqual(@as(usize, 93), dragOffset(7, 100, 400, 0));
+    try testing.expectEqual(@as(usize, 72), dragOffset(7, 100, 5, 0));
+    try testing.expectEqual(@as(usize, 0), dragOffset(7, 100, 1, 2));
+    try testing.expectEqual(@as(usize, 0), dragOffset(7, 100, -3, 0));
 }
 
 test "M30 scrollbar the thumb covers the visible row that the old formula missed" {
