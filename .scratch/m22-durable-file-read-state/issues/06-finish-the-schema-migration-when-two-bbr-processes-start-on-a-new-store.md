@@ -67,6 +67,20 @@ The busy timeout of 2000 ms makes a second process wait for the lock.
 The fork test passes under `zig build` only when it prints nothing to stderr.
 The triage did not commit it.
 
+### 2026-11-16 committed cross-process test
+
+`c5f1717b` adds `tests/store_migration_race_cli_test.py`, which `zig build test-cli` runs.
+It starts four `bbr local` processes at once on a new `pending.db`, in ten rounds with a new store each.
+It expects that every process opens the store and that the store ends at the version that one bbr reaches alone.
+
+| Build | Runs | Result |
+| --- | --- | --- |
+| `main` at `3b290393`, Debug | 5 | 5 fail. 19 to 23 of 40 opens fail, and some stores stay at version 1 or 6. |
+| M22 with `migrateStep` unlocked (no `BEGIN IMMEDIATE`, no second version read, no busy timeout) | 3 | 3 fail. 19 to 23 of 40 opens fail. |
+| M22 at `c5f1717b` | 5 | 5 pass. No open fails. |
+
+In 100 rounds, the Debug build of `main` had a failed open in 99 and 100 rounds of two runs. The M22 build had none in 400 opens.
+
 ## Completion
 
 - Fix: `a4456464` runs each migration step in `BEGIN IMMEDIATE`, reads `user_version` again inside the lock, and sets a busy timeout of 2000 ms before it migrates.
