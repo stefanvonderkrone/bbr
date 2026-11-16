@@ -625,6 +625,16 @@ pub const Buffer = struct {
     }
 
     pub fn fileHeaderRow(self: Buffer, file_index: usize) ?usize {
+        return (self.fileRow(file_index) orelse return null).first_row;
+    }
+
+    /// The status placeholder rows of File `file_index`.
+    pub fn statusPlaceholders(self: Buffer, file_index: usize) []const Row {
+        const range = (self.fileRow(file_index) orelse return &.{}).status_placeholders;
+        return self.rows[range.start..range.end];
+    }
+
+    fn fileRow(self: Buffer, file_index: usize) ?FileRow {
         var low: usize = 0;
         var high = self.file_rows.len;
         while (low < high) {
@@ -635,7 +645,7 @@ pub const Buffer = struct {
             } else if (candidate.file_index > file_index) {
                 high = middle;
             } else {
-                return candidate.first_row;
+                return candidate;
             }
         }
         return null;
@@ -877,6 +887,9 @@ pub const FileTally = struct { comments: usize = 0, drafts: usize = 0 };
 pub const FileRow = struct {
     file_index: usize,
     first_row: usize,
+    /// The File's status placeholder rows. The build emits them one after the
+    /// other, so a range holds all of them.
+    status_placeholders: RowRange = .{ .start = 0, .end = 0 },
 };
 
 pub const BuildError = error{
@@ -1044,6 +1057,7 @@ pub fn buildWithComments(
             if (draft.parent == null and draftCurrentInFile(draft, opts, file.*)) try w.emitDraft(draft_index);
         }
 
+        const placeholders_start = rows.items.len;
         if (whole_unified) {
             if (wholeFileState(opts, fi, file.*)) |state| try rows.append(allocator, .{ .status_placeholder = switch (opts.selected_version) {
                 .old => .{ .file = file, .old = state },
@@ -1054,6 +1068,7 @@ pub fn buildWithComments(
             const new = wholeFileStateFor(opts, fi, file.*, .new);
             if (old != null or new != null) try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } });
         } else try emitStatusPlaceholders(allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
+        file_rows.items[file_rows.items.len - 1].status_placeholders = .{ .start = placeholders_start, .end = rows.items.len };
 
         // True-whole-file: splice the fetched Hunk lines into the selected side's
         // unchanged lines and emit one continuous sequence without headers or
@@ -3153,6 +3168,19 @@ test "side_by_side keeps old-side and new-side Comments and Drafts on their Line
     try testing.expectEqual(@as(usize, 2), countKind(buf, .draft));
 }
 
+fn expectStatusPlaceholdersOfEachFile(buf: Buffer, diff: model.Diff) !void {
+    for (diff.files, 0..) |*file, file_index| {
+        const placeholders = buf.statusPlaceholders(file_index);
+        var found: usize = 0;
+        for (buf.rows, 0..) |row, index| if (row == .status_placeholder and row.status_placeholder.file == file) {
+            try testing.expect(found < placeholders.len);
+            try testing.expectEqual(&buf.rows[index], &placeholders[found]);
+            found += 1;
+        };
+        try testing.expectEqual(placeholders.len, found);
+    }
+}
+
 test "unavailable File sides project non-source Status Placeholders in every Layout and Scope" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3173,6 +3201,7 @@ test "unavailable File sides project non-source Status Placeholders in every Lay
                 .content_statuses = &content_statuses,
             });
             try testing.expectEqual(@as(usize, 1), countKind(projected, .status_placeholder));
+            try expectStatusPlaceholdersOfEachFile(projected, diff);
             for (projected.rows) |row| if (row == .status_placeholder) {
                 if (layout == .unified and whole_file) {
                     try testing.expect(row.status_placeholder.old == null);
@@ -3255,6 +3284,7 @@ test "binary Files project independent sides in every Layout and Scope" {
             });
             const expected: usize = if (layout == .unified and whole_file) 4 else if (layout == .unified) 6 else 4;
             try testing.expectEqual(expected, countKind(projected, .status_placeholder));
+            try expectStatusPlaceholdersOfEachFile(projected, diff);
             try testing.expectEqual(@as(usize, 2), countKind(projected, .comment));
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line));
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line_pair));

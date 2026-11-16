@@ -14589,8 +14589,7 @@ fn scopeOnSelectedVersion(scope: bbr.review.CommentScope, selected: SelectedVers
 }
 
 fn selectedVersionUnavailableForFile(buffer: buffer_mod.Buffer, file_index: usize, selected: SelectedVersion) bool {
-    for (buffer.rows, 0..) |row, index| {
-        if (buffer.fileIndexForRow(index) != file_index or row != .status_placeholder) continue;
+    for (buffer.statusPlaceholders(file_index)) |row| {
         const state = if (selected == .old) row.status_placeholder.old else row.status_placeholder.new;
         switch (state orelse continue) {
             .empty => {},
