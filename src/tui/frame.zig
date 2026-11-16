@@ -596,19 +596,25 @@ pub const NavigationIndex = struct {
     const Owners = std.HashMapUnmanaged(RowOwner, usize, OwnerContext, 80);
     const Spans = std.HashMapUnmanaged(RowOwner, std.ArrayList(Span), OwnerContext, 80);
 
+    /// The first row of each owner that is not a Line. A Line row resolves
+    /// through `spans`, because its rows differ by source offset.
     owners: Owners = .empty,
     spans: Spans = .empty,
 
     /// The caller owns all allocations through its Frame arena.
     pub fn build(a: std.mem.Allocator, rows: []const VisualRow) !NavigationIndex {
         var result: NavigationIndex = .{};
-        try result.owners.ensureTotalCapacity(a, @intCast(rows.len));
+        var owner_rows: u32 = 0;
+        for (rows) |row| owner_rows += @intFromBool(row.owner != .line);
+        try result.owners.ensureTotalCapacity(a, owner_rows);
         try result.spans.ensureTotalCapacity(a, @intCast(rows.len));
         for (rows, 0..) |row, index| {
-            var key = row.owner;
-            if (key == .section) key.section.path = try a.dupe(u8, key.section.path);
-            const exact = try result.owners.getOrPut(a, key);
-            if (!exact.found_existing) exact.value_ptr.* = index;
+            if (row.owner != .line) {
+                var key = row.owner;
+                if (key == .section) key.section.path = try a.dupe(u8, key.section.path);
+                const exact = try result.owners.getOrPut(a, key);
+                if (!exact.found_existing) exact.value_ptr.* = index;
+            }
             if (row.halves) |halves| {
                 if (halves.right) |half| try result.add(a, .{ .line = row.owner.line.sibling(half.line) }, half.source_start, half.source_end, index);
                 if (halves.left) |half| if (halves.right == null or halves.right.?.line != half.line)
