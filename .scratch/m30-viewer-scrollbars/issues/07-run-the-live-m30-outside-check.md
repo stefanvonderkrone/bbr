@@ -41,7 +41,13 @@ Run each step in a terminal with 30 rows, then repeat it in a terminal with 80 r
 - [x] The thumb and the marks follow File isolation, the Layout switch, and the resize.
 - [x] The wheel works as before.
 - [x] Notes on how readable the marks are in a crowded track are recorded for ticket 08.
-- [x] The results, the terminal sizes, and the bbr commit are recorded under `## Completion` in this ticket.
+- [x] The results, the terminal sizes, and the bbr commit are recorded under `### 2026-11-16 operator decisions on findings 2, 3, and 4
+
+- Finding 2 is [ticket 01 of the M30 live check follow-up](../../m30-live-check-follow-up/issues/01-clear-an-accepted-buffer-search-query.md).
+- Finding 3 is [ticket 13](13-mark-an-outdated-thread-in-a-collapsed-group.md).
+- Finding 4 is [ticket 02 of the M30 live check follow-up](../../m30-live-check-follow-up/issues/02-check-the-review-search-cpu-after-the-rebuild-cascade-merge.md).
+
+## Completion` in this ticket.
 
 ## Agent notes for the human
 
