@@ -1,7 +1,6 @@
 # 24: Check that a published Session never changes its Diff or Threads
 
-Status: claimed
-Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade (t23-24 runner)
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -29,12 +28,12 @@ Make the mention names of a Session read-only after the Session loader builds th
 
 ## Acceptance criteria
 
-- [ ] `Session.mention_names` is `*const review_body.MentionNames`. Only `resolveMentions` and test fixtures before publication set it.
-- [ ] A scratch call of `session.mention_names.getOrPut(...)` in production code fails to compile after the change and compiles at `aba58b5`. Record both compiler results in the Completion. Do not commit the scratch call.
-- [ ] Buffer Search and ReviewCards still show resolved mention names: the existing mention name tests pass unchanged, apart from the fixture setup.
-- [ ] The `AGENTS.md` rules table has the new row.
-- [ ] `zig build test` passes.
-- [ ] `python3 tools/check_agent_docs.py` passes.
+- [x] `Session.mention_names` is `*const review_body.MentionNames`. Only `resolveMentions` and test fixtures before publication set it.
+- [x] A scratch call of `session.mention_names.getOrPut(...)` in production code fails to compile after the change and compiles at `aba58b5`. Record both compiler results in the Completion. Do not commit the scratch call.
+- [x] Buffer Search and ReviewCards still show resolved mention names: the existing mention name tests pass unchanged, apart from the fixture setup.
+- [x] The `AGENTS.md` rules table has the new row.
+- [x] `zig build test` passes.
+- [x] `python3 tools/check_agent_docs.py` passes.
 
 ## Comments
 
@@ -63,3 +62,26 @@ The runner asked for a triage of tickets 23 and 24 together, and set this ticket
 - A Debug assertion that compares the identity at publication with the identity at each build was rejected. The key already sees a reassignment with a new address, so the assertion would cover only an address reuse in the same arena.
 
 **Effect on ticket 23.** This ticket does not remove the identity fields from the key, because a field reassignment stays possible. It changes the `.mention_names` arm, so do it first and give ticket 23 a stable key to replace.
+
+## Completion
+
+Commit `7d9102cf` makes the mention names read-only after load.
+
+- `Session.mention_names` in `src/tui/session.zig` is `*const review_body.MentionNames` with `&.empty` as its default. The four Session constructors set `&.empty`.
+- `resolveMentions` fills a `MentionNames` that it creates in the Session arena, and sets the field to it after the last comment. Only `resolveMentions` and the fixture of the test "mention display survives reprojection and both searches while yank keeps authored bytes" in `src/tui/presentation.zig` set the field. The fixture builds its own map before `Presentation.init`.
+- Every reader that took `&session.mention_names` reads the pointer. The `.mention_names` arm of `SearchCandidateInputs.key` already hashed the pointer value, so its code did not change. The doc comments of `mention_names` and `session_epoch` in `src/tui/buffer.zig` name the rule and the types that hold it.
+- `AGENTS.md` has the new row before the `ListOverlay` row.
+
+**Scratch call.** The scratch line `_ = published.session.mention_names.getOrPut(published.session.arena.allocator(), "scratch") catch unreachable;` went before `body.parsed.applyMentionNames(...)` in the Review Search code preview of `src/tui/presentation.zig`. The source of `src` at the start of this work was the same as at `aba58b5`.
+
+- Before the change: `zig build` exit 0.
+- After the change: `src/tui/presentation.zig:12222:48: error: expected type '*T', found '*const T'`, with `T = hash_map.HashMapUnmanaged([]const u8,[]const u8,hash_map.StringContext,80)`.
+- The scratch line is not committed.
+
+**Checks.**
+
+- `zig build test`: exit 0. The mention name tests pass with only the fixture setup changed.
+- `zig fmt --check src build.zig tests`: exit 0.
+- `python3 tools/check_agent_docs.py`: pass.
+
+**Review.** The runner read the diff. The two-axis code review of the branch runs with ticket 23 and is recorded there.
