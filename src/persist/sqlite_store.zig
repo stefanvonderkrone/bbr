@@ -179,14 +179,36 @@ pub const SqliteStore = struct {
             }
             var offset: usize = 0;
             while (offset < step.sql.len) {
+                const char = step.sql[offset];
+                if (char == '\'' or char == '"') {
+                    offset += 1;
+                    while (offset < step.sql.len) {
+                        if (step.sql[offset] == char) {
+                            offset += 1;
+                            if (offset == step.sql.len or step.sql[offset] != char) break;
+                        }
+                        offset += 1;
+                    }
+                    continue;
+                }
+                if (std.mem.startsWith(u8, step.sql[offset..], "--")) {
+                    while (offset < step.sql.len and step.sql[offset] != '\n') : (offset += 1) {}
+                    continue;
+                }
+                if (std.mem.startsWith(u8, step.sql[offset..], "/*")) {
+                    offset += 2;
+                    while (offset < step.sql.len and !std.mem.startsWith(u8, step.sql[offset..], "*/")) : (offset += 1) {}
+                    offset = @min(offset + 2, step.sql.len);
+                    continue;
+                }
                 const start = offset;
                 while (offset < step.sql.len and (std.ascii.isAlphanumeric(step.sql[offset]) or step.sql[offset] == '_')) : (offset += 1) {}
                 const word = step.sql[start..offset];
-                for (.{ "user_version", "BEGIN", "COMMIT" }) |reserved| {
+                for (.{ "user_version", "COMMIT" }) |reserved| {
                     if (std.ascii.eqlIgnoreCase(word, reserved))
                         return std.fmt.comptimePrint("step `{s}` in `migrations` in src/persist/sqlite_store.zig contains `{s}`: remove it because migrateStep owns the transaction and the version", .{ step.name, reserved });
                 }
-                if (offset < step.sql.len) offset += 1;
+                if (offset == start) offset += 1;
             }
         }
         return null;
@@ -2715,6 +2737,8 @@ test "SQLite carries final server guidance into a fresh Submission budget" {
     try testing.expect(retry.pending_wait);
 }
 
+/// The SQL for `from` turns a `from` database into a `from - 1` database.
+/// These entries cover only the legacy steps.
 const downgrades = [_]struct { from: i64, sql: [*:0]const u8 }{
     .{ .from = 8, .sql = "DROP TABLE submission_run_items;" },
     .{ .from = 9, .sql =
@@ -2747,6 +2771,8 @@ comptime {
     ));
 }
 
+/// Turns a migrated store into a `version` store for migration tests.
+/// Undoes legacy steps and deletes their names from `schema_steps`.
 fn downgradeTo(sqlite: *SqliteStore, comptime version: i64) !void {
     const oldest = downgrades[0].from - 1;
     if (version < oldest) @compileError(std.fmt.comptimePrint(
@@ -2955,24 +2981,16 @@ test "M22 read a migration step that another process already applied is skipped"
     try testing.expectEqual(@as(usize, 1), (try stale.fileReadStore().load(arena.allocator(), review)).len);
 }
 
-fn migrationTestInt(sqlite: *SqliteStore, sql: [:0]const u8) !i64 {
-    var stmt: ?*c.sqlite3_stmt = null;
-    _ = try sqlite.native(c.sqlite3_prepare_v2(sqlite.db, sql, -1, &stmt, null), .prepare, @src());
-    defer settled(sqlite.native(c.sqlite3_finalize(stmt), .finalize, @src()));
-    try testing.expectEqual(c.SQLITE_ROW, try sqlite.native(c.sqlite3_step(stmt), .step, @src()));
-    return c.sqlite3_column_int64(stmt, 0);
-}
-
 fn expectMigrationNames(sqlite: *SqliteStore, count: i64) !void {
-    try testing.expectEqual(count, try migrationTestInt(sqlite, "SELECT count(*) FROM schema_steps;"));
-    try testing.expectEqual(count, try migrationTestInt(sqlite, "SELECT count(DISTINCT name) FROM schema_steps;"));
+    try testing.expectEqual(count, try sqlite.queryInt("SELECT count(*) FROM schema_steps;", null));
+    try testing.expectEqual(count, try sqlite.queryInt("SELECT count(DISTINCT name) FROM schema_steps;", null));
     for (SqliteStore.migrations) |step| {
         var buf: [160]u8 = undefined;
-        try testing.expectEqual(@as(i64, 1), try migrationTestInt(sqlite, try std.fmt.bufPrintZ(
+        try testing.expectEqual(@as(i64, 1), try sqlite.queryInt(try std.fmt.bufPrintZ(
             &buf,
             "SELECT count(*) FROM schema_steps WHERE name='{s}';",
             .{step.name},
-        )));
+        ), null));
     }
 }
 
@@ -3008,10 +3026,10 @@ test "M22 read named steps from two branches both run and keep earlier Drafts" {
     try sqlite.migrateSteps(&(SqliteStore.migrations ++ branch_a));
     try sqlite.migrateSteps(&(SqliteStore.migrations ++ branch_b ++ branch_a));
     try sqlite.exec("INSERT INTO branch_a VALUES (1); INSERT INTO branch_b VALUES (2);");
-    try testing.expectEqual(@as(i64, 1), try migrationTestInt(&sqlite, "SELECT x FROM branch_a;"));
-    try testing.expectEqual(@as(i64, 2), try migrationTestInt(&sqlite, "SELECT x FROM branch_b;"));
+    try testing.expectEqual(@as(i64, 1), try sqlite.queryInt("SELECT x FROM branch_a;", null));
+    try testing.expectEqual(@as(i64, 2), try sqlite.queryInt("SELECT x FROM branch_b;", null));
     try expectMigrationNames(&sqlite, 13);
-    try testing.expectEqual(@as(i64, 2), try migrationTestInt(&sqlite, "SELECT count(*) FROM schema_steps WHERE name IN ('branch_a', 'branch_b');"));
+    try testing.expectEqual(@as(i64, 2), try sqlite.queryInt("SELECT count(*) FROM schema_steps WHERE name IN ('branch_a', 'branch_b');", null));
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const drafts = try sqlite.store().load(arena.allocator(), key);
@@ -3032,9 +3050,9 @@ test "M22 read pre-ticket versions and the old M22 shape record every name and k
         defer sqlite.deinit();
         try expectMigrationNames(&sqlite, 11);
         try testing.expectEqual(@as(i64, 11), try sqlite.userVersion());
-        try testing.expectEqual(@as(i64, if (version > 0) 1 else 0), try migrationTestInt(&sqlite, "SELECT count(*) FROM drafts WHERE body='legacy Draft';"));
-        try testing.expectEqual(@as(i64, if (version == 11 or old_m22) 1 else 0), try migrationTestInt(&sqlite, "SELECT count(*) FROM file_read_receipts WHERE path='kept.zig' AND fingerprint=zeroblob(32);"));
-        try testing.expectEqual(@as(i64, 1), try migrationTestInt(&sqlite, "SELECT integrity_check='ok' FROM pragma_integrity_check;"));
+        try testing.expectEqual(@as(i64, if (version > 0) 1 else 0), try sqlite.queryInt("SELECT count(*) FROM drafts WHERE body='legacy Draft';", null));
+        try testing.expectEqual(@as(i64, if (version == 11 or old_m22) 1 else 0), try sqlite.queryInt("SELECT count(*) FROM file_read_receipts WHERE path='kept.zig' AND fingerprint=zeroblob(32);", null));
+        try testing.expectEqual(@as(i64, 1), try sqlite.queryInt("SELECT integrity_check='ok' FROM pragma_integrity_check;", null));
     }
 }
 
@@ -3051,7 +3069,7 @@ test "M22 read two connections reconcile a pre-ticket store and skip every appli
     for (SqliteStore.migrations, 0..) |step, index| try rival.migrateStep(index, step);
     for (SqliteStore.migrations, 0..) |step, index| try stale.migrateStep(index, step);
     try expectMigrationNames(&stale, 11);
-    try testing.expectEqual(@as(i64, 1), try migrationTestInt(&stale, "SELECT count(*) FROM drafts WHERE body='legacy Draft';"));
+    try testing.expectEqual(@as(i64, 1), try stale.queryInt("SELECT count(*) FROM drafts WHERE body='legacy Draft';", null));
 }
 
 test "M22 read reconcile finds legacy steps applied after schema_steps was created" {
@@ -3069,7 +3087,7 @@ test "M22 read reconcile finds legacy steps applied after schema_steps was creat
     var sqlite = try SqliteStore.open(path);
     defer sqlite.deinit();
     try expectMigrationNames(&sqlite, 11);
-    try testing.expectEqual(@as(i64, 1), try migrationTestInt(&sqlite, "SELECT count(*) FROM drafts WHERE body='legacy Draft';"));
+    try testing.expectEqual(@as(i64, 1), try sqlite.queryInt("SELECT count(*) FROM drafts WHERE body='legacy Draft';", null));
 }
 
 test "M22 read a named step after the legacy steps leaves user_version at 11" {
@@ -3079,7 +3097,7 @@ test "M22 read a named step after the legacy steps leaves user_version at 11" {
         .{ .name = "after_legacy", .sql = "CREATE TABLE after_legacy (x INTEGER);" },
     }));
     try testing.expectEqual(@as(i64, 11), try sqlite.userVersion());
-    try testing.expectEqual(@as(i64, 1), try migrationTestInt(&sqlite, "SELECT count(*) FROM schema_steps WHERE name='after_legacy';"));
+    try testing.expectEqual(@as(i64, 1), try sqlite.queryInt("SELECT count(*) FROM schema_steps WHERE name='after_legacy';", null));
 }
 
 test "M22 read a store with every name opens without a write lock" {
@@ -3112,20 +3130,37 @@ test "M22 read steps reject invalid names lists and migration-owned SQL at compt
         var old_version = SqliteStore.migrations;
         old_version[10].sql = "PRAGMA user_version = 4;";
         if (SqliteStore.stepError(&old_version) == null) @compileError("accepted the old version write");
-        var old_begin = SqliteStore.migrations;
-        old_begin[10].sql = "BEGIN;";
-        if (SqliteStore.stepError(&old_begin) == null) @compileError("accepted the old transaction start");
         var old_commit = SqliteStore.migrations;
         old_commit[10].sql = "COMMIT;";
         if (SqliteStore.stepError(&old_commit) == null) @compileError("accepted the old transaction end");
         var mixed_case = SqliteStore.migrations;
-        for (.{ "pragma UsEr_VeRsIoN = 4;", "bEgIn;", "cOmMiT;" }) |sql| {
+        for (.{ "pragma UsEr_VeRsIoN = 4;", "cOmMiT;" }) |sql| {
             mixed_case[10].sql = sql;
             if (SqliteStore.stepError(&mixed_case) == null) @compileError("accepted mixed-case migration-owned SQL");
         }
         var word_boundaries = SqliteStore.migrations;
         word_boundaries[10].sql = "CREATE TABLE begin_steps (commit_id INTEGER, user_version_hint INTEGER);";
         if (SqliteStore.stepError(&word_boundaries) != null) @compileError("rejected identifiers with reserved word prefixes");
+        var quoted = SqliteStore.migrations;
+        for (.{
+            "CREATE TRIGGER added AFTER INSERT ON drafts BEGIN SELECT 1; END;",
+            "SELECT 'commit', 'it''s user_version';",
+            "SELECT \"commit\", \"a\"\"user_version\" FROM drafts;",
+            "-- commit user_version\nSELECT 1;",
+            "/* COMMIT user_version */ SELECT 1;",
+        }) |sql| {
+            quoted[10].sql = sql;
+            if (SqliteStore.stepError(&quoted) != null) @compileError("rejected a trigger, literal, quoted identifier, or comment");
+        }
+        for (.{
+            "SELECT 'safe'; COMMIT;",
+            "SELECT \"safe\"; PRAGMA user_version = 4;",
+            "-- safe\nCOMMIT;",
+            "/* safe */ PRAGMA user_version = 4;",
+        }) |sql| {
+            quoted[10].sql = sql;
+            if (SqliteStore.stepError(&quoted) == null) @compileError("ignored migration-owned SQL after a quote or comment");
+        }
         if (SqliteStore.stepError(&SqliteStore.migrations) != null) @compileError("rejected migrations");
     }
 }
