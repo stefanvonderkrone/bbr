@@ -277,8 +277,8 @@ pub const SqliteStore = struct {
         // v11 (M22): File Read Receipts, one per ReviewIdentity and canonical
         // path. The table is independent of every PendingReview table.
         // M22 builds before the merge 768977a8 set version 10 with
-        // file_read_receipts and no posted_drafts, so this step accepts either
-        // table already present and creates the one that is missing.
+        // file_read_receipts and no posted_drafts. So this step creates each
+        // table only when it is missing.
         \\CREATE TABLE IF NOT EXISTS posted_drafts (
         \\  workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
         \\  temp_id INTEGER NOT NULL, comment_id INTEGER NOT NULL,

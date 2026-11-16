@@ -298,7 +298,8 @@ PRAGMA user_version = 11;
 
 Version 10 on `main` creates `posted_drafts`.
 M22 builds before the merge `768977a8` set version 10 with `file_read_receipts` and without `posted_drafts`.
-So version 11 creates each of the two tables only when it is missing, and a store of either shape reaches version 11 with every Draft and receipt.
+So version 11 creates each of the two tables only when it is missing.
+A store of either shape reaches version 11 with every Draft and receipt.
 
 `review_kind` is `0` for a RemoteReview and `1` for a LocalReview.
 A RemoteReview row stores its Workspace, Repository, and PullRequestId, with `0` and empty text in the local columns.

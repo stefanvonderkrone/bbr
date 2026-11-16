@@ -69,6 +69,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-store-message-cli-") as directory:
     # repository identity lookup cannot prepare its query.
     run(dict(env, XDG_STATE_HOME=str(root / "reference")), repository)
     current = version(root / "reference/bbr/pending.db")
+    assert current > 0, "bbr made no reference store"
     with sqlite3.connect(database) as connection:
         connection.execute(f"PRAGMA user_version = {current}")
     result, records = run(env, repository)
