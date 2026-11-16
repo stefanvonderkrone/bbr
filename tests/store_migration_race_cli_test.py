@@ -1,4 +1,9 @@
-"""Run with zig build test-cli. No network access."""
+"""Run with zig build test-cli. No network access.
+
+Several bbr processes that start at the same time on one pending-review store
+all open it (ticket 06). The store reaches the schema version and the step names
+of one bbr alone, also from the old M22 shape without `schema_steps` (ticket 08).
+"""
 
 from pathlib import Path
 import shutil

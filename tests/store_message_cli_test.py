@@ -66,6 +66,8 @@ with tempfile.TemporaryDirectory(prefix="bbr-store-message-cli-") as directory:
     database.rmdir()
 
     run(dict(env, XDG_STATE_HOME=str(root / "reference")), repository)
+    # A store with every step name and no other table opens, but the
+    # repository identity lookup cannot prepare its query.
     reference = root / "reference/bbr/pending.db"
     current = version(reference)
     assert current > 0, "bbr made no reference store"
