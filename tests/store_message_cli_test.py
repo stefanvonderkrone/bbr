@@ -21,6 +21,11 @@ def logs(env):
     return set((Path(env["XDG_STATE_HOME"]) / "bbr/diagnostics").glob("*.log"))
 
 
+def version(database):
+    with sqlite3.connect(database) as connection:
+        return connection.execute("PRAGMA user_version").fetchone()[0]
+
+
 def run(env, cwd):
     before = logs(env)
     result = subprocess.run(
@@ -62,9 +67,14 @@ with tempfile.TemporaryDirectory(prefix="bbr-store-message-cli-") as directory:
 
     # A store at the current schema version without its tables opens, but the
     # repository identity lookup cannot prepare its query.
+    run(dict(env, XDG_STATE_HOME=str(root / "reference")), repository)
+    current = version(root / "reference/bbr/pending.db")
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version = 10")
+        connection.execute(f"PRAGMA user_version = {current}")
     result, records = run(env, repository)
+    with sqlite3.connect(database) as connection:
+        tables = connection.execute("SELECT name FROM sqlite_master").fetchall()
+    assert tables == [], f"a migration step ran on a store at version {current}: {tables}"
     assert result.returncode == 0, result
     assert result.stderr == b"bbr local: cannot resolve repository identity\n", result.stderr
     assert len(records) == 1, records
