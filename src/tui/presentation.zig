@@ -25737,6 +25737,7 @@ fn searchProjectionBaselines() ![8]SearchBaseline {
                 var ph = std.hash.Wyhash.init(0);
                 var vh = std.hash.Wyhash.init(0);
                 var scanned_entries: usize = 0;
+                var saw_fold = false;
                 for (visual) |row| {
                     std.hash.autoHash(&vh, row.buffer_index);
                     std.hash.autoHash(&vh, row.source_start);
@@ -25762,13 +25763,27 @@ fn searchProjectionBaselines() ![8]SearchBaseline {
                         scanned_entries += @intFromBool(row.owner.line.newNo() != null);
                     }
                     std.hash.autoHash(&ph, projection.navigation.find(row));
-                    std.hash.autoHash(&ph, projection.navigation.owners.get(row.owner));
+                    var inside = row;
+                    inside.source_start += (row.source_end -| row.source_start) / 2;
+                    std.hash.autoHash(&ph, projection.navigation.find(inside));
+                    // Every `owners` reader asks for an owner that is not a Line.
+                    if (row.owner != .line) std.hash.autoHash(&ph, projection.navigation.owners.get(row.owner));
                     const disclosure = buffer_mod.disclosureKey(buffer.rows[row.buffer_index]);
                     std.hash.autoHash(&ph, disclosure != null);
                     if (disclosure) |value| {
                         std.hash.autoHash(&ph, std.meta.activeTag(value));
                         std.hash.autoHash(&ph, projection.disclosure_rows.get(value));
+                        saw_fold = saw_fold or value == .fold;
                     }
+                }
+                try testing.expect(saw_fold);
+                for (session.threads) |thread| {
+                    std.hash.autoHash(&ph, projection.navigation.owners.get(.{ .disclosure = .{ .resolved_thread = thread.root.id } }));
+                    std.hash.autoHash(&ph, projection.navigation.owners.get(cardHeaderOwner(.{ .comment = thread.root.id })));
+                    for (thread.replies) |reply| std.hash.autoHash(&ph, projection.navigation.owners.get(cardHeaderOwner(.{ .comment = reply.id })));
+                }
+                for (published.review.drafts.items) |draft| {
+                    std.hash.autoHash(&ph, projection.navigation.owners.get(cardHeaderOwner(.{ .draft = draft.local_id })));
                 }
                 var indexed_entries: usize = 0;
                 var multi_row_key = false;
@@ -25786,9 +25801,6 @@ fn searchProjectionBaselines() ![8]SearchBaseline {
                                 .new_line = if (source_key.side == .new) source_key.line else null,
                             } });
                             const found = projection.occurrenceRows(occurrence);
-                            const direct = if (projection.source_rows.get(source_key)) |list| list.items else &.{};
-                            try testing.expectEqualSlices(usize, direct, found);
-                            hashBaselineRows(&ph, direct);
                             hashBaselineRows(&ph, found);
                             hashBaselineDisclosures(&ph, projection, occurrence);
                             indexed_entries += found.len;
@@ -25807,19 +25819,16 @@ fn searchProjectionBaselines() ![8]SearchBaseline {
                 for (session.threads) |thread| {
                     const occurrence = baselineOccurrence(.{ .review_body = .{ .owner = .{ .comment = thread.root.id }, .logical_line = 0 } });
                     hashBaselineRows(&ph, projection.occurrenceRows(occurrence));
-                    hashBaselineRows(&ph, if (projection.body_rows.get(occurrence.location.review_body.owner)) |list| list.items else &.{});
                     hashBaselineDisclosures(&ph, projection, occurrence);
                     for (thread.replies) |reply| {
                         const reply_occurrence = baselineOccurrence(.{ .review_body = .{ .owner = .{ .comment = reply.id }, .logical_line = 0 } });
                         hashBaselineRows(&ph, projection.occurrenceRows(reply_occurrence));
-                        hashBaselineRows(&ph, if (projection.body_rows.get(reply_occurrence.location.review_body.owner)) |list| list.items else &.{});
                         hashBaselineDisclosures(&ph, projection, reply_occurrence);
                     }
                 }
                 for (published.review.drafts.items) |draft| {
                     const occurrence = baselineOccurrence(.{ .review_body = .{ .owner = .{ .draft = draft.local_id }, .logical_line = 0 } });
                     hashBaselineRows(&ph, projection.occurrenceRows(occurrence));
-                    hashBaselineRows(&ph, if (projection.body_rows.get(occurrence.location.review_body.owner)) |list| list.items else &.{});
                     hashBaselineDisclosures(&ph, projection, occurrence);
                 }
                 result[fixture] = .{ .projection = ph.final(), .visual = vh.final(), .rows = visual.len };
@@ -25830,11 +25839,11 @@ fn searchProjectionBaselines() ![8]SearchBaseline {
     return result;
 }
 
-test "search projection lookups match the 9601be3 baseline in both Layouts" {
+test "search projection lookups match the 6f9f09f baseline in both Layouts" {
     const actual = try searchProjectionBaselines();
     const expected = [_]u64{
-        11736595582100757729, 2518425522605288483,  9014994094431836833,  11736595582100757729,
-        14311309471756834833, 14401948231105690527, 18171018725666854220, 14311309471756834833,
+        11665696117170084277, 15890573843805325160, 13831342787368225404, 11665696117170084277,
+        16124611065901445865, 10221081267576725555, 16330722121011155598, 16124611065901445865,
     };
     for (actual, expected) |value, digest| try testing.expectEqual(digest, value.projection);
     const session = try testDisclosureSession(testing.allocator, 1);
