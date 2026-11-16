@@ -1,6 +1,6 @@
 # 08: Name each schema migration step so two branches cannot share a version
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -100,13 +100,13 @@ A step after step 11 does not write `user_version`.
 
 ### Acceptance criteria
 
-- [ ] A store that a build with steps "legacy + `branch_a`" migrated, opened by a build with steps "legacy + `branch_b` + `branch_a`", has both tables, both names, and every earlier Draft.
-- [ ] A store from before this ticket at each version 0 to 11 opens with every one of the eleven names recorded, `user_version` 11, and every Draft.
-- [ ] The old M22 shape (version 10, `file_read_receipts`, no `posted_drafts`, no `schema_steps`) opens with both tables, its Draft, and its receipt, with the plain `CREATE TABLE` of step 11.
-- [ ] Two connections that bootstrap and migrate the same store from before this ticket both succeed, and each name is recorded once.
-- [ ] A store at every name opens without `BEGIN IMMEDIATE`.
-- [ ] A step after step 11 leaves `user_version` at 11.
-- [ ] A repeated or empty name in `migrations` fails to compile.
+- [x] A store that a build with steps "legacy + `branch_a`" migrated, opened by a build with steps "legacy + `branch_b` + `branch_a`", has both tables, both names, and every earlier Draft.
+- [x] A store from before this ticket at each version 0 to 11 opens with every one of the eleven names recorded, `user_version` 11, and every Draft.
+- [x] The old M22 shape (version 10, `file_read_receipts`, no `posted_drafts`, no `schema_steps`) opens with both tables, its Draft, and its receipt, with the plain `CREATE TABLE` of step 11.
+- [x] Two connections that bootstrap and migrate the same store from before this ticket both succeed, and each name is recorded once.
+- [x] A store at every name opens without `BEGIN IMMEDIATE`.
+- [x] A step after step 11 leaves `user_version` at 11.
+- [x] A repeated or empty name in `migrations` fails to compile.
 
 ### Tests that fail on the current code
 
@@ -223,3 +223,38 @@ The decision is hard to reverse, because stores record the names, and a frozen `
 `main` ends at 0014. M32 plans 0015, M28 has 0016, and M27 and M33 have 0017. So the next free number is 0018.
 
 **Label.** `ready-for-agent`. The agent brief above specifies every decision.
+
+## Completion
+
+The design check on 2026-11-16 changed two points of the agent brief.
+`reconcile` runs inside every step transaction, not once when `schema_steps` is missing.
+An older build can migrate a store by `user_version` after a newer build created `schema_steps`, for example after a crash between two steps.
+The next step transaction then records the names of the steps that the older build applied.
+A legacy step writes `user_version = index + 1` when the version is lower, because the loop records the steps before it in earlier transactions.
+`schema_version` is deleted, and `legacy_version` is 11.
+
+- `a6defc4a` adds the `Step` record, the names, `migrateSteps`, and the `comptime` name check.
+- `d5416d58` adds the failing tests. Seven of 66 `test-file-read` tests fail there: the collision test fails with `error.Reported` from the second `CREATE TABLE branch_a`, the step after step 11 sets version 12, and the others find no `schema_steps`.
+- The collision test in the form of the brief, with the old `migrateStep`, fails on `3413b2a0` with `error.Reported` from `exec` (59 of 60 tests pass).
+- `740324e5` records the names in `schema_steps`, adds `reconcile` and the read-only open, and makes step 11 a plain `CREATE TABLE file_read_receipts`.
+- `543551e9` and `076bc248` update `tests/store_message_cli_test.py` and `tests/store_migration_race_cli_test.py`. The race check adds ten rounds of four processes on the old M22 shape.
+- `581be63a`, `0c385ebd`, and `0964ced5` (the `correct` skill) make `stepError` reject `COMMIT` and `user_version` in step SQL outside literals and comments, and name the step and the fix in each error. That rule was a convention with no check.
+- `6e7bbb13`, `a7064f6f`, and `97eca46d` add ADR 0018, update SPEC.md, ADR 0006, and the AGENTS.md rules rows.
+
+Checks:
+
+- `zig build test --summary all`: 51 of 51 steps, 1668 of 1668 tests (1661 on `3413b2a0`).
+- `zig build test-file-read`: 66 of 66 tests.
+- `zig fmt --check src build.zig tests`, every `tools/check_*.py`, and `python3 tools/check_agent_docs.py` pass.
+- Manual: a repeated name fails with ``step `drafts` at index 11 in `migrations` in src/persist/sqlite_store.zig repeats a name: give each step a unique stable name``. `PRAGMA user_version = 12;` in a step fails with ``step `file_read_receipts` in `migrations` in src/persist/sqlite_store.zig contains `user_version` ...``.
+
+Live proof, with ReleaseSafe builds, a scratch Git repository, and one new `XDG_STATE_HOME` with mode 700 for each store. The operator's store was not opened.
+
+1. Old builds made three stores, each with one Review-level Draft. `9231fcb9` made version 10 with `file_read_receipts`, no `posted_drafts`, and a receipt for `a.txt`. `main` at `3b290393` made version 10 with `posted_drafts`. `3413b2a0` made version 11 with both tables and a receipt.
+2. The build at `a7064f6f` opened each store with no stderr. Each store showed its Draft, had eleven distinct names, `user_version` 11, and `integrity_check` `ok`. The two stores with a receipt showed `a.txt` read and `b.txt` unread.
+3. The `3b290393` and `3413b2a0` builds opened each store again with no stderr and showed the Draft.
+4. Two scratch builds appended the step `branch_a` or `branch_b`. Each ran on its own copy of a store from step 2. A merge put `branch_b` before `branch_a`. The merged build opened both copies with no stderr. Each copy then had both tables, 13 names, its Draft, and `integrity_check` `ok`.
+5. `tests/store_migration_race_cli_test.py` passed through `zig build test`.
+6. The Worktrees, state directories, and tmux sessions of the proof are removed.
+
+Review: code review of `6ccab05f..HEAD` on two axes. Spec: no missing criterion. The `BEGIN` ban rejected a valid `CREATE TRIGGER` step, so `0964ced5` removed it. Standards: no hard code violation. Three AGENTS.md claims and five long sentences were fixed in `97eca46d`. Kept: the boolean `old_m22` parameter of the test fixture, and the literal step indexes 9 and 10 in `reconcile`.
