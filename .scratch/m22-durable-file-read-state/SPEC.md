@@ -305,7 +305,12 @@ bbr builds without named steps read only that version.
 Version 10 has two meanings.
 On `main`, version 10 has `posted_drafts`.
 M22 builds before the merge `768977a8` set version 10 with `file_read_receipts` and without `posted_drafts`.
-So each step transaction first records the names that a store without them already applied: steps 1 to `min(user_version, 9)`, `posted_drafts` when that table exists, and `file_read_receipts` when that table exists.
+So each step transaction first records the names of the steps that the store already applied:
+
+- steps 1 to `min(user_version, 9)`;
+- `posted_drafts` when that table exists;
+- `file_read_receipts` when that table exists.
+
 A store of either shape then applies only the step that it lacks, and keeps every Draft and receipt.
 
 `review_kind` is `0` for a RemoteReview and `1` for a LocalReview.
