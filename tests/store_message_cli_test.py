@@ -65,17 +65,21 @@ with tempfile.TemporaryDirectory(prefix="bbr-store-message-cli-") as directory:
     assert " phase=open " in records[0] and records[0].endswith(" cause=sqlite result=14 extended=14"), records
     database.rmdir()
 
-    # A store at the current schema version without its tables opens, but the
-    # repository identity lookup cannot prepare its query.
     run(dict(env, XDG_STATE_HOME=str(root / "reference")), repository)
-    current = version(root / "reference/bbr/pending.db")
+    reference = root / "reference/bbr/pending.db"
+    current = version(reference)
     assert current > 0, "bbr made no reference store"
+    with sqlite3.connect(reference) as connection:
+        names = connection.execute("SELECT name FROM schema_steps ORDER BY name").fetchall()
+    assert names, "bbr recorded no reference migration names"
     with sqlite3.connect(database) as connection:
         connection.execute(f"PRAGMA user_version = {current}")
+        connection.execute("CREATE TABLE schema_steps (name TEXT PRIMARY KEY) WITHOUT ROWID")
+        connection.executemany("INSERT INTO schema_steps(name) VALUES (?)", names)
     result, records = run(env, repository)
     with sqlite3.connect(database) as connection:
-        tables = connection.execute("SELECT name FROM sqlite_master").fetchall()
-    assert tables == [], f"a migration step ran on a store at version {current}: {tables}"
+        tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+    assert tables == ["schema_steps"], f"a migration step ran on a store with every name: {tables}"
     assert result.returncode == 0, result
     assert result.stderr == b"bbr local: cannot resolve repository identity\n", result.stderr
     assert len(records) == 1, records
