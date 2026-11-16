@@ -1248,6 +1248,8 @@ test "a NavigationIndex whose keys each have one span grows nothing" {
     var growth: GrowthCount = .{ .child = a };
     const index = try NavigationIndex.build(growth.allocator(), visual_rows);
     try testing.expectEqual(@as(usize, 0), growth.failed_remaps);
+    // No reader asks `owners` for a Line, so Line rows add no entry.
+    try testing.expectEqual(@as(u32, 0), index.owners.count());
     for (visual_rows, 0..) |row, expected| try testing.expectEqual(@as(?usize, expected), index.find(row));
 }
 
