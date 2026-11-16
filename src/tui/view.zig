@@ -325,6 +325,17 @@ pub fn thumb(extent: u16, total: usize, offset: usize) ?Thumb {
     return .{ .first = first, .len = last - first + 1 };
 }
 
+/// The scroll offset whose thumb starts at `cell`, the inverse of `thumb`.
+/// The first cell gives the first offset. From the cell where the thumb of
+/// the last offset starts, it is the last offset, because that cell can hold
+/// rows above the last offset. Requires total > extent > 0.
+pub fn thumbOffset(extent: u16, total: usize, cell: u16) usize {
+    if (cell == 0) return 0;
+    const last = total - extent;
+    if (cell >= trackCell(extent, total, last)) return last;
+    return cellFirstRow(extent, total, cell);
+}
+
 /// Visit `node` and then each descendant, in tree order, with its placed
 /// rings. `visitor.visit(*const View(Slot), Placed)` is called once per View.
 pub fn walk(comptime Slot: type, node: *const View(Slot), area: Rect, visitor: anytype) void {
@@ -769,6 +780,23 @@ test "M30 scrollbar the first row of a cell projects to that cell" {
             }
         }
     }
+}
+
+test "M30 scrollbar thumbOffset puts the thumb on its cell and the last cell on the last offset" {
+    for (1..41) |extent_index| {
+        const extent: u16 = @intCast(extent_index);
+        for (extent + 1..2001) |total| {
+            const last = total - extent;
+            const bottom = thumb(extent, total, last).?.first;
+            try testing.expectEqual(@as(usize, 0), thumbOffset(extent, total, 0));
+            for (0..bottom + 1) |cell_index| {
+                const cell: u16 = @intCast(cell_index);
+                try testing.expectEqual(cell, thumb(extent, total, thumbOffset(extent, total, cell)).?.first);
+            }
+            for (@max(bottom, 1)..extent + 2) |cell| try testing.expectEqual(last, thumbOffset(extent, total, @intCast(cell)));
+        }
+    }
+    try testing.expectEqual(@as(usize, 25), thumbOffset(5, 30, 4));
 }
 
 test "M30 scrollbar the thumb covers the visible row that the old formula missed" {

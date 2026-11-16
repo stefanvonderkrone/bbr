@@ -451,10 +451,14 @@ The pointer can be over another Pane, outside the track, or past the track ends.
 ```text
 p      = pointer row - track.y       (signed)
 first  = p - grab                    (signed)
-offset = 0                           when first <= 0
-offset = cellFirstRow(first)         otherwise
-offset = min(offset, total - extent)
+offset = thumbOffset(max(first, 0))
 ```
+
+`view.thumbOffset(cell)` is the inverse of `view.thumb`.
+Cell 0 gives offset 0.
+From the cell where the thumb of `total - extent` starts, it gives `total - extent`.
+Each other cell gives `cellFirstRow(cell)`.
+So a drag to the last thumb cell shows the last row, also when one cell holds more rows than the track has cells (ticket 12).
 
 Each drag event reads the current Frame through `frame.scrollState`.
 So a content change or a resize during the drag uses the new numbers at once.
@@ -514,7 +518,7 @@ The README mouse paragraph adds the track press and the Scroll Drag.
 
 ## Data model
 
-- `view.ScrollMark`, `view.trackCell`, `view.cellFirstRow`, the new `view.thumb`, and `view.Scrollbar.marks`.
+- `view.ScrollMark`, `view.trackCell`, `view.cellFirstRow`, the new `view.thumb`, `view.thumbOffset`, and `view.Scrollbar.marks`.
 - `layouts.Scroll.marks`.
 - `scroll_marks.RowMark`, `scroll_marks.rowMarks`, and `scroll_marks.project`.
 - `frame.ScrollBar`, `frame.ScrollState`, `frame.scrollState`, `frame.ScrollBarHit`, and `HitTarget.scroll_bar`.
@@ -528,7 +532,7 @@ No SQLite table, config key, or file format changes.
 
 | Module | Change |
 | --- | --- |
-| `src/tui/view.zig` | `ScrollMark`, `trackCell`, `cellFirstRow`, the new `thumb`, and `Scrollbar.marks`. |
+| `src/tui/view.zig` | `ScrollMark`, `trackCell`, `cellFirstRow`, the new `thumb`, `thumbOffset`, and `Scrollbar.marks`. |
 | `src/tui/layouts.zig` | `Scroll.marks` and its copy in `bar`. |
 | `src/tui/view_paint.zig` | Scroll Marks and thumb overlap in `drawScrollbar`, `scrollMarkGlyph`, and the glyph `comptime` check. |
 | `src/tui/scroll_marks.zig` (new) | `RowMark`, `rowMarks`, and `project`. |
@@ -580,7 +584,7 @@ Every new test name starts with `M30 scrollbar`, so `zig build test-scrollbars` 
 
 ### Seams
 
-- `view.trackCell`, `view.cellFirstRow`, and `view.thumb` are pure arithmetic.
+- `view.trackCell`, `view.cellFirstRow`, `view.thumb`, and `view.thumbOffset` are pure arithmetic.
 - `scroll_marks.rowMarks` and `scroll_marks.project` are pure.
   Fixtures build Buffers in memory, as the `buffer.zig` and `frame.zig` tests do.
 - The Presentation transition is the integration seam, as in ADR-0012.
@@ -608,6 +612,7 @@ Projection and thumb:
   It checks every `extent` from 1 to 40, every `total` up to 200, and every offset.
 - The thumb starts in cell 0 at the top and ends in cell `extent - 1` at the bottom.
 - `cellFirstRow` is the first row whose `trackCell` is that cell.
+- `thumbOffset` puts the thumb on each cell up to the last thumb cell, and every cell from the last thumb cell gives the last offset.
 - The example `extent = 7`, `total = 20`, `offset = 6` gives cells 2 to 4.
 
 Existing scroll bars:

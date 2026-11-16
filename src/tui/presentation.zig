@@ -6875,10 +6875,8 @@ pub const Presentation = struct {
         if (self.publishedEpoch() != drag.epoch) return;
         const state = frame_mod.scrollTarget(self.frameProjection(), drag.bar) orelse return;
         self.scroll_drag = drag;
-        const extent = state.track.height;
         const first = @as(i32, pointer_row) - state.track.y - drag.grab;
-        const offset = if (first <= 0) 0 else @min(view_mod.cellFirstRow(extent, state.total, @intCast(first)), state.total - extent);
-        self.scrollBarTo(drag.bar, state, offset);
+        self.scrollBarTo(drag.bar, state, view_mod.thumbOffset(state.track.height, state.total, @intCast(@max(first, 0))));
     }
 
     fn publishedEpoch(self: *const Presentation) ?SessionEpoch {
