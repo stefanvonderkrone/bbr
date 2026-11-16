@@ -44,6 +44,10 @@ class RowScanCheckTest(unittest.TestCase):
         text = "fn f(p: P) void {\n    for (p.frame.visual_rows) |v| if (p.buffer.fileIndexForRow(v.buffer_index) == 1) count(v);\n}\n"
         self.assertEqual(len(self.check(text)), 1)
 
+    def test_a_loop_over_the_indexes_of_all_rows_is_rejected(self):
+        text = "fn f(buffer: Buffer) void {\n    for (0..buffer.rows.len) |i| _ = buffer.fileIndexForRow(i);\n}\n"
+        self.assertEqual(len(self.check(text)), 1)
+
     def test_a_loop_over_a_slice_of_rows_or_without_the_call_is_allowed(self):
         text = "\n".join((
             "fn f(buffer: Buffer, range: R) void {",

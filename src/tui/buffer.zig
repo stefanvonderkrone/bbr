@@ -889,7 +889,7 @@ pub const FileRow = struct {
     first_row: usize,
     /// The File's status placeholder rows. The build emits them one after the
     /// other, so a range holds all of them.
-    status_placeholders: RowRange = .{ .start = 0, .end = 0 },
+    status_placeholders: RowRange,
 };
 
 pub const BuildError = error{
@@ -1038,7 +1038,7 @@ pub fn buildWithComments(
             if (fi != only) continue;
         }
         w.span_cursors = .init(opts.highlights, fi);
-        try file_rows.append(allocator, .{ .file_index = fi, .first_row = rows.items.len });
+        const header_row = rows.items.len;
         const whole_unified = opts.whole_file and layout == .unified;
         const whole_side_by_side = opts.whole_file and layout == .side_by_side;
         const header_path = if (!opts.whole_file)
@@ -1068,7 +1068,11 @@ pub fn buildWithComments(
             const new = wholeFileStateFor(opts, fi, file.*, .new);
             if (old != null or new != null) try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } });
         } else try emitStatusPlaceholders(allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
-        file_rows.items[file_rows.items.len - 1].status_placeholders = .{ .start = placeholders_start, .end = rows.items.len };
+        try file_rows.append(allocator, .{
+            .file_index = fi,
+            .first_row = header_row,
+            .status_placeholders = .{ .start = placeholders_start, .end = rows.items.len },
+        });
 
         // True-whole-file: splice the fetched Hunk lines into the selected side's
         // unchanged lines and emit one continuous sequence without headers or
@@ -3286,6 +3290,14 @@ test "binary Files project independent sides in every Layout and Scope" {
             try testing.expectEqual(expected, countKind(projected, .status_placeholder));
             try expectStatusPlaceholdersOfEachFile(projected, diff);
             try testing.expectEqual(@as(usize, 2), countKind(projected, .comment));
+            const isolated = try buildWithComments(a, diff, layout, threads, .{
+                .whole_file = whole_file,
+                .fold_context = !whole_file,
+                .content_statuses = &content_statuses,
+                .only_file = 2,
+            });
+            try testing.expect(countKind(isolated, .status_placeholder) > 0);
+            try expectStatusPlaceholdersOfEachFile(isolated, diff);
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line));
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line_pair));
             for (projected.rows) |row| if (row == .status_placeholder) {

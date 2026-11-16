@@ -18,7 +18,7 @@ from source_lines import zig_files
 
 BASELINE = "tools/row_scan_baseline.txt"
 FOR = re.compile(r"\bfor\s*\(")
-WHOLE_ROWS = re.compile(r"^(?:[\w.]+\.)?(?:rows|visual_rows)$")
+WHOLE_ROWS = re.compile(r"^(?:0\s*\.\.\s*)?(?:[\w.]+\.)?(?:rows|visual_rows)(?:\.len)?$")
 CALL = re.compile(r"\bfileIndexForRow\s*\(")
 FIX = (
     "Ask the Buffer about one File instead of each row: `Buffer.statusPlaceholders`, "
@@ -59,7 +59,7 @@ def operands(header):
 def scans(lines):
     """The line of each `fileIndexForRow` call in the body of a loop over all rows."""
     text, line_of = joined(production(lines))
-    found = set()
+    found = []
     for loop in FOR.finditer(text):
         end = closing(text, loop.end())
         if not any(WHOLE_ROWS.match(operand) for operand in operands(text[loop.end():end])):
@@ -68,8 +68,8 @@ def scans(lines):
         body_start = end + 1 + (captures.end() if captures else 0)
         body = text[body_start:handler_end(text, body_start)]
         for call in CALL.finditer(body):
-            found.add(line_of(body_start + call.start()))
-    return sorted(found)
+            found.append(line_of(body_start + call.start()))
+    return found
 
 
 def counts(root):

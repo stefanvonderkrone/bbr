@@ -25897,7 +25897,7 @@ fn exerciseSourceRowCapacityHint(allocator: Allocator, session: *const Session) 
     const buffer: buffer_mod.Buffer = .{
         .rows = &rows,
         .layout = .side_by_side,
-        .file_rows = &.{.{ .file_index = 0, .first_row = 0 }},
+        .file_rows = &.{.{ .file_index = 0, .first_row = 0, .status_placeholders = .{ .start = 0, .end = 0 } }},
         .file_rows_end = rows.len,
     };
     const visual = try frame_mod.buildVisualRowsWithOptions(allocator, buffer.rows, .bytes, .{ .layout = .side_by_side, .width = 40 });
