@@ -24017,6 +24017,166 @@ test "yank allocation failure consumes Count and preserves Selection" {
     try testing.expect(presentation.takeCommand() == null);
 }
 
+test "yank availability keeps unavailable content within its File in both layouts and scopes" {
+    for ([_]usize{ 0, 1 }) |unavailable_file| for ([_]bool{ false, true }) |whole| for ([_]bool{ false, true }) |side_by_side| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testTwoFileSession(testing.allocator, 1);
+        const comments = try session.arena.allocator().alloc(bbr.review.Comment, 2);
+        comments[0] = .{ .id = 1, .author = "Ada", .body = "file body", .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } } };
+        comments[1] = .{ .id = 2, .author = "Bo", .body = "", .scope = .{ .file = .{ .path = "b.zig", .source_commit = "source" } } };
+        session.threads = try bbr.review.buildThreads(session.arena.allocator(), comments);
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 120, .rows = 40 },
+        });
+        defer presentation.deinit();
+        for (0..2) |file_index| {
+            const review = presentation.projection().review.?;
+            for (review.frame.visual_rows, 0..) |visual, index| {
+                if (review.buffer.rows[visual.buffer_index] == .file_header and review.buffer.fileIndexForRow(visual.buffer_index) == file_index) {
+                    try moveToRow(&presentation, index);
+                    break;
+                }
+            }
+            try presentation.dispatch(.ensure_focused_enrichment);
+            const command = presentation.takeCommand().?.enrich_file;
+            const responses = [_]bbr.http.Canned{
+                .{ .status = if (file_index == unavailable_file) 404 else 200, .body = if (file_index == 0) "old a\n" else "old b\n" },
+                .{ .status = 200, .body = if (file_index == 0) "new a\n" else "new b\n" },
+            };
+            var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+            const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+            var highlighter = TestNoopHighlighter{};
+            const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+            try presentation.dispatch(.{ .file_enrichment_completed = .{
+                .command_id = command.command_id,
+                .work_id = command.work_id,
+                .session_epoch = command.session_epoch,
+                .file_index = command.file_index,
+                .outcome = .{ .completed = result },
+            } });
+            try completeDisclosureBuild(&presentation);
+        }
+        if (side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        if (whole) {
+            try dispatchView(&presentation, .{ .action = .cycle_scope });
+            try dispatchView(&presentation, .{ .action = .cycle_scope });
+        }
+        for ([_]SelectedVersion{ .old, .new }) |selected| {
+            try dispatchView(&presentation, .{ .action = if (selected == .old) .select_old_version else .select_new_version });
+            var headers: usize = 0;
+            var placeholders: usize = 0;
+            var lines: usize = 0;
+            var cards: usize = 0;
+            const review = presentation.projection().review.?;
+            for (review.frame.visual_rows, 0..) |visual, index| {
+                const row = review.buffer.rows[visual.buffer_index];
+                const file_index = review.buffer.fileIndexForRow(visual.buffer_index) orelse continue;
+                var yank: ?YankRefusal = .no_source;
+                var inline_refusal: ?InlineCommentRefusal = .no_source;
+                var suggestion: ?SuggestionRefusal = .no_source;
+                switch (row) {
+                    .file_header, .hunk_header => {
+                        if (row == .file_header) headers += 1;
+                        if (selected == .old and file_index == unavailable_file) yank = .selected_content_unavailable;
+                    },
+                    .status_placeholder => {
+                        placeholders += 1;
+                        if (selected == .old) yank = .selected_content_unavailable;
+                        if (whole) {
+                            inline_refusal = .selected_content_unavailable;
+                            suggestion = .selected_content_unavailable;
+                        }
+                    },
+                    .line, .line_pair => {
+                        if (frame_mod.selectedSource(visual, selected) == null) continue;
+                        lines += 1;
+                        yank = null;
+                        inline_refusal = null;
+                        suggestion = if (whole and selected == .old) .old_version else null;
+                    },
+                    .comment => |card| {
+                        if (card.part != .header) continue;
+                        cards += 1;
+                        yank = if (file_index == 0) null else .no_body;
+                    },
+                    else => continue,
+                }
+                try moveToRow(&presentation, index);
+                const availability = presentation.projection().action_availability;
+                try testing.expectEqual(yank, availability.yank_refusal);
+                try testing.expectEqual(inline_refusal, availability.inline_comment_refusal);
+                try testing.expectEqual(suggestion, availability.suggestion_refusal);
+                if (yank) |refusal| {
+                    try presentation.dispatch(.{ .action = .yank });
+                    const expected: ActionError = switch (refusal) {
+                        .no_source => .yank_no_source,
+                        .no_body => .yank_no_body,
+                        .opposite_version => .yank_opposite_version,
+                        .selected_content_unavailable => .old_content_unavailable,
+                    };
+                    try testing.expectEqual(expected, presentation.projection().action_error.?);
+                }
+            }
+            try testing.expectEqual(@as(usize, 2), headers);
+            try testing.expectEqual(@as(usize, 2), cards);
+            try testing.expect(lines > 0);
+            try testing.expectEqual(@as(usize, if (whole and !side_by_side and selected == .new) 0 else 1), placeholders);
+        }
+    };
+}
+
+test "yank availability treats an empty whole-file side as no source in both layouts" {
+    for ([_]bool{ false, true }) |side_by_side| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.ensure_focused_enrichment);
+        const command = presentation.takeCommand().?.enrich_file;
+        const responses = [_]bbr.http.Canned{
+            .{ .status = 200, .body = "" },
+            .{ .status = 200, .body = "" },
+        };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+        var highlighter = TestNoopHighlighter{};
+        const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+        try presentation.dispatch(.{ .file_enrichment_completed = .{
+            .command_id = command.command_id,
+            .work_id = command.work_id,
+            .session_epoch = command.session_epoch,
+            .file_index = command.file_index,
+            .outcome = .{ .completed = result },
+        } });
+        try completeDisclosureBuild(&presentation);
+        if (side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
+        for ([_]SelectedVersion{ .old, .new }) |selected| {
+            try dispatchView(&presentation, .{ .action = if (selected == .old) .select_old_version else .select_new_version });
+            const review = presentation.projection().review.?;
+            var checked: usize = 0;
+            for (review.frame.visual_rows, 0..) |visual, index| {
+                const row = review.buffer.rows[visual.buffer_index];
+                if (row != .file_header and row != .status_placeholder) continue;
+                checked += 1;
+                try moveToRow(&presentation, index);
+                const availability = presentation.projection().action_availability;
+                try testing.expectEqual(@as(?YankRefusal, .no_source), availability.yank_refusal);
+                try testing.expectEqual(@as(?InlineCommentRefusal, if (row == .status_placeholder) .selected_content_unavailable else .no_source), availability.inline_comment_refusal);
+                try testing.expectEqual(@as(?SuggestionRefusal, if (row == .status_placeholder) .selected_content_unavailable else .no_source), availability.suggestion_refusal);
+                try presentation.dispatch(.{ .action = .yank });
+                try testing.expectEqual(ActionError.yank_no_source, presentation.projection().action_error.?);
+            }
+            try testing.expectEqual(@as(usize, 2), checked);
+        }
+    }
+}
+
 test "yank reports unavailable Selected Version content" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
