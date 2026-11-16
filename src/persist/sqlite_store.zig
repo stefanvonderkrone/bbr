@@ -386,8 +386,8 @@ pub const SqliteStore = struct {
         try self.exec("CREATE TABLE IF NOT EXISTS schema_steps (name TEXT PRIMARY KEY) WITHOUT ROWID;");
         const prefix: usize = @intCast(@min(@max(try self.userVersion(), 0), 9));
         for (migrations[0..prefix]) |step| try self.recordStep(step.name);
-        if (try self.tableExists("posted_drafts")) try self.recordStep("posted_drafts");
-        if (try self.tableExists("file_read_receipts")) try self.recordStep("file_read_receipts");
+        if (try self.tableExists("posted_drafts")) try self.recordStep(migrations[9].name);
+        if (try self.tableExists("file_read_receipts")) try self.recordStep(migrations[10].name);
     }
 
     fn recordStep(self: *SqliteStore, name: [:0]const u8) SqliteError!void {
@@ -2990,7 +2990,6 @@ fn preTicketStore(path: [:0]const u8, version: usize, old_m22: bool) !void {
     }
     if (old_m22) {
         try sqlite.exec(SqliteStore.migrations[10].sql);
-        try sqlite.exec("DROP TABLE IF EXISTS posted_drafts;");
     }
     if (version == 11 or old_m22) try sqlite.exec(
         \\INSERT INTO file_read_receipts VALUES (0, '', '', 1, 0, '', '', 'kept.zig', zeroblob(32));
