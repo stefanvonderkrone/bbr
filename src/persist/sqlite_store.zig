@@ -162,19 +162,31 @@ pub const SqliteStore = struct {
     const Step = struct { name: [:0]const u8, sql: [:0]const u8 };
     const legacy_version = 11;
 
-    fn stepNameError(comptime steps: []const Step) ?[]const u8 {
+    fn stepError(comptime steps: []const Step) ?[]const u8 {
+        @setEvalBranchQuota(100_000);
         if (steps.len < legacy_version)
-            return "`migrations` in src/persist/sqlite_store.zig needs every legacy step";
+            return std.fmt.comptimePrint("`migrations` in src/persist/sqlite_store.zig ends before step index {d}: keep all {d} legacy steps", .{ steps.len, legacy_version });
         for (steps, 0..) |step, index| {
             if (step.name.len == 0)
-                return "`migrations` in src/persist/sqlite_store.zig has an empty step name";
+                return std.fmt.comptimePrint("step index {d} in `migrations` in src/persist/sqlite_store.zig has an empty name: give each step a stable name", .{index});
             for (step.name) |char| {
                 if (!(char >= 'a' and char <= 'z') and !(char >= '0' and char <= '9') and char != '_')
-                    return "`migrations` in src/persist/sqlite_store.zig has an invalid step name";
+                    return std.fmt.comptimePrint("step `{s}` in `migrations` in src/persist/sqlite_store.zig has an invalid name: use lowercase letters, digits, and underscores", .{step.name});
             }
             for (steps[0..index]) |previous| {
                 if (std.mem.eql(u8, previous.name, step.name))
-                    return "`migrations` in src/persist/sqlite_store.zig repeats a step name";
+                    return std.fmt.comptimePrint("step `{s}` at index {d} in `migrations` in src/persist/sqlite_store.zig repeats a name: give each step a unique stable name", .{ step.name, index });
+            }
+            var offset: usize = 0;
+            while (offset < step.sql.len) {
+                const start = offset;
+                while (offset < step.sql.len and (std.ascii.isAlphanumeric(step.sql[offset]) or step.sql[offset] == '_')) : (offset += 1) {}
+                const word = step.sql[start..offset];
+                for (.{ "user_version", "BEGIN", "COMMIT" }) |reserved| {
+                    if (std.ascii.eqlIgnoreCase(word, reserved))
+                        return std.fmt.comptimePrint("step `{s}` in `migrations` in src/persist/sqlite_store.zig contains `{s}`: remove it because migrateStep owns the transaction and the version", .{ step.name, reserved });
+                }
+                if (offset < step.sql.len) offset += 1;
             }
         }
         return null;
@@ -326,7 +338,7 @@ pub const SqliteStore = struct {
     };
 
     comptime {
-        if (stepNameError(&migrations)) |message| @compileError(message);
+        if (stepError(&migrations)) |message| @compileError(message);
     }
 
     fn migrate(self: *SqliteStore) SqliteError!void {
@@ -335,7 +347,7 @@ pub const SqliteStore = struct {
 
     fn migrateSteps(self: *SqliteStore, comptime steps: []const Step) SqliteError!void {
         comptime {
-            if (stepNameError(steps)) |message| @compileError(message);
+            if (stepError(steps)) |message| @compileError(message);
             for (steps[0..legacy_version], migrations[0..legacy_version]) |step, legacy| {
                 if (!std.mem.eql(u8, step.name, legacy.name))
                     @compileError("`migrations` in src/persist/sqlite_store.zig must keep the legacy step names in order");
@@ -3085,19 +3097,36 @@ test "M22 read a store with every name opens without a write lock" {
     try owner.exec("ROLLBACK;");
 }
 
-test "M22 read step names reject empty repeated invalid and short lists at comptime" {
+test "M22 read steps reject invalid names lists and migration-owned SQL at comptime" {
     comptime {
-        @setEvalBranchQuota(10_000);
+        @setEvalBranchQuota(1_000_000);
         var empty = SqliteStore.migrations;
         empty[10].name = "";
-        if (SqliteStore.stepNameError(&empty) == null) @compileError("accepted an empty step name");
+        if (SqliteStore.stepError(&empty) == null) @compileError("accepted an empty step name");
         var repeated = SqliteStore.migrations;
         repeated[10].name = repeated[0].name;
-        if (SqliteStore.stepNameError(&repeated) == null) @compileError("accepted a repeated step name");
+        if (SqliteStore.stepError(&repeated) == null) @compileError("accepted a repeated step name");
         var invalid = SqliteStore.migrations;
         invalid[10].name = "not-a-name";
-        if (SqliteStore.stepNameError(&invalid) == null) @compileError("accepted an invalid step name");
-        if (SqliteStore.stepNameError(SqliteStore.migrations[0..10]) == null) @compileError("accepted too few legacy steps");
-        if (SqliteStore.stepNameError(&SqliteStore.migrations) != null) @compileError("rejected migrations");
+        if (SqliteStore.stepError(&invalid) == null) @compileError("accepted an invalid step name");
+        if (SqliteStore.stepError(SqliteStore.migrations[0..10]) == null) @compileError("accepted too few legacy steps");
+        var old_version = SqliteStore.migrations;
+        old_version[10].sql = "PRAGMA user_version = 4;";
+        if (SqliteStore.stepError(&old_version) == null) @compileError("accepted the old version write");
+        var old_begin = SqliteStore.migrations;
+        old_begin[10].sql = "BEGIN;";
+        if (SqliteStore.stepError(&old_begin) == null) @compileError("accepted the old transaction start");
+        var old_commit = SqliteStore.migrations;
+        old_commit[10].sql = "COMMIT;";
+        if (SqliteStore.stepError(&old_commit) == null) @compileError("accepted the old transaction end");
+        var mixed_case = SqliteStore.migrations;
+        for (.{ "pragma UsEr_VeRsIoN = 4;", "bEgIn;", "cOmMiT;" }) |sql| {
+            mixed_case[10].sql = sql;
+            if (SqliteStore.stepError(&mixed_case) == null) @compileError("accepted mixed-case migration-owned SQL");
+        }
+        var word_boundaries = SqliteStore.migrations;
+        word_boundaries[10].sql = "CREATE TABLE begin_steps (commit_id INTEGER, user_version_hint INTEGER);";
+        if (SqliteStore.stepError(&word_boundaries) != null) @compileError("rejected identifiers with reserved word prefixes");
+        if (SqliteStore.stepError(&SqliteStore.migrations) != null) @compileError("rejected migrations");
     }
 }
