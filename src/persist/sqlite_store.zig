@@ -2856,7 +2856,7 @@ test "M22 read a version 10 store that an old M22 build migrated reaches version
         try sqlite.fileReadStore().put(review, "src/a.zig", .{ .bytes = @splat(5) });
         try downgradeTo(&sqlite, 11);
         // No current migration makes this shape. Old M22 builds set version 10 with file_read_receipts.
-        try sqlite.exec("DROP TABLE posted_drafts; PRAGMA user_version = 10;");
+        try sqlite.exec("DROP TABLE schema_steps; DROP TABLE posted_drafts; PRAGMA user_version = 10;");
     }
 
     var upgraded = try SqliteStore.open(path);
@@ -2918,4 +2918,163 @@ test "M22 read a migration step that another process already applied is skipped"
     const review: ReviewIdentity = .{ .remote = testReviewKey(81) };
     try stale.fileReadStore().put(review, "src/a.zig", .{ .bytes = @splat(8) });
     try testing.expectEqual(@as(usize, 1), (try stale.fileReadStore().load(arena.allocator(), review)).len);
+}
+
+fn migrationTestInt(sqlite: *SqliteStore, sql: [:0]const u8) !i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    _ = try sqlite.native(c.sqlite3_prepare_v2(sqlite.db, sql, -1, &stmt, null), .prepare, @src());
+    defer settled(sqlite.native(c.sqlite3_finalize(stmt), .finalize, @src()));
+    try testing.expectEqual(c.SQLITE_ROW, try sqlite.native(c.sqlite3_step(stmt), .step, @src()));
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn expectMigrationNames(sqlite: *SqliteStore, count: i64) !void {
+    try testing.expectEqual(count, try migrationTestInt(sqlite, "SELECT count(*) FROM schema_steps;"));
+    try testing.expectEqual(count, try migrationTestInt(sqlite, "SELECT count(DISTINCT name) FROM schema_steps;"));
+    for (SqliteStore.migrations) |step| {
+        var buf: [160]u8 = undefined;
+        try testing.expectEqual(@as(i64, 1), try migrationTestInt(sqlite, try std.fmt.bufPrintZ(
+            &buf,
+            "SELECT count(*) FROM schema_steps WHERE name='{s}';",
+            .{step.name},
+        )));
+    }
+}
+
+fn preTicketStore(path: [:0]const u8, version: usize, old_m22: bool) !void {
+    var db: ?*c.sqlite3 = null;
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_open_v2(path, &db, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, null));
+    var sqlite: SqliteStore = .{ .db = db.? };
+    defer sqlite.deinit();
+    for (SqliteStore.migrations[0..if (old_m22) 9 else version], 0..) |step, index| {
+        try sqlite.exec(step.sql);
+        if (index == 0) try sqlite.exec(
+            \\INSERT INTO drafts(pr_id, local_id, kind, target, parent_kind, body, state_kind)
+            \\VALUES (1, 1, 0, 0, 0, 'legacy Draft', 0);
+        );
+    }
+    if (old_m22) {
+        try sqlite.exec(SqliteStore.migrations[10].sql);
+        try sqlite.exec("DROP TABLE IF EXISTS posted_drafts;");
+    }
+    if (version == 11 or old_m22) try sqlite.exec(
+        \\INSERT INTO file_read_receipts VALUES (0, '', '', 1, 0, '', '', 'kept.zig', zeroblob(32));
+    );
+    var buf: [40]u8 = undefined;
+    try sqlite.exec(try std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{version}));
+}
+
+test "M22 read named steps from two branches both run and keep earlier Drafts" {
+    var sqlite = try SqliteStore.open(":memory:");
+    defer sqlite.deinit();
+    const key = testReviewKey(91);
+    try sqlite.store().put(key, .{ .local_id = 1, .kind = .comment, .body = "before the branches" });
+    const branch_a = [_]SqliteStore.Step{.{ .name = "branch_a", .sql = "CREATE TABLE branch_a (x INTEGER);" }};
+    const branch_b = [_]SqliteStore.Step{.{ .name = "branch_b", .sql = "CREATE TABLE branch_b (x INTEGER);" }};
+    try sqlite.migrateSteps(&(SqliteStore.migrations ++ branch_a));
+    try sqlite.migrateSteps(&(SqliteStore.migrations ++ branch_b ++ branch_a));
+    try sqlite.exec("INSERT INTO branch_a VALUES (1); INSERT INTO branch_b VALUES (2);");
+    try testing.expectEqual(@as(i64, 1), try migrationTestInt(&sqlite, "SELECT x FROM branch_a;"));
+    try testing.expectEqual(@as(i64, 2), try migrationTestInt(&sqlite, "SELECT x FROM branch_b;"));
+    try expectMigrationNames(&sqlite, 13);
+    try testing.expectEqual(@as(i64, 2), try migrationTestInt(&sqlite, "SELECT count(*) FROM schema_steps WHERE name IN ('branch_a', 'branch_b');"));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try sqlite.store().load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqualStrings("before the branches", drafts[0].body);
+}
+
+test "M22 read pre-ticket versions and the old M22 shape record every name and keep their rows" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (0..13) |fixture| {
+        const old_m22 = fixture == 12;
+        const version = if (old_m22) 10 else fixture;
+        const path = try std.fmt.allocPrintSentinel(testing.allocator, ".zig-cache/tmp/{s}/legacy-{d}.db", .{ &tmp.sub_path, fixture }, 0);
+        defer testing.allocator.free(path);
+        try preTicketStore(path, version, old_m22);
+        var sqlite = try SqliteStore.open(path);
+        defer sqlite.deinit();
+        try expectMigrationNames(&sqlite, 11);
+        try testing.expectEqual(@as(i64, 11), try sqlite.userVersion());
+        try testing.expectEqual(@as(i64, if (version > 0) 1 else 0), try migrationTestInt(&sqlite, "SELECT count(*) FROM drafts WHERE body='legacy Draft';"));
+        try testing.expectEqual(@as(i64, if (version == 11 or old_m22) 1 else 0), try migrationTestInt(&sqlite, "SELECT count(*) FROM file_read_receipts WHERE path='kept.zig' AND fingerprint=zeroblob(32);"));
+        try testing.expectEqual(@as(i64, 1), try migrationTestInt(&sqlite, "SELECT integrity_check='ok' FROM pragma_integrity_check;"));
+    }
+}
+
+test "M22 read two connections reconcile a pre-ticket store and skip every applied step" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, ".zig-cache/tmp/{s}/legacy-race.db", .{&tmp.sub_path}, 0);
+    defer testing.allocator.free(path);
+    try preTicketStore(path, 7, false);
+    var stale = try openUnmigrated(path);
+    defer stale.deinit();
+    var rival = try openUnmigrated(path);
+    defer rival.deinit();
+    for (SqliteStore.migrations, 1..) |step, version| try rival.migrateStep(@intCast(version), step.sql);
+    for (SqliteStore.migrations, 1..) |step, version| try stale.migrateStep(@intCast(version), step.sql);
+    try expectMigrationNames(&stale, 11);
+    try testing.expectEqual(@as(i64, 1), try migrationTestInt(&stale, "SELECT count(*) FROM drafts WHERE body='legacy Draft';"));
+}
+
+test "M22 read reconcile finds legacy steps applied after schema_steps was created" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, ".zig-cache/tmp/{s}/old-build.db", .{&tmp.sub_path}, 0);
+    defer testing.allocator.free(path);
+    try preTicketStore(path, 0, false);
+    {
+        var sqlite = try openUnmigrated(path);
+        defer sqlite.deinit();
+        try sqlite.exec("CREATE TABLE schema_steps (name TEXT PRIMARY KEY) WITHOUT ROWID;");
+    }
+    try preTicketStore(path, 10, false);
+    var sqlite = try SqliteStore.open(path);
+    defer sqlite.deinit();
+    try expectMigrationNames(&sqlite, 11);
+    try testing.expectEqual(@as(i64, 1), try migrationTestInt(&sqlite, "SELECT count(*) FROM drafts WHERE body='legacy Draft';"));
+}
+
+test "M22 read a named step after the legacy steps leaves user_version at 11" {
+    var sqlite = try SqliteStore.open(":memory:");
+    defer sqlite.deinit();
+    try sqlite.migrateSteps(&(SqliteStore.migrations ++ [_]SqliteStore.Step{
+        .{ .name = "after_legacy", .sql = "CREATE TABLE after_legacy (x INTEGER);" },
+    }));
+    try testing.expectEqual(@as(i64, 11), try sqlite.userVersion());
+    try testing.expectEqual(@as(i64, 1), try migrationTestInt(&sqlite, "SELECT count(*) FROM schema_steps WHERE name='after_legacy';"));
+}
+
+test "M22 read a store with every name opens without a write lock" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, ".zig-cache/tmp/{s}/fast.db", .{&tmp.sub_path}, 0);
+    defer testing.allocator.free(path);
+    var owner = try SqliteStore.open(path);
+    defer owner.deinit();
+    try owner.exec("BEGIN IMMEDIATE;");
+    var reader = try SqliteStore.open(path);
+    defer reader.deinit();
+    try expectMigrationNames(&reader, 11);
+    try owner.exec("ROLLBACK;");
+}
+
+test "M22 read step names reject empty repeated invalid and short lists at comptime" {
+    comptime {
+        @setEvalBranchQuota(10_000);
+        var empty = SqliteStore.migrations;
+        empty[10].name = "";
+        if (SqliteStore.stepNameError(&empty) == null) @compileError("accepted an empty step name");
+        var repeated = SqliteStore.migrations;
+        repeated[10].name = repeated[0].name;
+        if (SqliteStore.stepNameError(&repeated) == null) @compileError("accepted a repeated step name");
+        var invalid = SqliteStore.migrations;
+        invalid[10].name = "not-a-name";
+        if (SqliteStore.stepNameError(&invalid) == null) @compileError("accepted an invalid step name");
+        if (SqliteStore.stepNameError(SqliteStore.migrations[0..10]) == null) @compileError("accepted too few legacy steps");
+        if (SqliteStore.stepNameError(&SqliteStore.migrations) != null) @compileError("rejected migrations");
+    }
 }
