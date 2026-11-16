@@ -1,7 +1,6 @@
 # 07: Repair a pending Draft store that an old M22 build migrated
 
-Status: claimed
-Claimed by: delegate session in /Volumes/Work/t3-code/m22-durable-file-read-state
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -83,10 +82,10 @@ Update `SPEC.md` in this folder: the SQLite schema section and the acceptance li
 
 ### Acceptance criteria
 
-- [ ] A store at version 10 with `file_read_receipts`, one Draft, one receipt, and no `posted_drafts` opens at version 11 and keeps the Draft and the receipt.
-- [ ] After that open, `posted_drafts` accepts a row.
-- [ ] A store at version 10 from `main` (with `posted_drafts`, no `file_read_receipts`) still migrates to version 11. The existing test "M22 read a version 10 database migrates to version 11, keeps its Drafts, and reopens once" proves it.
-- [ ] A new store still reaches version 11.
+- [x] A store at version 10 with `file_read_receipts`, one Draft, one receipt, and no `posted_drafts` opens at version 11 and keeps the Draft and the receipt.
+- [x] After that open, `posted_drafts` accepts a row.
+- [x] A store at version 10 from `main` (with `posted_drafts`, no `file_read_receipts`) still migrates to version 11. The existing test "M22 read a version 10 database migrates to version 11, keeps its Drafts, and reopens once" proves it.
+- [x] A new store still reaches version 11.
 
 ### Test that fails on the current code
 
@@ -136,3 +135,29 @@ The class happened once, so option 2 alone is also defensible.
 
 - Did you run any M22 build other than the ones between `9231fcb9` and `768977a8` against your store? The repair assumes that the old M22 shape is the only foreign shape.
 - Do you want the prevention as a new ticket now, and with option 1 or option 2?
+
+### 2026-11-16 operator answers
+
+The operator does not know whether a newer M22 build ran on the real store.
+Every M22 build from `9231fcb9` makes the same `file_read_receipts` table, and step 11 creates each of its two tables only when it is missing.
+So a store from any M22 build, older or newer, reaches version 11.
+The operator approved the prevention as ticket 08, with option 1. Option 2 is rejected for now, because it only reports the state.
+
+## Completion
+
+- Failing test: `7747fb9b` adds "M22 read a version 10 store that an old M22 build migrated reaches version 11 and keeps its Drafts and receipts". On `7747fb9b` it fails, because `SqliteStore.open` returns `error.Reported` from the `exec` of step 11 in `migrateStep`.
+- Fix: `046ccd0c` makes step 11 run `CREATE TABLE IF NOT EXISTS` for `posted_drafts` and `file_read_receipts`. Step 10 and `downgrades` stay unchanged. `SPEC.md` names version 11.
+- Check: `zig build test-file-read` passes 59 of 59 tests after the fix.
+- Check: `zig build test` passes, 51 of 51 steps and 1661 of 1661 tests.
+- Check: `zig fmt --check src build.zig tests`, every `tools/check_*.py` that `build.zig` runs, and `python3 tools/check_agent_docs.py` pass.
+- Manual check, in a separate `XDG_STATE_HOME` with mode 700 and a scratch Git repository. The operator's store was not opened.
+  1. The `9231fcb9` ReleaseSafe build authored one Review-level Draft and marked `a.txt` read. The store was at version 10, with `file_read_receipts` and one receipt, one Draft, and no `posted_drafts`.
+  2. The `63ce96c3` build on a copy printed `bbr: could not open <state>/bbr/pending.db; drafts won't persist this session` and showed no Draft. The copy stayed at version 10.
+  3. The `046ccd0c` ReleaseSafe build printed nothing on stderr and showed the old Draft. A new Draft persisted after a restart, and the Session showed both Drafts.
+  4. The store was then at version 11, with `posted_drafts`, `file_read_receipts`, both Drafts, and the receipt for `a.txt`. The File Tree showed `a.txt` read and `b.txt` unread.
+- Related: `c5f1717b` adds the cross-process migration check of ticket 06. `0102fcd3` makes the store message check read the current schema version from bbr, because its literal `10` went stale with step 11.
+- Review: code review of `63ce96c3..HEAD` on two axes, Standards and Spec. No finding blocked the change.
+  - Standards: two sentences over 20 words, in the step 11 comment and in `SPEC.md`. Both are split.
+  - Standards: step 11 repeats the `posted_drafts` SQL of step 10. It stays, because a migration step is fixed history.
+  - Spec: the reference run in the store message check checked nothing. It now expects a version above 0.
+  - Both: the race check ignores the exit code. It stays, because `bbr local` without a terminal exits with 1 and prints `error: NoDevice` on M22 and on `main`.
