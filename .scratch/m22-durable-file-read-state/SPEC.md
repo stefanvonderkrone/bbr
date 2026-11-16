@@ -272,10 +272,15 @@ Tests that do not set it see every File unread and no warning.
 
 ### SQLite schema
 
-`SqliteStore.migrate` adds version 10 in one transaction:
+`SqliteStore.migrate` adds version 11 in one transaction:
 
 ```sql
-CREATE TABLE file_read_receipts (
+CREATE TABLE IF NOT EXISTS posted_drafts (
+  workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
+  temp_id INTEGER NOT NULL, comment_id INTEGER NOT NULL,
+  PRIMARY KEY (workspace, repository, pr_id, temp_id)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS file_read_receipts (
   review_kind   INTEGER NOT NULL,
   workspace     TEXT NOT NULL,
   repository    TEXT NOT NULL,
@@ -288,8 +293,12 @@ CREATE TABLE file_read_receipts (
   PRIMARY KEY (review_kind, workspace, repository, pr_id,
                repository_id, base_ref, source_ref, path)
 ) WITHOUT ROWID;
-PRAGMA user_version = 10;
+PRAGMA user_version = 11;
 ```
+
+Version 10 on `main` creates `posted_drafts`.
+M22 builds before the merge `768977a8` set version 10 with `file_read_receipts` and without `posted_drafts`.
+So version 11 creates each of the two tables only when it is missing, and a store of either shape reaches version 11 with every Draft and receipt.
 
 `review_kind` is `0` for a RemoteReview and `1` for a LocalReview.
 A RemoteReview row stores its Workspace, Repository, and PullRequestId, with `0` and empty text in the local columns.
@@ -314,7 +323,7 @@ M22 adds no new path and no new XDG read.
 | `src/git/client.zig` | Add `--full-index` to `ShellGitClient.diff`. |
 | `src/review/file_read.zig` (new) | `FileReviewFingerprint`, `fingerprint`, `FileReadReceipt`, `FileReadStore`, and `InMemoryFileReadStore`. |
 | `src/root.zig` | Export the new `bbr.review` names. |
-| `src/persist/sqlite_store.zig` | Migration to version 10 and `SqliteStore.fileReadStore()`. |
+| `src/persist/sqlite_store.zig` | Migration to version 11 and `SqliteStore.fileReadStore()`. |
 | `src/tui/presentation.zig` | `Dependencies.file_reads`, `Published.file_reads`, receipt load in `Published.createInputs`, `Published.toggleFileRead`, and three `ActionError` values. |
 | `src/tui/file_tree.zig` | `Entry.unread`, File and Directory read state in `build`. |
 | `src/tui/render.zig` | Row weight in `drawFileTree`. |
@@ -409,8 +418,9 @@ Store round trips, against both stores:
 - Receipts stay apart for two Repositories with the same PullRequestId.
 - Receipts stay apart for a RemoteReview and a LocalReview.
 - Receipts stay apart for two LocalReviews with other BaseRefs or SourceRefs.
-- A version 9 database migrates to version 10 and keeps its Drafts.
-- A version 10 database reopens without a second migration.
+- A version 10 database migrates to version 11 and keeps its Drafts.
+- A version 10 database that an old M22 build migrated, with `file_read_receipts` and without `posted_drafts`, migrates to version 11 and keeps its Drafts and receipts.
+- A version 11 database reopens without a second migration.
 
 Presentation:
 
