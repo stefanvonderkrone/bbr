@@ -4,8 +4,8 @@
 //!
 //! One row per Draft, keyed `(workspace, repository, pr_id, local_id)`. `put` is INSERT OR REPLACE,
 //! `remove` a keyed DELETE, `load` a per-PR SELECT that dupes every string into
-//! the caller's allocator. Schema versioning rides SQLite's `PRAGMA user_version`
-//! so migrations are a forward table (see `migrations`).
+//! the caller's allocator. Each migration has a stable name in `schema_steps`.
+//! `PRAGMA user_version` stops at 11 for builds that predate named steps.
 //!
 //! Concurrency: the store is touched only on the main thread (design §10/§11);
 //! the amalgamation is compiled `SQLITE_THREADSAFE=0` to match. The Bitbucket
@@ -180,8 +180,8 @@ pub const SqliteStore = struct {
         return null;
     }
 
-    /// Entry `i` turns a version `i` database into a version `i + 1` database.
-    /// `migrateStep` owns the transaction and the `user_version` write.
+    /// A name never changes after a build applies it. Append each new step.
+    /// Only the first `legacy_version` steps write `user_version`.
     const migrations = [_]Step{
         .{ .name = "drafts", .sql = schema_v1 },
         // v2 (M10b): multi-line anchors. Add the range's top-line columns. They
@@ -308,16 +308,8 @@ pub const SqliteStore = struct {
         },
         // v11 (M22): File Read Receipts, one per ReviewIdentity and canonical
         // path. The table is independent of every PendingReview table.
-        // M22 builds before the merge 768977a8 set version 10 with
-        // file_read_receipts and no posted_drafts. So this step creates each
-        // table only when it is missing.
         .{ .name = "file_read_receipts", .sql =
-        \\CREATE TABLE IF NOT EXISTS posted_drafts (
-        \\  workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
-        \\  temp_id INTEGER NOT NULL, comment_id INTEGER NOT NULL,
-        \\  PRIMARY KEY (workspace, repository, pr_id, temp_id)
-        \\) WITHOUT ROWID;
-        \\CREATE TABLE IF NOT EXISTS file_read_receipts (
+        \\CREATE TABLE file_read_receipts (
         \\  review_kind   INTEGER NOT NULL,
         \\  workspace     TEXT NOT NULL,
         \\  repository    TEXT NOT NULL,
@@ -337,9 +329,6 @@ pub const SqliteStore = struct {
         if (stepNameError(&migrations)) |message| @compileError(message);
     }
 
-    /// The `user_version` that the last migration sets.
-    const schema_version: i64 = migrations.len;
-
     fn migrate(self: *SqliteStore) SqliteError!void {
         return self.migrateSteps(&migrations);
     }
@@ -352,33 +341,69 @@ pub const SqliteStore = struct {
                     @compileError("`migrations` in src/persist/sqlite_store.zig must keep the legacy step names in order");
             }
         }
-        // A current database opens without a write lock.
-        if (try self.userVersion() >= steps.len) return;
-        for (steps, 1..) |step, version| try self.migrateStep(@intCast(version), step.sql);
+        if (try self.tableExists("schema_steps")) {
+            for (steps) |step| {
+                if (!try self.recorded(step.name)) break;
+            } else return;
+        }
+        for (steps, 0..) |step, index| try self.migrateStep(index, step);
     }
 
-    /// Another process can migrate between the first read and the lock, so the
-    /// step reads the version again inside its transaction.
-    fn migrateStep(self: *SqliteStore, version: i64, sql: [:0]const u8) SqliteError!void {
+    fn migrateStep(self: *SqliteStore, index: usize, step: Step) SqliteError!void {
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch |err| switch (err) {
             error.Exec, error.Open, error.Prepare, error.Step, error.Reported => {},
         };
-        if (try self.userVersion() < version) {
-            try self.exec(sql);
+        try self.reconcile();
+        if (!try self.recorded(step.name)) {
+            try self.exec(step.sql);
+            try self.recordStep(step.name);
+        }
+        if (index < legacy_version and try self.userVersion() < index + 1) {
             var buf: [40]u8 = undefined;
-            try self.exec(std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{version}) catch |err| switch (err) {
+            try self.exec(std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{index + 1}) catch |err| switch (err) {
                 error.NoSpaceLeft => unreachable,
             });
         }
         try self.exec("COMMIT;");
     }
 
-    fn userVersion(self: *SqliteStore) SqliteError!i64 {
+    /// Old builds can advance `user_version` after a partial named migration.
+    /// Version 10 can mean either table, so only versions 1 to 9 identify steps.
+    fn reconcile(self: *SqliteStore) SqliteError!void {
+        try self.exec("CREATE TABLE IF NOT EXISTS schema_steps (name TEXT PRIMARY KEY) WITHOUT ROWID;");
+        const prefix: usize = @intCast(@min(@max(try self.userVersion(), 0), 9));
+        for (migrations[0..prefix]) |step| try self.recordStep(step.name);
+        if (try self.tableExists("posted_drafts")) try self.recordStep("posted_drafts");
+        if (try self.tableExists("file_read_receipts")) try self.recordStep("file_read_receipts");
+    }
+
+    fn recordStep(self: *SqliteStore, name: [:0]const u8) SqliteError!void {
         var stmt: ?*c.sqlite3_stmt = null;
-        if (try self.native(c.sqlite3_prepare_v2(self.db, "PRAGMA user_version;", -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK)
+        _ = try self.native(c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO schema_steps(name) VALUES (?1);", -1, &stmt, null), .prepare, @src());
+        defer settled(self.native(c.sqlite3_finalize(stmt), .finalize, @src()));
+        _ = try self.native(c.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), null), .bind, @src());
+        _ = try self.native(c.sqlite3_step(stmt), .step, @src());
+    }
+
+    fn tableExists(self: *SqliteStore, name: [:0]const u8) SqliteError!bool {
+        return try self.queryInt("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1;", name) != 0;
+    }
+
+    fn recorded(self: *SqliteStore, name: [:0]const u8) SqliteError!bool {
+        return try self.queryInt("SELECT count(*) FROM schema_steps WHERE name=?1;", name) != 0;
+    }
+
+    fn userVersion(self: *SqliteStore) SqliteError!i64 {
+        return self.queryInt("PRAGMA user_version;", null);
+    }
+
+    fn queryInt(self: *SqliteStore, sql: [:0]const u8, text: ?[:0]const u8) SqliteError!i64 {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (try self.native(c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null), .prepare, @src()) != c.SQLITE_OK)
             return error.Prepare;
         defer settled(self.native(c.sqlite3_finalize(stmt), .finalize, @src()));
+        if (text) |value| _ = try self.native(c.sqlite3_bind_text(stmt, 1, value.ptr, @intCast(value.len), null), .bind, @src());
         return switch (try self.native(c.sqlite3_step(stmt), .step, @src())) {
             c.SQLITE_ROW => c.sqlite3_column_int64(stmt, 0),
             else => error.Step,
@@ -2678,8 +2703,6 @@ test "SQLite carries final server guidance into a fresh Submission budget" {
     try testing.expect(retry.pending_wait);
 }
 
-/// The inverse of each migration. The SQL for `from` turns a `from` database
-/// into a `from - 1` database. Entries are contiguous and end at `schema_version`.
 const downgrades = [_]struct { from: i64, sql: [*:0]const u8 }{
     .{ .from = 8, .sql = "DROP TABLE submission_run_items;" },
     .{ .from = 9, .sql =
@@ -2706,14 +2729,12 @@ comptime {
         ));
     }
     const last = downgrades[downgrades.len - 1].from;
-    if (last != SqliteStore.schema_version) @compileError(std.fmt.comptimePrint(
+    if (last != SqliteStore.legacy_version) @compileError(std.fmt.comptimePrint(
         "add the inverse of migration {d} to `downgrades` in src/persist/sqlite_store.zig",
         .{last + 1},
     ));
 }
 
-/// Turns a freshly migrated database into a `version` database. A migration
-/// test fakes an old database only through this function.
 fn downgradeTo(sqlite: *SqliteStore, comptime version: i64) !void {
     const oldest = downgrades[0].from - 1;
     if (version < oldest) @compileError(std.fmt.comptimePrint(
@@ -2721,16 +2742,18 @@ fn downgradeTo(sqlite: *SqliteStore, comptime version: i64) !void {
         .{oldest},
     ));
     const current = try sqlite.userVersion();
-    if (current != SqliteStore.schema_version) {
+    if (current != SqliteStore.legacy_version) {
         std.debug.print(
-            "migrate ends at version {d}: set `schema_version` in src/persist/sqlite_store.zig to {d} and add the inverse of migration {d} to `downgrades`\n",
-            .{ current, current, current },
+            "migrate ended at version {d}, not legacy_version {d}\n",
+            .{ current, SqliteStore.legacy_version },
         );
         return error.SchemaVersionStale;
     }
-    var from = SqliteStore.schema_version;
+    var from: i64 = SqliteStore.legacy_version;
     while (from > version) : (from -= 1) {
         try sqlite.exec(downgrades[@intCast(from - downgrades[0].from)].sql);
+        var name_buf: [160]u8 = undefined;
+        try sqlite.exec(try std.fmt.bufPrintZ(&name_buf, "DELETE FROM schema_steps WHERE name='{s}';", .{SqliteStore.migrations[@intCast(from - 1)].name}));
         var buf: [40]u8 = undefined;
         try sqlite.exec(try std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{from - 1}));
     }
@@ -2911,8 +2934,8 @@ test "M22 read a migration step that another process already applied is skipped"
     var rival = try openUnmigrated(path);
     defer rival.deinit();
 
-    try rival.migrateStep(11, SqliteStore.migrations[10].sql);
-    try stale.migrateStep(11, SqliteStore.migrations[10].sql);
+    try rival.migrateStep(10, SqliteStore.migrations[10]);
+    try stale.migrateStep(10, SqliteStore.migrations[10]);
 
     try testing.expectEqual(@as(i64, 11), try stale.userVersion());
     const review: ReviewIdentity = .{ .remote = testReviewKey(81) };
@@ -3014,8 +3037,8 @@ test "M22 read two connections reconcile a pre-ticket store and skip every appli
     defer stale.deinit();
     var rival = try openUnmigrated(path);
     defer rival.deinit();
-    for (SqliteStore.migrations, 1..) |step, version| try rival.migrateStep(@intCast(version), step.sql);
-    for (SqliteStore.migrations, 1..) |step, version| try stale.migrateStep(@intCast(version), step.sql);
+    for (SqliteStore.migrations, 0..) |step, index| try rival.migrateStep(index, step);
+    for (SqliteStore.migrations, 0..) |step, index| try stale.migrateStep(index, step);
     try expectMigrationNames(&stale, 11);
     try testing.expectEqual(@as(i64, 1), try migrationTestInt(&stale, "SELECT count(*) FROM drafts WHERE body='legacy Draft';"));
 }
