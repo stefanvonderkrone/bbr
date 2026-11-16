@@ -2784,6 +2784,37 @@ test "M22 read a version 10 database migrates to version 11, keeps its Drafts, a
     try testing.expectEqual(@as(usize, 1), (try reopened.store().load(arena.allocator(), key)).len);
 }
 
+test "M22 read a version 10 store that an old M22 build migrated reaches version 11 and keeps its Drafts and receipts" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/old-m22.db", .{&tmp.sub_path}, 0);
+    const key = testReviewKey(71);
+    const review: ReviewIdentity = .{ .remote = key };
+
+    {
+        var sqlite = try SqliteStore.open(path);
+        defer sqlite.deinit();
+        try sqlite.store().put(key, .{ .local_id = 1, .kind = .comment, .body = "kept from the old M22 build" });
+        try sqlite.fileReadStore().put(review, "src/a.zig", .{ .bytes = @splat(5) });
+        try downgradeTo(&sqlite, 11);
+        // No current migration makes this shape. Old M22 builds set version 10 with file_read_receipts.
+        try sqlite.exec("DROP TABLE posted_drafts; PRAGMA user_version = 10;");
+    }
+
+    var upgraded = try SqliteStore.open(path);
+    defer upgraded.deinit();
+    try testing.expectEqual(@as(i64, 11), try upgraded.userVersion());
+    const drafts = try upgraded.store().load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqualStrings("kept from the old M22 build", drafts[0].body);
+    const receipts = try upgraded.fileReadStore().load(arena.allocator(), review);
+    try testing.expectEqual(@as(usize, 1), receipts.len);
+    try testing.expectEqualStrings("src/a.zig", receipts[0].path);
+    try upgraded.exec("INSERT INTO posted_drafts VALUES ('w', 'r', 1, 1, 7);");
+}
+
 test "M22 read SqliteStore.open sets a busy timeout so a write waits for another bbr process" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
