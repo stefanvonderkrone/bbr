@@ -1262,9 +1262,15 @@ fn cardRowCapacity(body: []const u8, content_width: usize) usize {
 pub const SearchCandidateInputs = struct {
     diff: model.Diff,
     threads: []const Thread,
+    /// `key` reads the pointer, not the names. The Session loader sets
+    /// `Session.mention_names` once, and the pointer is `*const`, so a
+    /// published Session cannot change the names in place.
     mention_names: *const MentionNames,
     /// Names the Session. A published Session never changes its Diff, its
-    /// Threads, or its mention names.
+    /// Threads, or its mention names: `[]const File`, `[]const Hunk`,
+    /// `[]const Line`, `*const Comment`, and `*const MentionNames` make an
+    /// in-place change a compile error. A change makes a new Session with a
+    /// new epoch through Refresh or Reconciliation.
     session_epoch: u64,
     layout: Layout,
     scope: SearchCandidateScope,

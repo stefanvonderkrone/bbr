@@ -1,6 +1,7 @@
 # 24: Check that a published Session never changes its Diff or Threads
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade (t23-24 runner)
 Blocked by: none
 
 ## Summary

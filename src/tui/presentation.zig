@@ -3216,7 +3216,7 @@ pub const DisclosureBuild = struct {
         return .{
             .diff = self.session.diff,
             .threads = self.session.threads,
-            .mention_names = &self.session.mention_names,
+            .mention_names = self.session.mention_names,
             .session_epoch = self.epoch,
             .layout = self.preferences.layout,
             .scope = searchCandidateScope(self.preferences, self.blobs),
@@ -3245,7 +3245,7 @@ pub const DisclosureBuild = struct {
             .collapsed_rows = self.collapsed_rows,
             .emphasis_cache = &self.session.emphasis_cache.?,
             .side_by_side_plans = self.plans,
-            .mention_names = &self.session.mention_names,
+            .mention_names = self.session.mention_names,
         });
     }
 
@@ -4586,7 +4586,7 @@ const Published = struct {
                     .collapsed_rows = published.comments_collapsed_rows,
                     .emphasis_cache = &published.emphasis_cache,
                     .side_by_side_plans = session.side_by_side_plans,
-                    .mention_names = &session.mention_names,
+                    .mention_names = session.mention_names,
                 },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -4991,7 +4991,7 @@ const Published = struct {
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
                 .side_by_side_plans = self.session.side_by_side_plans,
-                .mention_names = &self.session.mention_names,
+                .mention_names = self.session.mention_names,
             },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -5169,7 +5169,7 @@ const Published = struct {
         return .{
             .diff = self.session.diff,
             .threads = self.session.threads,
-            .mention_names = &self.session.mention_names,
+            .mention_names = self.session.mention_names,
             .session_epoch = self.epoch,
             .layout = preferences.layout,
             .scope = searchCandidateScope(preferences, self.session.enrichment.projection().blobs),
@@ -5189,17 +5189,17 @@ const Published = struct {
         var order: usize = 0;
         for (self.session.threads) |thread| {
             if (!thread.root.deleted) {
-                const body = try review_card.ReviewBody.parseWithMentions(allocator, thread.root.body, &self.session.mention_names);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, thread.root.body, self.session.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .comment = thread.root.id }, self.epoch, &order, &candidates);
             }
             for (thread.replies) |reply| {
                 if (reply.deleted) continue;
-                const body = try review_card.ReviewBody.parseWithMentions(allocator, reply.body, &self.session.mention_names);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, reply.body, self.session.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .comment = reply.id }, self.epoch, &order, &candidates);
             }
         }
         for (self.review.drafts.items) |draft| {
-            const body = try review_card.ReviewBody.parseWithMentions(allocator, draft.body, &self.session.mention_names);
+            const body = try review_card.ReviewBody.parseWithMentions(allocator, draft.body, self.session.mention_names);
             try search.appendReviewBodyCandidates(allocator, body, .{ .draft = draft.local_id }, self.epoch, &order, &candidates);
         }
         return BufferSearchCorpus.create(candidates.items);
@@ -12219,7 +12219,7 @@ pub const Presentation = struct {
             body.visible = true;
         }
         if (self.codePreviewBody(published)) |body| {
-            body.parsed.applyMentionNames(&published.session.mention_names);
+            body.parsed.applyMentionNames(published.session.mention_names);
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const geometry = frame_mod.reviewSearchGeometry(self.geometry) orelse return;
@@ -13959,7 +13959,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
     switch (owner) {
         .comment => |id| for (published.session.threads) |thread| {
             if (thread.root.id == id) return .{
-                .mention_names = &published.session.mention_names,
+                .mention_names = published.session.mention_names,
                 .kind = "COMMENT",
                 .source = thread.root.author,
                 .body = thread.root.body,
@@ -13968,7 +13968,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                 .occurrence = occurrence,
             };
             for (thread.replies) |reply| if (reply.id == id) return .{
-                .mention_names = &published.session.mention_names,
+                .mention_names = published.session.mention_names,
                 .kind = "REPLY",
                 .source = reply.author,
                 .body = reply.body,
@@ -13989,7 +13989,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                     .comment => |parent_id| {
                         for (published.session.threads) |thread| {
                             if (thread.root.id == parent_id) return .{
-                                .mention_names = &published.session.mention_names,
+                                .mention_names = published.session.mention_names,
                                 .kind = "DRAFT",
                                 .source = "local",
                                 .body = draft.body,
@@ -13998,7 +13998,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                                 .occurrence = occurrence,
                             };
                             for (thread.replies) |reply| if (reply.id == parent_id) return .{
-                                .mention_names = &published.session.mention_names,
+                                .mention_names = published.session.mention_names,
                                 .kind = "DRAFT",
                                 .source = "local",
                                 .body = draft.body,
@@ -14020,7 +14020,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                 }
                 break;
             };
-            return .{ .mention_names = &published.session.mention_names, .kind = "DRAFT", .source = "local", .body = draft.body, .scope = scope, .scope_state = scope_state, .occurrence = occurrence };
+            return .{ .mention_names = published.session.mention_names, .kind = "DRAFT", .source = "local", .body = draft.body, .scope = scope, .scope_state = scope_state, .occurrence = occurrence };
         },
     }
     unreachable;
@@ -21926,7 +21926,10 @@ test "mention display survives reprojection and both searches while yank keeps a
         try store.store().put(.{ .workspace = "workspace", .repository = "repo", .pull_request_id = 1 }, .{ .local_id = 1, .kind = .comment, .body = raw });
         const session = try testCommentSession(testing.allocator, 1);
         @constCast(session.threads[0].root).body = raw;
-        try session.mention_names.put(session.arena.allocator(), "id", "@Stefan von der Krone");
+        const mention_names = try session.arena.allocator().create(@import("review_body.zig").MentionNames);
+        mention_names.* = .empty;
+        try mention_names.put(session.arena.allocator(), "id", "@Stefan von der Krone");
+        session.mention_names = mention_names;
         var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
             .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
             .geometry = .{ .cols = 100, .rows = 40 },
@@ -21968,7 +21971,7 @@ test "mention display survives reprojection and both searches while yank keeps a
                     try testing.expectEqual(@as(usize, 2), batch.occurrences.len);
                     const result = reviewSearchResult(published, batch.occurrences[0]);
                     try testing.expectEqualStrings(raw, result.body);
-                    try testing.expect(result.mention_names == &session.mention_names);
+                    try testing.expect(result.mention_names == session.mention_names);
                 }
             }
             try selectRows(&state, first.?, first.?);
