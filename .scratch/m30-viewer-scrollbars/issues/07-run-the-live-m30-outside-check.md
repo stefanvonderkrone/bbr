@@ -233,6 +233,7 @@ The branch changes no production wheel code.
    On PullRequest A, one cell holds about 4,500 rows at 30 rows and about 1,500 rows at 80 rows.
    The last row comes only when the pointer goes past the track, onto the border or further.
    The 30-row File Tree shows the same behavior. A longer thumb, as in the 80-row File Tree and in an isolated File, reaches the last row.
+   Ticket [12](12-drag-a-one-cell-thumb-to-the-last-row.md) fixes this finding.
 2. No input clears an accepted Buffer Search query.
    `/`, `Ctrl-U`, and `Enter` repeat the accepted query. `Esc` and a motion keep the highlights.
    The hit marks follow the highlights in every case, as the SPEC asks.
