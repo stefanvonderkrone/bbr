@@ -1,7 +1,6 @@
 # 09: Make SearchProjection.create cheaper
 
-Status: claimed
-Claimed by: /Volumes/Work/t3-code/enrichment-rebuild-cascade
+Status: needs-info
 Blocked by: 25
 
 ## Summary
@@ -97,14 +96,14 @@ Use the method of ticket 07 with `[DEBUG-09]` marks.
 
 ## Acceptance criteria
 
-- [ ] A test builds the projection of Unified and SideBySide Buffers with wrapped Lines, context Lines on both sides, ReviewCards, Drafts, folds, and disclosures. For every source key, body owner, and visual row, `occurrenceRows`, `NavigationIndex.find`, the `owners` lookups of ReviewCard headers, Draft headers, and disclosures, `requiredDisclosures`, and `disclosure_rows` give the same result as the code before this change.
-- [ ] Buffer Search results and the cursor restoration after a resize are the same as before the change.
-- [ ] On the workload, the median of the projection phase of a Unified disclosure toggle and of a Unified resize is at least 20 percent lower than the baseline at `6f9f09f` of the same run.
-- [ ] The median of the projection phase of a Layout switch to SideBySide is at least 20 percent lower than the baseline at `6f9f09f` of the same run.
+- [x] A test builds the projection of Unified and SideBySide Buffers with wrapped Lines, context Lines on both sides, ReviewCards, Drafts, folds, and disclosures. For every source key, body owner, and visual row, `occurrenceRows`, `NavigationIndex.find`, the `owners` lookups of ReviewCard headers, Draft headers, and disclosures, `requiredDisclosures`, and `disclosure_rows` give the same result as the code before this change.
+- [x] Buffer Search results and the cursor restoration after a resize are the same as before the change.
+- [x] On the workload, the median of the projection phase of a Unified disclosure toggle and of a Unified resize is at least 20 percent lower than the baseline at `6f9f09f` of the same run.
+- [x] The median of the projection phase of a Layout switch to SideBySide is at least 20 percent lower than the baseline at `6f9f09f` of the same run.
 - [ ] The process CPU of 8 resizes is lower than the baseline by more than the range of the runs.
-- [ ] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
-- [ ] No `[DEBUG-09]` or `[DEBUG-t07]` line stays in the repository.
-- [ ] `zig build test` passes.
+- [x] The Buffer rows and the visual rows of each measured rebuild are the same as in the baseline.
+- [x] No `[DEBUG-09]` or `[DEBUG-t07]` line stays in the repository.
+- [x] `zig build test` passes.
 
 ## Comments
 
@@ -130,3 +129,58 @@ Ticket 25 is resolved. It made the projection about 25 percent cheaper in Unifie
 The user approved this plan: take a fresh baseline at `6f9f09f`, do step 1 (no `.line` owners) and step 3 (key lists without one list per key) in separate commits, and measure each step against the fresh baseline in the same alternating run.
 The new targets are in the acceptance criteria: the projection phase at least 20 percent lower for a Unified toggle, a Unified resize, and a switch to SideBySide, and lower process CPU for 8 resizes by more than the run-to-run range.
 If step 3 misses its target, record the numbers and set this ticket to `needs-info`. Ticket 12 (projected search ranges) stays out of scope.
+
+### 2026-11-16 result: needs-info
+
+Both steps are done and committed. The projection targets are met. The process CPU target of 8 resizes is not proven, so this ticket goes to `needs-info` as the plan says.
+
+**Change.**
+
+- `30afd1d` pins the projection lookups in the forms that their readers use. The test "search projection lookups match the 6f9f09f baseline in both Layouts" hashes `occurrenceRows` for every source key and body owner, `NavigationIndex.find` for every visual row at its start and at an offset inside it, the `owners` lookup of every row whose owner is not a Line, the ReviewCard header, Draft header, and resolved Thread disclosure lookups, `requiredDisclosures`, and `disclosure_rows`. It covers Unified and SideBySide at widths 24 and 40, collapsed and expanded, with wrapped Lines, context Lines, ReviewCards, a Draft chain, a Fold, and disclosures. The digests are the values of `6f9f09f`, and no later commit changes them.
+- `38445a9` keeps Line owners out of `NavigationIndex.owners`. Every `owners` reader was checked: `find` reads `owners` only for an owner that is not a Line, and the other readers (`cardHeaderOwner` lookups, the Draft header jump, the resolved Thread disclosure) ask for owners that are not Lines. The build reserves `owners` from the count of the other rows.
+- `d9947f0` adds `KeyLists` in `src/tui/key_lists.zig`. `NavigationIndex.spans`, `SearchProjection.source_rows`, and `SearchProjection.body_rows` use it. A build calls its source twice: the first pass numbers the keys and counts their entries, and the second pass writes each entry into one shared array at its key's cursor. Each list keeps the call order. `addSourceRow` is deleted. The new test "a NavigationIndex build allocates the same for any key count and grows no key list" fails on the per-key lists of `38445a9` with 2,049 allocations for 512 rows and 16,385 for 4,096 rows.
+- `65c44b6` checks that Line rows add no `owners` entry. The build of `30afd1d` fails it with 4,096 entries. AGENTS.md has the rule.
+- `027f456` restores the free count of the one-span growth test, which `d9947f0` dropped, and checks `find` for a missing Line key.
+
+**Measurement.** Method of ticket 25, ReleaseFast, `[DEBUG-09]` marks in detached worktrees that are now removed. Runs alternated base, step 1, step 3 three times, then base and step 3 twice more, with 8 resizes, 8 toggles, and 8 Layout switches in each run. Thread CPU of the worker per rebuild, median [range], in ms. "Step 1" is `38445a9` (no Line owners). "Step 3" is `d9947f0` (KeyLists, with step 1). The 1-minute load average was 1.9 to 6.2 from other work, on the Apple M5 Pro with 18 cores.
+
+| Rebuild | Side | n | Whole job | Projection | Projection faults | Projection allocations |
+| --- | --- | --- | --- | --- | --- | --- |
+| Resize, Unified | base | 40 | 91.3 [68.6, 99.9] | 40.2 [37.6, 45.1] | 6,051 | 382,339 |
+| | step 1 | 24 | 89.6 [72.1, 97.2] | 36.2 [34.0, 49.3] | 5,404 | 382,341 |
+| | step 3 | 40 | 83.3 [57.7, 89.2] | 28.1 [25.7, 31.7] | 4,809 | 15 |
+| Disclosure toggle | base | 40 | 90.8 [67.9, 106.7] | 39.0 [36.4, 61.1] | 6,001 | 382,265 |
+| | step 1 | 24 | 83.6 [62.6, 91.5] | 34.6 [31.3, 42.1] | 5,355 | 382,270 |
+| | step 3 | 40 | 75.7 [56.2, 84.6] | 26.7 [25.0, 36.2] | 4,781 | 15 |
+| Switch to SideBySide | base | 20 | 135.3 [105.5, 214.1] | 50.6 [48.4, 52.5] | 9,768 | 394,249 |
+| | step 1 | 12 | 123.9 [99.3, 211.0] | 44.2 [42.4, 45.9] | 8,467 | 394,249 |
+| | step 3 | 20 | 123.5 [100.6, 207.8] | 38.5 [37.6, 47.1] | 6,704 | 15 |
+| Switch to Unified | base | 20 | 118.0 [93.3, 128.5] | 38.1 [36.1, 42.6] | 6,000 | 382,265 |
+| | step 1 | 12 | 112.2 [86.4, 120.2] | 33.0 [32.4, 35.3] | 5,354 | 382,266 |
+| | step 3 | 20 | 106.2 [81.9, 112.8] | 25.4 [24.8, 28.2] | 4,781 | 15 |
+
+Against the baseline of the same runs, the projection is 30 percent lower for a Unified resize, 32 percent lower for a toggle, and 24 percent lower for a switch to SideBySide. Step 1 saves 4 to 7 ms of it, and step 3 saves 6 to 8 ms more. The 12,362 failed remaps of a SideBySide projection, the growth copies of key lists, went to 0.
+
+Process CPU (`ps -o time=`) for 8 actions, sorted:
+
+| Side | 8 resizes | 8 toggles | 8 Layout switches | RSS after the resizes | RSS after the switches |
+| --- | --- | --- | --- | --- | --- |
+| Base | 0.63, 0.74, 0.79, 0.82, 0.84 s | 0.77, 0.77, 0.83, 0.83, 0.88 s | 0.99, 1.12, 1.14, 1.18, 1.18 s | 406 to 413 MB | 507 to 514 MB |
+| Step 1 | 0.73, 0.77, 0.81 s | 0.71, 0.77, 0.80 s | 1.00, 1.07, 1.11 s | 400 MB | 502 MB |
+| Step 3 | 0.65, 0.69, 0.72, 0.73, 0.73 s | 0.62, 0.69, 0.72, 0.72, 0.76 s | 0.96, 0.97, 1.08, 1.08, 1.10 s | 391 MB | 493 MB |
+
+The median process CPU of 8 resizes went from 0.79 to 0.72 s. The difference, 0.07 s, is smaller than the base range of 0.21 s, so the last target is not met as written. One base run at 0.63 s makes most of that range. A rank-sum test of the 5 and 5 runs gives U = 5, which is not significant at 5 percent (the limit is 2). The expected saving is about 8 × 12 ms = 0.1 s of about 0.75 s, so this criterion needs more runs or a quieter machine to show it.
+
+Checks on the numbers:
+
+- One diagnostic run for each side ran the fixed loop of 2 million xorshift steps before the projection. It took 3.4 [3.2, 3.6] ms on the base and 3.4 [3.0, 3.6] ms with step 3 for a resize, so the clock before the projection is the same.
+- The visual row phase is unchanged (resize 24.0 against 24.2 ms). The Buffer phase is bimodal by the clock state, as in ticket 25. The whole job of a resize saves 8 ms and of a toggle 15 ms, so the saving does not move into another phase.
+- The release of the projection on the Presentation thread went from 2.6 [1.2, 6.0] to 2.1 [1.3, 4.2] ms, so the saving does not move into the free path.
+- Every measured rebuild logged a digest of its Buffer row tags and visual rows. Each rebuild kind had the same row counts and digest on all sides: 187,839 and 206,104 for Unified, 187,856 and 206,121 with the Draft expanded, 209,672 visual rows at 150 columns, and 183,464 and 264,856 for SideBySide.
+- Limiter, inferred and not profiled: the remaining 4,800 faults of fresh projection memory (about 3.6 ms at 0.76 µs per fault), the hashing of about 370,000 `source_rows` keys and the `spans` keys, and the two passes over the rows.
+
+**Checks.** `zig build test --summary all`: 58 of 58 steps, 1,677 of 1,677 tests. `zig fmt --check src build.zig tests` and every `tools/check_*.py`: exit 0. No `DEBUG-` line in the commits.
+
+**Review.** The two-axis review (standards and spec) found no wrong lookup. `027f456` fixes the dropped free count and adds the missing Line key check. Kept as they are: the release-build panic in `KeyLists` when a source changes its call count (an unchecked index would corrupt memory instead), the repeated `sink.add` pairs of the production and oracle sources, and the move of `body_rows` and the oracle to `KeyLists`, so no per-key list remains in the projection.
+
+**Open question.** Accept the result on the projection targets and the RSS, or run more alternating runs to settle the process CPU of 8 resizes?
