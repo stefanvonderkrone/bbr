@@ -71,7 +71,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tui/benchmark.zig"),
         .target = target,
         .optimize = bench_optimize,
-        .imports = &.{.{ .name = "bbr", .module = bench_core_mod }},
+        .imports = &.{
+            .{ .name = "bbr", .module = bench_core_mod },
+            .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+        },
     });
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/benchmark/main.zig"),
@@ -215,6 +218,9 @@ pub fn build(b: *std.Build) void {
     const box_glyphs = b.addSystemCommand(&.{"python3"});
     box_glyphs.addFileArg(b.path("tools/check_box_glyphs.py"));
     box_glyphs.addDirectoryArg(b.path("."));
+    const benchmark_metrics = b.addSystemCommand(&.{"python3"});
+    benchmark_metrics.addFileArg(b.path("tools/check_benchmark_metrics.py"));
+    benchmark_metrics.addDirectoryArg(b.path("."));
     const stdio_writers = b.addSystemCommand(&.{"python3"});
     stdio_writers.addFileArg(b.path("tools/check_stdio_writers.py"));
     stdio_writers.addDirectoryArg(b.path("."));
@@ -236,6 +242,18 @@ pub fn build(b: *std.Build) void {
     error_comparisons.addFileArg(b.path("tools/check_error_comparisons.py"));
     error_comparisons.addDirectoryArg(b.path("."));
     test_step.dependOn(&error_comparisons.step);
+    const search_index = b.addSystemCommand(&.{"python3"});
+    search_index.addFileArg(b.path("tools/check_search_index.py"));
+    search_index.addDirectoryArg(b.path("."));
+    test_step.dependOn(&search_index.step);
+    const row_scans = b.addSystemCommand(&.{"python3"});
+    row_scans.addFileArg(b.path("tools/check_row_scans.py"));
+    row_scans.addDirectoryArg(b.path("."));
+    test_step.dependOn(&row_scans.step);
+    const navigation_fields = b.addSystemCommand(&.{"python3"});
+    navigation_fields.addFileArg(b.path("tools/check_navigation_fields.py"));
+    navigation_fields.addDirectoryArg(b.path("."));
+    test_step.dependOn(&navigation_fields.step);
     const task_spawns = b.addSystemCommand(&.{"python3"});
     task_spawns.addFileArg(b.path("tools/check_task_spawns.py"));
     task_spawns.addDirectoryArg(b.path("."));
@@ -432,6 +450,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&xdg_reads.step);
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&stdio_writers.step);
+    test_step.dependOn(&benchmark_metrics.step);
     test_step.dependOn(&b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true }).step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);

@@ -1,0 +1,2 @@
+# fileIndexForRow calls inside loops over all rows, per file. Lower only.
+7 src/tui/presentation.zig
