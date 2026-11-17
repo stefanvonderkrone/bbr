@@ -109,6 +109,20 @@ class NavigationFieldsTest(unittest.TestCase):
         )
         self.assertEqual(found, [])
 
+    def test_a_test_inside_a_struct_is_allowed_and_the_fields_after_it_are_checked(self):
+        found = self.check(
+            "const Holder = struct {\n"
+            '    test "a fixture" {\n'
+            "        const Snapshot = struct {\n"
+            "            navigation: Nav,\n"
+            "        };\n"
+            "    }\n"
+            "    kept: Nav,\n"
+            "};\n"
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("src/tui/presentation.zig:7: the field `kept` of `Holder`", found[0])
+
     def test_an_owner_name_in_another_file_is_rejected_and_test_files_are_skipped(self):
         frame = "pub const Projection = struct {\n    navigation: Nav,\n};\n"
         self.assertEqual(self.check(frame, "src/tui/frame.zig"), [])
