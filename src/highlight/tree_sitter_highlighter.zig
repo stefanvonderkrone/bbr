@@ -52,7 +52,7 @@ const BuiltInPackages = struct {
         defer self.mutex.unlock(self.io);
         const slot = &self.slots[@intFromEnum(grammar)];
         if (slot.*) |*package| return package;
-        slot.* = try prepare(self.allocator, grammar, self.diagnostic);
+        slot.* = try prepare(self.allocator, grammarSource(grammar) orelse return error.MissingBuiltInGrammar, self.diagnostic);
         return &slot.*.?;
     }
 
@@ -63,14 +63,10 @@ const BuiltInPackages = struct {
     }
 };
 
-fn prepare(allocator: Allocator, grammar: BuiltInGrammar, diagnostic_handle: diagnostics.Handle) !RuntimePackage {
-    const source = grammarSource(grammar) orelse return error.MissingBuiltInGrammar;
+fn prepare(allocator: Allocator, source: GrammarSource, diagnostic_handle: diagnostics.Handle) !RuntimePackage {
     var diagnostic: predicate_mod.Diagnostic = undefined;
     return RuntimePackage.init(allocator, source.language, source.query, source.locals_query, source.injections_query, &diagnostic) catch |err| switch (err) {
-        error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidInjectionQuery, error.InvalidPredicate => {
-            diagnostic.report();
-            return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src());
-        },
+        error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidInjectionQuery, error.InvalidPredicate => return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src()),
         else => return err,
     };
 }
@@ -669,6 +665,35 @@ test "diagnostics expected BuiltInGrammar content limits return their errors wit
     const bytes = try diagnosticBytes(tmp);
     defer testing.allocator.free(bytes);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n"));
+}
+
+test "diagnostics an invalid BuiltInGrammar query writes nothing to stderr and has one record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    var sink = try privateSink(tmp, &env);
+    defer sink.deinit();
+    const source: GrammarSource = .{ .language = language(.javascript).?, .query = "(identifier) @x (#private-predicate? @x)" };
+
+    var stderr_file = try tmp.dir.createFile(testing.io, "stderr", .{ .read = true });
+    defer stderr_file.close(testing.io);
+    const saved = std.c.dup(std.posix.STDERR_FILENO);
+    try testing.expect(saved >= 0);
+    defer _ = std.c.close(saved);
+    try testing.expect(std.c.dup2(stderr_file.handle, std.posix.STDERR_FILENO) >= 0);
+    const result = prepare(testing.allocator, source, sink.handle(.highlighting, .{}));
+    try testing.expect(std.c.dup2(saved, std.posix.STDERR_FILENO) >= 0);
+    try testing.expectError(error.Reported, result);
+
+    const stderr_bytes = try tmp.dir.readFileAlloc(testing.io, "stderr", testing.allocator, .limited(4096));
+    defer testing.allocator.free(stderr_bytes);
+    try testing.expectEqualStrings("", stderr_bytes);
+    const bytes = try diagnosticBytes(tmp);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "phase=query"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n") - 1);
+    try testing.expect(std.mem.indexOf(u8, bytes, "private-predicate") == null);
 }
 
 test "diagnostics retain native query and regex codes without source or engine fragments" {

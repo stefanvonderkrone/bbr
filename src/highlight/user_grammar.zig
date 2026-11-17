@@ -297,10 +297,7 @@ pub const Registry = struct {
                 "",
                 &diagnostic,
             ) catch |err| switch (err) {
-                error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidPredicate => {
-                    diagnostic.report();
-                    return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src());
-                },
+                error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidPredicate => return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src()),
                 else => return err,
             };
             installation.loaded = .{ .library = library, .language = language, .package = package };

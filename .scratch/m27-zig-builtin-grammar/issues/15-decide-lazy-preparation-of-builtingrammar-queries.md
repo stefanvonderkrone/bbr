@@ -65,7 +65,7 @@ The agent implemented option 2 on 2026-11-02.
   One `std.Io.Mutex` guards the slots, because highlight workers share them.
 - A failed preparation returns its error for that highlight and keeps no entry.
   The next use tries again. The caller's failure path for a highlight error does not change.
-- An invalid query reports its diagnostic and fails the highlight, as the UserGrammar load does.
+- An invalid query records its failure and fails the highlight, as the UserGrammar load does.
   Before this change, it stopped bbr at startup.
 - The test "M27 grammar every BuiltInGrammar loads its queries" prepares every query, so CI still finds an invalid query.
 
@@ -87,7 +87,6 @@ The first use of C++ now takes 87 ms, and the first use of Swift or C# takes 64 
 Still open:
 
 - The binary size (57.5 MB in ReleaseSafe) and the `vendors/` size (277 MB). Option 2 does not change them.
-- An invalid-query diagnostic during the TUI goes to `std.log`, as for a UserGrammar. Only a broken build can show it, because CI prepares every query.
 
 Checks:
 
@@ -96,3 +95,22 @@ Checks:
 - `zig fmt --check build.zig src tests`: exit code 0.
 - `python3 tools/check_agent_docs.py`: pass.
 - `python3 tools/check_guard_mutations.py`: 10 mutations caught, baseline passes.
+
+## Follow-up of 2026-11-17
+
+The Completion listed an invalid-query diagnostic during the TUI as open, and named it a `std.log` write.
+It was a direct stderr write. `prepare` called `Diagnostic.report`, which wrote through `std.debug.lockStderr` while the TUI owned the terminal.
+The UserGrammar load in `Registry.load` had the same call.
+
+The operator asked if the write must be a log. It must not.
+ADR 0014 says that a site on a TUI path cannot print, because the terminal is in raw mode.
+`tools/check_diagnostics.py` rejects `std.log`.
+The record through `Handle.fail` is the log, and it already held the query code and offset.
+
+- `prepare` and `Registry.load` now only return `Handle.fail`, so each failure has one record and no stderr text.
+- `Diagnostic.report` had no other caller, so it is deleted.
+- `bbr grammar` keeps its stderr message, because `validateQuery` prints through `bbr.cli_failure.fail`.
+- The test "diagnostics an invalid BuiltInGrammar query writes nothing to stderr and has one record" points stderr at a file.
+  It failed on the old code with the text `error: highlight-query:1:18: invalid predicate: unknown_operator`.
+- No unit test reaches `Registry.load`, because unit tests have no native UserGrammar library.
+  The deleted `Diagnostic.report` keeps that path from a stderr write.
