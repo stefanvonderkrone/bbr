@@ -682,14 +682,18 @@ pub const Storage = struct {
         self.commitCacheUpdate();
     }
 
-    pub fn stageAdmission(self: *Storage, file_idx: usize, result: *Result) error{ AlreadyTransferred, AlreadyAdmitted, FileOutOfRange }!bool {
-        std.debug.assert(self.retired.items.len == 0);
+    pub fn checkAdmission(self: *const Storage, file_idx: usize, result: *const Result) error{ AlreadyTransferred, AlreadyAdmitted, FileOutOfRange }!void {
         if (file_idx >= self.files.len) return error.FileOutOfRange;
         if (result.old == .transferred or result.new == .transferred) return error.AlreadyTransferred;
         const stored = &self.files[file_idx];
         if ((stored.old != .pending and stored.old != .absent and stored.old != .binary and stored.old != .unavailable) or
             (stored.new != .pending and stored.new != .absent and stored.new != .binary and stored.new != .unavailable)) return error.AlreadyAdmitted;
+    }
 
+    pub fn stageAdmission(self: *Storage, file_idx: usize, result: *Result) error{ AlreadyTransferred, AlreadyAdmitted, FileOutOfRange }!bool {
+        std.debug.assert(self.retired.items.len == 0);
+        try self.checkAdmission(file_idx, result);
+        const stored = &self.files[file_idx];
         stored.old = transfer(&result.old);
         stored.new = transfer(&result.new);
         self.projectSide(file_idx, .old);

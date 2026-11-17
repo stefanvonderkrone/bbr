@@ -13,6 +13,11 @@ pub const CellMetrics = struct {
     /// SGR 9 is available in the vaxis adapter. Other terminal adapters can
     /// retain authored strikethrough delimiters instead.
     strikethrough_supported: bool = true,
+    /// The adapter measures each printable ASCII byte as one grapheme of one
+    /// cell. Then `width` and the Line wrap skip the adapter for text of only
+    /// printable ASCII. An adapter that measures printable ASCII another way
+    /// sets this to false.
+    ascii_is_narrow: bool = true,
 
     pub const VTable = struct {
         next: *const fn (ptr: *const anyopaque, text: []const u8) Measurement,
@@ -30,8 +35,13 @@ pub const CellMetrics = struct {
         };
     }
 
+    /// True when each byte of `text` is one grapheme of one cell.
+    pub fn narrowAscii(self: CellMetrics, text: []const u8) bool {
+        return self.ascii_is_narrow and isNarrowAscii(text);
+    }
+
     pub fn width(self: CellMetrics, text: []const u8) usize {
-        if (isNarrowAscii(text)) return text.len;
+        if (self.narrowAscii(text)) return text.len;
         if (self.vtable.width) |measure| return measure(self.ptr, text);
 
         var total: usize = 0;
