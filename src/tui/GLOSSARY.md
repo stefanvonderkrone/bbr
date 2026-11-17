@@ -103,7 +103,7 @@ The List Overlay that lists the built-in Themes and paints the selected Theme as
 _Avoid_: theme picker, theme palette, theme switcher.
 
 **Buffer Search**:
-The `/`-initiated search over semantic text owned by the current DiffPane Buffer. Layout, Scope, and File isolation define its corpus, but a Fold or authored-content disclosure does not remove hidden text. Buffer Search never starts File Enrichment. It highlights every Search Occurrence and gives `n` and `N` a current occurrence to traverse.
+The `/`-initiated search over semantic text owned by the current DiffPane Buffer. Layout, Scope, File isolation, the Drafts, and in the whole-file Scope the Selected Version and the loaded File text define its corpus, but a Fold or authored-content disclosure does not remove hidden text. Buffer Search never starts File Enrichment. It highlights every Search Occurrence and gives `n` and `N` a current occurrence to traverse.
 _Avoid_: Review Search (crosses File boundaries), find (the Action has defined search semantics).
 
 **Review Search**:
@@ -163,6 +163,10 @@ _Avoid_: highlight (the cursor and search have their own), thread focus.
 **Presentation Frame**:
 One internally consistent projection of the published Session and its Session-relative interaction state at the current terminal geometry. It is the shared source for rendering, navigation restoration, and semantic mouse targeting; a failed reprojection preserves the previous complete Frame.
 _Avoid_: screen (the terminal output), Buffer (only the DiffPane rows), render state, layout snapshot.
+
+**Navigation Anchor**:
+A DiffPane cursor, its viewport offset, and its Selection mark, held by the identity of their rows instead of their row numbers. Any later Presentation Frame of the same Session resolves it to rows.
+_Avoid_: Anchor (binds a Comment to source), saved navigation, origin.
 
 **Session Epoch**:
 The identity of one published Session. Session-bound work such as File Enrichment carries that Session's Epoch and cannot change a later Session, even when both Sessions represent the same PullRequest. The Epoch changes only when a complete Session replacement is published; a failed replacement preserves the current Epoch and its in-flight work.

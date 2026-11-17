@@ -71,6 +71,8 @@ pub fn checksum(buffer: buffer_mod.Buffer) u64 {
     for (buffer.file_rows) |file_row| {
         hashScalar(&hash, file_row.file_index);
         hashScalar(&hash, file_row.first_row);
+        hashScalar(&hash, file_row.status_placeholders.start);
+        hashScalar(&hash, file_row.status_placeholders.end);
     }
     return hash.final();
 }

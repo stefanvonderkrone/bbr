@@ -9,9 +9,9 @@ The [Presentation glossary](./GLOSSARY.md) defines the domain terms used here.
 | Authored Markdown meaning and source ranges | [`review_body.zig`](./review_body.zig) interprets a ReviewBody independently of terminal width. |
 | ReviewCard wrapping and disclosure | [`review_card.zig`](./review_card.zig) projects a ReviewBody into width-dependent rows with authored source ranges. |
 | DiffPane row order and Thread placement | [`buffer.zig`](./buffer.zig) combines source Lines, ReviewCards, Folds, and disclosures into a Buffer. |
-| Search matching and authored locations | [`search.zig`](./search.zig) defines the search corpus, mappings, and Search Occurrences. [`presentation.zig`](./presentation.zig) owns search interaction and navigation. |
+| Search matching and authored locations | [`search.zig`](./search.zig) defines the search Candidates, mappings, and Search Occurrences. [`buffer.zig`](./buffer.zig) builds the Buffer Search Candidates from `SearchCandidateInputs`, and its key holds those inputs and compares them exactly. [`presentation.zig`](./presentation.zig) owns the Buffer Search corpus, reuses it when the key of a rebuild is equal, and owns search interaction and navigation. |
 | Selection and clipboard commands | [`presentation.zig`](./presentation.zig) owns Selection and yank behavior. [`frame.zig`](./frame.zig) projects source targets for Selected Version. |
-| Geometry and terminal cells | [`frame.zig`](./frame.zig) builds the Presentation Frame. [`render.zig`](./render.zig) draws its rows with styles from [`theme.zig`](./theme.zig). |
+| Geometry and terminal cells | [`frame.zig`](./frame.zig) builds the Presentation Frame. [`cell_metrics.zig`](./cell_metrics.zig) is the cell measurement seam, and [`terminal_cell_metrics.zig`](./terminal_cell_metrics.zig) is its vaxis adapter, which the app and the benchmarks share. [`render.zig`](./render.zig) draws its rows with styles from [`theme.zig`](./theme.zig). |
 | Views, Compositions, and decoration | [`view.zig`](./view.zig) places a View tree without vaxis. [`layouts.zig`](./layouts.zig) holds the View tree of each Pane, Overlay, and the status row. [`view_paint.zig`](./view_paint.zig) paints fills, borders, rules, Titles, and scroll bars. See [ADR-0013](../../docs/adr/0013-one-view-type-with-a-composition-union-lays-out-the-terminal.md). |
 | Scroll bars and Scroll Marks | [`view.zig`](./view.zig) projects rows to track cells with `trackCell` and places the thumb with `thumb`. `thumbOffset` is its inverse, the scroll offset of a thumb cell. `dragOffset` maps the Scroll Drag pointer to an offset through it. [`scroll_marks.zig`](./scroll_marks.zig) finds the Scroll Mark rows with `rowMarks` and projects them and the Buffer Search hits to track cells with `project`. [`frame.zig`](./frame.zig) gives each scroll bar its numbers with `scrollState` and `scrollTarget`. [`presentation.zig`](./presentation.zig) owns the Scroll Drag. |
 | Key input and Actions | [`keymap.zig`](./keymap.zig) resolves input. [`action.zig`](./action.zig) defines Actions. [`presentation.zig`](./presentation.zig) dispatches them. |
@@ -23,6 +23,20 @@ The [Presentation glossary](./GLOSSARY.md) defines the domain terms used here.
 Markdown changes can affect search mappings, Selection bytes, and terminal cells through this projection chain.
 The relevant tests live beside their implementation and enter the build through the imports in [`../main.zig`](../main.zig).
 [`../../build.zig`](../../build.zig) defines focused test targets as well as the full `test` gate.
+
+## Navigation Anchor
+
+[`frame.zig`](./frame.zig) defines the Navigation Anchor as `NavigationAnchor`.
+`NavigationAnchor.capture` takes it from a Frame, and only `NavigationAnchor.resolve` against a Frame gives row numbers.
+Each Buffer build makes its own Whole File gap Lines in its arena, so a gap Line pointer is valid in one Frame only.
+The anchor holds the owner of each Line row as a `LineOwner`.
+A `LineOwner` holds a Hunk Line by its pointer, because a Hunk Line lives as long as the Session.
+It holds a gap Line by its File, side, and line number.
+When the Frame lost the row, the cursor goes to the top of the Buffer.
+The cursor restoration of every admission after a rebuild goes through the anchor.
+State that outlives a Frame stores an anchor, not a `Nav`.
+An example is the start of the Buffer Search input in `input.start`.
+[The rule details](../../docs/agents/rule-details.md#navigation-across-frames) name the check and the tests.
 
 ## Acquisition concurrency
 
