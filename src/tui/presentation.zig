@@ -12562,10 +12562,17 @@ pub const Presentation = struct {
     }
 
     fn promoteSpeculativeEnrichment(self: *Presentation, epoch: SessionEpoch, file_index: usize) void {
-        for (self.commands.items) |*queued| {
-            if (queued.* == .enrich_file and queued.enrich_file.session_epoch == epoch and queued.enrich_file.file_index == file_index)
-                queued.enrich_file.speculative = false;
-        }
+        for (self.commands.items) |*queued| switch (queued.*) {
+            .enrich_file => |*enrich| if (enrich.session_epoch == epoch and enrich.file_index == file_index) {
+                enrich.speculative = false;
+            },
+            .build_buffer_disclosure => |job| if (job.kind == .enrichment and job.epoch == epoch) {
+                for (job.enrichments.items) |*enriched| if (enriched.index == file_index) {
+                    enriched.speculative = false;
+                };
+            },
+            else => {},
+        };
         for (self.issued_enrichments.items) |*issued| {
             if (issued.session_epoch == epoch and issued.file_index == file_index) issued.speculative = false;
         }
