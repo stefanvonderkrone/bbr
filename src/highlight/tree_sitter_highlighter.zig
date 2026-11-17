@@ -66,10 +66,7 @@ const BuiltInPackages = struct {
 fn prepare(allocator: Allocator, source: GrammarSource, diagnostic_handle: diagnostics.Handle) !RuntimePackage {
     var diagnostic: predicate_mod.Diagnostic = undefined;
     return RuntimePackage.init(allocator, source.language, source.query, source.locals_query, source.injections_query, &diagnostic) catch |err| switch (err) {
-        error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidInjectionQuery, error.InvalidPredicate => {
-            diagnostic.report();
-            return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src());
-        },
+        error.InvalidHighlightQuery, error.InvalidLocalsQuery, error.InvalidInjectionQuery, error.InvalidPredicate => return diagnostic_handle.fail(.query, diagnostic.cause() orelse .{ .zig = err }, @src()),
         else => return err,
     };
 }

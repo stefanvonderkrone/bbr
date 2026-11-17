@@ -27,15 +27,6 @@ pub const Diagnostic = struct {
         invalid_query,
     };
 
-    pub fn report(self: Diagnostic) void {
-        var buffer: [512]u8 = undefined;
-        const stderr = std.debug.lockStderr(&buffer);
-        defer std.debug.unlockStderr();
-        write(&stderr.file_writer.interface, self) catch |err| switch (err) {
-            error.WriteFailed => return,
-        };
-    }
-
     pub fn write(writer: *std.Io.Writer, self: Diagnostic) std.Io.Writer.Error!void {
         const query_kind = @tagName(self.query_kind);
         if (self.regex_failure) |failure| {
