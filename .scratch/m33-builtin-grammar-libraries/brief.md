@@ -284,3 +284,4 @@ Their size depends on the language, from about 20 KB for HTML to about 12 MB for
 9. Do the hermetic Capture tests keep the `linked` build, or do they load GrammarLibraries?
 10. Does Homebrew or another package manager need all GrammarLibraries in the package?
 11. Which ADR number does M33 take? The next free number when the ADR ticket runs.
+12. How does a ready GrammarLibrary add Spans to a File that the Session already admitted? Today a File takes one Enrichment result, so it keeps plain text. [Ticket 01](issues/01-decide-how-a-ready-grammarlibrary-reaches-an-admitted-file.md) lists the evidence and four options.
