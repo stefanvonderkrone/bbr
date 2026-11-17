@@ -49,6 +49,19 @@ class BenchmarkMetricsTest(unittest.TestCase):
         )
         self.assertEqual(list(checker.violations(self.root)), [])
 
+    def test_a_bytes_field_initializer_is_allowed_and_a_bytes_value_is_rejected(self):
+        self.source.write_text(
+            "const sample = .{ .bytes = payload };\n"
+            "const other = .{\n"
+            "    .bytes=payload,\n"
+            "};\n"
+            "const options = .{ .cell_metrics = .bytes };\n"
+            "    .bytes => 1,\n",
+            encoding="utf-8",
+        )
+        found = list(checker.violations(self.root))
+        self.assertEqual([message.split(":")[1] for message in found], ["5", "6"])
+
 
 if __name__ == "__main__":
     unittest.main()
