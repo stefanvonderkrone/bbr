@@ -12,7 +12,7 @@ An ADR records the M32 image decision and its evidence.
 ## Scope
 
 - Add `docs/adr/<next free number>-<slug>.md`.
-  Take the next free number when this ticket runs. The expected number is 0015, because M27 holds ADR-0014.
+  Take the next free number when this ticket runs. The expected number is 0015, the number that the operator assigned to M32.
 - Write every section from the "Decision document" section of the spec.
   Keep the ADR to the decision, the rules, and the reopen conditions.
   Link the protocol matrix, the measurements, and the screenshots, and do not copy them.
@@ -76,3 +76,8 @@ The ADR now has six short sections instead of 13.
 On 2026-11-02, the M32 review fix run added the production flate callers to the scope (M32I-8).
 A `ReleaseSafe` probe with the `readArchive` calls panicked on a gzip stream that lost 11 bytes.
 The UserGrammar flate ticket holds the evidence.
+
+On 2026-11-17, the milestone follow-up corrected the stale ADR numbers.
+On `main`, ADR-0014 is the record-once ADR, not an M27 ADR.
+ADR-0015 stays assigned to M32.
+M28 holds ADR-0016, M27 holds ADR-0017, M22 holds ADR-0018, and M33 plans ADR-0019.

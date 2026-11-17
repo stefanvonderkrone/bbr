@@ -436,8 +436,9 @@ In a terminal with no image protocol, bbr sends no image request.
 ## Decision document
 
 Ticket 06 writes the ADR at the next free number in `docs/adr/`.
-ADR-0014 belongs to M27 (`0014-builtin-grammar-queries-come-from-nvim-treesitter.md`).
+On `main`, ADR-0014 is `0014-a-failure-is-recorded-once-and-error-reported-marks-it.md`.
 The operator assigned ADR-0015 to M32.
+The other milestones hold ADR-0016 (M28), ADR-0017 (M27), ADR-0018 (M22), and ADR-0019 (M33, planned).
 Ticket 06 takes the next free number when it runs, and expects 0015.
 
 The ADR records the decision, the rules, and the reopen conditions.
@@ -563,7 +564,7 @@ The human can change a choice at ticket 05.
 9. Cache: memory only, for one Session. No disk cache.
 10. Starting inline size: the card content width, at most 12 rows, no upscale.
 11. Fallback: the M23 text, plus a short state that ticket 05 accepts or removes.
-12. Decision document: an ADR at the next free number, expected ADR-0015, because M27 holds ADR-0014.
+12. Decision document: an ADR at the next free number, expected ADR-0015, the number that the operator assigned to M32.
 13. Relative references: the prototype shows the fallback until ticket 01 finds the base that Bitbucket uses.
 
 ## Comments
