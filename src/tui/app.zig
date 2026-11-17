@@ -1682,8 +1682,10 @@ fn reviewerVerdictLabel(verdict: ?bbr.bitbucket.ReviewerVerdict) []const u8 {
 test {
     _ = @import("cell_metrics.zig");
     _ = @import("browser.zig");
+    _ = @import("terminal_cell_metrics.zig");
     _ = @import("buffer.zig");
     _ = @import("frame.zig");
+    _ = @import("key_lists.zig");
     _ = @import("view.zig");
     _ = @import("layouts.zig");
     _ = @import("view_paint.zig");

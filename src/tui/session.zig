@@ -49,9 +49,13 @@ pub const Session = struct {
     source: SourceContext,
     diff: bbr.diff.Diff,
     threads: []const bbr.review.Thread,
-    mention_names: review_body.MentionNames = .empty,
+    /// `resolveMentions` sets it once, so a published Session never changes it.
+    mention_names: *const review_body.MentionNames = &.empty,
     enrichment: file_enrichment.Storage,
     emphasis_cache: ?buffer.EmphasisCache = null,
+    /// Built by the first SideBySide build. Only the Presentation thread reads
+    /// or sets it. A worker gets a copy of the pointer when its build starts.
+    side_by_side_plans: ?*buffer.SideBySidePlans = null,
     /// Independently acquired mutation capability. A missing UUID never makes
     /// the read-only Session unusable.
     authenticated_account_uuid: ?[]const u8 = null,
@@ -63,6 +67,7 @@ pub const Session = struct {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         const backing = self.arena.child_allocator;
         self.enrichment.deinit();
+        if (self.side_by_side_plans) |plans| plans.destroy();
         self.arena.deinit();
         for (&self.acquisition_arenas) |*arena| if (arena.*) |*owned| owned.deinit();
         backing.destroy(self);
@@ -86,12 +91,14 @@ pub const Session = struct {
         const a = self.arena.allocator();
         var scratch = std.heap.ArenaAllocator.init(self.arena.child_allocator);
         defer scratch.deinit();
+        const names = try a.create(review_body.MentionNames);
+        names.* = .empty;
         for (comments) |comment| {
             if (comment.deleted or std.mem.indexOf(u8, comment.body, "@{") == null) continue;
             const body = try review_body.ReviewBody.parse(scratch.allocator(), comment.body);
             for (body.blocks) |block| for (block.spans) |span| {
                 if (span.mention.len == 0) continue;
-                const entry = try self.mention_names.getOrPut(a, span.mention);
+                const entry = try names.getOrPut(a, span.mention);
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try a.dupe(u8, span.mention);
                 entry.value_ptr.* = "";
@@ -108,6 +115,7 @@ pub const Session = struct {
             };
             if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
         }
+        self.mention_names = names;
     }
 
     pub fn remotePullRequest(self: *Session) ?*PullRequest {
@@ -141,7 +149,8 @@ pub fn create(backing: Allocator) !*Session {
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
-    s.mention_names = .empty;
+    s.side_by_side_plans = null;
+    s.mention_names = &.empty;
     errdefer s.arena.deinit();
     s.threads = &.{};
     s.enrichment = try file_enrichment.Storage.init(s.arena.allocator(), &.{});
@@ -259,7 +268,8 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
-    s.mention_names = .empty;
+    s.side_by_side_plans = null;
+    s.mention_names = &.empty;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -312,7 +322,8 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
-    s.mention_names = .empty;
+    s.side_by_side_plans = null;
+    s.mention_names = &.empty;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -425,7 +436,8 @@ pub fn loadLocalWith(
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
-    s.mention_names = .empty;
+    s.side_by_side_plans = null;
+    s.mention_names = &.empty;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
