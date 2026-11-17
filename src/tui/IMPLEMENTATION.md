@@ -23,6 +23,20 @@ Markdown changes can affect search mappings, Selection bytes, and terminal cells
 The relevant tests live beside their implementation and enter the build through the imports in [`../main.zig`](../main.zig).
 [`../../build.zig`](../../build.zig) defines focused test targets as well as the full `test` gate.
 
+## Navigation Anchor
+
+[`frame.zig`](./frame.zig) defines the Navigation Anchor as `NavigationAnchor`.
+`NavigationAnchor.capture` takes it from a Frame, and only `NavigationAnchor.resolve` against a Frame gives row numbers.
+Each Buffer build makes its own Whole File gap Lines in its arena, so a gap Line pointer is valid in one Frame only.
+The anchor holds the owner of each Line row as a `LineOwner`.
+A `LineOwner` holds a Hunk Line by its pointer, because a Hunk Line lives as long as the Session.
+It holds a gap Line by its File, side, and line number.
+When the Frame lost the row, the cursor goes to the top of the Buffer.
+The cursor restoration of every admission after a rebuild goes through the anchor.
+State that outlives a Frame stores an anchor, not a `Nav`.
+An example is the start of the Buffer Search input in `input.start`.
+[The rule details](../../docs/agents/rule-details.md#navigation-across-frames) name the check and the tests.
+
 ## Acquisition concurrency
 
 All remote TUI work uses one TUI-lifetime `StdHttpClient` connection pool.
