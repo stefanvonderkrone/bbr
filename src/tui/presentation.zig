@@ -34505,6 +34505,31 @@ test "M22 read m in the DiffPane and on a Sidebar File row marks the focused Fil
     try testing.expectEqual(@as(usize, 2), reads.writes);
 }
 
+test "M22 read m after a layout rebuild marks the File that the restored cursor is in" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .next_file });
+    try presentation.dispatch(.{ .action = .down });
+    try testing.expectEqual(@as(?usize, 1), presentation.published.?.activeFile());
+    const layout = presentation.preferences.layout;
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try completeQueuedTestWork(&presentation);
+    try testing.expect(layout != presentation.preferences.layout);
+    try testing.expectEqual(@as(?usize, 1), presentation.published.?.activeFile());
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(!try testFileUnread(&presentation, 1));
+}
+
 test "M22 read m on a read File deletes its receipt and shows the File unread" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
