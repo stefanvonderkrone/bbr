@@ -94,3 +94,8 @@ The operator moved this ticket out of the enrichment rebuild cascade, where it w
 Ticket numbers in the text above are the numbers of the enrichment rebuild cascade. [The map](../map.md) lists the new numbers.
 Take a new baseline at the head of the branch that starts this work.
 
+### 2026-11-17, the rule details moved
+
+The benchmark metrics row in `AGENTS.md` now holds one rule sentence and its check.
+Its full text is the section "Benchmark cell metrics" in [the rule details](../../../docs/agents/rule-details.md#benchmark-cell-metrics).
+Step 8 rewrites both.
