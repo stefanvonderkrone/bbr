@@ -158,3 +158,13 @@ The `WorkerLaunchFailed` warnings in the test output also appear on green runs.
 - `.scratch/m27-zig-builtin-grammar/binary-size.md` (new)
 - `.scratch/m27-zig-builtin-grammar/SPEC.md`
 - `.scratch/m27-zig-builtin-grammar/issues/12-measure-binary-size-document-m27-and-verify-the-suite.md`
+
+## Comments
+
+On 2026-11-17, the follow-up review checked the `test-python` step.
+Commit `0af57c0d` added it to run five Python test files.
+Main commit `6b9dd9ed` ("build: run each tests/ script by the suffix of its name") replaced it.
+`addTestScripts` in `build.zig` now runs each `*_test.py` in `tests/` from `zig build test`.
+The merge `5f66835f` brought that commit into this branch and removed the step.
+The five files still exist and run through their suffix, so no branch needs the step.
+The Completion above and `decisions.tsv` keep the old step as history.
