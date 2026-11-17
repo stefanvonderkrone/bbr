@@ -117,6 +117,23 @@ The runner replaced the triage questions with a measurable target.
 
 The probe worktrees, the logs, and the state directory are deleted.
 
+### 2026-11-17, the queued `.accepted` build after a rebuild
+
+A PullRequest review repeated the gap that the Spec review noted in the Review section below.
+The review said that an enrichment rebuild can publish a new accepted batch first.
+Then a queued `.accepted` build would return without a retry.
+The code does not take that path.
+`acceptAcceptedDisclosure` in `src/tui/presentation.zig` compares two values before it compares the accepted batch.
+It compares the build's `frame_revision` with `visual_rows_revision`, and its `inputs` with `disclosure_inputs`.
+An enrichment or view admission always sets a new `visual_rows_revision`, and it replaces `disclosure_inputs` when it completes inputs.
+So the build fails the first comparison and goes through `retryAcceptedDisclosure`, which maps `destination_active` into the current batch.
+The test "M21 kernel Buffer Search retries hidden fold moves after Changes enrichment" queues an `.accepted` build behind an enrichment rebuild and expects the cursor on the mapped occurrence.
+With the `frame_revision` comparison removed as a probe, that test still passed, because the `inputs` comparison also retries the build.
+A Session load also sets a new `visual_rows_revision`.
+An accepted Buffer Search input replaces the batch only after the user typed its query.
+That query started a new search generation, so the queued build is already superseded.
+So the early return on a batch mismatch is not reached with a current build, and the gap is not real.
+
 ## Completion
 
 Commits:
