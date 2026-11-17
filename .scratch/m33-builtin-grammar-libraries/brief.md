@@ -283,5 +283,5 @@ Their size depends on the language, from about 20 KB for HTML to about 12 MB for
 8. How does a development build find its GrammarLibraries outside `zig-out/`?
 9. Do the hermetic Capture tests keep the `linked` build, or do they load GrammarLibraries?
 10. Does Homebrew or another package manager need all GrammarLibraries in the package?
-11. Which ADR number does M33 take? The next free number when the ADR ticket runs.
+11. M33's own ADR takes number 0019. Other milestones hold 0015 to 0018: M32 plans 0015, M28 has 0016, M27 has 0017, and M22 has 0018. M33 contains M27, so its copy of 0017 is the M27 file and no number collides.
 12. How does a ready GrammarLibrary add Spans to a File that the Session already admitted? Today a File takes one Enrichment result, so it keeps plain text. [Ticket 01](issues/01-decide-how-a-ready-grammarlibrary-reaches-an-admitted-file.md) lists the evidence and four options.
