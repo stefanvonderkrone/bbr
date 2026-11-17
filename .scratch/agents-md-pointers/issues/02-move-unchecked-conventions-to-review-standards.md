@@ -30,3 +30,18 @@ The implementing agent carries the most context. The reviewer receives a diff an
 - [ ] The import rule for `presentation.zig` is a check that `zig build test` runs, or the ticket records why it is not.
 - [ ] The `code-review` skill finds `CODING_STANDARDS.md` without changes, or its pointer is updated.
 - [ ] `python3 tools/check_agent_docs.py` and `zig build test` pass.
+
+## Completion of the move
+
+2026-11-17, branch `agents-md-pointers`. The move is done. The checks stay open.
+
+- `CODING_STANDARDS.md` holds every "Convention (no check)" rule, full or partial, from the old table and from `docs/agents/rule-details.md`. Each standard names why no check covers it and links its checked rule. The `code-review` skill finds the file by name, so its pointer needs no change.
+- Full conventions: `error.Canceled` prongs, fixed scroll bars, and the imports of `presentation.zig`. The other 16 standards are the unchecked parts of checked rules.
+
+Candidates for a check, not done:
+
+- `presentation.zig` imports no vaxis and no `theme.zig`. A line check in `tools/` can reject a direct `@import` of either in `src/tui/presentation.zig`. The import through `keymap.zig` stays, because the rule is about the direct import.
+- A literal `.{ .hunk_line = ` outside `LineOwner.of`. A line check can reject it in production code.
+- A `@constCast` of a Session field after publication. A line check can reject `@constCast` on Session fields outside test blocks.
+- The `.bytes` default of `BuildOptions.cell_metrics`. Follow-up ticket 03 removes the default.
+- The fixed help sections. A test can compare the keys that each fixed-key handler reads with its section in `help.fixed_sections`.

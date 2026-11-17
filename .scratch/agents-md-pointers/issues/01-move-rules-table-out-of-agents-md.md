@@ -1,6 +1,6 @@
 # Move the rules table out of AGENTS.md
 
-Status: needs-triage
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -59,8 +59,20 @@ Each rule is one `##` section in its area doc. The heading names the rule, and i
 
 ## Acceptance criteria
 
-- [ ] `AGENTS.md` is less than 5,000 bytes.
-- [ ] Each rule from the old table exists exactly once in a disclosed doc, or it is deleted with a reason in the commit message.
-- [ ] Each rule area has a pointer line in `AGENTS.md` that names the condition for reading it.
-- [ ] No disclosed doc lists test names that only repeat what the check reports.
-- [ ] `python3 tools/check_agent_docs.py` passes.
+- [x] `AGENTS.md` is less than 5,000 bytes.
+- [x] Each rule from the old table exists exactly once in a disclosed doc, or it is deleted with a reason in the commit message.
+- [x] Each rule area has a pointer line in `AGENTS.md` that names the condition for reading it.
+- [x] No disclosed doc lists test names that only repeat what the check reports.
+- [x] `python3 tools/check_agent_docs.py` passes.
+
+## Completion
+
+2026-11-17, branch `agents-md-pointers`.
+
+- `AGENTS.md` is 2,234 bytes. It holds the tracker, domain, and verify pointers and one line for each rule area with its read condition.
+- The five area docs in `docs/rules/` hold 68 rule sections. Some long rows became several sections. No rule is deleted.
+- [The rule areas guide](../../../docs/agents/rule-areas.md) is now the source of truth for the layout above. It holds the sort rule and the section format.
+- The sections of `docs/agents/rule-details.md` moved under the same headings to `docs/rules/tui-state.md` and `docs/rules/build-and-checks.md`. The file is gone. `src/tui/IMPLEMENTATION.md` and follow-up tickets 03, 05, 11, and 12 point to the new places.
+- The convention parts moved to `CODING_STANDARDS.md` (ticket 02).
+- `tools/check_agent_docs.py` fails when `AGENTS.md` is larger than 5,000 bytes, and when two ADRs in `docs/adr/` share a number. It also reads the links in `docs/rules/` and `CODING_STANDARDS.md`. The old `AGENTS.md` fails the cap. The ADR 0014 of branch `m27-zig-builtin-grammar` fails the number check against `main`.
+- Other milestone branches still add rows to the old table. Each merge must move its rows into the area docs with the rule areas guide.
