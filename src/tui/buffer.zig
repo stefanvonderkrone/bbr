@@ -22,6 +22,7 @@ const Parent = bbr.review.draft.Parent;
 const anchor_projection = bbr.review.anchor;
 const review_card = @import("review_card.zig");
 const search = @import("search.zig");
+const MentionNames = @import("review_body.zig").MentionNames;
 const anchor_cols = @import("frame.zig").anchor_cols;
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 pub const CellMeasurement = @import("cell_metrics.zig").Measurement;
@@ -216,7 +217,7 @@ pub const Fold = struct {
 /// deferred.) Every hidden-content owner keeps a persistent disclosure row and
 /// is expanded only when its tagged semantic key is explicitly present.
 pub const BuildOptions = struct {
-    /// Reclaimable storage for temporary rows. It must not be the result arena.
+    /// Reclaimable storage for ReviewCard projection scratch, separate from the result arena.
     scratch_allocator: std.mem.Allocator = std.heap.page_allocator,
     fold_context: bool = false,
     context_margin: usize = 3,
@@ -253,8 +254,207 @@ pub const BuildOptions = struct {
     cell_metrics: CellMetrics = .bytes,
     collapsed_rows: usize = 9,
     emphasis_cache: ?*const EmphasisCache = null,
-    mention_names: *const @import("review_body.zig").MentionNames = &.empty,
+    /// A block without a plan here plans itself, as without plans.
+    side_by_side_plans: ?*const SideBySidePlans = null,
+    mention_names: *const MentionNames = &.empty,
 };
+
+/// One SideBySide row of a change block. A pair row holds the emphasis of
+/// its removed and its added Line. The rows that a plan leaves out follow
+/// it: the remaining removed Lines, then the remaining added Lines.
+pub const ChangeStep = union(enum) {
+    pair: struct { old: []const Segment, new: []const Segment },
+    left,
+    right,
+};
+
+/// The SideBySide change block plans depend only on the Diff. A Session keeps
+/// them after their first use, so a later SideBySide build does not match the
+/// Lines again. A block is keyed by its first removed Line. A block without
+/// added Lines has no plan, because its rows need no matching.
+pub const SideBySidePlans = struct {
+    arena: std.heap.ArenaAllocator,
+    blocks: std.AutoHashMapUnmanaged(*const model.Line, []const ChangeStep) = .empty,
+    /// True when the plans cover every File of the Diff.
+    complete: bool,
+
+    pub fn build(backing: std.mem.Allocator, diff: model.Diff, only_file: ?usize) !*SideBySidePlans {
+        const plans = try backing.create(SideBySidePlans);
+        plans.* = .{ .arena = .init(backing), .complete = only_file == null };
+        errdefer plans.destroy();
+        const a = plans.arena.allocator();
+        var scratch: ChangeBlockScratch = .init(backing);
+        defer scratch.deinit();
+        const files = if (only_file) |index| diff.files[index..][0..1] else diff.files;
+        for (files) |file| for (file.hunks) |hunk| {
+            var i: usize = 0;
+            while (i < hunk.lines.len) {
+                if (hunk.lines[i].kind != .removed) {
+                    i += 1;
+                    continue;
+                }
+                const block = changeBlockAt(hunk.lines, i);
+                i += block.removed.len + block.added.len;
+                if (block.added.len == 0) continue;
+                try plans.blocks.put(a, &block.removed[0], try planChangeBlock(a, &scratch, block.removed, block.added));
+            }
+        };
+        return plans;
+    }
+
+    pub fn destroy(self: *SideBySidePlans) void {
+        const backing = self.arena.child_allocator;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
+};
+
+const ChangeBlock = struct { removed: []const model.Line, added: []const model.Line };
+
+/// The change block that starts at the removed Line `lines[start]`: its run of
+/// removed Lines and the run of added Lines that follows it.
+fn changeBlockAt(lines: []const model.Line, start: usize) ChangeBlock {
+    var added_start = start;
+    while (added_start < lines.len and lines[added_start].kind == .removed) added_start += 1;
+    var end = added_start;
+    while (end < lines.len and lines[end].kind == .added) end += 1;
+    return .{ .removed = lines[start..added_start], .added = lines[added_start..end] };
+}
+
+const ChangeBlockScratch = struct {
+    match: std.heap.ArenaAllocator,
+    lexical: std.heap.ArenaAllocator,
+
+    fn init(backing: std.mem.Allocator) ChangeBlockScratch {
+        return .{ .match = .init(backing), .lexical = .init(backing) };
+    }
+
+    fn deinit(self: *ChangeBlockScratch) void {
+        self.match.deinit();
+        self.lexical.deinit();
+    }
+};
+
+/// Plan the rows of a change block into `allocator`. Small blocks pair each
+/// removed Line with its most similar added Line in order. Above
+/// `side_by_side_work_limit`, the block pairs Lines by index.
+fn planChangeBlock(
+    allocator: std.mem.Allocator,
+    scratch: *ChangeBlockScratch,
+    removed: []const model.Line,
+    added: []const model.Line,
+) ![]const ChangeStep {
+    if (added.len == 0) return &.{};
+    var old_parts: usize = 0;
+    for (removed) |line| old_parts +|= intraline.lexicalPartCount(line.text);
+    var new_parts: usize = 0;
+    for (added) |line| new_parts +|= intraline.lexicalPartCount(line.text);
+    const work = removed.len *| added.len +| old_parts *| new_parts;
+    if (work > side_by_side_work_limit) {
+        const steps = try allocator.alloc(ChangeStep, @min(removed.len, added.len));
+        for (steps, removed[0..steps.len], added[0..steps.len]) |*step, old, new| {
+            const pair = try intraline.diff(allocator, old.text, new.text);
+            const emphasize = pair.whole_line or intraline.similarity(pair) >= emphasis_threshold;
+            step.* = .{ .pair = if (emphasize) .{ .old = pair.old, .new = pair.new } else .{ .old = &.{}, .new = &.{} } };
+        }
+        return steps;
+    }
+
+    defer _ = scratch.match.reset(.retain_capacity);
+    const match = scratch.match.allocator();
+    const stride = added.len + 1;
+    const similarities = try match.alloc(f64, removed.len * added.len);
+    for (removed, 0..) |old, old_index| {
+        for (added, 0..) |new, new_index| {
+            _ = scratch.lexical.reset(.retain_capacity);
+            similarities[old_index * added.len + new_index] = try intraline.matchingSimilarity(scratch.lexical.allocator(), old.text, new.text);
+        }
+    }
+
+    const cells = try match.alloc(MatchCell, (removed.len + 1) * stride);
+    var old_cursor = removed.len + 1;
+    while (old_cursor > 0) {
+        old_cursor -= 1;
+        var new_cursor = added.len + 1;
+        while (new_cursor > 0) {
+            new_cursor -= 1;
+            if (old_cursor == removed.len and new_cursor == added.len) {
+                cells[old_cursor * stride + new_cursor] = .{ .cost = 0, .exact_pairs = 0, .operation = .done };
+                continue;
+            }
+
+            var best: ?MatchCell = null;
+            if (old_cursor < removed.len and new_cursor < added.len) {
+                const score = similarities[old_cursor * added.len + new_cursor];
+                if (score >= emphasis_threshold) {
+                    const next = cells[(old_cursor + 1) * stride + new_cursor + 1];
+                    chooseMatch(&best, .{
+                        .cost = next.cost + 1.0 - score,
+                        .exact_pairs = next.exact_pairs + @intFromBool(std.mem.eql(u8, removed[old_cursor].text, added[new_cursor].text)),
+                        .first_old = old_cursor,
+                        .first_new = new_cursor,
+                        .operation = .pair,
+                    });
+                }
+            }
+            if (old_cursor < removed.len) {
+                const next = cells[(old_cursor + 1) * stride + new_cursor];
+                chooseMatch(&best, .{
+                    .cost = next.cost + 1.0,
+                    .exact_pairs = next.exact_pairs,
+                    .first_old = next.first_old,
+                    .first_new = next.first_new,
+                    .operation = .left,
+                });
+            }
+            if (new_cursor < added.len) {
+                const next = cells[old_cursor * stride + new_cursor + 1];
+                chooseMatch(&best, .{
+                    .cost = next.cost + 1.0,
+                    .exact_pairs = next.exact_pairs,
+                    .first_old = next.first_old,
+                    .first_new = next.first_new,
+                    .operation = .right,
+                });
+            }
+            cells[old_cursor * stride + new_cursor] = best.?;
+        }
+    }
+
+    var step_count: usize = 0;
+    old_cursor = 0;
+    var new_cursor: usize = 0;
+    while (true) : (step_count += 1) switch (cells[old_cursor * stride + new_cursor].operation) {
+        .pair => {
+            old_cursor += 1;
+            new_cursor += 1;
+        },
+        .left => old_cursor += 1,
+        .right => new_cursor += 1,
+        .done => break,
+    };
+    const steps = try allocator.alloc(ChangeStep, step_count);
+    old_cursor = 0;
+    new_cursor = 0;
+    for (steps) |*step| switch (cells[old_cursor * stride + new_cursor].operation) {
+        .pair => {
+            const pair = try intraline.diff(allocator, removed[old_cursor].text, added[new_cursor].text);
+            step.* = .{ .pair = .{ .old = pair.old, .new = pair.new } };
+            old_cursor += 1;
+            new_cursor += 1;
+        },
+        .left => {
+            step.* = .left;
+            old_cursor += 1;
+        },
+        .right => {
+            step.* = .right;
+            new_cursor += 1;
+        },
+        .done => unreachable,
+    };
+    return steps;
+}
 
 /// Hunk emphasis depends only on the Diff. Keep its segments in the Session
 /// arena so a disclosure rebuild does not repeat word-level diff work.
@@ -425,6 +625,16 @@ pub const Buffer = struct {
     }
 
     pub fn fileHeaderRow(self: Buffer, file_index: usize) ?usize {
+        return (self.fileRow(file_index) orelse return null).first_row;
+    }
+
+    /// The status placeholder rows of File `file_index`.
+    pub fn statusPlaceholders(self: Buffer, file_index: usize) []const Row {
+        const range = (self.fileRow(file_index) orelse return &.{}).status_placeholders;
+        return self.rows[range.start..range.end];
+    }
+
+    fn fileRow(self: Buffer, file_index: usize) ?FileRow {
         var low: usize = 0;
         var high = self.file_rows.len;
         while (low < high) {
@@ -435,7 +645,7 @@ pub const Buffer = struct {
             } else if (candidate.file_index > file_index) {
                 high = middle;
             } else {
-                return candidate.first_row;
+                return candidate;
             }
         }
         return null;
@@ -677,6 +887,9 @@ pub const FileTally = struct { comments: usize = 0, drafts: usize = 0 };
 pub const FileRow = struct {
     file_index: usize,
     first_row: usize,
+    /// The File's status placeholder rows. The build emits them one after the
+    /// other, so a range holds all of them.
+    status_placeholders: RowRange,
 };
 
 pub const BuildError = error{
@@ -704,7 +917,8 @@ pub fn buildWithComments(
     opts: BuildOptions,
 ) BuildError!Buffer {
     var rows: std.ArrayList(Row) = .empty;
-    defer rows.deinit(opts.scratch_allocator);
+    errdefer rows.deinit(allocator);
+    try rows.ensureTotalCapacityPrecise(allocator, rowCapacity(diff, layout, threads, opts));
     var projection_scratch = std.heap.ArenaAllocator.init(opts.scratch_allocator);
     defer projection_scratch.deinit();
     var file_rows: std.ArrayList(FileRow) = .empty;
@@ -800,7 +1014,7 @@ pub fn buildWithComments(
         if (!emitted_threads[index] and isPrLevel(thread)) pr_count += 1;
     };
     if (pr_count > 0) {
-        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
+        try rows.append(allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
         for (threads) |*t| {
             if (isPrLevel(t.*)) try w.emitThread(t);
         }
@@ -811,7 +1025,7 @@ pub fn buildWithComments(
     // emitThread / emitDraft), not here.
     const pending_count = if (opts.only_file == null) countPendingRoots(opts.drafts) else 0;
     if (pending_count > 0) {
-        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
+        try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
         for (opts.drafts, 0..) |*d, i| {
             if (d.parent == null and draftScope(d, opts) == .review) try w.emitDraft(i);
         }
@@ -824,7 +1038,7 @@ pub fn buildWithComments(
             if (fi != only) continue;
         }
         w.span_cursors = .init(opts.highlights, fi);
-        try file_rows.append(allocator, .{ .file_index = fi, .first_row = rows.items.len });
+        const header_row = rows.items.len;
         const whole_unified = opts.whole_file and layout == .unified;
         const whole_side_by_side = opts.whole_file and layout == .side_by_side;
         const header_path = if (!opts.whole_file)
@@ -833,7 +1047,7 @@ pub fn buildWithComments(
             file.old_path
         else
             file.new_path;
-        try rows.append(opts.scratch_allocator, .{ .file_header = .{ .file = file, .path = header_path } });
+        try rows.append(allocator, .{ .file_header = .{ .file = file, .path = header_path } });
 
         // File-level roots live at the File header, before hunks/folds/lines.
         for (threads) |*t| {
@@ -843,16 +1057,22 @@ pub fn buildWithComments(
             if (draft.parent == null and draftCurrentInFile(draft, opts, file.*)) try w.emitDraft(draft_index);
         }
 
+        const placeholders_start = rows.items.len;
         if (whole_unified) {
-            if (wholeFileState(opts, fi, file.*)) |state| try rows.append(opts.scratch_allocator, .{ .status_placeholder = switch (opts.selected_version) {
+            if (wholeFileState(opts, fi, file.*)) |state| try rows.append(allocator, .{ .status_placeholder = switch (opts.selected_version) {
                 .old => .{ .file = file, .old = state },
                 .new => .{ .file = file, .new = state },
             } });
         } else if (whole_side_by_side) {
             const old = wholeFileStateFor(opts, fi, file.*, .old);
             const new = wholeFileStateFor(opts, fi, file.*, .new);
-            if (old != null or new != null) try rows.append(opts.scratch_allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } });
-        } else try emitStatusPlaceholders(opts.scratch_allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
+            if (old != null or new != null) try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } });
+        } else try emitStatusPlaceholders(allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
+        try file_rows.append(allocator, .{
+            .file_index = fi,
+            .first_row = header_row,
+            .status_placeholders = .{ .start = placeholders_start, .end = rows.items.len },
+        });
 
         // True-whole-file: splice the fetched Hunk lines into the selected side's
         // unchanged lines and emit one continuous sequence without headers or
@@ -868,7 +1088,7 @@ pub fn buildWithComments(
             try w.emitSideBySideWholeFile(file, old, new);
         } else if (!whole_unified) {
             for (file.hunks) |*hunk| {
-                try rows.append(opts.scratch_allocator, .{ .hunk_header = hunk });
+                try rows.append(allocator, .{ .hunk_header = hunk });
                 const folds = try computeFolds(allocator, hunk.lines, opts);
                 switch (layout) {
                     .unified => try w.emitUnifiedHunk(file, hunk.lines, if (opts.emphasis_cache) |cache| cache.entries.get(hunk).? else try computeEmphasis(allocator, hunk.lines), folds),
@@ -885,7 +1105,7 @@ pub fn buildWithComments(
         if (od_count > 0) {
             const key: DisclosureKey = .{ .outdated_file = file };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
-            try rows.append(opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
+            try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
             if (expanded) {
                 for (threads) |*t| {
                     if (isFileOutdated(t.*, file.*)) try w.emitThreadContent(t, false);
@@ -924,7 +1144,7 @@ pub fn buildWithComments(
     if (fallback_outdated_count > 0) {
         const key: DisclosureKey = .outdated_review;
         const expanded = w.expanded_disclosures.contains(disclosureId(key));
-        try rows.append(opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
+        try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
         if (expanded) {
             if (opts.only_file == null) for (threads, 0..) |*thread, thread_index| {
                 if (!emitted_threads[thread_index] and thread.root.state == .outdated) try w.emitThreadContent(thread, false);
@@ -945,7 +1165,7 @@ pub fn buildWithComments(
         }
     }
     if (unavailable_count > 0) {
-        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .unavailable, .count = unavailable_count } });
+        try rows.append(allocator, .{ .section = .{ .kind = .unavailable, .count = unavailable_count } });
         for (opts.drafts, 0..) |*draft, draft_index| {
             if (draft.parent != null or emitted[draft_index]) continue;
             if (!draftInScope(draft, diff, opts)) continue;
@@ -970,14 +1190,14 @@ pub fn buildWithComments(
             (opts.only_file == null and w.parentUnavailable(d.parent)))) stranded += 1;
     }
     if (stranded > 0) {
-        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
+        try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
         for (opts.drafts, 0..) |*d, i| {
             if (!emitted[i] and ((d.parent == null and draftInScope(d, diff, opts)) or
                 (opts.only_file == null and w.parentUnavailable(d.parent)))) try w.emitDraft(i);
         }
     }
 
-    const owned_rows = try allocator.dupe(Row, rows.items);
+    const owned_rows = try rows.toOwnedSlice(allocator);
     const row_kinds = try allocator.alloc(RowKind, owned_rows.len);
     if (tree_starts.items.len > 0) {
         const cards = try allocator.alloc(review_card.Card, w.card_count);
@@ -1000,37 +1220,246 @@ pub fn buildWithComments(
     };
 }
 
+fn rowCapacity(diff: model.Diff, layout: Layout, threads: []const Thread, opts: BuildOptions) usize {
+    // Estimate without projecting cards or folds. A miss still permits normal growth.
+    var count: usize = 5 + opts.expanded_disclosures.len;
+    for (diff.files, 0..) |file, index| {
+        if (opts.only_file) |only| if (index != only) continue;
+        count += 5;
+        for (file.hunks) |hunk| count += 1 + hunk.lines.len;
+        if (opts.whole_file and index < opts.blobs.len) {
+            const blob = opts.blobs[index];
+            if (layout == .side_by_side or opts.selected_version == .old) {
+                if (blob.old) |text| count += std.mem.count(u8, text, "\n") + 1;
+            }
+            if (layout == .side_by_side or opts.selected_version == .new) {
+                if (blob.new) |text| count += std.mem.count(u8, text, "\n") + 1;
+            }
+        }
+    }
+    const content_width = @max(@min(cardContentWidth(opts.card_width, anchor_cols), 40) / 2, 1);
+    for (threads) |thread| {
+        count += cardRowCapacity(thread.root.body, content_width);
+        for (thread.replies) |reply| count += cardRowCapacity(reply.body, content_width);
+    }
+    for (opts.drafts) |draft| {
+        count += cardRowCapacity(draft.body, content_width);
+        if (draft.snapshot) |snapshot| count += std.mem.count(u8, snapshot.text, "\n") + 1;
+    }
+    return count;
+}
+
+fn cardRowCapacity(body: []const u8, content_width: usize) usize {
+    return 8 + 2 * std.mem.count(u8, body, "\n") + body.len / content_width;
+}
+
+/// Everything that decides the Buffer Search candidates. `key` reads every
+/// field, so two builds with equal keys make the same candidates. The width,
+/// the cell metrics, the highlights, the folds, and the expanded disclosures
+/// are not inputs: the build wraps nothing that a candidate reads, and it
+/// expands every disclosure itself.
+pub const SearchCandidateInputs = struct {
+    diff: model.Diff,
+    threads: []const Thread,
+    /// `key` reads the pointer, not the names. The Session loader sets
+    /// `Session.mention_names` once, and the pointer is `*const`, so a
+    /// published Session cannot change the names in place.
+    mention_names: *const MentionNames,
+    /// Names the Session. A published Session never changes its Diff, its
+    /// Threads, or its mention names: `[]const File`, `[]const Hunk`,
+    /// `[]const Line`, `*const Comment`, and `*const MentionNames` make an
+    /// in-place change a compile error. A change makes a new Session with a
+    /// new epoch through Refresh or Reconciliation.
+    session_epoch: u64,
+    layout: Layout,
+    scope: SearchCandidateScope,
+    only_file: ?usize,
+    drafts: []const Draft,
+    scope_projections: []const anchor_projection.ScopeProjectionEntry,
+    /// Make the build faster and leave its candidates the same.
+    emphasis_cache: ?*const EmphasisCache = null,
+    side_by_side_plans: ?*const SideBySidePlans = null,
+
+    pub fn key(self: SearchCandidateInputs, allocator: std.mem.Allocator) std.mem.Allocator.Error!SearchCandidateKey {
+        var result: SearchCandidateKey = undefined;
+        inline for (comptime std.enums.values(std.meta.FieldEnum(SearchCandidateInputs))) |field| {
+            const value = @field(self, @tagName(field));
+            switch (field) {
+                .diff => result.diff = .of(value.files),
+                .threads => result.threads = .of(value),
+                .mention_names => result.mention_names = @intFromPtr(value),
+                .session_epoch, .layout, .only_file => @field(result, @tagName(field)) = value,
+                .drafts, .scope_projections => {
+                    @field(result, @tagName(field)) = value;
+                    try copyContent(allocator, &@field(result, @tagName(field)));
+                },
+                .scope => result.scope = switch (value) {
+                    .hunks => .hunks,
+                    .whole_file => |whole| whole: {
+                        // A File side holds the same text whenever it is
+                        // loaded, so its identity changes only when it loads
+                        // or leaves.
+                        const blobs = try allocator.alloc(SearchCandidateKey.BlobIdentity, whole.blobs.len);
+                        for (whole.blobs, blobs) |blob, *identity| identity.* = .{
+                            .old = if (blob.old) |text| .of(text) else null,
+                            .new = if (blob.new) |text| .of(text) else null,
+                        };
+                        break :whole .{ .whole_file = .{ .selected_version = whole.selected_version, .blobs = blobs } };
+                    },
+                },
+                .emphasis_cache, .side_by_side_plans => comptime std.debug.assert(!@hasField(SearchCandidateKey, @tagName(field))),
+            }
+        }
+        return result;
+    }
+};
+
+/// The source Lines that the candidates hold. The Changes and fetched scopes
+/// differ only in their folds, which hide nothing from the candidates.
+pub const SearchCandidateScope = union(enum) {
+    hunks,
+    whole_file: struct {
+        selected_version: SelectedVersion,
+        blobs: []const model.FileBlob,
+    },
+};
+
+/// The inputs of one candidate build, compared exactly. The Diff, the
+/// Threads, the mention names, and the File blob sides are read-only data,
+/// so the key holds their identity. It holds a copy of every other input.
+pub const SearchCandidateKey = struct {
+    diff: Identity,
+    threads: Identity,
+    mention_names: usize,
+    session_epoch: u64,
+    layout: Layout,
+    scope: union(enum) {
+        hunks,
+        whole_file: struct {
+            selected_version: SelectedVersion,
+            blobs: []const BlobIdentity,
+        },
+    },
+    only_file: ?usize,
+    drafts: []const Draft,
+    scope_projections: []const anchor_projection.ScopeProjectionEntry,
+
+    const Identity = struct {
+        address: usize,
+        len: usize,
+
+        fn of(slice: anytype) Identity {
+            return .{ .address = @intFromPtr(slice.ptr), .len = slice.len };
+        }
+    };
+
+    const BlobIdentity = struct { old: ?Identity, new: ?Identity };
+
+    pub fn eql(a: SearchCandidateKey, b: SearchCandidateKey) bool {
+        return eqlContent(a, b);
+    }
+
+    comptime {
+        // `SearchCandidateInputs.key` sets each field from the input of the
+        // same name, so a field with no input would stay undefined.
+        for (std.meta.fieldNames(SearchCandidateKey)) |name| std.debug.assert(@hasField(SearchCandidateInputs, name));
+    }
+};
+
+/// Replaces each slice behind `target` with a copy, so the value outlives the
+/// source of its slices.
+fn copyContent(allocator: std.mem.Allocator, target: anytype) std.mem.Allocator.Error!void {
+    const T = @TypeOf(target.*);
+    switch (@typeInfo(T)) {
+        .optional => if (target.*) |*payload| try copyContent(allocator, payload),
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => {
+                const copy = try allocator.dupe(pointer.child, target.*);
+                for (copy) |*item| try copyContent(allocator, item);
+                target.* = copy;
+            },
+            else => @compileError("copyContent cannot follow " ++ @typeName(T)),
+        },
+        .@"struct" => |info| inline for (info.fields) |field| try copyContent(allocator, &@field(target.*, field.name)),
+        .@"union" => switch (target.*) {
+            inline else => |*payload| try copyContent(allocator, payload),
+        },
+        .int, .bool, .@"enum", .error_set, .void => {},
+        else => @compileError("copyContent cannot copy " ++ @typeName(T)),
+    }
+}
+
+/// Compares the content behind slices, with the presence of each optional,
+/// the length of each slice, and the tag of each union.
+fn eqlContent(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
+    switch (@typeInfo(T)) {
+        .optional => {
+            const left = a orelse return b == null;
+            const right = b orelse return false;
+            return eqlContent(left, right);
+        },
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => {
+                if (pointer.child == u8) return std.mem.eql(u8, a, b);
+                if (a.len != b.len) return false;
+                for (a, b) |left, right| if (!eqlContent(left, right)) return false;
+                return true;
+            },
+            else => @compileError("eqlContent cannot follow " ++ @typeName(T)),
+        },
+        .@"struct" => |info| {
+            inline for (info.fields) |field| if (!eqlContent(@field(a, field.name), @field(b, field.name))) return false;
+            return true;
+        },
+        .@"union" => {
+            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+            return switch (a) {
+                inline else => |payload, tag| eqlContent(payload, @field(b, @tagName(tag))),
+            };
+        },
+        .int, .bool, .@"enum", .error_set, .void => return a == b,
+        else => @compileError("eqlContent cannot compare " ++ @typeName(T)),
+    }
+}
+
 /// Build the semantic Buffer Search corpus before Fold and ReviewCard
 /// disclosure projection. Returned Candidates borrow Diff and Review storage;
 /// generated ReviewBody text and mappings use `allocator`.
-pub fn buildSearchCandidates(
-    allocator: std.mem.Allocator,
-    diff: model.Diff,
-    layout: Layout,
-    threads: []const Thread,
-    opts: BuildOptions,
-    session_epoch: u64,
-) ![]search.Candidate {
+pub fn buildSearchCandidates(allocator: std.mem.Allocator, inputs: SearchCandidateInputs) ![]search.Candidate {
+    const diff = inputs.diff;
+    const session_epoch = inputs.session_epoch;
     var disclosures: std.ArrayList(DisclosureKey) = .empty;
     defer disclosures.deinit(allocator);
-    try disclosures.appendSlice(allocator, opts.expanded_disclosures);
     try disclosures.append(allocator, .outdated_review);
     for (diff.files) |*file| {
         try disclosures.append(allocator, .{ .outdated_file = file });
         try disclosures.append(allocator, .{ .opposite_version = file });
     }
-    for (threads) |thread| {
+    for (inputs.threads) |thread| {
         if (thread.resolved) try disclosures.append(allocator, .{ .resolved_thread = thread.root.id });
         try disclosures.append(allocator, .{ .review_card = .{ .comment = thread.root.id } });
         for (thread.replies) |reply| try disclosures.append(allocator, .{ .review_card = .{ .comment = reply.id } });
     }
-    for (opts.drafts) |draft| try disclosures.append(allocator, .{ .review_card = .{ .draft = draft.local_id } });
+    for (inputs.drafts) |draft| try disclosures.append(allocator, .{ .review_card = .{ .draft = draft.local_id } });
 
-    var semantic_options = opts;
-    semantic_options.fold_context = false;
-    semantic_options.expanded_disclosures = disclosures.items;
-    semantic_options.collapsed_rows = 0;
-    const semantic = try buildWithComments(allocator, diff, layout, threads, semantic_options);
+    const whole = switch (inputs.scope) {
+        .hunks => null,
+        .whole_file => |whole| whole,
+    };
+    const semantic = try buildWithComments(allocator, diff, inputs.layout, inputs.threads, .{
+        .expanded_disclosures = disclosures.items,
+        .drafts = inputs.drafts,
+        .scope_projections = inputs.scope_projections,
+        .only_file = inputs.only_file,
+        .whole_file = whole != null,
+        .selected_version = if (whole) |value| value.selected_version else .new,
+        .blobs = if (whole) |value| value.blobs else &.{},
+        .collapsed_rows = 0,
+        .emphasis_cache = inputs.emphasis_cache,
+        .side_by_side_plans = inputs.side_by_side_plans,
+        .mention_names = inputs.mention_names,
+    });
 
     var candidates: std.ArrayList(search.Candidate) = .empty;
     var corpus_order: usize = 0;
@@ -1053,14 +1482,14 @@ pub fn buildSearchCandidates(
         .comment => |card| {
             const comment = card.commentItem();
             if (!comment.deleted and !hasBodyOwner(candidates.items, .{ .comment = comment.id })) {
-                const body = try review_card.ReviewBody.parseWithMentions(allocator, comment.body, opts.mention_names);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, comment.body, inputs.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .comment = comment.id }, session_epoch, &corpus_order, &candidates);
             }
         },
         .draft => |card| {
             const draft = card.draftItem();
             if (!hasBodyOwner(candidates.items, .{ .draft = draft.local_id })) {
-                const body = try review_card.ReviewBody.parseWithMentions(allocator, draft.body, opts.mention_names);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, draft.body, inputs.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .draft = draft.local_id }, session_epoch, &corpus_order, &candidates);
             }
         },
@@ -1215,7 +1644,7 @@ const Weave = struct {
             const key: DisclosureKey = .{ .resolved_thread = t.root.id };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
             if (!expanded) {
-                try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = false, .count = t.replies.len, .author = t.root.author } });
+                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = false, .count = t.replies.len, .author = t.root.author } });
                 return;
             }
         }
@@ -1276,7 +1705,7 @@ const Weave = struct {
     }
 
     pub fn append(w: *Weave, row: ReviewCardRow) !void {
-        try w.rows.append(w.opts.scratch_allocator, switch (row.owner) {
+        try w.rows.append(w.a, switch (row.owner) {
             .comment => .{ .comment = row },
             .draft => .{ .draft = row },
         });
@@ -1346,7 +1775,7 @@ const Weave = struct {
             var lines = std.mem.splitScalar(u8, snapshot.text, '\n');
             var line_index: u32 = 0;
             while (lines.next()) |line| : (line_index += 1) {
-                try w.rows.append(w.opts.scratch_allocator, .{ .snapshot = .{
+                try w.rows.append(w.a, .{ .snapshot = .{
                     .draft = draft,
                     .line = line,
                     .selected = line_index >= snapshot.selection_start and line_index < snapshot.selection_start +| snapshot.selection_len,
@@ -1402,13 +1831,13 @@ const Weave = struct {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
                 const expanded = w.expanded_disclosures.contains(disclosureId(key));
-                try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
+                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
                     continue;
                 }
             }
-            try w.rows.append(w.opts.scratch_allocator, .{ .line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), emphasis[i]) });
+            try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), emphasis[i]) });
             try w.weaveInline(file, &lines[i]);
             i += 1;
         }
@@ -1418,7 +1847,7 @@ const Weave = struct {
         for (lines) |line| {
             var projected = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
             projected.display_version = side;
-            try w.rows.append(w.opts.scratch_allocator, .{ .line = projected });
+            try w.rows.append(w.a, .{ .line = projected });
             try w.weaveInlineSide(file, line, side);
         }
     }
@@ -1445,7 +1874,7 @@ const Weave = struct {
         if (count == 0) return;
         const key: DisclosureKey = .{ .opposite_version = file };
         const expanded = w.expanded_disclosures.contains(disclosureId(key));
-        try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{
+        try w.rows.append(w.a, .{ .disclosure = .{
             .key = key,
             .kind = .opposite_version,
             .expanded = expanded,
@@ -1519,7 +1948,7 @@ const Weave = struct {
             pair.right = try decoratedLine(w.a, line, w.span_cursors.lineSpansForSide(line.*, .new), &.{});
             pair.right.?.display_version = .new;
         }
-        try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = pair });
+        try w.rows.append(w.a, .{ .line_pair = pair });
     }
 
     fn emitWholeFileSideHunk(w: *Weave, file: *const model.File, lines: []const model.Line, side: SelectedVersion) !void {
@@ -1545,7 +1974,7 @@ const Weave = struct {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
                 const expanded = w.expanded_disclosures.contains(disclosureId(key));
-                try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
+                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
                     continue;
@@ -1560,7 +1989,7 @@ const Weave = struct {
                         .{ .right = line }
                     else
                         .{ .left = line, .right = line };
-                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = pair });
+                    try w.rows.append(w.a, .{ .line_pair = pair });
                     try w.weaveInline(file, &lines[i]);
                     i += 1;
                 },
@@ -1570,22 +1999,14 @@ const Weave = struct {
                     while (i < lines.len and lines[i].kind == .added) i += 1;
                     var p = start;
                     while (p < i) : (p += 1) {
-                        try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], w.span_cursors.lineSpans(lines[p]), &.{}) } });
+                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], w.span_cursors.lineSpans(lines[p]), &.{}) } });
                         try w.weaveInline(file, &lines[p]);
                     }
                 },
                 .removed => {
-                    const rem_start = i;
-                    while (i < lines.len and lines[i].kind == .removed) i += 1;
-                    const rem_end = i;
-                    var add_start = i;
-                    var add_end = i;
-                    if (i < lines.len and lines[i].kind == .added) {
-                        add_start = i;
-                        while (i < lines.len and lines[i].kind == .added) i += 1;
-                        add_end = i;
-                    }
-                    try w.emitSideBySideChangeBlock(file, lines[rem_start..rem_end], lines[add_start..add_end]);
+                    const block = changeBlockAt(lines, i);
+                    i += block.removed.len + block.added.len;
+                    try w.emitSideBySideChangeBlock(file, block.removed, block.added);
                 },
             }
         }
@@ -1597,134 +2018,56 @@ const Weave = struct {
         removed: []const model.Line,
         added: []const model.Line,
     ) !void {
-        var old_parts: usize = 0;
-        for (removed) |line| old_parts +|= intraline.lexicalPartCount(line.text);
-        var new_parts: usize = 0;
-        for (added) |line| new_parts +|= intraline.lexicalPartCount(line.text);
-        const work = removed.len *| added.len +| old_parts *| new_parts;
-        if (work > side_by_side_work_limit) return w.emitIndexedChangeBlock(file, removed, added);
-
-        var match_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer match_scratch.deinit();
-        const scratch = match_scratch.allocator();
-        const stride = added.len + 1;
-        const similarities = try scratch.alloc(f64, removed.len * added.len);
-        var lexical_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer lexical_scratch.deinit();
-        for (removed, 0..) |old, old_index| {
-            for (added, 0..) |new, new_index| {
-                _ = lexical_scratch.reset(.retain_capacity);
-                similarities[old_index * added.len + new_index] = try intraline.matchingSimilarity(lexical_scratch.allocator(), old.text, new.text);
-            }
-        }
-
-        const cells = try scratch.alloc(MatchCell, (removed.len + 1) * stride);
-        var old_cursor = removed.len + 1;
-        while (old_cursor > 0) {
-            old_cursor -= 1;
-            var new_cursor = added.len + 1;
-            while (new_cursor > 0) {
-                new_cursor -= 1;
-                if (old_cursor == removed.len and new_cursor == added.len) {
-                    cells[old_cursor * stride + new_cursor] = .{ .cost = 0, .exact_pairs = 0, .operation = .done };
-                    continue;
-                }
-
-                var best: ?MatchCell = null;
-                if (old_cursor < removed.len and new_cursor < added.len) {
-                    const score = similarities[old_cursor * added.len + new_cursor];
-                    if (score >= emphasis_threshold) {
-                        const next = cells[(old_cursor + 1) * stride + new_cursor + 1];
-                        chooseMatch(&best, .{
-                            .cost = next.cost + 1.0 - score,
-                            .exact_pairs = next.exact_pairs + @intFromBool(std.mem.eql(u8, removed[old_cursor].text, added[new_cursor].text)),
-                            .first_old = old_cursor,
-                            .first_new = new_cursor,
-                            .operation = .pair,
-                        });
-                    }
-                }
-                if (old_cursor < removed.len) {
-                    const next = cells[(old_cursor + 1) * stride + new_cursor];
-                    chooseMatch(&best, .{
-                        .cost = next.cost + 1.0,
-                        .exact_pairs = next.exact_pairs,
-                        .first_old = next.first_old,
-                        .first_new = next.first_new,
-                        .operation = .left,
-                    });
-                }
-                if (new_cursor < added.len) {
-                    const next = cells[old_cursor * stride + new_cursor + 1];
-                    chooseMatch(&best, .{
-                        .cost = next.cost + 1.0,
-                        .exact_pairs = next.exact_pairs,
-                        .first_old = next.first_old,
-                        .first_new = next.first_new,
-                        .operation = .right,
-                    });
-                }
-                cells[old_cursor * stride + new_cursor] = best.?;
-            }
-        }
-
-        old_cursor = 0;
-        var new_cursor: usize = 0;
-        while (old_cursor < removed.len or new_cursor < added.len) {
-            switch (cells[old_cursor * stride + new_cursor].operation) {
-                .pair => {
-                    const pair = try intraline.diff(w.a, removed[old_cursor].text, added[new_cursor].text);
-                    const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), pair.old);
-                    const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), pair.new);
-                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left, .right = right } });
-                    try w.weaveInline(file, right.line);
-                    try w.weaveInline(file, left.line);
-                    old_cursor += 1;
-                    new_cursor += 1;
-                },
-                .right => {
-                    const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), &.{});
-                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .right = right } });
-                    try w.weaveInline(file, right.line);
-                    new_cursor += 1;
-                },
-                .left => {
-                    const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), &.{});
-                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left } });
-                    try w.weaveInline(file, left.line);
-                    old_cursor += 1;
-                },
-                .done => unreachable,
-            }
-        }
+        if (w.opts.side_by_side_plans) |plans| if (plans.blocks.get(&removed[0])) |steps| {
+            return w.emitChangeSteps(file, removed, added, steps);
+        };
+        var scratch: ChangeBlockScratch = .init(std.heap.page_allocator);
+        defer scratch.deinit();
+        try w.emitChangeSteps(file, removed, added, try planChangeBlock(w.a, &scratch, removed, added));
     }
 
-    fn emitIndexedChangeBlock(
+    fn emitChangeSteps(
         w: *Weave,
         file: *const model.File,
         removed: []const model.Line,
         added: []const model.Line,
+        steps: []const ChangeStep,
     ) !void {
-        const pair_count = @min(removed.len, added.len);
-        for (0..pair_count) |i| {
-            const pair = try intraline.diff(w.a, removed[i].text, added[i].text);
-            const emphasize = pair.whole_line or intraline.similarity(pair) >= emphasis_threshold;
-            const left = try decoratedLine(w.a, &removed[i], w.span_cursors.lineSpans(removed[i]), if (emphasize) pair.old else &.{});
-            const right = try decoratedLine(w.a, &added[i], w.span_cursors.lineSpans(added[i]), if (emphasize) pair.new else &.{});
-            try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left, .right = right } });
-            try w.weaveInline(file, right.line);
-            try w.weaveInline(file, left.line);
-        }
-        for (removed[pair_count..]) |*line| {
-            const left = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
-            try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left } });
-            try w.weaveInline(file, left.line);
-        }
-        for (added[pair_count..]) |*line| {
-            const right = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
-            try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .right = right } });
-            try w.weaveInline(file, right.line);
-        }
+        var old_cursor: usize = 0;
+        var new_cursor: usize = 0;
+        for (steps) |step| switch (step) {
+            .pair => |segments| {
+                const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), segments.old);
+                const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), segments.new);
+                try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
+                try w.weaveInline(file, right.line);
+                try w.weaveInline(file, left.line);
+                old_cursor += 1;
+                new_cursor += 1;
+            },
+            .left => {
+                try w.emitLeft(file, &removed[old_cursor]);
+                old_cursor += 1;
+            },
+            .right => {
+                try w.emitRight(file, &added[new_cursor]);
+                new_cursor += 1;
+            },
+        };
+        for (removed[old_cursor..]) |*line| try w.emitLeft(file, line);
+        for (added[new_cursor..]) |*line| try w.emitRight(file, line);
+    }
+
+    fn emitLeft(w: *Weave, file: *const model.File, line: *const model.Line) !void {
+        const left = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
+        try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
+        try w.weaveInline(file, left.line);
+    }
+
+    fn emitRight(w: *Weave, file: *const model.File, line: *const model.Line) !void {
+        const right = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
+        try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
+        try w.weaveInline(file, right.line);
     }
 
     /// Append any current/moved inline threads anchored to `ln` in `file`
@@ -2715,6 +3058,117 @@ test "side_by_side indexed fallback leaves unrelated pairs without IntraLineSegm
     try testing.expect(!buffer.rows[2].line_pair.right.?.decoration.runs[0].emphasis);
 }
 
+fn changeBlockDiff(a: std.mem.Allocator) !model.Diff {
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.appendSlice(a,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,14 +1,11 @@
+        \\ keep
+        \\-const host = config.host;
+        \\-const port = config.port;
+        \\+const host = settings.host;
+        \\+const port = settings.port;
+        \\ keep2
+        \\-import legacy
+        \\-legacy.boot()
+        \\+const service = createService()
+        \\+return service.run()
+        \\ keep3
+        \\-client.open(source);
+        \\-client.retry(source);
+        \\-client.close(source);
+        \\+client.open(target);
+        \\+client.close(target);
+        \\ keep4
+        \\-dropped one
+        \\-dropped two
+        \\ keep5
+        \\
+    );
+    const line_count = 260;
+    try raw.print(a, "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1,{d} +1,{d} @@\n", .{ line_count, line_count });
+    for (0..line_count) |i| try raw.print(a, "-line_{d}\n", .{i});
+    for (0..line_count) |i| if (i % 2 == 0) try raw.print(a, "+line_{d}x\n", .{i}) else try raw.print(a, "+other {d}\n", .{i});
+    return parse(a, raw.items);
+}
+
+fn expectSameRows(expected: Buffer, actual: Buffer) !void {
+    try testing.expectEqual(expected.rows.len, actual.rows.len);
+    for (expected.rows, actual.rows) |want, got| {
+        try testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+        switch (want) {
+            .line_pair => |pair| for ([_]?LineRow{ pair.left, pair.right }, [_]?LineRow{ got.line_pair.left, got.line_pair.right }) |want_side, got_side| {
+                try testing.expectEqual(want_side == null, got_side == null);
+                const want_line = want_side orelse continue;
+                const got_line = got_side.?;
+                try testing.expectEqual(want_line.line, got_line.line);
+                try testing.expectEqual(want_line.display_version, got_line.display_version);
+                try testing.expectEqualDeep(want_line.decoration.runs, got_line.decoration.runs);
+            },
+            .comment => |card| {
+                try testing.expectEqual(card.owner, got.comment.owner);
+                try testing.expectEqual(card.part, got.comment.part);
+            },
+            else => {},
+        }
+    }
+}
+
+test "side_by_side rows with stored change block plans equal rows that plan each block" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try changeBlockDiff(a);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "why?", .anchor = .{ .path = "a.txt", .to = 3 } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const plans = try SideBySidePlans.build(testing.allocator, diff, null);
+    defer plans.destroy();
+    try testing.expect(plans.complete);
+
+    const blobs = try a.alloc(model.FileBlob, diff.files.len);
+    for (diff.files, blobs) |file, *blob| {
+        var old: std.ArrayList(u8) = .empty;
+        var new: std.ArrayList(u8) = .empty;
+        for (file.hunks[0].lines) |line| {
+            if (line.old_no != 0) try old.print(a, "{s}\n", .{line.text});
+            if (line.new_no != 0) try new.print(a, "{s}\n", .{line.text});
+        }
+        blob.* = .{ .old = old.items, .new = new.items };
+    }
+
+    for ([_]bool{ false, true }) |whole_file| for ([_]bool{ false, true }) |fold_context| for ([_]?usize{ null, 0, 1 }) |only_file| for ([_]SelectedVersion{ .new, .old }) |selected_version| for ([_][]const model.FileBlob{ &.{}, blobs }) |file_blobs| {
+        const options: BuildOptions = .{ .whole_file = whole_file, .fold_context = fold_context, .only_file = only_file, .selected_version = selected_version, .blobs = file_blobs };
+        const planned = try buildWithComments(a, diff, .side_by_side, threads, options);
+        var with_plans = options;
+        with_plans.side_by_side_plans = plans;
+        try expectSameRows(planned, try buildWithComments(a, diff, .side_by_side, threads, with_plans));
+    };
+    const indexed = (try buildWithComments(a, diff, .side_by_side, threads, .{ .side_by_side_plans = plans })).rows;
+    var emphasized: usize = 0;
+    for (indexed) |row| if (row == .line_pair) if (row.line_pair.right) |right| {
+        for (right.decoration.runs) |run| emphasized += @intFromBool(run.emphasis);
+    };
+    try testing.expect(emphasized > 0);
+}
+
+test "side_by_side plans of one File leave the other Files to plan their own blocks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try changeBlockDiff(a);
+    const plans = try SideBySidePlans.build(testing.allocator, diff, 0);
+    defer plans.destroy();
+    try testing.expect(!plans.complete);
+
+    const planned = try buildWithComments(a, diff, .side_by_side, &.{}, .{});
+    const stored = try buildWithComments(a, diff, .side_by_side, &.{}, .{ .side_by_side_plans = plans });
+    try expectSameRows(planned, stored);
+}
+
 test "side_by_side weaves an inline thread once, under its anchored pair" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2779,6 +3233,19 @@ test "side_by_side keeps old-side and new-side Comments and Drafts on their Line
     try testing.expectEqual(@as(usize, 2), countKind(buf, .draft));
 }
 
+fn expectStatusPlaceholdersOfEachFile(buf: Buffer, diff: model.Diff) !void {
+    for (diff.files, 0..) |*file, file_index| {
+        const placeholders = buf.statusPlaceholders(file_index);
+        var found: usize = 0;
+        for (buf.rows, 0..) |row, index| if (row == .status_placeholder and row.status_placeholder.file == file) {
+            try testing.expect(found < placeholders.len);
+            try testing.expectEqual(&buf.rows[index], &placeholders[found]);
+            found += 1;
+        };
+        try testing.expectEqual(placeholders.len, found);
+    }
+}
+
 test "unavailable File sides project non-source Status Placeholders in every Layout and Scope" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2799,6 +3266,7 @@ test "unavailable File sides project non-source Status Placeholders in every Lay
                 .content_statuses = &content_statuses,
             });
             try testing.expectEqual(@as(usize, 1), countKind(projected, .status_placeholder));
+            try expectStatusPlaceholdersOfEachFile(projected, diff);
             for (projected.rows) |row| if (row == .status_placeholder) {
                 if (layout == .unified and whole_file) {
                     try testing.expect(row.status_placeholder.old == null);
@@ -2881,7 +3349,16 @@ test "binary Files project independent sides in every Layout and Scope" {
             });
             const expected: usize = if (layout == .unified and whole_file) 4 else if (layout == .unified) 6 else 4;
             try testing.expectEqual(expected, countKind(projected, .status_placeholder));
+            try expectStatusPlaceholdersOfEachFile(projected, diff);
             try testing.expectEqual(@as(usize, 2), countKind(projected, .comment));
+            const isolated = try buildWithComments(a, diff, layout, threads, .{
+                .whole_file = whole_file,
+                .fold_context = !whole_file,
+                .content_statuses = &content_statuses,
+                .only_file = 2,
+            });
+            try testing.expect(countKind(isolated, .status_placeholder) > 0);
+            try expectStatusPlaceholdersOfEachFile(isolated, diff);
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line));
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line_pair));
             for (projected.rows) |row| if (row == .status_placeholder) {
@@ -2983,6 +3460,71 @@ const long_context_diff =
     \\+B
     \\
 ;
+
+test "a Buffer build without ReviewCards builds its rows in the result storage" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, long_context_diff);
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |fold_context| {
+        const buf = try buildWithComments(a, diff, layout, &.{}, .{ .scratch_allocator = testing.failing_allocator, .fold_context = fold_context });
+        try testing.expect(buf.rows.len > 0);
+    };
+}
+
+test "rowCapacity holds every row of a Buffer build" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, long_context_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Root", .body = "First paragraph with **marked** text.\n\nSecond paragraph wraps across the narrow card width.", .anchor = .{ .path = "a.txt", .to = 1 } },
+        .{ .id = 2, .parent_id = 1, .author = "Reply", .body = "Reply\n\n```zig\nconst x = 1;\n```" },
+        .{ .id = 3, .author = "Resolved", .body = "Resolved body", .resolved = true, .anchor = .{ .path = "a.txt", .to = 12 } },
+        .{ .id = 4, .parent_id = 3, .author = "Reply", .body = "Resolved reply" },
+        .{ .id = 5, .author = "Old", .body = "Outdated body", .state = .outdated, .anchor = .{ .path = "a.txt", .to = 100 } },
+        .{ .id = 6, .author = "Review", .body = "Review body" },
+        .{ .id = 7, .author = "Old side", .body = "Old side body", .anchor = .{ .path = "a.txt", .from = 1 } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .comment, .body = "First Draft paragraph.\n\nSecond Draft paragraph with enough text to wrap.\n\nThird paragraph.", .anchor = .{ .path = "a.txt", .to = 1 } },
+        .{ .local_id = 2, .kind = .comment, .body = "Draft Reply", .parent = .{ .comment = 2 } },
+        .{ .local_id = 3, .kind = .comment, .body = "Nested Reply", .parent = .{ .draft = 2 } },
+        .{ .local_id = 4, .kind = .comment, .body = "Pending Review Draft" },
+    };
+    const blobs = [_]model.FileBlob{.{ .old = "a\nc1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10\nb\n", .new = "A\nc1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10\nB\n" }};
+    const statuses = [_]model.FileContent{.{ .old = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } }, .new = .{ .binary = 48 } }};
+    var keys: std.ArrayList(DisclosureKey) = .empty;
+    defer keys.deinit(a);
+    try keys.appendSlice(a, &.{ .outdated_review, .{ .outdated_file = &diff.files[0] }, .{ .opposite_version = &diff.files[0] }, .{ .resolved_thread = 3 } });
+    for (threads) |thread| {
+        try keys.append(a, .{ .review_card = .{ .comment = thread.root.id } });
+        for (thread.replies) |reply| try keys.append(a, .{ .review_card = .{ .comment = reply.id } });
+    }
+    for (drafts) |draft| try keys.append(a, .{ .review_card = .{ .draft = draft.local_id } });
+    const folded = try buildWithComments(a, diff, .unified, &.{}, .{ .fold_context = true });
+    for (folded.rows) |row| if (row == .disclosure and row.disclosure.kind == .fold) try keys.append(a, row.disclosure.key);
+
+    const Mode = enum { collapsed, expanded, semantic, whole_new, whole_old, isolated, statuses, whole_statuses };
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]usize{ 24, 80 }) |width| for (std.meta.tags(Mode)) |mode| {
+        const opts: BuildOptions = .{
+            .scratch_allocator = testing.allocator,
+            .drafts = &drafts,
+            .card_width = width,
+            .collapsed_rows = if (mode == .semantic) 0 else 3,
+            .fold_context = mode != .semantic,
+            .expanded_disclosures = if (mode == .collapsed or mode == .statuses) &.{} else keys.items,
+            .whole_file = mode == .whole_new or mode == .whole_old or mode == .whole_statuses,
+            .selected_version = if (mode == .whole_old) .old else .new,
+            .only_file = if (mode == .isolated) 0 else null,
+            .blobs = if (mode == .whole_statuses) &.{} else &blobs,
+            .content_statuses = if (mode == .statuses or mode == .whole_statuses) &statuses else &.{},
+        };
+        const buf = try buildWithComments(a, diff, layout, threads, opts);
+        try testing.expect(buf.rows.len <= rowCapacity(diff, layout, threads, opts));
+    };
+}
 
 test "the changes scope folds a long context run, keeping a margin each side" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4643,7 +5185,17 @@ test "M21 kernel Buffer Candidates include hidden semantic content and one share
         .{ .id = 2, .author = "Ada", .body = "generated ghost", .deleted = true },
     };
     const threads = try bbr.review.thread.build(allocator, &comments);
-    const candidates = try buildSearchCandidates(allocator, diff, .side_by_side, threads, .{ .fold_context = true }, 9);
+    const candidates = try buildSearchCandidates(allocator, .{
+        .diff = diff,
+        .threads = threads,
+        .mention_names = &.empty,
+        .session_epoch = 9,
+        .layout = .side_by_side,
+        .scope = .hunks,
+        .only_file = null,
+        .drafts = &.{},
+        .scope_projections = &.{},
+    });
 
     var same_count: usize = 0;
     var saw_body = false;
@@ -4668,15 +5220,22 @@ test "M21 kernel Buffer Candidate corpus follows Layout Scope and File isolation
         .{ .old = "before\nkeep\nold\nafter\n", .new = "before\nkeep\nnew\nafter\n" },
         .{ .old = "one\ntwo\nthree\nfour\nctx\n", .new = "one\ntwo\nthree\nfour\nctx\nextra\n" },
     };
-    const scopes = [_]BuildOptions{
-        .{ .fold_context = true },
-        .{},
-        .{ .whole_file = true, .blobs = &blobs },
+    const scopes = [_]SearchCandidateScope{
+        .hunks,
+        .{ .whole_file = .{ .selected_version = .new, .blobs = &blobs } },
     };
     for ([_]Layout{ .unified, .side_by_side }) |layout| for (scopes) |scope| for ([_]?usize{ null, 0 }) |only_file| {
-        var options = scope;
-        options.only_file = only_file;
-        const candidates = try buildSearchCandidates(allocator, diff, layout, &.{}, options, 1);
+        const candidates = try buildSearchCandidates(allocator, .{
+            .diff = diff,
+            .threads = &.{},
+            .mention_names = &.empty,
+            .session_epoch = 1,
+            .layout = layout,
+            .scope = scope,
+            .only_file = only_file,
+            .drafts = &.{},
+            .scope_projections = &.{},
+        });
         try testing.expect(candidates.len > 0);
         var saw_second_file = false;
         var shared_keep_count: usize = 0;
@@ -4692,6 +5251,56 @@ test "M21 kernel Buffer Candidate corpus follows Layout Scope and File isolation
         };
         try testing.expectEqual(@as(usize, 1), shared_keep_count);
         try testing.expectEqual(only_file == null, saw_second_file);
-        try testing.expectEqual(scope.whole_file, saw_whole_file_gap);
+        try testing.expectEqual(scope == .whole_file, saw_whole_file_gap);
     };
+}
+
+test "the search candidate key changes with each input that the candidates read" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const diff = try parse(arena.allocator(), two_file_diff);
+    const anchored: Draft = .{ .local_id = 1, .kind = .comment, .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } }, .body = "root" };
+    const reply: Draft = .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" };
+    const drafts = [_]Draft{ anchored, reply };
+    const blobs = [_]model.FileBlob{ .{ .new = "one\n" }, .{} };
+    const base: SearchCandidateInputs = .{
+        .diff = diff,
+        .threads = &.{},
+        .mention_names = &.empty,
+        .session_epoch = 1,
+        .layout = .unified,
+        .scope = .{ .whole_file = .{ .selected_version = .new, .blobs = &blobs } },
+        .only_file = null,
+        .drafts = &drafts,
+        .scope_projections = &.{},
+    };
+    const key = try base.key(arena.allocator());
+
+    var same = base;
+    const copied = [_]Draft{ anchored, reply };
+    same.drafts = &copied;
+    try testing.expect(key.eql(try same.key(arena.allocator())));
+
+    var changed = base;
+    changed.session_epoch = 2;
+    try testing.expect(!key.eql(try changed.key(arena.allocator())));
+
+    const reparented = [_]Draft{ anchored, .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 1 }, .body = "reply" } };
+    changed = base;
+    changed.drafts = &reparented;
+    try testing.expect(!key.eql(try changed.key(arena.allocator())));
+
+    const submitting = [_]Draft{ anchored, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply", .state = .submitting } };
+    changed = base;
+    changed.drafts = &submitting;
+    try testing.expect(!key.eql(try changed.key(arena.allocator())));
+
+    const evicted = [_]model.FileBlob{ .{}, .{} };
+    changed = base;
+    changed.scope = .{ .whole_file = .{ .selected_version = .new, .blobs = &evicted } };
+    try testing.expect(!key.eql(try changed.key(arena.allocator())));
+
+    var hunks = base;
+    hunks.scope = .hunks;
+    try testing.expect(!key.eql(try hunks.key(arena.allocator())));
 }
