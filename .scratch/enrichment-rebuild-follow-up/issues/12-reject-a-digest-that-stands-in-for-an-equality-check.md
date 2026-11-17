@@ -25,7 +25,7 @@ The triage of tickets 23 and 24 looked at each level of the `correct` skill:
 - A check in `tools/`, read through `zig_files` in `tools/source_lines.py`, that rejects `std.hash.` in production code under `src/` outside a function named `hash`, with `src/benchmark/` and `test` blocks excluded. Its message names the fix: compare the inputs, or put the digest in a `HashMap` context that has an `eql`.
 - How the check treats a file-scope helper that only tests call, such as `hashBaselineRows` in `src/tui/presentation.zig`.
 - Prove the check on the real mistakes: it fails on `src/tui/buffer.zig` at `aba58b55`, and on the highlight sites until ticket 10 removes them.
-- Add a row to the `AGENTS.md` rules table that names the check.
+- Add a rule section that names the check to the area doc that [the rule areas guide](../../../docs/agents/rule-areas.md) picks.
 
 ## Comments
 

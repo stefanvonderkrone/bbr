@@ -18,7 +18,7 @@ A later change that loads a side from another source, for example a working tree
 
 - Whether the rule can be a type or an architecture fact, for example a blob that is never freed while its Session lives, or a load generation that the key covers.
 - Whether a test can show the rule, without a forbidden edit in the test itself.
-- Whether the rule belongs in the `AGENTS.md` rules table.
+- Whether the rule belongs in an area doc under `docs/rules/` (see [the rule areas guide](../../../docs/agents/rule-areas.md)).
 
 ## Comments
 
