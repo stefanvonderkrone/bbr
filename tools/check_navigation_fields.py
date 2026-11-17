@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import sys
 
+from check_diagnostics import production
 from source_lines import zig_files
 
 SOURCES = (Path("src"),)
@@ -24,7 +25,6 @@ FRAME_OWNERS = {
     # A value snapshot of one Frame: `navigation` beside `buffer` and `frame`.
     (Path("src/tui/presentation.zig"), "ReviewProjection"),
 }
-TEST_START = re.compile(r"^test\b.*\{\s*$")
 FIELD = re.compile(r"^\s*(?:pub\s+)?([A-Za-z_]\w*)\s*:\s*([^=]+?)\s*(?:=.*|,\s*)$")
 NAV = re.compile(r"\bNav\b")
 CONTAINER = re.compile(r"\b(?:struct|union|opaque)(?:\((?:[^()]|\([^()]*\))*\))?\s*$")
@@ -40,14 +40,7 @@ def violations(root):
         if relative.name.endswith("_test.zig"):
             continue
         stack = [f"the file struct of {relative.name}"]
-        in_test = False
-        for number, line in enumerate(lines, 1):
-            if in_test:
-                in_test = line != "}"
-                continue
-            if TEST_START.match(line):
-                in_test = True
-                continue
+        for number, line in production(lines):
             field = FIELD.match(line)
             if field and stack and stack[-1] is not None and stack[-1] != "(" and NAV.search(field.group(2)):
                 container = stack[-1]
