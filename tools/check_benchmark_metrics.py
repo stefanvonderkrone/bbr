@@ -12,7 +12,7 @@ import sys
 from source_lines import zig_files
 
 SOURCES = ("src/benchmark", "src/benchmark_buffer_search.zig")
-BYTES_METRICS = re.compile(r"(?:\bCellMetrics|(?<![\w)\]]))\.bytes\b(?!\s*\()")
+BYTES_METRICS = re.compile(r"(?:\bCellMetrics|(?<![\w)\]]))\.bytes\b(?!\s*(?:\(|=(?![=>])))")
 
 
 def violations(root):
