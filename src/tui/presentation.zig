@@ -30656,6 +30656,39 @@ test "a failed enrichment rebuild releases each File and reports only demanded F
     }
 }
 
+test "a File focused while its result waits in an enrichment rebuild reports the failed rebuild" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 4) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+    const batch = try takeTestEnrichments(&presentation, &buffer);
+    try testing.expect(batch.len >= 2);
+    try testing.expect(batch[0].speculative and batch[1].speculative);
+    try deliverTestEnrichment(&presentation, batch[0]);
+    try deliverTestEnrichment(&presentation, batch[1]);
+    try presentation.dispatch(.{ .action = .next_file });
+    try testing.expectEqual(batch[0].file_index, presentation.published.?.activeFile().?);
+    try presentation.dispatch(.ensure_focused_enrichment);
+
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(@as(usize, 2), worker.enrichments.items.len);
+    var saved_arena = worker.arena;
+    defer saved_arena.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    worker.arena = std.heap.ArenaAllocator.init(failing.allocator());
+    worker.build();
+    try testing.expect(worker.failed);
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+
+    try testing.expectEqual(@as(?ActionError, .buffer_build_failed), presentation.projection().action_error);
+    for (batch[2..]) |command| try deliverTestEnrichment(&presentation, command);
+}
+
 test "batched enrichment rebuilds publish the Buffer and candidates of single-File rebuilds" {
     var buffers: [2][]const u8 = undefined;
     var candidates: [2]usize = undefined;
