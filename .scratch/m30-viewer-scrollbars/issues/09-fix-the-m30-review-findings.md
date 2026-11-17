@@ -58,3 +58,16 @@ The entry names both effects of a track press, the jump and the Scroll Drag.
 - Every Zig command ran with HOME and the XDG directories under `$TMPDIR`, no `BITBUCKET_*` variable, and proxies at 127.0.0.1:9.
 - No command started bbr or sent a request to Bitbucket.
 - Native target: aarch64-macos with Zig 0.16.0.
+
+## Comments
+
+### 2026-11-17 the row mark list grows from empty
+
+`scroll_marks.rowMarks` appends to an empty list in each Buffer rebuild.
+The rule "A Buffer rebuild reserves each list and map whose size it knows before its loop" does not apply, because `rowMarks` does not know the count before its loop.
+A mark comes from a File header, a resolved Thread disclosure, a Thread root header, or a Draft header.
+The Buffer holds only the File count, in `file_rows`.
+`buffer.rows.len` is a bound, but it is far larger than the mark count, so a reservation of that size costs more than the growth.
+A close bound is the File count plus the Thread count plus the Draft count, but only the callers hold the Thread and Draft counts.
+The mark count is small next to the visual row count, so the growth is a few allocations in the build arena (inferred, not measured).
+The branch changes nothing. [Ticket 07 of the enrichment rebuild follow-up](../../enrichment-rebuild-follow-up/issues/07-find-the-other-rebuild-lists-that-grow-from-empty.md) now lists `rowMarks`, and its measurement decides whether to reserve.

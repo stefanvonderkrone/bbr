@@ -33,3 +33,10 @@ The operator moved this ticket out of the enrichment rebuild cascade, where it w
 Ticket numbers in the text above are the numbers of the enrichment rebuild cascade. [The map](../map.md) lists the new numbers.
 Take a new baseline at the head of the branch that starts this work.
 
+
+### 2026-11-17 the row mark list of M30
+
+M30 adds one more site of this kind.
+`scroll_marks.rowMarks` in `src/tui/scroll_marks.zig` grows the row mark list from empty in each rebuild, after the visual rows.
+The Buffer knows only the File count. The close bound is Files + Threads + Drafts, which the callers of `rowMarks` hold, not `rowMarks` itself.
+Measure it with the other sites. If it stays, pass the bound to `rowMarks` and extend a growth test.
