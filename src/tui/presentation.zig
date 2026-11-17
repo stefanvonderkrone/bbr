@@ -35494,6 +35494,147 @@ test "M30 scrollbar an allocation failure in rowMarks keeps the previous Frame" 
     try expectPublishedRowMarks(expanded);
 }
 
+/// The Scroll Marks of a Frame and the visual row of each File header.
+const M30MarkSnapshot = struct {
+    marks: []const scroll_marks.RowMark,
+    headers: []const usize,
+
+    fn take(frame: frame_mod.Projection) !M30MarkSnapshot {
+        const marks = try testing.allocator.dupe(scroll_marks.RowMark, frame.row_marks);
+        errdefer testing.allocator.free(marks);
+        return .{ .marks = marks, .headers = try m30FileHeaderRows(frame) };
+    }
+
+    fn deinit(self: M30MarkSnapshot) void {
+        testing.allocator.free(self.marks);
+        testing.allocator.free(self.headers);
+    }
+};
+
+fn m30FileHeaderRows(frame: frame_mod.Projection) ![]const usize {
+    const headers = try testing.allocator.alloc(usize, frame.buffer.file_rows.len);
+    for (frame.buffer.file_rows, headers) |file_row, *header| header.* = frame_mod.visualIndexForBufferIndex(frame.visual_rows, file_row.first_row).?;
+    return headers;
+}
+
+/// File Enrichment changes rows only inside a File. In these tests it adds
+/// them below every Thread of the File, so each Scroll Mark moves with its
+/// File header.
+/// Returns the rows that the last File header moved.
+fn expectRowMarksFollowTheirFiles(before: M30MarkSnapshot, after: frame_mod.Projection) !usize {
+    try expectPublishedRowMarks(after);
+    const headers = try m30FileHeaderRows(after);
+    defer testing.allocator.free(headers);
+    try testing.expectEqual(before.headers.len, headers.len);
+    try testing.expectEqual(before.marks.len, after.row_marks.len);
+    for (before.marks, after.row_marks) |old, new| {
+        var file: usize = 0;
+        while (file + 1 < before.headers.len and before.headers[file + 1] <= old.first) file += 1;
+        const shift = headers[file] - before.headers[file];
+        try testing.expectEqual(old.kind, new.kind);
+        try testing.expectEqual(old.first + shift, new.first);
+        try testing.expectEqual(old.end + shift, new.end);
+    }
+    return headers[headers.len - 1] - before.headers[before.headers.len - 1];
+}
+
+test "M30 scrollbar a File Enrichment rebuild moves the Scroll Marks of the Threads below the File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testBufferSearchStartSession(false) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try testing.expectEqual(Scope.whole, presentation.preferences.scope);
+    const before = try M30MarkSnapshot.take(presentation.projection().review.?.frame);
+    defer before.deinit();
+    try testing.expectEqual(@as(usize, 1), countRowMarks(presentation.projection().review.?.frame, .unresolved_thread));
+
+    try deliverTestBufferSearchStartEnrichment(&presentation, 0, "a\n1\n2\n3\n4\nb\n", "A\n1\n2\n3\n4\nB\n");
+    try testing.expectEqual(@as(usize, 1), queuedEnrichmentBuilds(&presentation));
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(try expectRowMarksFollowTheirFiles(before, presentation.projection().review.?.frame) > 0);
+}
+
+test "M30 scrollbar a coalesced File Enrichment rebuild moves the Scroll Marks for each of its Files" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testBufferSearchStartSession(true) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try testing.expectEqual(Scope.whole, presentation.preferences.scope);
+    const published = presentation.published.?;
+    const before = try M30MarkSnapshot.take(presentation.projection().review.?.frame);
+    defer before.deinit();
+
+    try presentation.queueFileEnrichment(published, 0, false);
+    try presentation.queueFileEnrichment(published, 1, false);
+    var buffer: [2]EnrichFile = undefined;
+    const commands = takeQueuedTestEnrichments(&presentation, &buffer);
+    try testing.expectEqual(@as(usize, 2), commands.len);
+    try deliverTestEnrichmentSides(&presentation, commands[0], "a\n1\n2\n3\n4\nb\n", "A\n1\n2\n3\n4\nB\n");
+    try deliverTestEnrichmentSides(&presentation, commands[1], "a\nmore\n", "A\nmore\n");
+    try testing.expectEqual(@as(usize, 1), queuedEnrichmentBuilds(&presentation));
+    try testing.expectEqual(@as(usize, 2), presentation.queuedEnrichmentBuild(published.epoch).?.enrichments.items.len);
+    try completeDisclosureBuild(&presentation);
+    const after = presentation.projection().review.?.frame;
+    const last_shift = try expectRowMarksFollowTheirFiles(before, after);
+    const headers = try m30FileHeaderRows(after);
+    defer testing.allocator.free(headers);
+    const first_shift = headers[1] - before.headers[1];
+    try testing.expect(first_shift > 0);
+    try testing.expect(last_shift > first_shift);
+}
+
+test "M30 scrollbar a File Enrichment rebuild that reuses the search corpus moves the row and hit Scroll Marks" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testBufferSearchStartSession(false) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer presentation.deinit();
+    try testing.expectEqual(Scope.changes, presentation.preferences.scope);
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'z', .text = "zz" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const published = presentation.published.?;
+    const corpus = published.search_corpus.?;
+    const before = try M30MarkSnapshot.take(presentation.projection().review.?.frame);
+    defer before.deinit();
+    const hits_before = try testing.allocator.dupe(frame_mod.ProjectedSourceRange, presentation.projection().review.?.frame.search_ranges);
+    defer testing.allocator.free(hits_before);
+    try testing.expect(hits_before.len > 0);
+
+    // Invalid UTF-8 makes both sides unavailable, so two status rows appear
+    // under the File header, and the Changes candidates stay the same.
+    try deliverTestBufferSearchStartEnrichment(&presentation, 0, "a\xff\n", "A\xff\n");
+    try completeDisclosureBuild(&presentation);
+    try testing.expectEqual(corpus, published.search_corpus.?);
+    const after = presentation.projection().review.?.frame;
+    const shift = try expectRowMarksFollowTheirFiles(before, after);
+    try testing.expectEqual(@as(usize, 2), shift);
+
+    try testing.expect(after.buffer_search_ranges);
+    try testing.expectEqual(hits_before.len, after.search_ranges.len);
+    const pane = frame_mod.scrollState(after, .diff_pane).?;
+    const track = try scroll_marks.project(testing.allocator, pane.track.height, pane.total, after.row_marks, after.search_ranges);
+    defer testing.allocator.free(track);
+    try testing.expect(track.len > 0);
+    for (hits_before, after.search_ranges) |old, new| {
+        try testing.expectEqual(old.visual_row + shift, new.visual_row);
+        try testing.expectEqual(@as(?view_mod.ScrollMark, .buffer_search_hit), track[view_mod.trackCell(pane.track.height, pane.total, new.visual_row)]);
+    }
+}
+
 /// Publishes `completed` and checks the result against a full rank and projection.
 /// With `hide_rows`, the publication runs without visual rows or Buffer rows.
 fn expectReviewSourcePublication(presentation: *Presentation, completed: ReviewSourceScanned, hide_rows: bool) !void {
@@ -35979,7 +36120,10 @@ fn testBufferSearchStartSession(third_file: bool) !*session_mod.Session {
 
 fn deliverTestBufferSearchStartEnrichment(presentation: *Presentation, file: usize, old: []const u8, new: []const u8) !void {
     try presentation.queueFileEnrichment(presentation.published.?, file, false);
-    const command = presentation.takeCommand().?.enrich_file;
+    try deliverTestEnrichmentSides(presentation, presentation.takeCommand().?.enrich_file, old, new);
+}
+
+fn deliverTestEnrichmentSides(presentation: *Presentation, command: EnrichFile, old: []const u8, new: []const u8) !void {
     const responses = [_]bbr.http.Canned{
         .{ .status = 200, .body = old },
         .{ .status = 200, .body = new },
