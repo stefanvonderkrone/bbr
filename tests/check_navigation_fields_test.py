@@ -123,6 +123,23 @@ class NavigationFieldsTest(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn("src/tui/presentation.zig:7: the field `kept` of `Holder`", found[0])
 
+    def test_a_test_inside_a_test_keeps_the_outer_test_excluded(self):
+        found = self.check(
+            'test "outer" {\n'
+            "    const Local = struct {\n"
+            '        test "inner" {}\n'
+            "    };\n"
+            "    const Snapshot = struct {\n"
+            "        navigation: Nav,\n"
+            "    };\n"
+            "}\n"
+            "const Holder = struct {\n"
+            "    kept: Nav,\n"
+            "};\n"
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("src/tui/presentation.zig:10: the field `kept` of `Holder`", found[0])
+
     def test_an_owner_name_in_another_file_is_rejected_and_test_files_are_skipped(self):
         frame = "pub const Projection = struct {\n    navigation: Nav,\n};\n"
         self.assertEqual(self.check(frame, "src/tui/frame.zig"), [])
