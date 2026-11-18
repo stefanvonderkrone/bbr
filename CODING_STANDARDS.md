@@ -141,6 +141,12 @@ No check: a field check cannot tell a Hunk Line from a gap Line, because both ha
 
 ### Only a Review Search source scan moves the queued cache update
 
-A queued cache update keeps its place in the queue. Only a new Review Search source scan moves it to the end, and only while the cache is not far over the budget. Another request that moves it can starve the cache update and hold the cache over the budget.
+A queued cache update keeps its place in the queue. Only a new Review Search source scan moves it to the end, and only while the cache is not far over the budget. Far over the budget is a byte limit that depends only on the budget, never on a File count. Another request that moves it can starve the cache update and hold the cache over the budget.
 
 No check: a check would have to know every request that can reach the queue. Related checked rule: [Coalesced Buffer builds](docs/rules/tui-state.md#coalesced-buffer-builds).
+
+### A surface that shows File content protects it from eviction
+
+A surface that reads File content from the cache, such as the DiffPane through the cache focus and the Review Search Preview through its hold, keeps that File out of eviction while it shows it. A cache update evicts every other inactive File, and nothing acquires a File again only because a surface reads it.
+
+No check: a check cannot tell which projection field a painter reads as File content. Related checked rule: [Review Search Preview hold](docs/rules/tui-state.md#review-search-preview-hold).
