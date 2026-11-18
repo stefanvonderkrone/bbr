@@ -147,6 +147,6 @@ No check: a check would have to know every request that can reach the queue. Rel
 
 ### A surface that shows File content protects it from eviction
 
-A surface that reads File content from the cache, such as the DiffPane through the cache focus and the Review Search Preview through its hold, keeps that File out of eviction while it shows it. A cache update evicts every other inactive File, and nothing acquires a File again only because a surface reads it.
+A surface that reads File content from the cache keeps that File out of eviction while it shows it. The DiffPane does this through the cache focus, and the Review Search Preview through its hold. A cache update evicts every other inactive File, and nothing acquires a File again only because a surface reads it.
 
 No check: a check cannot tell which projection field a painter reads as File content. Related checked rule: [Review Search Preview hold](docs/rules/tui-state.md#review-search-preview-hold).

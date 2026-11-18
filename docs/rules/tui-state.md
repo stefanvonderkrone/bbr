@@ -223,7 +223,7 @@ One exception exists.
 A new Review Search source scan moves the queued cache update to the end of the queue while `Storage.cachePressure` is not `far_over_budget`.
 Far over the budget means that the inactive Files exceed the budget by more than the larger of the budget and `Storage.far_over_budget_floor` (4 MiB).
 So while the scans run, the inactive bytes stay at or below the budget plus that excess, plus one File.
-Each cache update frees more than the excess, so the scans cost at most one full Buffer build for each excess that they release, plus one for each stop.
+Each cache update frees more than the excess. So the scans cost at most one full Buffer build for each excess that they release, plus one for each stop.
 The floor keeps a budget smaller than one File from costing a build for each released File.
 When the scans stop, the cache update reaches the front and brings the cache within the budget.
 
@@ -234,14 +234,14 @@ Enforcement: the switch in `refreshQueuedBuild` in `src/tui/presentation.zig` na
 A Buffer build retains the current search Batches only so that acceptance can tell whether the build is still current.
 The accepted build stays alive as `Published.worker_frame`, because its arena holds the Buffer.
 `acceptBufferDisclosure` releases its snapshots when it becomes the published Frame.
-A snapshot that the Frame kept would make the Frame the only owner of a Batch that a later scan replaced, and a Review Search Batch can hold gigabytes.
+A later scan can replace the Batch of a snapshot. A snapshot in the Frame then keeps the replaced Batch alive, and a Review Search Batch can hold gigabytes.
 
 Enforcement: the test "M21 kernel a Buffer build during Review Search keeps no replaced Batch after the Overlay closes" in `src/tui/presentation.zig`, run by `zig build test`.
 
 ## Review Search Preview hold
 
 The File that the Review Search Preview shows has a hold, so a cache update never evicts the content on screen.
-`holdReviewSearchPreview` runs after each dispatch and derives the held File from the open state, the Batch, and the selection.
+`holdReviewSearchPreview` runs at the end of each dispatch. It gets the held File from `ReviewSearchState.previewSource`, which the Preview projection also reads.
 It acquires the File again when a cache update evicted it before the selection reached it.
 `Published.releaseReviewSearchHolds` releases the hold with the scan holds.
 

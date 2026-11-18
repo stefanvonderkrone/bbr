@@ -263,12 +263,12 @@ A selection move during the scans showed "Reacquiring File content…" in the Pr
 
 Cause: no event republishes the Preview, because nothing reacquires the File. The selected File had no lease and was outside the cache focus, so a cache update evicted it like any File that a scan released. Only `selectReviewSearch` acquired a pending File again.
 
-Fix: Presentation holds the File of the selected source occurrence while the Overlay shows it (`ReviewSearchState.preview_held`). `holdReviewSearchPreview` runs after each dispatch, moves the hold when the selected File changes, and acquires the File again when it was evicted before the selection reached it. `Published.releaseReviewSearchHolds` releases the hold.
+Fix: Presentation holds the File of the selected source occurrence while the Overlay shows it (`ReviewSearchState.preview_held`). `holdReviewSearchPreview` runs at the end of each dispatch and moves the hold when the selected File changes. It acquires the File again when a cache update evicted it before the selection reached it. `Published.releaseReviewSearchHolds` releases the hold.
 
 - `70b2c7c5` tui: test that the Review Search Preview keeps its File content
 - `6bd68cb6` tui: hold the File that the Review Search Preview shows
 
-The test fails for a one-byte budget (eviction while the scans run) and for a budget of thirty Files (eviction when they end). "M21 authored opening evicted source waits for exact File Enrichment" evicted the selected File while the Overlay was open, so it now closes the Overlay to evict it and opens it again.
+The test checks the Preview after each step from the selection on. It fails for Files of about 1.2 MiB, which a cache update evicts while the scans run. It also fails for small Files, which stay below the limit and are evicted when the scans end. "M21 authored opening evicted source waits for exact File Enrichment" evicted the selected File while the Overlay was open, so it now closes the Overlay to evict it and opens it again.
 
 Live, C-d 3 s after typing `e`, then 15 s after the scans stop: before, 1 of 1 run showed "Reacquiring File content…" from about 10 s to the end. With the fix, 3 of 3 runs (two at 1 MiB, one at 8 MiB) never showed it.
 
@@ -278,7 +278,7 @@ A hold changes `Storage.revision`, so a selection move to another File during a 
 
 The eighth of the Files let 24 to 28 large Files hold ten times a 1 MiB budget, and the 64 MiB clause never acted on a 22.6 MiB Review.
 
-Now far over the budget means that the inactive Files exceed the budget by more than the larger of the budget and `Storage.far_over_budget_floor` (4 MiB). Each cache update while the scans run frees more than that excess, so the scans cost at most one full Buffer build for each excess that they release. Twice the budget keeps that ratio for a large budget. The floor keeps a budget smaller than one File from costing a build for each released File. On the local Review, 4 MiB gave fewer cache updates than the old rule at 1 MiB, and the same at 8 MiB.
+Now far over the budget means that the inactive Files exceed the budget by more than the larger of the budget and `Storage.far_over_budget_floor` (4 MiB). Each cache update while the scans run frees more than that excess. So the scans cost at most one full Buffer build for each excess that they release. Twice the budget keeps that ratio for a large budget. The floor keeps a budget smaller than one File from costing a build for each released File. On the local Review, 4 MiB gave fewer cache updates than the old rule at 1 MiB, and the same at 8 MiB.
 
 - `1c4d6cb2` tui: test a byte limit for the cache updates of Review Search
 - `3ae9b944` tui: limit the bytes over the budget that Review Search scans keep
