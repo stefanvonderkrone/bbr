@@ -812,9 +812,9 @@ pub const Storage = struct {
 
     /// Far over the budget means that the inactive Files exceed the budget by
     /// more than the larger of the budget and `far_over_budget_floor`. One
-    /// cache update from there frees at least that much, so the full Buffer
-    /// build that publishes it pays for itself also when the budget is
-    /// smaller than one File.
+    /// cache update from there frees more than that excess. So the full
+    /// Buffer build that publishes it pays for itself, also when the budget
+    /// is smaller than one File.
     pub const CachePressure = enum { within_budget, over_budget, far_over_budget };
     pub const far_over_budget_floor = 4 * 1024 * 1024;
 

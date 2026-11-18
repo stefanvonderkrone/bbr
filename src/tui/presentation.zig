@@ -4248,6 +4248,16 @@ const ReviewSearchState = struct {
         self.request_id +%= 1;
     }
 
+    /// The source location that the Preview shows, if the selection is one.
+    fn previewSource(self: *const ReviewSearchState, files: usize) ?search.SourceLocation {
+        if (!self.open or self.pending) return null;
+        const batch = self.batch orelse return null;
+        const index = self.selected orelse return null;
+        if (index >= batch.occurrences.len or batch.occurrences[index].location != .source) return null;
+        const source = batch.occurrences[index].location.source;
+        return if (source.file_index < files) source else null;
+    }
+
     fn clearSource(self: *ReviewSearchState, allocator: Allocator) void {
         _ = allocator;
         if (self.source_scanned) |scanned| @memset(scanned, false);
@@ -6669,6 +6679,7 @@ pub const Presentation = struct {
     /// The sole mutation entry point. Candidate construction consumes a loaded
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
+        defer self.holdReviewSearchPreview();
         defer if (self.published) |published| {
             if (published.diagnostic_failure) |failure| self.reportEvidence(failure);
             published.diagnostic_failure = null;
@@ -6752,7 +6763,6 @@ pub const Presentation = struct {
             .request_shutdown => self.requestShutdown(),
         }
         if (self.published == null or self.published.?.composer == null) self.composer_footer.clearRetainingCapacity();
-        self.holdReviewSearchPreview();
         if (self.code_work != null or (self.published != null and self.published.?.code_highlighting.bodies.items.len > 0)) self.refreshCodeVisibility();
     }
 
@@ -6938,11 +6948,8 @@ pub const Presentation = struct {
                 search_view.highlight_statuses = published.session.enrichment.statuses;
                 if (search_view.results.len == 0 and search_view.list_scroll < published.session.enrichment.len())
                     search_view.status_preview = published.session.enrichment.file(search_view.list_scroll);
-                if (search_view.selected) |selected| if (selected < search_view.results.len) {
-                    const occurrence = search_view.results[selected].occurrence;
-                    if (occurrence.location == .source and occurrence.location.source.file_index < published.session.enrichment.len())
-                        search_view.source_preview = published.session.enrichment.file(occurrence.location.source.file_index);
-                };
+                if (published.review_search.previewSource(published.session.enrichment.len())) |source|
+                    search_view.source_preview = published.session.enrichment.file(source.file_index);
                 break :blk search_view;
             } else null,
             .clipboard_status = self.clipboard_status,
@@ -9051,10 +9058,7 @@ pub const Presentation = struct {
     fn holdReviewSearchPreview(self: *Presentation) void {
         const published = self.published orelse return;
         const state = &published.review_search;
-        const shown: ?search.SourceLocation = if (!state.open or state.pending) null else if (state.batch) |batch| if (state.selected) |index|
-            if (index < batch.occurrences.len and batch.occurrences[index].location == .source) batch.occurrences[index].location.source else null
-        else
-            null else null;
+        const shown = state.previewSource(published.session.enrichment.len());
         const wanted = if (shown) |source| source.file_index else null;
         if (std.meta.eql(wanted, state.preview_held)) return;
         const released = state.preview_held;
@@ -9718,6 +9722,7 @@ pub const Presentation = struct {
     fn acceptBufferDisclosure(self: *Presentation, job: *DisclosureBuild) void {
         job.keepPlans();
         var owned = true;
+        // A build that is not owned here became the published Frame.
         defer if (owned) job.destroy() else job.releaseSnapshots();
         if (!self.consumeCommand(job.command_id, .build_buffer_disclosure)) return;
         const published = self.published orelse return;
@@ -30886,31 +30891,75 @@ test "M21 kernel a Buffer build during Review Search keeps no replaced Batch aft
 }
 
 test "M21 kernel the Review Search Preview keeps its File content while cache updates evict" {
-    // One byte evicts while the scans run. Thirty Files evicts when they end.
-    for ([_]usize{ 1, 30 * test_enriched_file_bytes }) |budget| {
+    // Files of about 1.2 MiB pass the cache update limit while the scans run.
+    // Small Files stay below it, so they are evicted when the scans end.
+    const large = try testing.allocator.alloc(u8, 384 * 1024);
+    defer testing.allocator.free(large);
+    @memset(large, 'x');
+    large[large.len - 1] = '\n';
+    const old_large = try testing.allocator.dupe(u8, large);
+    defer testing.allocator.free(old_large);
+    @memcpy(old_large[0..4], "old\n");
+    const new_large = try testing.allocator.dupe(u8, large);
+    defer testing.allocator.free(new_large);
+    @memcpy(new_large[0..4], "new\n");
+    for ([_][2][]const u8{ .{ old_large, new_large }, .{ "old\n", "new\n" } }) |texts| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         var presentation = try Presentation.init(testing.allocator, .{
             .reviews = store.store(),
-            .inactive_file_cache_max_bytes = budget,
+            .inactive_file_cache_max_bytes = 1,
         }, .{
-            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 40) },
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 16) },
         });
         defer presentation.deinit();
         try presentation.dispatch(.{ .action = .open_review_search });
         try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
-        try runReviewSearchTestWork(&presentation, 3);
-        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
-        const before = presentation.projection().review_search.?;
-        const chosen = before.results[before.selected.?].occurrence.location.source;
-        try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
-
-        const view = presentation.projection().review_search.?;
-        const source = view.results[view.selected.?].occurrence.location.source;
-        try testing.expectEqual(chosen.file_index, source.file_index);
-        const preview = view.source_preview.?;
-        try testing.expect((if (source.relation == .old) preview.old else preview.new) == .content);
-        try testing.expect(presentation.published.?.session.enrichment.retainedBytes() < 40 * test_enriched_file_bytes);
+        var scans: usize = 0;
+        var chosen: ?search.SourceLocation = null;
+        var evictions: usize = 0;
+        while (presentation.takeCommand()) |next| {
+            var command = next;
+            switch (command) {
+                .enrich_file => |enrich| try deliverSizedTestEnrichment(&presentation, enrich, texts[0], texts[1]),
+                .build_buffer_disclosure => |job| {
+                    if (job.kind == .cache_update) evictions += 1;
+                    job.build();
+                    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+                },
+                .scan_buffer_search => |*scan| {
+                    defer command.deinit();
+                    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, scan) });
+                },
+                .scan_review_source => |*scan| {
+                    const completed = executeReviewSourceScan(testing.allocator, scan);
+                    command.deinit();
+                    try presentation.dispatch(.{ .review_source_scanned = completed });
+                    scans += 1;
+                    if (scans == 3) {
+                        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+                        const view = presentation.projection().review_search.?;
+                        chosen = view.results[view.selected.?].occurrence.location.source;
+                        // Cache updates before the selection do not count.
+                        evictions = 0;
+                    }
+                },
+                else => return error.UnexpectedCommand,
+            }
+            const source = chosen orelse continue;
+            const view = presentation.projection().review_search.?;
+            const shown = view.results[view.selected.?].occurrence.location.source;
+            try testing.expectEqual(source.file_index, shown.file_index);
+            const preview = view.source_preview.?;
+            try testing.expect((if (shown.relation == .old) preview.old else preview.new) == .content);
+        }
+        try testing.expect(chosen != null);
+        try testing.expect(evictions > 0);
+        var retained: usize = 0;
+        for (0..16) |index| {
+            if (presentation.published.?.session.enrichment.file(index).new == .content) retained += 1;
+        }
+        try testing.expect(retained < 16);
     }
 }
 
