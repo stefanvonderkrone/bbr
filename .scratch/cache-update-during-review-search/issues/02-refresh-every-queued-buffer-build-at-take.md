@@ -32,3 +32,13 @@ The intent fields of each kind must survive the new snapshot, such as the target
 The switch in `refreshQueuedBuild` names every kind, so the change for one kind is one arm.
 
 ## Comments
+
+### 2026-11-18 a background stream costs one full Buffer build per item
+
+The mistake class "a background stream costs one full Buffer build per item" has two cases now.
+The first case was the File Enrichment rebuild cascade, which cascade ticket 01 fixed with one coalesced queued build.
+The second case was the cache updates of Review Search scans, which ticket 01 of this effort fixed with one queued cache update and a far-over-budget rule.
+Both fixes are special rules for one build kind, with tests and the `switch` without `else` in `refreshQueuedBuild`.
+The architecture-level fix is one coalescing queue for every build kind, so that a new background stream cannot cost one build per item.
+Decide it together with the take-time refresh of the other build kinds above.
+
