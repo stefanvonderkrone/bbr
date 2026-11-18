@@ -3313,13 +3313,22 @@ pub const DisclosureBuild = struct {
         self.built_plans = null;
     }
 
+    /// The snapshots only tell acceptance whether the build is current. The
+    /// published Frame keeps no snapshot, because a search that replaces
+    /// its Batch would leave the Frame as the only owner of the old one.
+    fn releaseSnapshots(self: *DisclosureBuild) void {
+        if (self.accepted_snapshot) |*batch| batch.deinit(std.heap.page_allocator);
+        self.accepted_snapshot = null;
+        if (self.review_snapshot) |*batch| batch.deinit(std.heap.page_allocator);
+        self.review_snapshot = null;
+    }
+
     pub fn destroy(self: *DisclosureBuild) void {
         if (self.built_plans) |plans| plans.destroy();
         if (self.deletion_origin) |origin| origin.release();
         for (self.enrichments.items) |*enriched| enriched.result.deinit();
         if (self.batch) |*batch| batch.deinit(std.heap.page_allocator);
-        if (self.accepted_snapshot) |*batch| batch.deinit(std.heap.page_allocator);
-        if (self.review_snapshot) |*batch| batch.deinit(std.heap.page_allocator);
+        self.releaseSnapshots();
         if (self.ranges) |ranges| std.heap.page_allocator.free(ranges);
         if (self.navigation_rows) |rows| std.heap.page_allocator.free(rows);
         if (self.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
@@ -9687,7 +9696,7 @@ pub const Presentation = struct {
     fn acceptBufferDisclosure(self: *Presentation, job: *DisclosureBuild) void {
         job.keepPlans();
         var owned = true;
-        defer if (owned) job.destroy();
+        defer if (owned) job.destroy() else job.releaseSnapshots();
         if (!self.consumeCommand(job.command_id, .build_buffer_disclosure)) return;
         const published = self.published orelse return;
         if (self.shutdown_requested or published.epoch != job.epoch) return;
