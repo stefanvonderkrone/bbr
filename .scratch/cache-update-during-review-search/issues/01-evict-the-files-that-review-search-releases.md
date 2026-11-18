@@ -219,7 +219,7 @@ The rule is the section [Coalesced Buffer builds](../../../docs/rules/tui-state.
 
 The Standards review asked for the rule-table shape of `docs/agents/rule-details.md` and for names. The row and its details section follow it.
 The Spec review found the gap in bytes and the focus change that waits for the scans. Commit `0d38f1f3` closes the gap. This ticket records the wait.
-Open: the eighth of the Files and 64 MiB are judgement values. No run on a large Review measured them.
+Open: the eighth of the Files and 64 MiB are judgement values. No run on a large Review measured them. The section "Live test fixes" replaces them with a byte limit.
 
 ### Checks
 
@@ -228,3 +228,83 @@ Open: the eighth of the Files and 64 MiB are judgement values. No run on a large
 - `python3 tools/check_agent_docs.py`: pass.
 
 ## Comments
+
+## Live test fixes
+
+A live test on the local Review `fb701b11..18362616` (479 Files, 22.6 MiB of File content, 187,827 rows) found three problems. Each fix has a failing test commit before it.
+
+### Memory after the Overlay closes
+
+Over the budget, the branch kept 13.4 to 14.1 GB after Review Search closed in 6 of 7 runs. `main` kept 8.3 to 8.5 GB.
+
+Cause: the accepted Buffer build stays alive as `Published.worker_frame`, because its arena holds the Buffer. It also kept its Review Search snapshot, a retained `search.Batch`. Each source scan replaces the Batch, so the Frame became the only owner of the old Batch until the next Buffer build. On `main` the cache updates ran at the end of the scans, so the last snapshot was the final Batch. Here they run while the scans run, so the last one keeps a late Batch.
+
+Fix: `acceptBufferDisclosure` releases the snapshots when the build becomes the published Frame (`DisclosureBuild.releaseSnapshots`).
+
+- `3ef48837` tui: test that the published Frame keeps no replaced search Batch
+- `d916df00` tui: release the search snapshots of the published Frame
+
+Live, 1 MiB budget, physical footprint after close, after 30 s, and after 3 × `]` and 20 × `j`:
+
+| Side | Run | After close | After 30 s | After navigation |
+| --- | --- | ---: | ---: | ---: |
+| before | 1 | 8.4 GB | 8.4 GB | 8.4 GB |
+| before | 2 | 8.5 GB | 8.5 GB | 8.5 GB |
+| before | 3 | 14.3 GB | 14.3 GB | 8.5 GB |
+| fix | 1 | 8.5 GB | 8.5 GB | 8.5 GB |
+| fix | 2 | 8.4 GB | 8.4 GB | 8.4 GB |
+| fix | 3 | 8.5 GB | 8.5 GB | 8.5 GB |
+
+The four 1 MiB and 8 MiB runs of the byte limit below also end at 8.4 GB.
+
+### Preview stuck on "Reacquiring File content…"
+
+A selection move during the scans showed "Reacquiring File content…" in the Preview within 1 to 4 s, and it stayed until the next selection move. `main` showed it when the scans ended.
+
+Cause: no event republishes the Preview, because nothing reacquires the File. The selected File had no lease and was outside the cache focus, so a cache update evicted it like any File that a scan released. Only `selectReviewSearch` acquired a pending File again.
+
+Fix: Presentation holds the File of the selected source occurrence while the Overlay shows it (`ReviewSearchState.preview_held`). `holdReviewSearchPreview` runs after each dispatch, moves the hold when the selected File changes, and acquires the File again when it was evicted before the selection reached it. `Published.releaseReviewSearchHolds` releases the hold.
+
+- `70b2c7c5` tui: test that the Review Search Preview keeps its File content
+- `6bd68cb6` tui: hold the File that the Review Search Preview shows
+
+The test fails for a one-byte budget (eviction while the scans run) and for a budget of thirty Files (eviction when they end). "M21 authored opening evicted source waits for exact File Enrichment" evicted the selected File while the Overlay was open, so it now closes the Overlay to evict it and opens it again.
+
+Live, C-d 3 s after typing `e`, then 15 s after the scans stop: before, 1 of 1 run showed "Reacquiring File content…" from about 10 s to the end. With the fix, 3 of 3 runs (two at 1 MiB, one at 8 MiB) never showed it.
+
+A hold changes `Storage.revision`, so a selection move to another File during a running build makes that build retry. The live runs, which move the selection every 2 s, had 5 retries instead of 2.
+
+### Byte limit
+
+The eighth of the Files let 24 to 28 large Files hold ten times a 1 MiB budget, and the 64 MiB clause never acted on a 22.6 MiB Review.
+
+Now far over the budget means that the inactive Files exceed the budget by more than the larger of the budget and `Storage.far_over_budget_floor` (4 MiB). Each cache update while the scans run frees more than that excess, so the scans cost at most one full Buffer build for each excess that they release. Twice the budget keeps that ratio for a large budget. The floor keeps a budget smaller than one File from costing a build for each released File. On the local Review, 4 MiB gave fewer cache updates than the old rule at 1 MiB, and the same at 8 MiB.
+
+- `1c4d6cb2` tui: test a byte limit for the cache updates of Review Search
+- `3ae9b944` tui: limit the bytes over the budget that Review Search scans keep
+
+Deterministic Presentation run, 40 Files, 80 source scans, two query edits, one-byte budget. One run of each row, because the run is deterministic.
+
+| File size | Rule | Cache updates | Peak inactive bytes |
+| --- | --- | ---: | ---: |
+| 1.18 MB | old | 12 | 5,906,220 (5 Files) |
+| 1.18 MB | byte limit | 16 | 4,724,976 (4 Files) |
+| 608 B | old | 12 | 3,040 (5 Files) |
+| 608 B | byte limit | 1 | 23,712 (39 Files) |
+
+The limit allows 1 B + 4 MiB + one File, 5,375,549 bytes, for the large Files. The old rule fails it. Small Files stay below the floor, so the cache update waits for the end of the scans and the budget holds from there.
+
+Live, ReleaseFast, tmux 160×80, query `e` then `ee`, two runs on each side. Peak inactive bytes and cache updates come from an instrumented copy that prints a line for each accepted scan and each accepted cache update. CPU is the process CPU time after the load.
+
+| Budget | Side | Peak inactive MiB | Cache updates | Retries | CPU s | Scan `e` / `ee` s |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| 1 MiB | before | 16.35, 16.45 | 14, 15 | 5, 5 | 33.3, 34.2 | 16.1 / 13.9, 17.1 / 13.8 |
+| 1 MiB | byte limit | 12.22, 12.17 | 10, 10 | 3, 3 | 36.7, 38.7 | 19.1 / 15.0, 20.2 / 16.1 |
+| 8 MiB | before | 16.26, 16.26 | 2, 2 | 5, 4 | 33.0, 25.9 | 13.3 / 16.4, 15.1 / 11.4 |
+| 8 MiB | byte limit | 16.27, 16.26 | 3, 2 | 4, 4 | 31.6, 27.1 | 14.1 / 14.8, 13.5 / 10.7 |
+
+"Before" is `6bd68cb6`, which has the first two fixes. The 1 MiB peak with the byte limit is one File of about 7 MiB on top of the limit. Without it, the inactive bytes stay at about 5 MiB.
+
+The CPU time at 1 MiB goes up by 3 to 4 s although the cache updates go down. In the first pass of one run on each side, the old rule fired five cache updates at up to 54,000 occurrences and one at the end. The byte limit fired four at 37,000 to 149,000 occurrences and one at the end. A `sample` of 3 s during the first pass puts most of the active main thread time in `__munmap` and `__mmap` under `search.Batch.deinit` and `search.Batch.clone`, also under `DisclosureBuild.destroy`. So a cache update costs more when the Batch is larger. The cost of one cache update depends on the Batch, which no limit in bytes of File content controls. [Review Search Batch memory ticket 01](../../review-search-batch-memory/issues/01-find-why-review-search-holds-gigabytes.md) has the clone.
+
+M28 was not run again. Its fixture holds 8,308 bytes, below the floor, so a cache update there now waits for the end of the scans or a query, as option A in the table above. The S5 query edits wait for each search to end, so S5 likely still refetches (inferred, not run).

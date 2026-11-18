@@ -39,3 +39,8 @@ After the Overlay closes, `main` keeps about 8 GB until the process ends. The ra
 ### 2026-11-18 filed
 
 The operator asked for this ticket after the live test of the cache update branch.
+
+### 2026-11-18 two Batch owners found by the cache update fixes
+
+- The published Frame (`Published.worker_frame`) kept the Review Search snapshot of its build. After a source scan replaced the Batch, the Frame was the only owner of the old Batch until the next Buffer build. Commit `d916df00` on branch `cache-update-during-review-search` releases the snapshots at publication. That removed the 13 to 14 GB after close on that branch. It does not change the 8.5 GB floor.
+- `acceptReviewSourceScanned` clones the whole old Batch before each merge when `old.references != null`. `Batch.retain` sets `references` once and never clears it, so after the first Buffer build every source scan clones the whole Batch, also when no build holds it any more. A `sample` during the scans shows most active main thread time in `__munmap` and `__mmap` under `Batch.clone` and `Batch.deinit`. Checking the reference count instead of the pointer is likely to remove most of the copies (inferred, not tried).
