@@ -30793,6 +30793,48 @@ test "M21 kernel Review Search source scans over the cache budget share their ca
     }
 }
 
+/// The published Frame keeps no Batch that Presentation replaced. A replaced
+/// Review Search Batch can hold gigabytes.
+fn expectFrameKeepsNoReplacedBatch(published: *const Published) !void {
+    const frame = published.worker_frame orelse return;
+    if (frame.review_snapshot) |snapshot| {
+        const current = published.review_search.batch orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(current.occurrences.ptr, snapshot.occurrences.ptr);
+    }
+    if (frame.accepted_snapshot) |snapshot| {
+        const current = published.buffer_search.accepted_batch orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(current.occurrences.ptr, snapshot.occurrences.ptr);
+    }
+}
+
+test "M21 kernel a Buffer build during Review Search keeps no replaced Batch after the Overlay closes" {
+    // An unlimited budget (0) commits only File Enrichment builds while the
+    // scans run. Four Files of budget also commits cache updates.
+    for ([_]usize{ 0, 4 * test_enriched_file_bytes }) |budget| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{
+            .reviews = store.store(),
+            .inactive_file_cache_max_bytes = budget,
+        }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 40) },
+        });
+        defer presentation.deinit();
+        const published = presentation.published.?;
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+        try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+        try testing.expect(published.review_search.batch.?.occurrences.len > 1);
+        try testing.expect(published.worker_frame != null);
+        try expectFrameKeepsNoReplacedBatch(published);
+
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        try testing.expect(presentation.projection().review_search == null);
+        try runReviewSearchTestWork(&presentation, 0);
+        try expectFrameKeepsNoReplacedBatch(published);
+    }
+}
+
 test "a failed enrichment rebuild releases each File and reports only demanded Files" {
     for ([_]bool{ false, true }) |demanded| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
