@@ -32,9 +32,9 @@ After the join, a fan-out moves the slot of the returned failure with `Handle.ad
 
 No check: the parent is a runtime value of the same type as every other slot. Related checked rule: [A task gets its slot by pointer](docs/rules/diagnostics.md#a-task-gets-its-slot-by-pointer).
 
-### Each task spawn is reached by a Debug test
+### Each new task spawn is reached by a Debug test
 
-Each production task spawn has a test that reaches it in a Debug build. Without such a test, nothing checks the task arguments of that spawn. The worker spawns in `drainPresentationCommands` in `src/tui/app.zig` have no such test.
+Each new production task spawn has a test that reaches it in a Debug build. Without such a test, nothing checks the task arguments of that spawn. The existing worker spawns in `drainPresentationCommands` in `src/tui/app.zig` have no such test. [Ticket 05](.scratch/agents-md-pointers/issues/05-check-that-a-debug-test-reaches-each-task-spawn.md) adds the tests and a check.
 
 No check: the slot check in `diagnostics.concurrent` and `diagnostics.selectConcurrent` runs only in a Debug build, because a release panic would end a review over lost evidence. Related checked rule: [A task gets its slot by pointer](docs/rules/diagnostics.md#a-task-gets-its-slot-by-pointer).
 
