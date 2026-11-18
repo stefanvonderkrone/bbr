@@ -30618,6 +30618,71 @@ test "one enrichment rebuild keeps the Review Search effects of each File in it"
     for (commands[2..]) |command| try deliverTestEnrichment(&presentation, command);
 }
 
+/// Runs the queued work in order, as one worker does, until `source_scans`
+/// Review Search source scans and the Buffer builds that wait before the
+/// next scan complete, or until the queue is empty.
+fn runReviewSearchTestWork(presentation: *Presentation, source_scans: usize) !void {
+    var scanned: usize = 0;
+    while (scanned < source_scans or
+        (presentation.commands.items.len > 0 and presentation.commands.items[0] == .build_buffer_disclosure))
+    {
+        var command = presentation.takeCommand() orelse return;
+        switch (command) {
+            .enrich_file => |enrich| try deliverTestEnrichment(presentation, enrich),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_buffer_search => |*scan| {
+                defer command.deinit();
+                try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, scan) });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+                scanned += 1;
+            },
+            else => return error.UnexpectedCommand,
+        }
+    }
+}
+
+fn expectCacheBudgetAndFrameAgree(published: *const Published) !void {
+    const storage = &published.session.enrichment;
+    try testing.expect(!storage.requiresCacheEnforcement(storage.focused));
+    for (0..storage.len(), published.disclosure_inputs.blobs) |index, blob|
+        try testing.expectEqual(storage.file(index).new == .content, blob.new != null);
+}
+
+test "M21 kernel Review Search source scans evict the Files they release while the query changes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 6) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try runReviewSearchTestWork(&presentation, 3);
+    try testing.expect(presentation.projection().review_search != null);
+    try expectCacheBudgetAndFrameAgree(published);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    try runReviewSearchTestWork(&presentation, 3);
+    try testing.expect(presentation.projection().review_search != null);
+    try expectCacheBudgetAndFrameAgree(published);
+    var evicted: usize = 0;
+    for (0..published.session.enrichment.len()) |index| {
+        if (published.session.enrichment.file(index).new == .pending) evicted += 1;
+    }
+    try testing.expect(evicted > 0);
+}
+
 test "a failed enrichment rebuild releases each File and reports only demanded Files" {
     for ([_]bool{ false, true }) |demanded| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
