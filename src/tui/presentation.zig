@@ -30707,6 +30707,85 @@ test "M21 kernel Review Search source scans evict the Files they release while t
     try testing.expect(evicted > 0);
 }
 
+/// The retained bytes of one File that `deliverTestEnrichment` fills.
+const test_enriched_file_bytes = 608;
+
+test "M21 kernel Review Search source scans over the cache budget share their cache updates" {
+    const file_count = 40;
+    // While the scans run, a cache update waits until the inactive Files
+    // hold more than twice the budget in at least an eighth of the Files.
+    // Then it evicts down to the budget. A budget below one File is zero
+    // Files.
+    for ([_]usize{ 4, 0 }) |budget_files| {
+        const evicted_files = @max(budget_files, file_count / 8);
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{
+            .reviews = store.store(),
+            .inactive_file_cache_max_bytes = @max(1, budget_files * test_enriched_file_bytes),
+        }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, file_count) },
+        });
+        defer presentation.deinit();
+        const published = presentation.published.?;
+        const storage = &published.session.enrichment;
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+        var scans: usize = 0;
+        var query_changes: usize = 1;
+        var enrichment_builds: usize = 0;
+        var cache_builds: usize = 0;
+        while (presentation.takeCommand()) |next| {
+            var command = next;
+            switch (command) {
+                .enrich_file => |enrich| try deliverTestEnrichment(&presentation, enrich),
+                .build_buffer_disclosure => |job| {
+                    switch (job.kind) {
+                        .enrichment => enrichment_builds += 1,
+                        .cache_update => cache_builds += 1,
+                        else => {},
+                    }
+                    job.build();
+                    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+                },
+                .scan_buffer_search => |*scan| {
+                    defer command.deinit();
+                    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, scan) });
+                },
+                .scan_review_source => |*scan| {
+                    const completed = executeReviewSourceScan(testing.allocator, scan);
+                    command.deinit();
+                    try presentation.dispatch(.{ .review_source_scanned = completed });
+                    scans += 1;
+                    if (scans == file_count / 2 or scans == file_count) {
+                        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+                        query_changes += 1;
+                    }
+                },
+                else => return error.UnexpectedCommand,
+            }
+            var inactive_files: usize = 0;
+            for (storage.files, 0..) |stored, index| {
+                if (stored.new == .content and stored.leases == 0 and !storage.focused.contains(index)) inactive_files += 1;
+            }
+            try testing.expect(inactive_files <= @max(2 * budget_files, evicted_files) + 1);
+        }
+        try testing.expectEqual(@as(usize, 3), query_changes);
+        try testing.expect(scans >= 2 * file_count);
+        try testing.expect(presentation.projection().review_search != null);
+        try expectCacheBudgetAndFrameAgree(published);
+        var retained_files: usize = 0;
+        for (storage.files) |stored| {
+            if (stored.new == .content) retained_files += 1;
+        }
+        try testing.expectEqual(retained_files * test_enriched_file_bytes, storage.retainedBytes());
+        try testing.expect(retained_files < file_count);
+        // The other cache updates run when the scans wait for File
+        // Enrichment or a query.
+        try testing.expect(cache_builds <= scans / evicted_files + enrichment_builds + query_changes);
+    }
+}
+
 test "a failed enrichment rebuild releases each File and reports only demanded Files" {
     for ([_]bool{ false, true }) |demanded| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
