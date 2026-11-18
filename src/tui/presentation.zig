@@ -8794,6 +8794,13 @@ pub const Presentation = struct {
                 self.finishSearchLease(published, index);
                 held[index] = false;
             };
+            // A cache update is a full Buffer build, so it waits behind the
+            // scans until the released Files are far over the budget or the
+            // scans stop.
+            if (self.queuedBuildIndex(.cache_update, published.epoch)) |cache_index| {
+                if (published.session.enrichment.cachePressure(published.pending_cache_focus) != .far_over_budget)
+                    self.commands.appendAssumeCapacity(self.commands.orderedRemove(cache_index));
+            }
             state.source_scanned.?[index] = true;
             state.source_scan_active = true;
             return;
@@ -10208,8 +10215,8 @@ pub const Presentation = struct {
     }
 
     /// At most one cache update waits in the queue. A new request of the same
-    /// Session keeps its place, so a stream of Review Search scans cannot
-    /// push it back.
+    /// Session keeps its place. Only a Review Search source scan moves it
+    /// back, and only while the cache is not far over the budget.
     fn queueCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) !void {
         if (self.queuedBuildIndex(.cache_update, published.epoch)) |index| {
             self.commands.items[index].build_buffer_disclosure.cache_focused = focused;

@@ -807,13 +807,27 @@ pub const Storage = struct {
     }
 
     pub fn requiresCacheEnforcement(self: *const Storage, focused: FileRange) bool {
+        return self.cachePressure(focused) != .within_budget;
+    }
+
+    /// Far over the budget means more than twice the budget in at least an
+    /// eighth of the Files. One eviction from there frees enough to pay for
+    /// the full Buffer build that publishes it.
+    pub const CachePressure = enum { within_budget, over_budget, far_over_budget };
+
+    pub fn cachePressure(self: *const Storage, focused: FileRange) CachePressure {
         const budget = if (!self.cache.enabled) 0 else if (self.cache.max_retained_bytes == 0) std.math.maxInt(usize) else self.cache.max_retained_bytes;
         var total: usize = 0;
+        var files: usize = 0;
         for (self.files, 0..) |*stored, index| {
             if (focused.contains(index) or stored.leases > 0) continue;
-            total +|= stored.retainedBytes();
+            const bytes = stored.retainedBytes();
+            total +|= bytes;
+            if (bytes > 0) files += 1;
         }
-        return total > budget;
+        if (total > budget *| 2 and files *| 8 >= self.files.len) return .far_over_budget;
+        if (total > budget) return .over_budget;
+        return .within_budget;
     }
 
     pub fn len(self: *const Storage) usize {
