@@ -810,22 +810,24 @@ pub const Storage = struct {
         return self.cachePressure(focused) != .within_budget;
     }
 
-    /// Far over the budget means more than twice the budget in at least an
-    /// eighth of the Files. One eviction from there frees enough to pay for
-    /// the full Buffer build that publishes it.
+    /// Far over the budget means more than twice the budget, held in at
+    /// least an eighth of the Files or in `far_over_budget_bytes`. One
+    /// eviction from there frees enough to pay for the full Buffer build
+    /// that publishes it, also when the budget is smaller than one File.
     pub const CachePressure = enum { within_budget, over_budget, far_over_budget };
+    pub const far_over_budget_bytes = 64 * 1024 * 1024;
 
     pub fn cachePressure(self: *const Storage, focused: FileRange) CachePressure {
         const budget = if (!self.cache.enabled) 0 else if (self.cache.max_retained_bytes == 0) std.math.maxInt(usize) else self.cache.max_retained_bytes;
         var total: usize = 0;
-        var files: usize = 0;
+        var retaining_files: usize = 0;
         for (self.files, 0..) |*stored, index| {
             if (focused.contains(index) or stored.leases > 0) continue;
             const bytes = stored.retainedBytes();
             total +|= bytes;
-            if (bytes > 0) files += 1;
+            if (bytes > 0) retaining_files += 1;
         }
-        if (total > budget *| 2 and files *| 8 >= self.files.len) return .far_over_budget;
+        if (total > budget *| 2 and (retaining_files *| 8 >= self.files.len or total >= far_over_budget_bytes)) return .far_over_budget;
         if (total > budget) return .over_budget;
         return .within_budget;
     }
@@ -2304,6 +2306,30 @@ test "File content cache budget includes Highlight Spans" {
 
     storage.focus(.single(1));
     try testing.expect(storage.file(0).new == .pending);
+}
+
+test "File cache pressure is far over the budget only in an eighth of the Files or in many bytes" {
+    var files: [24]bbr.diff.File = undefined;
+    @memset(&files, test_files[0]);
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = true, .max_retained_bytes = 1 });
+    storage.focus(.{ .first = 0, .end = 4 });
+    var results: [3]Result = undefined;
+    for (&results, 1..) |*result, index| {
+        result.* = try ownedAddedResult(testing.allocator, "aaaaaa");
+        try storage.admit(index, result);
+    }
+    defer for (&results) |*result| result.deinit();
+
+    try testing.expectEqual(Storage.CachePressure.within_budget, storage.cachePressure(.{ .first = 0, .end = 4 }));
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = 2 }));
+    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.single(0)));
+
+    storage.cache.max_retained_bytes = Storage.far_over_budget_bytes / 4;
+    storage.files[3].new.content.retained_bytes = Storage.far_over_budget_bytes;
+    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
 }
 
 test "zero File cache budget retains unlimited inactive content and excludes the focused File" {
