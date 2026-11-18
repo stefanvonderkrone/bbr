@@ -810,27 +810,22 @@ pub const Storage = struct {
         return self.cachePressure(focused) != .within_budget;
     }
 
-    /// Far over the budget means more than twice the budget, held in at
-    /// least an eighth of the Files or in `far_over_budget_bytes`. One
-    /// eviction from there frees enough to pay for the full Buffer build
-    /// that publishes it, also when the budget is smaller than one File.
+    /// Far over the budget means that the inactive Files exceed the budget by
+    /// more than the larger of the budget and `far_over_budget_floor`. One
+    /// cache update from there frees at least that much, so the full Buffer
+    /// build that publishes it pays for itself also when the budget is
+    /// smaller than one File.
     pub const CachePressure = enum { within_budget, over_budget, far_over_budget };
-    pub const far_over_budget_bytes = 64 * 1024 * 1024;
-    /// Far over the budget will need more than the budget plus the larger
-    /// of the budget and this floor.
     pub const far_over_budget_floor = 4 * 1024 * 1024;
 
     pub fn cachePressure(self: *const Storage, focused: FileRange) CachePressure {
         const budget = if (!self.cache.enabled) 0 else if (self.cache.max_retained_bytes == 0) std.math.maxInt(usize) else self.cache.max_retained_bytes;
         var total: usize = 0;
-        var retaining_files: usize = 0;
         for (self.files, 0..) |*stored, index| {
             if (focused.contains(index) or stored.leases > 0) continue;
-            const bytes = stored.retainedBytes();
-            total +|= bytes;
-            if (bytes > 0) retaining_files += 1;
+            total +|= stored.retainedBytes();
         }
-        if (total > budget *| 2 and (retaining_files *| 8 >= self.files.len or total >= far_over_budget_bytes)) return .far_over_budget;
+        if (total > budget +| @max(budget, far_over_budget_floor)) return .far_over_budget;
         if (total > budget) return .over_budget;
         return .within_budget;
     }
