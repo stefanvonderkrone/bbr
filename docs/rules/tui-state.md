@@ -75,8 +75,9 @@ A published Session never changes its Diff, its Threads, or its mention names.
 A change makes a new Session with a new Session Epoch through Refresh or Reconciliation.
 The Buffer Search candidate key covers these inputs only by identity and the Session Epoch.
 A worker that retains the Session reads them while the Presentation thread owns it.
+The Session fields that hold them have `const` element types, so no code writes their contents through those fields.
 
-Enforcement: the `const` types of the Session fields in `src/tui/session.zig` (compile error). These are `[]const File`, `[]const Hunk`, `[]const Line`, `*const Comment`, and `*const MentionNames` (`Session.mention_names`). The search candidate key in `src/tui/buffer.zig` sees a field reassignment through the new address.
+Enforcement: the `const` types of the Session fields in `src/tui/session.zig` (compile error). These are `[]const File`, `[]const Hunk`, `[]const Line`, `*const Comment`, and `*const MentionNames` (`Session.mention_names`). The search candidate key in `src/tui/buffer.zig` sees a field reassignment through the new address. The types do not stop a field reassignment, a write through `@constCast`, or a write through a mutable alias that the producer keeps. [No change to a published Session](../../CODING_STANDARDS.md#no-change-to-a-published-session) covers those writes.
 
 ## New List Overlay
 
