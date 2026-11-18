@@ -213,7 +213,7 @@ The run was before commit `0d38f1f3`. That commit adds only the 64 MiB condition
 - `0f55293a` tui: let Review Search scans pass the cache update until far over
 - `0d38f1f3` tui: bound the bytes that Review Search scans keep over the budget
 
-The rule is now a row of the rule table in `AGENTS.md`, with its full text in `docs/agents/rule-details.md#coalesced-buffer-builds`.
+The rule is the section [Coalesced Buffer builds](../../../docs/rules/tui-state.md#coalesced-buffer-builds). Its unchecked part is a section in `CODING_STANDARDS.md`.
 
 ### Review
 

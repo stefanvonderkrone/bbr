@@ -61,7 +61,7 @@ Two Zig 0.16 experiments in a standalone project decide the design:
 5. Make `zig build` compile `bbr-buffer-search-bench`. Today only `zig build bench-buffer-search` compiles it, so CI does not see a compile error in it. A compile dependency of the install step is enough. The benchmark does not need to run.
 6. Add `.cell_metrics = .bytes` to each test literal that took the default, and pass `.bytes` to each test `buffer.build` call. Use a codemod, not hand edits. The test widths do not change.
 7. Delete `tools/check_benchmark_metrics.py`, `tests/check_benchmark_metrics_test.py`, and their step in `build.zig`. The compile error makes the mistake impossible in every built benchmark. A test can still use `.bytes`, but a test is not a measurement.
-8. Rewrite the AGENTS.md row for the benchmark metrics. The new enforcement is the compile error in `src/tui/cell_metrics.zig` and the compile of every benchmark executable by `zig build`. The rule that no file keeps its own copy of the vaxis adapter stays a convention.
+8. Rewrite the section [Benchmark cell metrics](../../../docs/rules/build-and-checks.md#benchmark-cell-metrics) and its convention in `CODING_STANDARDS.md`. The new enforcement is the compile error in `src/tui/cell_metrics.zig` and the compile of every benchmark executable by `zig build`. The rule that no file keeps its own copy of the vaxis adapter stays a convention.
 
 `ReviewSearchProjection.cell_metrics` is optional and `render.zig` falls back to the terminal metrics. That fallback is not `.bytes`, so this ticket leaves it.
 
@@ -71,7 +71,7 @@ Two Zig 0.16 experiments in a standalone project decide the design:
 - [ ] A reference to `CellMetrics.bytes` outside a test build fails to compile, and the message names `terminal_cell_metrics`. Proof: restore the old `.bytes` argument of `Published.create` in `benchmarkInitialSession`, and `zig build` fails with that message.
 - [ ] `zig build` compiles `bbr-buffer-search-bench`.
 - [ ] The Buffer Search benchmark and every Buffer build in `src/benchmark/` use the terminal metrics.
-- [ ] `tools/check_benchmark_metrics.py`, its test, and its `build.zig` step are gone. The AGENTS.md row names the compile error as its enforcement.
+- [ ] `tools/check_benchmark_metrics.py`, its test, and its `build.zig` step are gone. The section "Benchmark cell metrics" in `docs/rules/build-and-checks.md` names the compile error as its enforcement.
 - [ ] The completion records `zig build bench-buffer-search` before and after the change. It says that earlier Buffer Search numbers measured `CellMetrics.bytes`.
 - [ ] `zig build`, `zig build test`, and `python3 tools/check_agent_docs.py` pass.
 
@@ -96,6 +96,6 @@ Take a new baseline at the head of the branch that starts this work.
 
 ### 2026-11-17, the rule details moved
 
-The benchmark metrics row in `AGENTS.md` now holds one rule sentence and its check.
-Its full text is the section "Benchmark cell metrics" in [the rule details](../../../docs/agents/rule-details.md#benchmark-cell-metrics).
+The benchmark metrics rule left `AGENTS.md`.
+Its text is the section [Benchmark cell metrics](../../../docs/rules/build-and-checks.md#benchmark-cell-metrics), and its unchecked part is in `CODING_STANDARDS.md`.
 Step 8 rewrites both.

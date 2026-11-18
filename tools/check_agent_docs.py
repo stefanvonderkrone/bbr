@@ -14,6 +14,7 @@ TYPES = {"research", "prototype", "grilling", "task", "implementation"}
 FIELD = re.compile(r"^(?:\*\*)?([\w ]+):(?:\*\*)?\s*(.*?)\s*$")
 LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 REFERENCE = re.compile(r"^\s{0,3}\[(?!\^)[^\]\n]+\]:\s*(<[^>]+>|\S+)")
+AGENTS_MD_CAP = 5000
 
 
 def prose(text):
@@ -60,8 +61,29 @@ def check(root):
     def error(path, message):
         errors.append(f"{path.relative_to(root)}: {message}")
 
+    agents = root / "AGENTS.md"
+    if agents.is_file() and agents.stat().st_size > AGENTS_MD_CAP:
+        areas = ", ".join(str(path.relative_to(root)) for path in sorted(root.glob("docs/rules/*.md")))
+        error(agents, f"{agents.stat().st_size:,} bytes, above the cap of {AGENTS_MD_CAP:,}. "
+              "Every session loads AGENTS.md, so it holds only pointer lines. "
+              f"Put the rule in its area doc ({areas or 'docs/rules/'}) or, "
+              "when no check enforces it, in CODING_STANDARDS.md")
+
+    adrs = {}
+    for path in sorted(root.glob("docs/adr/*.md")):
+        number = re.match(r"(\d+)-", path.name)
+        if not number:
+            continue
+        if number[1] in adrs:
+            error(path, f"ADR number {number[1]} is also used by {adrs[number[1]].name}. "
+                  "Give the newer ADR the next free number and update its links. "
+                  "This check only sees one tree, so two branches that add the same number "
+                  "fail only after the merge")
+        else:
+            adrs[number[1]] = path
+
     documents = {root / "AGENTS.md", root / "GLOSSARY-MAP.md", root / "docs/code-navigation.md"}
-    for pattern in ("docs/agents/*.md", "src/**/GLOSSARY.md", "src/**/IMPLEMENTATION.md",
+    for pattern in ("docs/agents/*.md", "docs/rules/*.md", "CODING_STANDARDS.md", "src/**/GLOSSARY.md", "src/**/IMPLEMENTATION.md",
                     ".scratch/**/*.md", ".agents/skills/**/*.md"):
         documents.update(root.glob(pattern))
     for path in sorted(documents):
