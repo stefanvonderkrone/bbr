@@ -52,6 +52,7 @@ Case 2 is the `.cache_update` build, which has neither rule.
 - [x] "M21 kernel search lease release and Review Search hold release stage eviction once", "M21 authored opening evicted source waits for exact File Enrichment", and "M21 kernel cache Frame launch failure and closed sink preserve content and focus" pass unchanged.
 - [x] M28 `zig build test-file-cache` passes after a merge of the fix. S4 and S5 are reported against the pre-merge numbers.
 - [x] The number of full Buffer builds during a Review Search does not go back to the cascade.
+- [x] Over the budget, the cache updates during a Review Search do not cost one full Buffer build for each released File. A Presentation test counts them and fails on commit `6f2917c7`.
 - [x] `zig build test` passes.
 
 ## Completion
@@ -120,9 +121,105 @@ It also found that a release during a running cache update makes that run stale.
 
 ### Rule for `docs/rules/`
 
-`docs/rules/` does not exist on `main` yet. This is the rule text for it:
+`docs/rules/` does not exist on `main` yet. The coalesced cache update round put the rule into the rule table of `AGENTS.md`. This is the rule text for `docs/rules/`:
 
-> A Buffer build that a background stream requests (File Enrichment results, Review Search lease and hold releases) has at most one queued build of its kind. A new request joins the queued build and keeps its place. `takeCommand` gives the build a new snapshot through `refreshQueuedBuild`. Enforcement: the switch in `refreshQueuedBuild` names every `DisclosureBuild.Kind` (compile error for a new kind), and the tests "a stale enrichment rebuild gives its results to the one queued rebuild" and "M21 kernel Review Search source scans evict the Files they release while the query changes".
+> A Buffer build that a background stream requests (File Enrichment results, Review Search lease and hold releases) has at most one queued build of its kind. A new request joins the queued build and keeps its place. `takeCommand` gives the build a new snapshot through `refreshQueuedBuild`. The one exception: a new Review Search source scan moves the queued cache update behind it while `Storage.cachePressure` is not `far_over_budget`. Enforcement: the switch in `refreshQueuedBuild` names every `DisclosureBuild.Kind` (compile error for a new kind), and the tests "a stale enrichment rebuild gives its results to the one queued rebuild", "M21 kernel Review Search source scans evict the Files they release while the query changes", and "M21 kernel Review Search source scans over the cache budget share their cache updates".
+
+### Checks
+
+- `zig build test`: exit 0.
+- `zig fmt --check src build.zig tests`: exit 0.
+- `python3 tools/check_agent_docs.py`: pass.
+
+## Coalesced cache updates
+
+The first fix had a cost.
+Over the budget, each File that a source scan released asked for a cache update, and the queued cache update ran before the next scan.
+A cache update is a full Buffer build, so each released File cost one build.
+On a large Review over the budget, about 0.3 s for each build could add up to minutes of CPU. This is an estimate. No run measured it.
+
+### Options
+
+The bounds are for the time while the source scans run. Every option keeps the m21 invariant, because the cache update still publishes the cache content, the cache focus, and the Frame together. Every option ends within the budget when the scans stop.
+
+| Option | Memory over the budget while the scans run | Cache updates for each pass over the Files |
+| --- | --- | --- |
+| A. The cache update waits while a source scan is queued. It runs when the scans stop. | Every File the pass releases, up to the whole Review, for the whole pass. | One for each stop. A stop waits for File Enrichment or a query, so the count is at most the enrichment builds plus the query edits plus one. |
+| B. The cache update waits until the inactive Files are far over the budget: more than twice the budget, held in at least an eighth of the Files or in 64 MiB. It also runs when the scans stop. | At most the larger of twice the budget and 64 MiB, plus the one File that crosses the threshold. With small Files, the eighth of the Files stops it much earlier. | Each cache update evicts more than a budget of bytes. With Files of one size, it also evicts more than a sixteenth of the Files. So the count is at most the released bytes divided by the budget, plus the stops. With Files of one size, it is also at most 16 plus the stops. |
+| C. Enrichment builds evict the released Files on admission. A cache update runs only when no File Enrichment is in flight. | Every File the pass releases after the last enrichment build. When every File is already enriched, this is the whole Review. | At most one for each stop, as in A. Needs a signal for in-flight File Enrichment and a check after a failed fetch. |
+
+A probe of option A on the 40-File run below gave 1 cache update, but 39 inactive Files stayed in memory while the scans ran.
+That is the whole Review, so option A only moves the fault to the end of the pass.
+Option C has the same bound when no File Enrichment is in flight, and it needs more signals.
+
+### Pick
+
+Option B. It bounds the memory in bytes and the CPU in full Buffer builds.
+The threshold needs more than twice the budget and one of two amounts: an eighth of the Files or 64 MiB.
+Twice the budget alone degenerates when the budget is smaller than one File: then each release crosses it, and each File costs a build again.
+An eighth of the Files alone has no bound in bytes. A few large Files never reach it.
+64 MiB alone keeps a small Review over a small budget for the whole pass. M28 S5 would then likely see no refetch (inferred, not run).
+The first version had only the eighth of the Files. The Spec review found the gap in bytes, and commit `0d38f1f3` added the 64 MiB condition.
+Option B also keeps the enrichment fold of option C: an enrichment build that runs between two scans evicts on admission.
+
+`Storage.cachePressure` in `src/tui/file_enrichment.zig` returns `within_budget`, `over_budget`, or `far_over_budget`.
+`maybeQueueReviewSourceScan` in `src/tui/presentation.zig` moves the queued cache update behind the new scan unless the pressure is `far_over_budget`.
+A request for a new cache focus joins the queued cache update. While the scans run, the scan moves that update too. So a focus change while Review Search is open waits until the scans stop or the cache is far over the budget. `ensureFocusedEnrichment` also waits for it before `focusAdmitted`. The Overlay close is not affected, because no scan follows it.
+The move puts the cache update at the end of the queue, also behind commands that came after it. Its snapshot is new at take, so the order does not change its result.
+
+### Bound
+
+While the source scans run, the inactive bytes stay at or below the larger of twice the budget and 64 MiB, plus one File.
+With Files of one size, they also stay below the larger of twice the budget and an eighth of the Files, plus one File.
+The excess lasts until the next cache update commits, which is at the latest when the scans stop for File Enrichment, a query, or the end of the Files.
+Then the cache update reaches the front of the queue and brings the cache within the budget, before the Overlay closes.
+
+### Numbers
+
+A Presentation run over 40 Files, with the query `new` and two query edits, in queue order (80 source scans):
+
+| Budget | Side | Enrichment builds | Cache updates | Most inactive Files while scans run |
+| --- | --- | ---: | ---: | ---: |
+| 1 byte | `6f2917c7` | 11 | 77 | 1 |
+| 1 byte | this fix | 10 | 12 | 5 |
+| 4 Files (2432 bytes) | `6f2917c7` | 9 | 65 | 5 |
+| 4 Files (2432 bytes) | this fix | 9 | 11 | 9 |
+| unlimited | both | 5 | 0 | 39 |
+
+The run is deterministic, so one run of each row is enough.
+The earlier table above counted a run with 60 scans, so its numbers differ.
+
+The test "M21 kernel Review Search source scans over the cache budget share their cache updates" runs this case with both budgets.
+On `6f2917c7` it fails at the count: 65 cache updates against the bound of 32.
+
+### M28
+
+A throwaway merge of this branch into `m28-full-review-file-cache-evaluation` passes `zig build test-file-cache`. Two runs gave the same S4 and S5 numbers.
+
+| Scenario | Side | refetches | requests | enrichments | peak_retained_bytes | retained_bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| S4 | before `ae39a66d` | 1 | 12 | 5 | 6744 | 6744 |
+| S4 | this fix | 1 | 12 | 5 | 8308 | 6744 |
+| S5 | before `ae39a66d` | 3 | 7 | 6 | 6744 | 5280 |
+| S5 | this fix | 3 | 6 | 6 | 8308 | 6744 |
+
+The M28 fixture has 6 Files and a one-byte budget, so one released File is an eighth of the Files and far over the budget.
+The cache update keeps its place there, as in the first fix, and the numbers do not change.
+The run was before commit `0d38f1f3`. That commit adds only the 64 MiB condition, and the whole fixture Review is 8308 bytes, so the numbers cannot change (inferred, not run again).
+
+### Commits
+
+- `d1e23a91` tui: test that Review Search scans share their cache updates
+- `0f55293a` tui: let Review Search scans pass the cache update until far over
+- `0d38f1f3` tui: bound the bytes that Review Search scans keep over the budget
+
+The rule is now a row of the rule table in `AGENTS.md`, with its full text in `docs/agents/rule-details.md#coalesced-buffer-builds`.
+
+### Review
+
+The Standards review asked for the rule-table shape of `docs/agents/rule-details.md` and for names. The row and its details section follow it.
+The Spec review found the gap in bytes and the focus change that waits for the scans. Commit `0d38f1f3` closes the gap. This ticket records the wait.
+Open: the eighth of the Files and 64 MiB are judgement values. No run on a large Review measured them.
 
 ### Checks
 

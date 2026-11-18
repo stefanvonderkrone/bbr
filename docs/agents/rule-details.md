@@ -217,3 +217,27 @@ A new `*const bbr.diff.Line` field that outlives its Frame is also a convention.
 A field check cannot tell a Hunk Line from a gap Line, because both have the type `*const bbr.diff.Line`.
 Every existing Line pointer field is Frame-scoped or holds only Hunk Lines.
 So each existing field would be an exception.
+
+## Coalesced Buffer builds
+
+### Rule
+
+A Buffer build that a background stream requests has at most one queued build of its kind.
+The streams are File Enrichment results and Review Search lease and hold releases.
+A new request joins the queued build and keeps its place.
+`takeCommand` gives the build a new snapshot through `refreshQueuedBuild`.
+One exception exists.
+A new Review Search source scan moves the queued cache update to the end of the queue while `Storage.cachePressure` is not `far_over_budget`.
+Far over the budget means more than twice the budget, held in at least an eighth of the Files or in `Storage.far_over_budget_bytes`.
+So while the scans run, the inactive bytes stay at or below the larger of twice the budget and 64 MiB, plus one File.
+When the scans stop, the cache update reaches the front and brings the cache within the budget.
+
+### Enforcement
+
+The switch in `refreshQueuedBuild` in `src/tui/presentation.zig` names every `DisclosureBuild.Kind`, so a new kind needs a decision about its snapshot at take (compile error).
+The test "a stale enrichment rebuild gives its results to the one queued rebuild" in `src/tui/presentation.zig` checks the enrichment build.
+The test "M21 kernel Review Search source scans evict the Files they release while the query changes" fails on `f6378a45`, where the cache update never committed while the scans ran.
+The test "M21 kernel Review Search source scans over the cache budget share their cache updates" counts the cache updates of 80 source scans. Commit `6f2917c7` fails it with 65 cache updates against a bound of 32.
+The test "File cache pressure is far over the budget only in an eighth of the Files or in many bytes" in `src/tui/file_enrichment.zig` checks both conditions of `far_over_budget`.
+`zig build test` runs them.
+No check stops another request from moving the queued cache update. That is a convention.
