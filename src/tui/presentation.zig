@@ -30844,6 +30844,35 @@ test "M21 kernel a Buffer build during Review Search keeps no replaced Batch aft
     }
 }
 
+test "M21 kernel the Review Search Preview keeps its File content while cache updates evict" {
+    // One byte evicts while the scans run. Thirty Files evicts when they end.
+    for ([_]usize{ 1, 30 * test_enriched_file_bytes }) |budget| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{
+            .reviews = store.store(),
+            .inactive_file_cache_max_bytes = budget,
+        }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 40) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+        try runReviewSearchTestWork(&presentation, 3);
+        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+        const before = presentation.projection().review_search.?;
+        const chosen = before.results[before.selected.?].occurrence.location.source;
+        try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+
+        const view = presentation.projection().review_search.?;
+        const source = view.results[view.selected.?].occurrence.location.source;
+        try testing.expectEqual(chosen.file_index, source.file_index);
+        const preview = view.source_preview.?;
+        try testing.expect((if (source.relation == .old) preview.old else preview.new) == .content);
+        try testing.expect(presentation.published.?.session.enrichment.retainedBytes() < 40 * test_enriched_file_bytes);
+    }
+}
+
 test "a failed enrichment rebuild releases each File and reports only demanded Files" {
     for ([_]bool{ false, true }) |demanded| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
