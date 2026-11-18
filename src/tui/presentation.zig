@@ -4207,6 +4207,9 @@ const ReviewSearchState = struct {
     authored_scan_active: bool = false,
     acquired: ?[]bool = null,
     held: ?[]bool = null,
+    /// The File that the Preview shows. Presentation holds it, so a cache
+    /// update never evicts the content on screen.
+    preview_held: ?usize = null,
     source_candidates: ?[]usize = null,
 
     fn deinit(self: *ReviewSearchState, allocator: Allocator) void {
@@ -4734,6 +4737,8 @@ const Published = struct {
             self.session.enrichment.finishLeaseDeferred(index);
             holding.* = false;
         };
+        if (self.review_search.preview_held) |index| self.session.enrichment.finishLeaseDeferred(index);
+        self.review_search.preview_held = null;
     }
 
     fn projection(self: *const Published, preferences: Preferences) ReviewProjection {
@@ -6747,6 +6752,7 @@ pub const Presentation = struct {
             .request_shutdown => self.requestShutdown(),
         }
         if (self.published == null or self.published.?.composer == null) self.composer_footer.clearRetainingCapacity();
+        self.holdReviewSearchPreview();
         if (self.code_work != null or (self.published != null and self.published.?.code_highlighting.bodies.items.len > 0)) self.refreshCodeVisibility();
     }
 
@@ -9033,20 +9039,36 @@ pub const Presentation = struct {
             .review_body => |body| body.logical_line -| 3,
             .source => |source| (source.new_line orelse source.old_line orelse 1) -| 3,
         };
-        if (batch.occurrences[index].location == .source) {
-            const source = batch.occurrences[index].location.source;
-            const view = published.session.enrichment.file(source.file_index);
-            const side = if (source.relation == .old) view.old else view.new;
-            if (side == .pending and state.acquired != null) {
-                state.acquired.?[source.file_index] = false;
-                self.pumpReviewSearchAcquisition(published);
-            }
-        }
         const geometry = frame_mod.reviewSearchGeometry(self.geometry) orelse return;
         if (index < state.list_scroll) state.list_scroll = index;
         if (geometry.list.height > 0 and index >= state.list_scroll + geometry.list.height)
             state.list_scroll = index + 1 - geometry.list.height;
         published.frame_revision += 1;
+    }
+
+    /// Moves the Preview hold to the File of the selected source occurrence
+    /// and acquires that File again when a cache update evicted it before.
+    fn holdReviewSearchPreview(self: *Presentation) void {
+        const published = self.published orelse return;
+        const state = &published.review_search;
+        const shown: ?search.SourceLocation = if (!state.open or state.pending) null else if (state.batch) |batch| if (state.selected) |index|
+            if (index < batch.occurrences.len and batch.occurrences[index].location == .source) batch.occurrences[index].location.source else null
+        else
+            null else null;
+        const wanted = if (shown) |source| source.file_index else null;
+        if (std.meta.eql(wanted, state.preview_held)) return;
+        const released = state.preview_held;
+        if (shown) |source| {
+            published.session.enrichment.hold(source.file_index);
+            const view = published.session.enrichment.file(source.file_index);
+            const side = if (source.relation == .old) view.old else view.new;
+            if (side == .pending) if (state.acquired) |acquired| {
+                acquired[source.file_index] = false;
+                self.pumpReviewSearchAcquisition(published);
+            };
+        }
+        state.preview_held = wanted;
+        if (released) |index| self.finishSearchLease(published, index);
     }
 
     fn acceptReviewSearchScanned(self: *Presentation, completed_value: BufferSearchScanned) void {
@@ -17432,9 +17454,14 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
     }
     try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
     try testing.expect(presentation.published.?.session.enrichment.file(1).new == .content);
+    // The Preview holds the selected File, so it is evicted only while the
+    // Overlay is closed.
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     while (presentation.commands.items.len > 0 and presentation.commands.items[0] == .build_buffer_disclosure)
         try completeDisclosureBuild(&presentation);
     try testing.expect(presentation.published.?.session.enrichment.file(1).new == .pending);
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try testing.expectEqual(@as(?usize, 0), presentation.projection().review_search.?.selected);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     try testing.expect(presentation.projection().review_search != null);
     var command = presentation.takeCommand().?;
