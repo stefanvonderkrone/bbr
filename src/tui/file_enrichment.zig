@@ -456,7 +456,7 @@ const StoredFile = struct {
         self.new.deinit();
     }
 
-    fn retainedBytes(self: *const StoredFile) usize {
+    pub fn retainedBytes(self: *const StoredFile) usize {
         var total: usize = 0;
         if (self.old == .content) total +|= self.old.content.retained_bytes;
         if (self.new == .content) total +|= self.new.content.retained_bytes;
@@ -816,6 +816,9 @@ pub const Storage = struct {
     /// that publishes it, also when the budget is smaller than one File.
     pub const CachePressure = enum { within_budget, over_budget, far_over_budget };
     pub const far_over_budget_bytes = 64 * 1024 * 1024;
+    /// Far over the budget will need more than the budget plus the larger
+    /// of the budget and this floor.
+    pub const far_over_budget_floor = 4 * 1024 * 1024;
 
     pub fn cachePressure(self: *const Storage, focused: FileRange) CachePressure {
         const budget = if (!self.cache.enabled) 0 else if (self.cache.max_retained_bytes == 0) std.math.maxInt(usize) else self.cache.max_retained_bytes;
@@ -2308,7 +2311,7 @@ test "File content cache budget includes Highlight Spans" {
     try testing.expect(storage.file(0).new == .pending);
 }
 
-test "File cache pressure is far over the budget only in an eighth of the Files or in many bytes" {
+test "File cache pressure is far over the budget only above the budget plus the larger of the budget and the floor" {
     var files: [24]bbr.diff.File = undefined;
     @memset(&files, test_files[0]);
     var storage = try Storage.init(testing.allocator, &files);
@@ -2323,12 +2326,20 @@ test "File cache pressure is far over the budget only in an eighth of the Files 
     defer for (&results) |*result| result.deinit();
 
     try testing.expectEqual(Storage.CachePressure.within_budget, storage.cachePressure(.{ .first = 0, .end = 4 }));
-    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
-    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = 2 }));
-    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.single(0)));
+    // Three small Files are an eighth of the Files, but far below the floor.
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.single(0)));
 
-    storage.cache.max_retained_bytes = Storage.far_over_budget_bytes / 4;
-    storage.files[3].new.content.retained_bytes = Storage.far_over_budget_bytes;
+    const floor = Storage.far_over_budget_floor;
+    storage.files[3].new.content.retained_bytes = 1 + floor;
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
+    storage.files[3].new.content.retained_bytes = 1 + floor + 1;
+    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
+
+    // Above the floor, the budget sets the excess.
+    storage.cache.max_retained_bytes = 2 * floor;
+    storage.files[3].new.content.retained_bytes = 4 * floor;
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
+    storage.files[3].new.content.retained_bytes = 4 * floor + 1;
     try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
 }
 

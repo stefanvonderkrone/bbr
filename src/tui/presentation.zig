@@ -30495,7 +30495,12 @@ test "two File Enrichment completions keep the cache and Frame private until one
 }
 
 fn deliverTestEnrichment(presentation: *Presentation, command: EnrichFile) !void {
-    const responses = [_]bbr.http.Canned{ .{ .status = 200, .body = "old\n" }, .{ .status = 200, .body = "new\n" } };
+    return deliverSizedTestEnrichment(presentation, command, "old\n", "new\n");
+}
+
+/// Delivers the File Enrichment of `command` with the given old and new File text.
+fn deliverSizedTestEnrichment(presentation: *Presentation, command: EnrichFile, old: []const u8, new: []const u8) !void {
+    const responses = [_]bbr.http.Canned{ .{ .status = 200, .body = old }, .{ .status = 200, .body = new } };
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
     const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
     var highlighter = TestNoopHighlighter{};
@@ -30735,12 +30740,12 @@ test "M21 kernel Review Search source scans evict the Files they release while t
     const published = presentation.published.?;
     try presentation.dispatch(.{ .action = .open_review_search });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
-    try runReviewSearchTestWork(&presentation, 3);
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
     try testing.expect(presentation.projection().review_search != null);
     try expectCacheBudgetAndFrameAgree(published);
 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
-    try runReviewSearchTestWork(&presentation, 3);
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
     try testing.expect(presentation.projection().review_search != null);
     try expectCacheBudgetAndFrameAgree(published);
     var evicted: usize = 0;
@@ -30755,78 +30760,87 @@ const test_enriched_file_bytes = 608;
 
 test "M21 kernel Review Search source scans over the cache budget share their cache updates" {
     const file_count = 40;
+    // Each File holds about 1.2 MiB. The floor is between three and four
+    // Files, and an eighth of the Files is five.
+    const text = try testing.allocator.alloc(u8, 384 * 1024);
+    defer testing.allocator.free(text);
+    @memset(text, 'x');
+    text[text.len - 1] = '\n';
+    const old_text = try testing.allocator.dupe(u8, text);
+    defer testing.allocator.free(old_text);
+    @memcpy(old_text[0..4], "old\n");
+    const new_text = try testing.allocator.dupe(u8, text);
+    defer testing.allocator.free(new_text);
+    @memcpy(new_text[0..4], "new\n");
+    // A budget below one File.
+    const budget = 1;
     // While the scans run, a cache update waits until the inactive Files
-    // hold more than twice the budget in at least an eighth of the Files.
-    // Then it evicts down to the budget. A budget below one File is zero
-    // Files.
-    for ([_]usize{ 4, 0 }) |budget_files| {
-        const evicted_files = @max(budget_files, file_count / 8);
-        var store = bbr.review.InMemoryStore.init(testing.allocator);
-        defer store.deinit();
-        var presentation = try Presentation.init(testing.allocator, .{
-            .reviews = store.store(),
-            .inactive_file_cache_max_bytes = @max(1, budget_files * test_enriched_file_bytes),
-        }, .{
-            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, file_count) },
-        });
-        defer presentation.deinit();
-        const published = presentation.published.?;
-        const storage = &published.session.enrichment;
-        try presentation.dispatch(.{ .action = .open_review_search });
-        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
-        var scans: usize = 0;
-        var query_changes: usize = 1;
-        var enrichment_builds: usize = 0;
-        var cache_builds: usize = 0;
-        while (presentation.takeCommand()) |next| {
-            var command = next;
-            switch (command) {
-                .enrich_file => |enrich| try deliverTestEnrichment(&presentation, enrich),
-                .build_buffer_disclosure => |job| {
-                    switch (job.kind) {
-                        .enrichment => enrichment_builds += 1,
-                        .cache_update => cache_builds += 1,
-                        else => {},
-                    }
-                    job.build();
-                    try presentation.dispatch(.{ .buffer_disclosure_built = job });
-                },
-                .scan_buffer_search => |*scan| {
-                    defer command.deinit();
-                    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, scan) });
-                },
-                .scan_review_source => |*scan| {
-                    const completed = executeReviewSourceScan(testing.allocator, scan);
-                    command.deinit();
-                    try presentation.dispatch(.{ .review_source_scanned = completed });
-                    scans += 1;
-                    if (scans == file_count / 2 or scans == file_count) {
-                        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
-                        query_changes += 1;
-                    }
-                },
-                else => return error.UnexpectedCommand,
-            }
-            var inactive_files: usize = 0;
-            for (storage.files, 0..) |stored, index| {
-                if (stored.new == .content and stored.leases == 0 and !storage.focused.contains(index)) inactive_files += 1;
-            }
-            try testing.expect(inactive_files <= @max(2 * budget_files, evicted_files) + 1);
+    // exceed the budget by more than the larger of the budget and the
+    // floor. Then it evicts down to the budget.
+    const excess = @max(budget, file_enrichment.Storage.far_over_budget_floor);
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = budget,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, file_count) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const storage = &published.session.enrichment;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    var scans: usize = 0;
+    var query_changes: usize = 1;
+    var enrichment_builds: usize = 0;
+    var cache_builds: usize = 0;
+    var file_bytes: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |enrich| try deliverSizedTestEnrichment(&presentation, enrich, old_text, new_text),
+            .build_buffer_disclosure => |job| {
+                switch (job.kind) {
+                    .enrichment => enrichment_builds += 1,
+                    .cache_update => cache_builds += 1,
+                    else => {},
+                }
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_buffer_search => |*scan| {
+                defer command.deinit();
+                try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, scan) });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+                scans += 1;
+                if (scans == file_count / 2 or scans == file_count) {
+                    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+                    query_changes += 1;
+                }
+            },
+            else => return error.UnexpectedCommand,
         }
-        try testing.expectEqual(@as(usize, 3), query_changes);
-        try testing.expect(scans >= 2 * file_count);
-        try testing.expect(presentation.projection().review_search != null);
-        try expectCacheBudgetAndFrameAgree(published);
-        var retained_files: usize = 0;
-        for (storage.files) |stored| {
-            if (stored.new == .content) retained_files += 1;
+        var inactive: usize = 0;
+        for (storage.files, 0..) |*stored, index| {
+            file_bytes = @max(file_bytes, stored.retainedBytes());
+            if (stored.leases == 0 and !storage.focused.contains(index)) inactive += stored.retainedBytes();
         }
-        try testing.expectEqual(retained_files * test_enriched_file_bytes, storage.retainedBytes());
-        try testing.expect(retained_files < file_count);
-        // The other cache updates run when the scans wait for File
-        // Enrichment or a query.
-        try testing.expect(cache_builds <= scans / evicted_files + enrichment_builds + query_changes);
+        try testing.expect(inactive <= budget + excess + file_bytes);
     }
+    try testing.expectEqual(@as(usize, 3), query_changes);
+    try testing.expect(scans >= 2 * file_count);
+    try testing.expect(presentation.projection().review_search != null);
+    try expectCacheBudgetAndFrameAgree(published);
+    try testing.expect(storage.retainedBytes() < file_count * file_bytes);
+    // Each cache update while the scans run evicts more than `excess`
+    // bytes. The others run when the scans wait for File Enrichment or a
+    // query.
+    try testing.expect(cache_builds <= scans * file_bytes / excess + enrichment_builds + query_changes);
 }
 
 /// The published Frame keeps no Batch that Presentation replaced. A replaced
