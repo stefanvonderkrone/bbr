@@ -1,7 +1,6 @@
 # 01: Evict the Files that Review Search releases while it is open
 
-Status: claimed
-Claimed by: worktree `/Volumes/Work/t3-code/cache-update-during-review-search`
+Status: resolved
 Blocked by: none
 
 ## Summary
@@ -49,10 +48,86 @@ Case 2 is the `.cache_update` build, which has neither rule.
 
 ## Acceptance criteria
 
-- [ ] A Presentation test opens Review Search with a one-byte budget, runs the scans in queue order, and edits the query. While the Overlay is open, the inactive Files are within the budget, and the published Frame and the cache agree. It fails on `main`.
-- [ ] "M21 kernel search lease release and Review Search hold release stage eviction once", "M21 authored opening evicted source waits for exact File Enrichment", and "M21 kernel cache Frame launch failure and closed sink preserve content and focus" pass unchanged.
-- [ ] M28 `zig build test-file-cache` passes after a merge of the fix. S4 and S5 are reported against the pre-merge numbers.
-- [ ] The number of full Buffer builds during a Review Search does not go back to the cascade.
-- [ ] `zig build test` passes.
+- [x] A Presentation test opens Review Search with a one-byte budget, runs the scans in queue order, and edits the query. While the Overlay is open, the inactive Files are within the budget, and the published Frame and the cache agree. It fails on `main`.
+- [x] "M21 kernel search lease release and Review Search hold release stage eviction once", "M21 authored opening evicted source waits for exact File Enrichment", and "M21 kernel cache Frame launch failure and closed sink preserve content and focus" pass unchanged.
+- [x] M28 `zig build test-file-cache` passes after a merge of the fix. S4 and S5 are reported against the pre-merge numbers.
+- [x] The number of full Buffer builds during a Review Search does not go back to the cascade.
+- [x] `zig build test` passes.
+
+## Completion
+
+Commits on branch `cache-update-during-review-search`:
+
+- `1eaadeaa` tui: test that Review Search evicts the Files it releases
+- `3127762c` tui: keep the queued cache update in place and refresh it at take
+
+### Change
+
+The cache update follows the two rules of the enrichment build.
+At most one cache update waits in the queue, and a new request keeps its place and changes only its focus (`queueCacheBuild`).
+`takeCommand` gives the cache update a new snapshot when a worker takes it (`refreshQueuedBuild`, which replaces `refreshEnrichmentBuild`).
+The switch in `refreshQueuedBuild` names every build kind, so a new kind needs a decision.
+The cache update still publishes the cache content, the cache focus, and the Frame together, so the m21 invariant holds.
+
+Each rule alone leaves the new test red.
+With the snapshot rule only, the cache update stays behind the next source scan.
+With the place rule only, the new test and "M21 kernel cache focus supersedes queued and issued focus changes" fail.
+
+### Tests
+
+- "M21 kernel Review Search source scans evict the Files they release while the query changes" runs the queued work in order with a one-byte budget, edits the query, and checks the budget and the agreement of the Frame and the cache while the Overlay is open.
+  On `main` it fails at the first budget check. The queue was `scan_review_source, cache_update` after three scans.
+- The three m21 tests that option C broke pass unchanged.
+
+### M28
+
+A throwaway merge of this branch into `m28-full-review-file-cache-evaluation` passes `zig build test-file-cache`.
+Two runs gave the same S4 and S5 numbers.
+
+| Scenario | Side | refetches | requests | enrichments | peak_retained_bytes | retained_bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| S4 | before `ae39a66d` | 1 | 12 | 5 | 6744 | 6744 |
+| S4 | `main` | 1 | 12 | 5 | 8308 | 8308 |
+| S4 | this fix | 1 | 12 | 5 | 8308 | 6744 |
+| S5 | before `ae39a66d` | 3 | 7 | 6 | 6744 | 5280 |
+| S5 | `main` | 0 | 0 | 0 | 8308 | 8308 |
+| S5 | this fix | 3 | 6 | 6 | 8308 | 6744 |
+
+The S4 peak stays at 8308, because one batched admission holds every File of the batch before the first scan releases one.
+
+### Build count
+
+A temporary Presentation test, not committed, ran a Review Search on 40 Files with 60 source scans and two query edits, in queue order.
+
+| Budget | Side | Enrichment builds | Cache update builds | Rejected builds |
+| --- | --- | ---: | ---: | ---: |
+| 1 byte | `main` | 6 | 2 | 1 |
+| 1 byte | this fix | 7 | 57 | 0 |
+| 256 MiB (default) | `main` | 5 | 0 | 0 |
+| 256 MiB (default) | this fix | 5 | 0 | 0 |
+
+No build is rejected, so the cascade does not come back.
+Over the budget, each File that a scan releases costs one committed Buffer build, because the m21 invariant needs a new Frame for each eviction.
+Under the default budget, nothing changes.
+The live run on the large local Review was not done, because its Files stay far below the default budget, so no cache update is queued there.
+
+### Review
+
+The two-axis review found no violation of a documented standard and no gap in the criteria.
+It found that the in-place lookup matched only the current Session, so a cache update of an earlier Session could stay queued. The append path now removes it, as before.
+It also found that a release during a running cache update makes that run stale. The retry joins the queued cache update, so the waste is one run for each release during a run. The serial build count above cannot show it.
+[Ticket 02](02-refresh-every-queued-buffer-build-at-take.md) records the other build kinds that still take their snapshot when they are queued.
+
+### Rule for `docs/rules/`
+
+`docs/rules/` does not exist on `main` yet. This is the rule text for it:
+
+> A Buffer build that a background stream requests (File Enrichment results, Review Search lease and hold releases) has at most one queued build of its kind. A new request joins the queued build and keeps its place. `takeCommand` gives the build a new snapshot through `refreshQueuedBuild`. Enforcement: the switch in `refreshQueuedBuild` names every `DisclosureBuild.Kind` (compile error for a new kind), and the tests "a stale enrichment rebuild gives its results to the one queued rebuild" and "M21 kernel Review Search source scans evict the Files they release while the query changes".
+
+### Checks
+
+- `zig build test`: exit 0.
+- `zig fmt --check src build.zig tests`: exit 0.
+- `python3 tools/check_agent_docs.py`: pass.
 
 ## Comments
