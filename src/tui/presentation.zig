@@ -6771,8 +6771,8 @@ pub const Presentation = struct {
             self.requestShutdown();
             return null;
         };
-        if (next == .build_buffer_disclosure and next.build_buffer_disclosure.kind == .enrichment) {
-            if (self.published) |published| self.refreshEnrichmentBuild(published, 0);
+        if (next == .build_buffer_disclosure) {
+            if (self.published) |published| self.refreshQueuedBuild(published, 0);
         }
         var command = self.commands.orderedRemove(0);
         self.next_command_id +%= 1;
@@ -10207,12 +10207,19 @@ pub const Presentation = struct {
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
 
+    /// At most one cache update waits in the queue. A new request of the same
+    /// Session keeps its place, so a stream of Review Search scans cannot
+    /// push it back.
     fn queueCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) !void {
+        if (self.queuedBuildIndex(.cache_update, published.epoch)) |index| {
+            self.commands.items[index].build_buffer_disclosure.cache_focused = focused;
+            published.pending_cache_focus = focused;
+            return;
+        }
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
-        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation);
-        job.kind = .cache_update;
-        job.cache_focused = focused;
-        job.cache_request_id = published.cache_update_generation +% 1;
+        const request_id = published.cache_update_generation +% 1;
+        const job = try createCacheBuild(self, published, focused, request_id);
+        // A cache update of an earlier Session would only be dropped.
         var index: usize = 0;
         while (index < self.commands.items.len) {
             const command = self.commands.items[index];
@@ -10221,10 +10228,18 @@ pub const Presentation = struct {
                 discarded.deinit();
             } else index += 1;
         }
-        published.cache_update_generation = job.cache_request_id;
-        published.pending_cache_update = job.cache_request_id;
+        published.cache_update_generation = request_id;
+        published.pending_cache_update = request_id;
         published.pending_cache_focus = focused;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
+    }
+
+    fn createCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange, request_id: u64) !*DisclosureBuild {
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation);
+        job.kind = .cache_update;
+        job.cache_focused = focused;
+        job.cache_request_id = request_id;
+        return job;
     }
 
     fn queueDraftMutation(self: *Presentation, published: *Published, mutation: DraftMutation, retry_id: ?u64) !void {
@@ -10314,25 +10329,34 @@ pub const Presentation = struct {
     }
 
     fn queuedEnrichmentBuild(self: *const Presentation, epoch: SessionEpoch) ?*DisclosureBuild {
-        const index = self.queuedEnrichmentIndex(epoch) orelse return null;
+        const index = self.queuedBuildIndex(.enrichment, epoch) orelse return null;
         return self.commands.items[index].build_buffer_disclosure;
     }
 
-    fn queuedEnrichmentIndex(self: *const Presentation, epoch: SessionEpoch) ?usize {
+    fn queuedBuildIndex(self: *const Presentation, kind: DisclosureBuild.Kind, epoch: SessionEpoch) ?usize {
         for (self.commands.items, 0..) |command, index| {
-            if (command == .build_buffer_disclosure and command.build_buffer_disclosure.kind == .enrichment and
+            if (command == .build_buffer_disclosure and command.build_buffer_disclosure.kind == kind and
                 command.build_buffer_disclosure.epoch == epoch) return index;
         }
         return null;
     }
 
-    /// A worker takes the queued enrichment build only with a current
-    /// snapshot. A build from before the last commit would only be rejected.
-    fn refreshEnrichmentBuild(self: *Presentation, published: *Published, index: usize) void {
+    /// A worker takes a queued enrichment or cache build only with a current
+    /// snapshot. A build from before the last commit, lease, or hold would
+    /// only be rejected.
+    fn refreshQueuedBuild(self: *Presentation, published: *Published, index: usize) void {
         const stale = self.commands.items[index].build_buffer_disclosure;
         if (stale.epoch != published.epoch) return;
-        const job = self.createEnrichmentBuild(published, stale.enrichments.items) catch |err| switch (err) {
-            // The stale build still runs, and its rejection retries the results.
+        const created = switch (stale.kind) {
+            .enrichment => self.createEnrichmentBuild(published, stale.enrichments.items),
+            .cache_update => self.createCacheBuild(published, stale.cache_focused, stale.cache_request_id),
+            // A user action queues these kinds once. Their intent includes
+            // fields that `create` also sets, so a new snapshot needs its own
+            // rule for each kind.
+            .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => return,
+        };
+        const job = created catch |err| switch (err) {
+            // The stale build still runs, and its rejection retries it.
             error.OutOfMemory => return,
         };
         stale.enrichments = .empty;
@@ -10415,7 +10439,7 @@ pub const Presentation = struct {
         published.pending_view = .{ .request_id = request_id, .preferences = preferences, .isolated_file = isolated_file, .geometry = geometry, .navigation_policy = job.navigation_policy, .navigation_file = job.navigation_file };
         // A view build waits for the running build only. File Enrichment
         // results keep arriving, so behind them it would wait without end.
-        self.commands.insertAssumeCapacity(self.queuedEnrichmentIndex(published.epoch) orelse self.commands.items.len, .{ .build_buffer_disclosure = job });
+        self.commands.insertAssumeCapacity(self.queuedBuildIndex(.enrichment, published.epoch) orelse self.commands.items.len, .{ .build_buffer_disclosure = job });
     }
 
     fn queuedViewBuild(self: *const Presentation) ?*DisclosureBuild {
