@@ -135,6 +135,12 @@ class AgentDocsTest(unittest.TestCase):
         self.assertIn("only sees one tree", errors)
         self.assertNotIn("0016", errors)
 
+    def test_two_adrs_with_one_number_and_different_zero_padding_fail(self):
+        self.write("docs/adr/0017-first.md", "# First\n")
+        self.write("docs/adr/017-second.md", "# Second\n")
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("docs/adr/017-second.md: ADR number 017 is also used by 0017-first.md", errors)
+
 
 if __name__ == "__main__":
     unittest.main()
