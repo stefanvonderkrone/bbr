@@ -179,6 +179,19 @@ No other admission compares a selection.
 
 Enforcement: `DisclosureBuild` has no `review_selected` or `accepted_active` field, and `DisclosureBuild.create` takes no occurrence (compile error). The exhaustive switch in `Kind.opensOccurrence` makes each new Kind decide whether it opens an occurrence (compile error). The admission tests in `src/tui/presentation.zig`, run by `zig build test`, fail when an admission rejects or retries a build because the selection moved. The test "Buffer Search rejects and retries an enrichment rebuild after its accepted batch changes" keeps the batch check.
 
+## Review Search source scan failures
+
+A File gets two source scans at most for one Review Search query.
+After its first failed scan, the File keeps its Review Search hold and waits behind every unscanned File.
+The next source scan of the File retries it.
+After its second failed scan, Review Search gives up on the File, releases its hold, and shows `buffer_search_scan_failed`.
+A source scan command that cannot start gives up on its File at once, because no later completion would run a deferred retry.
+Presentation records that failure once.
+The other Files keep their scans in each case.
+A new query or a reopened Overlay scans a File again after Review Search gave up on it.
+
+Enforcement: the tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search releases the hold of a File whose source scan cannot start", and "M21 authored failed source scan retries after reopening Review Search" in `src/tui/presentation.zig`, run by `zig build test`.
+
 ## Search occurrence index mapping
 
 A search occurrence index maps into a newer batch by one of two rules.
