@@ -34452,6 +34452,57 @@ test "M21 kernel Review Search gives up on a File after its second failed source
     try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
 }
 
+test "M21 kernel Review Search stops its source scans after it gives up on a File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 3, .on);
+    defer presentation.deinit();
+    var scans: usize = 0;
+    var records: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |scan| {
+                scans += 1;
+                if (scans > 6) return error.EndlessRetry;
+                const failed: ReviewSourceScanned = .{
+                    .allocator = testing.allocator,
+                    .command_id = scan.command_id,
+                    .session_epoch = scan.session_epoch,
+                    .request_id = scan.request_id,
+                    .file_index = scan.file_index,
+                    .outcome = .failed,
+                };
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = failed });
+            },
+            .report_diagnostic => {
+                records += 1;
+                command.deinit();
+            },
+            else => return error.UnexpectedCommand,
+        }
+    }
+    // The worker boundary records each failed scan, so Presentation adds no record.
+    try testing.expectEqual(@as(usize, 2), scans);
+    try testing.expectEqual(@as(usize, 0), records);
+    try testing.expectEqualSlices(bool, &.{ false, false, false }, presentation.published.?.review_search.held.?);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try presentation.dispatch(.{ .action = .open_review_search });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        defer command.deinit();
+        if (command == .scan_review_source) return;
+    }
+    return error.MissingSourceScan;
+}
+
 test "M21 kernel Review Search starts a source scan when no allocation succeeds" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
