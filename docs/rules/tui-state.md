@@ -235,7 +235,7 @@ The eighth of the Review lets a small Review evict while the scans run, with abo
 Before Storage knows the bytes of every File, it cannot tell a small Review from a large one, so the floor stays at 4 MiB.
 When the scans stop, the cache update reaches the front and brings the cache within the budget.
 
-Enforcement: the switch in `refreshQueuedBuild` in `src/tui/presentation.zig` names every `DisclosureBuild.Kind`, so a new kind needs a decision about its snapshot at take (compile error). The build-counting and eviction tests of Review Search in `src/tui/presentation.zig` and the cache pressure test in `src/tui/file_enrichment.zig`, run by `zig build test`.
+Enforcement: the exhaustive switch in `refreshQueuedBuild` in `src/tui/presentation.zig` names every `DisclosureBuild.Kind`, so a new kind needs a decision about its snapshot at take (compile error). The build-counting and eviction tests of Review Search in `src/tui/presentation.zig` and the cache pressure test in `src/tui/file_enrichment.zig`, run by `zig build test`.
 
 ## Published Frame snapshots
 
