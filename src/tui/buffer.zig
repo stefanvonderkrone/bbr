@@ -1263,11 +1263,12 @@ pub const SearchCandidateInputs = struct {
     threads: []const Thread,
     /// `key` reads the pointer, not the names. The Session loader sets
     /// `Session.mention_names` once, and `read_only.assert` in
-    /// `session.zig` rejects a write through it.
+    /// `session.zig` rejects a type that allows a write through it.
     mention_names: *const MentionNames,
     /// Names the Session. A published Session never changes its Diff, its
     /// Threads, or its mention names: `read_only.assert` in `session.zig`
-    /// makes a write through the Session fields a compile error. A change
+    /// makes a write through the Session fields, other than through
+    /// `@constCast`, a compile error. A change
     /// makes a new Session with a new epoch through Refresh or
     /// Reconciliation.
     session_epoch: u64,

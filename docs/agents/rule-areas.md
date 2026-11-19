@@ -28,7 +28,8 @@ The heading names the rule. Other docs link to its anchor, so a heading change n
 The body states the rule and the reason when the rule does not show it.
 The last paragraph starts with "Enforcement:" and names the check, the compile error, or the test file, and the build step that runs it.
 The Enforcement paragraph claims only the violations that its check fails on. Before you write it, break the rule once and read the failure.
-A claim that a type stops a write names a `comptime` assertion, such as `read_only.assert` in `src/tui/read_only.zig`, not only the `const` in the type, because a `const` pointer can still return a mutable one.
+A claim that a type stops a write names a `comptime` assertion, such as `read_only.assert` in `src/tui/read_only.zig`, not only the `const` in the type, because a `const` pointer can still return a mutable one. A test that compiles the write and expects the error, such as `tests/read_only_test.py`, records the proof.
+No check reads these two sentences: a text check sees whether a named check exists, not what it fails on.
 
 Keep the facts that an agent cannot find from the check output or from the code.
 Leave out the test names of a test file that holds only the tests of this rule, because a failing test prints its name.

@@ -75,11 +75,11 @@ A published Session never changes its Diff, its Threads, or its mention names.
 A change makes a new Session with a new Session Epoch through Refresh or Reconciliation.
 The Buffer Search candidate key covers these inputs only by identity and the Session Epoch.
 A worker that retains the Session reads them while the Presentation thread owns it.
-No mutable pointer is reachable from the Session fields that hold them, so no code writes their contents through those fields.
-A `*const` pointer alone does not give this: `getPtr` and the iterators of a `std` hash map take the map by value and return a mutable `*V`.
+The types of the Session fields that hold them reach no mutable pointer, so no code writes their contents through those fields.
+A `*const` pointer alone does not give this: `getPtr` of a `std` hash map takes the map by value and returns a mutable `*V`, and its iterators give entries that hold one.
 So `Session.mention_names` points to a `std.StaticStringMap`, whose storage and accessors are `const`.
 
-Enforcement: the `comptime` block after `Session` in `src/tui/session.zig` calls `read_only.assert` from `src/tui/read_only.zig` on `diff`, `threads`, and `mention_names` (compile error). The assertion follows each field and the return type of each public non-generic function, and it names the first mutable pointer. A `*const std.StringHashMapUnmanaged` fails it. The search candidate key in `src/tui/buffer.zig` sees a field reassignment through the new address. The assertion does not stop a field reassignment, a write through `@constCast`, or a write through a mutable alias that the producer keeps. [No change to a published Session](../../CODING_STANDARDS.md#no-change-to-a-published-session) covers those writes.
+Enforcement: the `comptime` block after `Session` in `src/tui/session.zig` calls `read_only.assert` from `src/tui/read_only.zig` on `diff`, `threads`, and `mention_names` (compile error in every build). The assertion follows fields, elements, function pointers, and the return types of public non-generic functions, and it names the first mutable pointer. It does not follow a generic function. `tests/read_only_test.py`, run by `zig build test`, compiles a write through `*const MentionNames`, such as `getPtr(id).?.* = label`, and expects a compile error. It also expects `read_only.assert` to reject each kind of mutable pointer, the old `*const std.StringHashMapUnmanaged` included. The search candidate key in `src/tui/buffer.zig` sees a field reassignment through the new address. The assertion does not stop a field reassignment, a write through `@constCast`, or a write through a mutable alias that the producer keeps. [No change to a published Session](../../CODING_STANDARDS.md#no-change-to-a-published-session) covers those writes.
 
 ## New List Overlay
 
