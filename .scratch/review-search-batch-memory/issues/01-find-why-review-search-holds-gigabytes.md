@@ -1,6 +1,6 @@
 # 01: Find why Review Search holds gigabytes
 
-Status: needs-triage
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -44,3 +44,9 @@ The operator asked for this ticket after the live test of the cache update branc
 
 - The published Frame (`Published.worker_frame`) kept the Review Search snapshot of its build. After a source scan replaced the Batch, the Frame was the only owner of the old Batch until the next Buffer build. Commit `d916df00` on branch `cache-update-during-review-search` releases the snapshots at publication. That removed the 13 to 14 GB after close on that branch. It does not change the 8.5 GB floor.
 - `acceptReviewSourceScanned` clones the whole old Batch before each merge when `old.references != null`. `Batch.retain` sets `references` once and never clears it, so after the first Buffer build every source scan clones the whole Batch, also when no build holds it any more. A `sample` during the scans shows most active main thread time in `__munmap` and `__mmap` under `Batch.clone` and `Batch.deinit`. Checking the reference count instead of the pointer is likely to remove most of the copies (inferred, not tried).
+
+### 2026-11-19 diagnosis
+
+The footprint after close is live data, with no leak. 5.98 GB are 16 KiB pages that each hold about 27 bytes of Occurrence data. 2.19 GB are freed result arrays that libmalloc keeps. The peak at a 1 MiB budget holds a second full Batch copy. Details and raw data are in `mem8-notes.md` in the operator's temp folder.
+The causes are tickets [02](02-keep-the-occurrence-data-of-a-batch-in-one-allocation.md), [03](03-reuse-the-review-search-result-list.md), and [04](04-share-the-batch-while-a-build-holds-it.md).
+
