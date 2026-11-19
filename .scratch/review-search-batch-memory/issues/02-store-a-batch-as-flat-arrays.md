@@ -30,7 +30,7 @@ Estimate (arithmetic, not measured): about 30 to 40 bytes for each Occurrence, s
 
 ## Acceptance criteria
 
-- [ ] A test counts the allocations of a scan, a clone, and a merge, and fails on the current code: the count no longer grows with the number of Occurrences.
+- [ ] A test counts the allocations of a scan, a clone, and a merge, and fails on the current code. A clone and a merge take a fixed number of allocations. A scan takes at most a logarithmic number, from the amortized growth of its arrays, never one or more for each Occurrence.
 - [ ] A test or benchmark shows the bytes for each Occurrence before and after.
 - [ ] A live run on the large local Review shows the footprint after close and at the peak, and the scan times, before and after. A test build that swapped the page allocator for `c_allocator` gave 8.5 GB to 2.6 GB after close and 10.7 GB to 3.2 GB at the peak. The fix reaches at least that.
 - [ ] Buffer Search and Review Search tests pass unchanged, or each changed test names the reason.
