@@ -53,3 +53,19 @@ Commits: `62e3d445` (red A), `1258e1cd` (fix A), `3ed40bc1` (red B), `2e8ab1e7` 
 Checks: `zig build test` exit 0. `zig fmt --check src build.zig tests` passes. `python3 tools/check_agent_docs.py` passes.
 
 Open point: a lasting failure writes two records, not one, because each failed scan has its own record.
+
+Follow-up, round 3. CodeRabbit posted five comments on PR #36. Each one holds.
+
+Enforcement claim (4634097592). The return type of `ScanReviewSource.create` stops nothing, because a `catch` compiles. An allocation from the Presentation allocator with a `catch`, in `maybeQueueReviewSourceScan` or in `create`, fails the test "M21 kernel Review Search starts a source scan when no allocation succeeds". An allocation from `std.heap.page_allocator` passes it. The rule now names the test, and `CODING_STANDARDS.md` holds the gap. This was the fifth Enforcement paragraph that claimed more than its check. A separate PR on branch `enforcement-compile-claim-lint` adds a check that rejects a new compile-error claim that names no mechanism that fails.
+
+Reserved slot (4634097620). The query edit inserted its scan into a full queue after the discarded source scan staged a cache build. The query scan now takes the reserved slot before the discard of the source scan. A discarded scan also holds its File again, so the edit stages no cache build.
+
+Shown message (4634097636). A cache staging failure now shows `out_of_memory` only when no message shows, because the next lease release stages again.
+
+Rollback (4634097649). The reset of the source pass, the holds, and the new acquisition now run when the results of the query publish. A source scan without a result returns its File to the state and hold before the scan. A rollback resumes the restored pass.
+
+Stale hold (4634097603). After the rollback fix, a given-up state clears only with a new batch, which already retries a build. A first query or an Overlay change still changes the hold decision without a Storage change. Admission now retries a build whose recorded hold differs and takes the recorded hold.
+
+Commits: `5b31dda7`, `c26229e1` (red), `c39ac446`, `81787495`, `6ac7b91a`, `96d5075a` (red), `6c0379bf`, `fd4b29c4`, `814612aa` (red), `2ab56ef0`.
+
+Checks: `zig build test` exit 0. `zig fmt --check src build.zig tests` passes. `python3 tools/check_agent_docs.py` passes.
