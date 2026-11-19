@@ -2338,6 +2338,36 @@ test "File cache pressure is far over the budget only above the budget plus the 
     try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
 }
 
+test "File cache pressure floor is an eighth of the Review once every File was admitted" {
+    var files: [8]bbr.diff.File = undefined;
+    @memset(&files, test_files[0]);
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = true, .max_retained_bytes = 1 });
+    storage.focus(.{ .first = 0, .end = files.len });
+    var results: [files.len]Result = undefined;
+    for (&results, 0..) |*result, index| {
+        result.* = try ownedAddedResult(testing.allocator, "aaaaaa");
+        if (index + 1 < files.len) try storage.admit(index, result);
+    }
+    defer for (&results) |*result| result.deinit();
+    const file_bytes = storage.files[0].retainedBytes();
+
+    // Seven of eight Files are known. The 4 MiB floor still applies.
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.single(0)));
+
+    try storage.admit(files.len - 1, &results[files.len - 1]);
+    // An eighth of the Review is one File, so one inactive File is not far over and two are.
+    try testing.expectEqual(file_bytes, storage.retainedBytes() / files.len);
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = files.len - 1 }));
+    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.{ .first = 0, .end = files.len - 2 }));
+
+    // An eviction keeps the known size of the Review.
+    storage.focus(.{ .first = 0, .end = 4 });
+    try testing.expect(storage.files[files.len - 1].retainedBytes() == 0);
+    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.single(0)));
+}
+
 test "zero File cache budget retains unlimited inactive content and excludes the focused File" {
     var storage = try Storage.init(testing.allocator, test_files[0..3]);
     defer storage.deinit();

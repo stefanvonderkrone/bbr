@@ -30848,6 +30848,45 @@ test "M21 kernel Review Search source scans over the cache budget share their ca
     try testing.expect(cache_builds <= scans * file_bytes / excess + enrichment_builds + query_changes);
 }
 
+test "M21 kernel Review Search source scans of a small Review evict while the scans run once every File was admitted" {
+    const file_count = 40;
+    // A budget below one File.
+    const budget = 1;
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = budget,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, file_count) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const storage = &published.session.enrichment;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+
+    // The first pass admitted every File. The whole Review is far below the floor, so an eighth of its bytes
+    // sets the excess.
+    const excess = @max(budget, file_count * test_enriched_file_bytes / 8);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    var steps: usize = 0;
+    var peak: usize = 0;
+    while (presentation.commands.items.len > 0) {
+        try runReviewSearchTestWork(&presentation, 1);
+        steps += 1;
+        var inactive: usize = 0;
+        for (storage.files, 0..) |*stored, index| {
+            if (stored.leases == 0 and !storage.focused.contains(index)) inactive += stored.retainedBytes();
+        }
+        peak = @max(peak, inactive);
+    }
+    try testing.expect(steps >= file_count);
+    try testing.expect(presentation.projection().review_search != null);
+    try testing.expect(peak <= budget + excess + test_enriched_file_bytes);
+}
+
 /// The published Frame keeps no Batch that Presentation replaced. A replaced
 /// Review Search Batch can hold gigabytes.
 fn expectFrameKeepsNoReplacedBatch(published: *const Published) !void {
