@@ -8,7 +8,7 @@ Source: [ticket 01](01-evict-the-files-that-review-search-releases.md)
 
 During Review Search, each cache update that evicts Files is a full Buffer build, because the m21 rule says that cache content, cache focus, and the published Frame change together.
 The floor rule of ticket 01 (`min(4 MiB, Review bytes / 8)` above the budget) only decides how often that build runs. On the large local Review at a 1 MiB budget it runs 12 to 13 times during two scan passes (measured, `cuba-notes.md`).
-Most of the cost of one build is the copy of the Review Search Batch. [Ticket 04 of the Review Search memory effort](../../review-search-batch-memory/issues/04-share-the-batch-while-a-build-holds-it.md) removes that copy, and [ticket 02 of that effort](../../review-search-batch-memory/issues/02-keep-the-occurrence-data-of-a-batch-in-one-allocation.md) makes each Batch about 3 times smaller.
+Most of the cost of one build is the copy of the Review Search Batch. [Ticket 04 of the Review Search memory effort](../../review-search-batch-memory/issues/04-share-immutable-batch-chunks.md) removes that copy, and [ticket 02 of that effort](../../review-search-batch-memory/issues/02-store-a-batch-as-flat-arrays.md) stores each Batch as flat arrays of about 30 to 40 bytes for each Occurrence.
 
 ## Proposal
 

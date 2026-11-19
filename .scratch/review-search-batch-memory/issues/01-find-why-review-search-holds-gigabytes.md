@@ -48,5 +48,5 @@ The operator asked for this ticket after the live test of the cache update branc
 ### 2026-11-19 diagnosis
 
 The footprint after close is live data, with no leak. 5.98 GB are 16 KiB pages that each hold about 27 bytes of Occurrence data. 2.19 GB are freed result arrays that libmalloc keeps. The peak at a 1 MiB budget holds a second full Batch copy. Details and raw data are in `mem8-notes.md` in the operator's temp folder.
-The causes are tickets [02](02-keep-the-occurrence-data-of-a-batch-in-one-allocation.md), [03](03-reuse-the-review-search-result-list.md), and [04](04-share-the-batch-while-a-build-holds-it.md).
+The causes are tickets [02](02-store-a-batch-as-flat-arrays.md), [03](03-reuse-the-review-search-result-list.md), and [04](04-share-immutable-batch-chunks.md).
 
