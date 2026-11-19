@@ -6,6 +6,8 @@ import re
 import sys
 from urllib.parse import unquote, urlsplit
 
+import count_baseline
+
 
 TRIAGE = {"needs-triage", "needs-info", "ready-for-agent", "ready-for-human", "wontfix"}
 RESOLVED = {"resolved", "done", "completed"}
@@ -15,6 +17,30 @@ FIELD = re.compile(r"^(?:\*\*)?([\w ]+):(?:\*\*)?\s*(.*?)\s*$")
 LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 REFERENCE = re.compile(r"^\s{0,3}\[(?!\^)[^\]\n]+\]:\s*(<[^>]+>|\S+)")
 AGENTS_MD_CAP = 5000
+COMPILE_CLAIM = re.compile(r"compile error|does not compile|do not compile|fails to compile")
+# A mechanism that fails on the violation, not a type that only lacks a way to write it.
+COMPILE_MECHANISM = re.compile(r"comptime|exhaustive switch|@compileError|tests/\w+_test\.(?:py|sh)")
+COMPILE_CLAIM_BASELINE = "tools/compile_claim_baseline.txt"
+SENTENCE_END = re.compile(r"(?<=[.)])\s+(?=[A-Z`\"])")
+
+
+def unbacked_compile_claims(text):
+    """The line of each Enforcement sentence that claims a compile error and names no mechanism that fails."""
+    lines = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.startswith("Enforcement:"):
+            continue
+        sentences = []
+        for sentence in SENTENCE_END.split(line):
+            # "Its compile error ..." continues the sentence that names the mechanism.
+            if sentences and re.match(r"(?:Its|Their) ", sentence):
+                sentences[-1] += " " + sentence
+            else:
+                sentences.append(sentence)
+        for sentence in sentences:
+            if COMPILE_CLAIM.search(sentence) and not COMPILE_MECHANISM.search(sentence):
+                lines.append(number)
+    return lines
 
 
 def prose(text):
@@ -68,6 +94,24 @@ def check(root):
               "Every session loads AGENTS.md, so it holds only pointer lines. "
               f"Put the rule in its area doc ({areas or 'docs/rules/'}) or, "
               "when no check enforces it, in CODING_STANDARDS.md")
+
+    baseline = count_baseline.read(root / COMPILE_CLAIM_BASELINE)
+    for path in sorted(root.glob("docs/rules/*.md")):
+        name = str(path.relative_to(root))
+        claims = unbacked_compile_claims(path.read_text())
+        allowed = baseline.get(name, 0)
+        if len(claims) > allowed:
+            error(path, f"lines {', '.join(map(str, claims))}: {len(claims)} Enforcement sentences claim a compile error "
+                  f"without a mechanism that fails, and {COMPILE_CLAIM_BASELINE} allows {allowed}. "
+                  "A type that lacks a field, an error union, or a mutable pointer stops nothing that a catch, "
+                  "a new field, or a cast adds. Name the `comptime` assertion, the exhaustive switch, the @compileError, "
+                  "or the tests/*_test.py that compiles the violation, or name the behavior test that fails. "
+                  "See docs/agents/rule-areas.md#write-a-rule-section")
+        elif len(claims) < allowed:
+            error(path, f"{len(claims)} Enforcement sentences claim a compile error without a mechanism. "
+                  f"Lower its count in {COMPILE_CLAIM_BASELINE} to {len(claims)}")
+    for name in sorted(set(baseline) - {str(path.relative_to(root)) for path in root.glob("docs/rules/*.md")}):
+        error(root / COMPILE_CLAIM_BASELINE, f"{name} is not a rule area doc. Remove its line")
 
     adrs = {}
     for path in sorted(root.glob("docs/adr/*.md")):
