@@ -1266,9 +1266,10 @@ pub const SearchCandidateInputs = struct {
     /// `session.zig` rejects a type that allows a write through it.
     mention_names: *const MentionNames,
     /// Names the Session. A published Session never changes its Diff, its
-    /// Threads, or its mention names: `read_only.assert` in `session.zig`
-    /// makes a write through the Session fields, other than through
-    /// `@constCast`, a compile error. A change
+    /// Threads, or its mention names. `read_only.assert` in `session.zig`
+    /// makes a write through a pointer in those fields a compile error,
+    /// other than through `@constCast`. It does not stop a reassignment of
+    /// a field through a mutable `*Session`. A change
     /// makes a new Session with a new epoch through Refresh or
     /// Reconciliation.
     session_epoch: u64,
