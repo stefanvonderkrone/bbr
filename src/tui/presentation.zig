@@ -9132,7 +9132,7 @@ pub const Presentation = struct {
         if (!state.open or completed.session_epoch != published.epoch or !state.pending or completed.request_id != state.request_id) return;
         const worker_batch = switch (completed.outcome) {
             .failed => {
-                rollbackReviewSearchQuery(state);
+                self.rollbackReviewSearchQuery(published);
                 self.action_error = .buffer_search_scan_failed;
                 published.frame_revision += 1;
                 return;
@@ -9153,7 +9153,7 @@ pub const Presentation = struct {
         const ranges = published.projectReviewRanges(batch, selected) catch |err| {
             self.reportFailure(.review_search, .prepare, err, @src());
             batch.deinit(self.allocator);
-            rollbackReviewSearchQuery(state);
+            self.rollbackReviewSearchQuery(published);
             self.action_error = .out_of_memory;
             published.frame_revision += 1;
             return;
@@ -9162,7 +9162,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 batch.deinit(self.allocator);
                 std.heap.page_allocator.free(ranges);
-                rollbackReviewSearchQuery(state);
+                self.rollbackReviewSearchQuery(published);
                 self.action_error = .out_of_memory;
                 published.frame_revision += 1;
                 return;
@@ -9197,7 +9197,10 @@ pub const Presentation = struct {
         self.restartReviewSourceScans(published);
     }
 
-    fn rollbackReviewSearchQuery(state: *ReviewSearchState) void {
+    /// The rolled-back query resumes the source pass that the edit paused.
+    fn rollbackReviewSearchQuery(self: *Presentation, published: *Published) void {
+        defer self.maybeQueueReviewSourceScan(published);
+        const state = &published.review_search;
         state.pending = false;
         state.needs_scan = state.rollback_query == null;
         if (state.rollback_query) |previous| {
