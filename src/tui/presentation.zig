@@ -8878,7 +8878,9 @@ pub const Presentation = struct {
         if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
         self.queueCacheBuild(published, focused) catch |err| {
             self.reportFailure(.buffer_build, .prepare, err, @src());
-            self.action_error = .out_of_memory;
+            // The next lease release stages again, so this failure does not
+            // replace the outcome that the event shows.
+            if (self.action_error == null) self.action_error = .out_of_memory;
         };
     }
 
