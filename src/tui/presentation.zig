@@ -34330,12 +34330,17 @@ fn publishCheckedReviewSources(presentation: *Presentation, hide_rows: bool, bet
 }
 
 fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize) !Presentation {
+    return openTestReviewSourceSearchWith(store, allocator, file_count, std.heap.page_allocator, .off);
+}
+
+fn openTestReviewSourceSearchWith(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize, source_scan_allocator: Allocator, diagnostic_state: bbr.diagnostic.State) !Presentation {
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     // The emphasis splits one ReviewBody match into two ranges.
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "a new idea\n\nn**e**w again" });
-    var presentation = try Presentation.init(allocator, .{ .reviews = store.store() }, .{
+    var presentation = try Presentation.init(allocator, .{ .reviews = store.store(), .source_scan_allocator = source_scan_allocator }, .{
         .initial = .{ .key = key, .session = try testManyFileSession(testing.allocator, 1, file_count) },
         .geometry = .{ .cols = 100, .rows = 40 },
+        .diagnostic_state = diagnostic_state,
     });
     errdefer presentation.deinit();
     try presentation.dispatch(.{ .action = .open_review_search });
@@ -34343,6 +34348,107 @@ fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Alloc
     try completeBufferSearchScan(&presentation);
     try testing.expectEqual(@as(usize, 2), presentation.published.?.review_search.batch.?.occurrences.len);
     return presentation;
+}
+
+const TestSourceScanRun = struct {
+    /// The source scans of the failing File.
+    scans: usize = 0,
+    /// Whether Review Search held the failing File after each failed source scan.
+    held_after_failure: [4]bool = @splat(false),
+    review_search_records: usize = 0,
+};
+
+/// Runs every queued command. The first `failures` source scans of `file_index` fail.
+fn runTestSourceScans(presentation: *Presentation, file_index: usize, failures: usize) !TestSourceScanRun {
+    var run: TestSourceScanRun = .{};
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                var completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                if (completed.file_index != file_index) {
+                    try presentation.dispatch(.{ .review_source_scanned = completed });
+                    continue;
+                }
+                run.scans += 1;
+                if (run.scans > run.held_after_failure.len) return error.EndlessRetry;
+                if (run.scans > failures) {
+                    try presentation.dispatch(.{ .review_source_scanned = completed });
+                    continue;
+                }
+                const failed: ReviewSourceScanned = .{
+                    .allocator = completed.allocator,
+                    .command_id = completed.command_id,
+                    .session_epoch = completed.session_epoch,
+                    .request_id = completed.request_id,
+                    .file_index = completed.file_index,
+                    .outcome = .failed,
+                };
+                completed.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = failed });
+                run.held_after_failure[run.scans - 1] = presentation.published.?.review_search.held.?[file_index];
+            },
+            .report_diagnostic => |failure| {
+                if (failure.operation == .review_search) run.review_search_records += 1;
+                command.deinit();
+            },
+            else => return error.UnexpectedCommand,
+        }
+    }
+    return run;
+}
+
+fn testSourceOccurrences(presentation: *const Presentation, file_index: usize) usize {
+    var count: usize = 0;
+    for (presentation.published.?.review_search.batch.?.occurrences) |occurrence| {
+        if (occurrence.location == .source and occurrence.location.source.file_index == file_index) count += 1;
+    }
+    return count;
+}
+
+test "M21 kernel Review Search scans a File again after its source scan fails" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    const run = try runTestSourceScans(&presentation, 0, 1);
+    try testing.expectEqual(@as(usize, 2), run.scans);
+    try testing.expect(run.held_after_failure[0]);
+    try testing.expect(testSourceOccurrences(&presentation, 0) > 0);
+    try testing.expect(testSourceOccurrences(&presentation, 1) > 0);
+    try testing.expect(presentation.projection().action_error == null);
+}
+
+test "M21 kernel Review Search gives up on a File after its second failed source scan" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    const run = try runTestSourceScans(&presentation, 0, std.math.maxInt(usize));
+    try testing.expectEqual(@as(usize, 2), run.scans);
+    try testing.expectEqualSlices(bool, &.{ true, false }, run.held_after_failure[0..2]);
+    try testing.expectEqual(@as(usize, 0), testSourceOccurrences(&presentation, 0));
+    try testing.expect(testSourceOccurrences(&presentation, 1) > 0);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+}
+
+test "M21 kernel Review Search releases the hold of a File whose source scan cannot start" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = 0 });
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, failing.allocator(), .on);
+    defer presentation.deinit();
+    const run = try runTestSourceScans(&presentation, 0, 0);
+    try testing.expectEqual(@as(usize, 0), run.scans);
+    try testing.expectEqualSlices(bool, &.{ false, false }, presentation.published.?.review_search.held.?);
+    try testing.expectEqual(@as(usize, 2), run.review_search_records);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
 }
 
 test "Review Search admits an enrichment rebuild after a selection move with the current active ranges" {
