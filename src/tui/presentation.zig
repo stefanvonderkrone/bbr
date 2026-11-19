@@ -943,9 +943,6 @@ pub const Dependencies = struct {
     configured_theme: ThemeId = .system,
     /// False for the demo: choosing a Theme applies it to this process only.
     persist_theme: bool = true,
-    /// Owns the File copy and the query of each source scan command, which a
-    /// worker releases after the Presentation thread lets go of it.
-    source_scan_allocator: Allocator = std.heap.page_allocator,
 };
 
 pub const InitialReview = struct {
@@ -1897,16 +1894,19 @@ const LaunchFailureFixture = struct {
                 }
                 return error.MissingDisclosureBuild;
             },
-            .scan_review_source => .{ .scan_review_source = .{
-                .session_epoch = session_epoch,
-                .request_id = request_id,
-                .file_index = file_index,
-                .allocator = std.heap.page_allocator,
-                .arena = .init(std.heap.page_allocator),
-                .file = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} },
-                .lease = .{ .view = .{ .old = .pending, .new = .pending }, .old = null, .new = null },
-                .query = try search.Query.init(std.heap.page_allocator, "query"),
-            } },
+            .scan_review_source => blk: {
+                const query = try SharedQuery.create(a, "query");
+                const session = disclosure.published.?.session;
+                session.retain();
+                break :blk .{ .scan_review_source = .{
+                    .session_epoch = session_epoch,
+                    .request_id = request_id,
+                    .file_index = file_index,
+                    .session = session,
+                    .lease = .{ .view = .{ .old = .pending, .new = .pending }, .old = null, .new = null },
+                    .query = query,
+                } };
+            },
         };
     }
 
@@ -3461,49 +3461,59 @@ pub fn executeBufferSearchScan(allocator: Allocator, command: *const ScanBufferS
     return completed;
 }
 
+/// A Review Search query. A source scan command keeps it after the query
+/// changes, so a scan starts without an allocation.
+const SharedQuery = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    allocator: Allocator,
+    query: search.Query,
+
+    fn create(allocator: Allocator, text: []const u8) !*SharedQuery {
+        const shared = try allocator.create(SharedQuery);
+        errdefer allocator.destroy(shared);
+        shared.* = .{ .allocator = allocator, .query = try search.Query.init(allocator, text) };
+        return shared;
+    }
+
+    fn retain(self: *SharedQuery) *SharedQuery {
+        _ = self.references.fetchAdd(1, .acq_rel);
+        return self;
+    }
+
+    fn release(self: *SharedQuery) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        self.query.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+};
+
+/// The worker reads the File from the retained Session, which never changes
+/// its Diff.
 pub const ScanReviewSource = struct {
     command_id: CommandId = 0,
     session_epoch: SessionEpoch,
     request_id: u64,
     file_index: usize,
-    allocator: Allocator,
-    arena: std.heap.ArenaAllocator,
-    file: bbr.diff.File,
+    session: *Session,
     lease: file_enrichment.ReadLease,
-    query: search.Query,
+    query: *SharedQuery,
 
-    fn create(allocator: Allocator, published: *Published, file_index: usize) !ScanReviewSource {
-        const state = &published.review_search;
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-        var file = published.session.diff.files[file_index];
-        file.old_path = try a.dupe(u8, file.old_path);
-        file.new_path = try a.dupe(u8, file.new_path);
-        const hunks = try a.dupe(bbr.diff.Hunk, file.hunks);
-        for (hunks) |*hunk| {
-            const lines = try a.dupe(bbr.diff.Line, hunk.lines);
-            for (lines) |*line| line.text = try a.dupe(u8, line.text);
-            hunk.lines = lines;
-        }
-        file.hunks = hunks;
-        const query = try state.query.?.clone(allocator);
+    fn create(published: *Published, file_index: usize) ScanReviewSource {
+        published.session.retain();
         return .{
             .session_epoch = published.epoch,
-            .request_id = state.request_id,
+            .request_id = published.review_search.request_id,
             .file_index = file_index,
-            .allocator = allocator,
-            .arena = arena,
-            .file = file,
+            .session = published.session,
             .lease = published.session.enrichment.lease(file_index),
-            .query = query,
+            .query = published.review_search.query.?.retain(),
         };
     }
 
     pub fn deinit(self: *ScanReviewSource) void {
-        self.query.deinit(self.allocator);
+        self.query.release();
         self.lease.release();
-        self.arena.deinit();
+        self.session.destroy();
         self.* = undefined;
     }
 };
@@ -3526,7 +3536,7 @@ pub const ReviewSourceScanned = struct {
 pub fn executeReviewSourceScan(allocator: Allocator, command: *const ScanReviewSource) ReviewSourceScanned {
     const view = command.lease.view;
     var evidence: ?bbr.diagnostic.Failure = null;
-    const outcome: BufferSearchScanOutcome = if (search.scanFile(allocator, command.query, command.file, command.file_index, command.session_epoch, if (view.old == .content) view.old.content.blob else null, if (view.new == .content) view.new.content.blob else null)) |batch| .{ .scanned = batch } else |err| blk: {
+    const outcome: BufferSearchScanOutcome = if (search.scanFile(allocator, command.query.query, command.session.diff.files[command.file_index], command.file_index, command.session_epoch, if (view.old == .content) view.old.content.blob else null, if (view.new == .content) view.new.content.blob else null)) |batch| .{ .scanned = batch } else |err| blk: {
         evidence = bbr.diagnostic.Failure.capture(.review_search, .execute, .{ .command_id = command.command_id, .session_epoch = command.session_epoch, .file_index = command.file_index }, .{ .zig = err }, @src());
         break :blk .failed;
     };
@@ -4187,8 +4197,8 @@ const SourceScan = enum {
 
 const ReviewSearchState = struct {
     open: bool = false,
-    query: ?search.Query = null,
-    rollback_query: ?search.Query = null,
+    query: ?*SharedQuery = null,
+    rollback_query: ?*SharedQuery = null,
     batch: ?search.Batch = null,
     results: ?[]ReviewSearchResult = null,
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
@@ -4226,8 +4236,8 @@ const ReviewSearchState = struct {
         if (self.acquired) |acquired| allocator.free(acquired);
         if (self.held) |held| allocator.free(held);
         if (self.source_candidates) |counts| allocator.free(counts);
-        if (self.query) |*query| query.deinit(allocator);
-        if (self.rollback_query) |*query| query.deinit(allocator);
+        if (self.query) |query| query.release();
+        if (self.rollback_query) |query| query.release();
         if (self.batch) |*batch| batch.deinit(allocator);
         if (self.results) |results| allocator.free(results);
         if (self.ranges) |ranges| std.heap.page_allocator.free(ranges);
@@ -4238,7 +4248,7 @@ const ReviewSearchState = struct {
 
     fn invalidate(self: *ReviewSearchState, allocator: Allocator) void {
         self.clearSource(allocator);
-        if (self.rollback_query) |*query| query.deinit(allocator);
+        if (self.rollback_query) |query| query.release();
         self.rollback_query = null;
         if (self.corpus) |corpus| corpus.release();
         self.corpus = null;
@@ -4264,7 +4274,7 @@ const ReviewSearchState = struct {
     fn projection(self: *const ReviewSearchState, geometry: frame_mod.Geometry) ?ReviewSearchProjection {
         if (!self.open) return null;
         return .{
-            .query = if (self.query) |query| query.text else "",
+            .query = if (self.query) |query| query.query.text else "",
             .occurrences = if (self.pending) &.{} else if (self.batch) |batch| batch.occurrences else &.{},
             .results = if (self.pending) &.{} else self.results orelse &.{},
             .candidate_count = self.candidate_count,
@@ -6555,6 +6565,9 @@ pub const Presentation = struct {
     next_work_id: WorkId = 0,
     next_command_id: CommandId = 0,
     commands: std.ArrayList(OwnedCommand) = .empty,
+    /// The one queued source scan has its own slot, so queueing it cannot
+    /// fail. `takeCommand` issues it when `commands` is empty.
+    queued_source_scan: ?ScanReviewSource = null,
     issued_commands: std.ArrayList(IssuedCommand) = .empty,
     code_work: ?code_highlighting.Identity = null,
     outstanding_loads: usize = 0,
@@ -6658,6 +6671,7 @@ pub const Presentation = struct {
     pub fn deinit(self: *Presentation) void {
         self.closeHelp();
         for (self.commands.items) |*command| command.deinit();
+        if (self.queued_source_scan) |*scan| scan.deinit();
         if (self.durable_submission) |durable| durable.destroy();
         if (self.submission_tree) |tree| tree.destroy();
         if (self.durable_comment_edit) |edit| edit.destroy();
@@ -6769,10 +6783,14 @@ pub const Presentation = struct {
             return .{ .report_diagnostic = failure };
         }
         if (self.commands.items.len > 0 and self.commands.items[0] == .report_diagnostic) return self.commands.orderedRemove(0);
-        if (self.commands.items.len == 0 and self.code_work == null and !self.shutdown_requested) self.scheduleCodeHighlight();
+        if (self.commands.items.len == 0 and self.queued_source_scan == null and self.code_work == null and !self.shutdown_requested) self.scheduleCodeHighlight();
         if (self.commands.items.len > 0 and self.commands.items[0] == .report_diagnostic) return self.commands.orderedRemove(0);
-        if (self.commands.items.len == 0) return null;
-        const next = self.commands.items[0];
+        const next: OwnedCommand = if (self.commands.items.len > 0)
+            self.commands.items[0]
+        else if (self.queued_source_scan) |scan|
+            .{ .scan_review_source = scan }
+        else
+            return null;
         if (next == .scan_buffer_search or next == .scan_review_source or next == .build_buffer_disclosure) {
             for (self.issued_commands.items) |issued| {
                 if (issued.target == .scan_review_source or
@@ -6781,9 +6799,9 @@ pub const Presentation = struct {
             }
         }
         if (self.published) |published| {
-            if (self.commands.items[0] == .scan_buffer_search and self.commands.items[0].scan_buffer_search.mode == .fuzzy and
+            if (next == .scan_buffer_search and next.scan_buffer_search.mode == .fuzzy and
                 (published.review_search.authored_scan_active or published.review_search.source_scan_active)) return null;
-            if (self.commands.items[0] == .scan_review_source and published.review_search.authored_scan_active) return null;
+            if (next == .scan_review_source and published.review_search.authored_scan_active) return null;
         }
         self.issued_commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
@@ -6794,7 +6812,8 @@ pub const Presentation = struct {
         if (next == .build_buffer_disclosure and next.build_buffer_disclosure.kind == .enrichment) {
             if (self.published) |published| self.refreshEnrichmentBuild(published, 0);
         }
-        var command = self.commands.orderedRemove(0);
+        var command = if (self.commands.items.len > 0) self.commands.orderedRemove(0) else next;
+        if (command == .scan_review_source) self.queued_source_scan = null;
         self.next_command_id +%= 1;
         if (self.next_command_id == 0) self.next_command_id = 1;
         const command_id = self.next_command_id;
@@ -6960,8 +6979,8 @@ pub const Presentation = struct {
         if (builtin.is_test) for (self.issued_commands.items) |issued| {
             if (issued.target == .scan_buffer_search or issued.target == .scan_review_source or issued.target == .build_buffer_disclosure or issued.target == .prepare_session) return false;
         };
-        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
-        return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
+        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.queued_source_scan == null and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
+        return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.queued_source_scan == null and self.issued_commands.items.len == 0;
     }
 
     fn reviewProjection(self: *const Presentation, published: *const Published) ReviewProjection {
@@ -8531,7 +8550,7 @@ pub const Presentation = struct {
         published.navigation.count = 0;
         self.action_error = null;
         if (state.needs_scan) {
-            const text = (state.query orelse unreachable).text;
+            const text = (state.query orelse unreachable).query.text;
             self.replaceReviewSearchQuery(text);
         }
         published.frame_revision += 1;
@@ -8579,7 +8598,7 @@ pub const Presentation = struct {
 
     fn insertReviewSearch(self: *Presentation, text: []const u8) void {
         const state = &((self.published orelse return).review_search);
-        const current = if (state.query) |query| query.text else "";
+        const current = if (state.query) |query| query.query.text else "";
         const joined = self.allocator.alloc(u8, current.len + text.len) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.action_error = .out_of_memory;
@@ -8594,7 +8613,7 @@ pub const Presentation = struct {
 
     fn editReviewSearch(self: *Presentation, edit: SearchEdit) void {
         const state = &((self.published orelse return).review_search);
-        const text = if (state.query) |query| query.text else return;
+        const text = if (state.query) |query| query.query.text else return;
         const end = switch (edit) {
             .backspace => search.lastScalarStart(text),
             .delete_word => search.wordStart(text),
@@ -8608,7 +8627,7 @@ pub const Presentation = struct {
         const state = &published.review_search;
         state.opening_source = false;
         state.opening_identity = null;
-        var query = search.Query.init(self.allocator, text) catch |err| {
+        const query = SharedQuery.create(self.allocator, text) catch |err| {
             switch (err) {
                 error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
                 error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
@@ -8621,10 +8640,10 @@ pub const Presentation = struct {
             return;
         };
         if (text.len == 0) {
-            query.deinit(self.allocator);
-            if (state.query) |*old| old.deinit(self.allocator);
+            query.release();
+            if (state.query) |old| old.release();
             state.query = null;
-            if (state.rollback_query) |*old| old.deinit(self.allocator);
+            if (state.rollback_query) |old| old.release();
             state.rollback_query = null;
             if (state.batch) |*batch| batch.deinit(self.allocator);
             state.batch = null;
@@ -8650,7 +8669,7 @@ pub const Presentation = struct {
                 error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
                 error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
-            query.deinit(self.allocator);
+            query.release();
             self.action_error = switch (err) {
                 error.OutOfMemory => .out_of_memory,
                 else => .buffer_search_invalid_query,
@@ -8658,7 +8677,7 @@ pub const Presentation = struct {
             return;
         };
         const corpus = state.corpus orelse {
-            query.deinit(self.allocator);
+            query.release();
             worker_query.deinit(std.heap.page_allocator);
             return;
         };
@@ -8673,7 +8692,7 @@ pub const Presentation = struct {
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
             command.deinit();
-            query.deinit(self.allocator);
+            query.release();
             self.action_error = .out_of_memory;
             return;
         };
@@ -8688,7 +8707,7 @@ pub const Presentation = struct {
         self.commands.insertAssumeCapacity(0, command);
         if (state.rollback_query == null and state.batch != null) {
             state.rollback_query = state.query;
-        } else if (state.query) |*old| old.deinit(self.allocator);
+        } else if (state.query) |old| old.release();
         state.query = query;
         state.request_id +%= 1;
         state.pending = true;
@@ -8698,20 +8717,16 @@ pub const Presentation = struct {
     }
 
     fn discardQueuedReviewSourceScans(self: *Presentation) void {
-        var index: usize = 0;
-        while (index < self.commands.items.len) {
-            if (self.commands.items[index] == .scan_review_source) {
-                var removed = self.commands.orderedRemove(index);
-                if (self.published) |published| {
-                    if (published.epoch == removed.scan_review_source.session_epoch) {
-                        self.finishSearchLease(published, removed.scan_review_source.file_index);
-                        if (published.review_search.source_scans) |scans| scans[removed.scan_review_source.file_index] = .unscanned;
-                    }
-                    published.review_search.source_scan_active = false;
-                }
-                removed.deinit();
-            } else index += 1;
+        var removed = self.queued_source_scan orelse return;
+        self.queued_source_scan = null;
+        if (self.published) |published| {
+            if (published.epoch == removed.session_epoch) {
+                self.finishSearchLease(published, removed.file_index);
+                if (published.review_search.source_scans) |scans| scans[removed.file_index] = .unscanned;
+            }
+            published.review_search.source_scan_active = false;
         }
+        removed.deinit();
     }
 
     fn discardQueuedSearchEnrichments(self: *Presentation, published: *Published) void {
@@ -8793,25 +8808,13 @@ pub const Presentation = struct {
         const scans = state.source_scans orelse return;
         for ([_]SourceScan{ .unscanned, .awaiting_retry }) |due| for (scans, 0..) |scan, index| {
             if (scan != due or !published.session.enrichment.isTerminal(index)) continue;
-            self.queueReviewSourceScan(published, index) catch |err| {
-                self.reportFailure(.review_search, .prepare, err, @src());
-                self.giveUpReviewSourceScan(published, index);
-                continue;
-            };
+            std.debug.assert(self.queued_source_scan == null);
+            self.queued_source_scan = ScanReviewSource.create(published, index);
             self.releaseReviewSearchHold(published, index);
             scans[index] = if (due == .unscanned) .scanning else .retrying;
             state.source_scan_active = true;
             return;
         };
-    }
-
-    fn queueReviewSourceScan(self: *Presentation, published: *Published, file_index: usize) !void {
-        var command: OwnedCommand = .{ .scan_review_source = try ScanReviewSource.create(self.dependencies.source_scan_allocator, published, file_index) };
-        errdefer {
-            self.finishSearchLease(published, file_index);
-            command.deinit();
-        }
-        try self.commands.append(self.allocator, command);
     }
 
     /// A first failure keeps the hold of its File, so its content stays for
@@ -9087,7 +9090,7 @@ pub const Presentation = struct {
         if (!state.open or completed.session_epoch != published.epoch or !state.pending or completed.request_id != state.request_id) return;
         const worker_batch = switch (completed.outcome) {
             .failed => {
-                self.rollbackReviewSearchQuery(state);
+                rollbackReviewSearchQuery(state);
                 self.action_error = .buffer_search_scan_failed;
                 published.frame_revision += 1;
                 return;
@@ -9108,7 +9111,7 @@ pub const Presentation = struct {
         const ranges = published.projectReviewRanges(batch, selected) catch |err| {
             self.reportFailure(.review_search, .prepare, err, @src());
             batch.deinit(self.allocator);
-            self.rollbackReviewSearchQuery(state);
+            rollbackReviewSearchQuery(state);
             self.action_error = .out_of_memory;
             published.frame_revision += 1;
             return;
@@ -9117,7 +9120,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 batch.deinit(self.allocator);
                 std.heap.page_allocator.free(ranges);
-                self.rollbackReviewSearchQuery(state);
+                rollbackReviewSearchQuery(state);
                 self.action_error = .out_of_memory;
                 published.frame_revision += 1;
                 return;
@@ -9134,7 +9137,7 @@ pub const Presentation = struct {
         state.previous_selection = null;
         state.pending = false;
         state.list_scroll = @min(state.list_scroll, (if (batch.occurrences.len > 0) batch.occurrences.len else published.session.diff.files.len) -| 1);
-        if (state.rollback_query) |*old| old.deinit(self.allocator);
+        if (state.rollback_query) |old| old.release();
         state.rollback_query = null;
         if (selected) |index| {
             if (!keep_preview) state.preview_scroll = switch (batch.occurrences[index].location) {
@@ -9152,11 +9155,11 @@ pub const Presentation = struct {
         self.maybeQueueReviewSourceScan(published);
     }
 
-    fn rollbackReviewSearchQuery(self: *Presentation, state: *ReviewSearchState) void {
+    fn rollbackReviewSearchQuery(state: *ReviewSearchState) void {
         state.pending = false;
         state.needs_scan = state.rollback_query == null;
         if (state.rollback_query) |previous| {
-            if (state.query) |*query| query.deinit(self.allocator);
+            if (state.query) |query| query.release();
             state.query = previous;
             state.rollback_query = null;
         }
@@ -34336,14 +34339,14 @@ fn publishCheckedReviewSources(presentation: *Presentation, hide_rows: bool, bet
 }
 
 fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize) !Presentation {
-    return openTestReviewSourceSearchWith(store, allocator, file_count, std.heap.page_allocator, .off);
+    return openTestReviewSourceSearchWith(store, allocator, file_count, .off);
 }
 
-fn openTestReviewSourceSearchWith(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize, source_scan_allocator: Allocator, diagnostic_state: bbr.diagnostic.State) !Presentation {
+fn openTestReviewSourceSearchWith(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize, diagnostic_state: bbr.diagnostic.State) !Presentation {
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     // The emphasis splits one ReviewBody match into two ranges.
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "a new idea\n\nn**e**w again" });
-    var presentation = try Presentation.init(allocator, .{ .reviews = store.store(), .source_scan_allocator = source_scan_allocator }, .{
+    var presentation = try Presentation.init(allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testManyFileSession(testing.allocator, 1, file_count) },
         .geometry = .{ .cols = 100, .rows = 40 },
         .diagnostic_state = diagnostic_state,
@@ -34422,7 +34425,7 @@ fn testSourceOccurrences(presentation: *const Presentation, file_index: usize) u
 test "M21 kernel Review Search scans a File again after its source scan fails" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, std.heap.page_allocator, .on);
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .on);
     defer presentation.deinit();
     const run = try runTestSourceScans(&presentation, 0, 1);
     try testing.expectEqual(@as(usize, 2), run.scans);
@@ -34437,7 +34440,7 @@ test "M21 kernel Review Search scans a File again after its source scan fails" {
 test "M21 kernel Review Search gives up on a File after its second failed source scan" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, std.heap.page_allocator, .on);
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .on);
     defer presentation.deinit();
     const run = try runTestSourceScans(&presentation, 0, std.math.maxInt(usize));
     try testing.expectEqual(@as(usize, 2), run.scans);
@@ -34449,24 +34452,11 @@ test "M21 kernel Review Search gives up on a File after its second failed source
     try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
 }
 
-test "M21 kernel Review Search releases the hold of a File whose source scan cannot start" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var failing = testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = 0 });
-    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, failing.allocator(), .on);
-    defer presentation.deinit();
-    const run = try runTestSourceScans(&presentation, 0, 0);
-    try testing.expectEqual(@as(usize, 0), run.scans);
-    try testing.expectEqualSlices(bool, &.{ false, false }, presentation.published.?.review_search.held.?);
-    try testing.expectEqual(@as(usize, 2), run.review_search_records);
-    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
-}
-
 test "M21 kernel Review Search starts a source scan when no allocation succeeds" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, std.heap.page_allocator, .on);
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .on);
     defer presentation.deinit();
     const enrichment = &presentation.published.?.session.enrichment;
     while (!enrichment.isTerminal(0) or !enrichment.isTerminal(1)) {
@@ -34712,11 +34702,8 @@ test "a Review Search source publication after a resize projects the new visual 
             const rows = published.visual_rows.len;
             const revision = published.visual_rows_revision;
             try target.dispatch(.{ .resize = .{ .cols = 40, .rows = 40 } });
-            // A publication makes a queued view build stale, so the next scan
-            // waits until the view build commits.
-            try testing.expect(target.commands.items[0] == .scan_review_source);
-            const scan = target.commands.orderedRemove(0);
-            defer target.commands.insertAssumeCapacity(0, scan);
+            // The view build runs before the queued source scan.
+            try testing.expect(target.queued_source_scan != null);
             try completeDisclosureBuild(target);
             try testing.expect(published.visual_rows_revision != revision);
             try testing.expect(published.visual_rows.len != rows);
