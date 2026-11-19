@@ -943,6 +943,9 @@ pub const Dependencies = struct {
     configured_theme: ThemeId = .system,
     /// False for the demo: choosing a Theme applies it to this process only.
     persist_theme: bool = true,
+    /// Owns the File copy and the query of each source scan command, which a
+    /// worker releases after the Presentation thread lets go of it.
+    source_scan_allocator: Allocator = std.heap.page_allocator,
 };
 
 pub const InitialReview = struct {
@@ -1898,6 +1901,7 @@ const LaunchFailureFixture = struct {
                 .session_epoch = session_epoch,
                 .request_id = request_id,
                 .file_index = file_index,
+                .allocator = std.heap.page_allocator,
                 .arena = .init(std.heap.page_allocator),
                 .file = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} },
                 .lease = .{ .view = .{ .old = .pending, .new = .pending }, .old = null, .new = null },
@@ -3462,14 +3466,15 @@ pub const ScanReviewSource = struct {
     session_epoch: SessionEpoch,
     request_id: u64,
     file_index: usize,
+    allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     file: bbr.diff.File,
     lease: file_enrichment.ReadLease,
     query: search.Query,
 
-    fn create(published: *Published, file_index: usize) !ScanReviewSource {
+    fn create(allocator: Allocator, published: *Published, file_index: usize) !ScanReviewSource {
         const state = &published.review_search;
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
         var file = published.session.diff.files[file_index];
@@ -3482,11 +3487,12 @@ pub const ScanReviewSource = struct {
             hunk.lines = lines;
         }
         file.hunks = hunks;
-        const query = try search.Query.init(std.heap.page_allocator, state.query.?.text);
+        const query = try search.Query.init(allocator, state.query.?.text);
         return .{
             .session_epoch = published.epoch,
             .request_id = state.request_id,
             .file_index = file_index,
+            .allocator = allocator,
             .arena = arena,
             .file = file,
             .lease = published.session.enrichment.lease(file_index),
@@ -3495,7 +3501,7 @@ pub const ScanReviewSource = struct {
     }
 
     pub fn deinit(self: *ScanReviewSource) void {
-        self.query.deinit(std.heap.page_allocator);
+        self.query.deinit(self.allocator);
         self.lease.release();
         self.arena.deinit();
         self.* = undefined;
@@ -8769,7 +8775,7 @@ pub const Presentation = struct {
         if (!state.open or state.pending or state.query == null or state.source_scan_active or state.source_scanned == null) return;
         for (published.session.diff.files, 0..) |_, index| {
             if (state.source_scanned.?[index] or !published.session.enrichment.isTerminal(index)) continue;
-            var command: OwnedCommand = .{ .scan_review_source = ScanReviewSource.create(published, index) catch |err| switch (err) {
+            var command: OwnedCommand = .{ .scan_review_source = ScanReviewSource.create(self.dependencies.source_scan_allocator, published, index) catch |err| switch (err) {
                 error.OutOfMemory => {
                     self.action_error = .out_of_memory;
                     return;
