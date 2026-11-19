@@ -307,4 +307,115 @@ Live, ReleaseFast, tmux 160×80, query `e` then `ee`, two runs on each side. Pea
 
 The CPU time at 1 MiB goes up by 3 to 4 s although the cache updates go down. In the first pass of one run on each side, the old rule fired five cache updates at up to 54,000 occurrences and one at the end. The byte limit fired four at 37,000 to 149,000 occurrences and one at the end. A `sample` of 3 s during the first pass puts most of the active main thread time in `__munmap` and `__mmap` under `search.Batch.deinit` and `search.Batch.clone`, also under `DisclosureBuild.destroy`. So a cache update costs more when the Batch is larger. The cost of one cache update depends on the Batch, which no limit in bytes of File content controls. [Review Search Batch memory ticket 01](../../review-search-batch-memory/issues/01-find-why-review-search-holds-gigabytes.md) has the clone.
 
-M28 was not run again. Its fixture holds 8,308 bytes, below the floor, so a cache update there now waits for the end of the scans or a query, as option A in the table above. The S5 query edits wait for each search to end, so S5 likely still refetches (inferred, not run).
+M28 was not run again here. The inference that S5 still refetches was wrong. The next section has the measurement and the fix.
+
+## Floor for a small Review
+
+A throwaway merge of `m28-full-review-file-cache-evaluation`, `origin/main`, and commit `1a4ab72a` failed `zig build test-file-cache` at `src/benchmark/file_cache.zig:2695`, because S5 refetched no File.
+The whole M28 fixture holds 8,308 bytes, far below the 4 MiB floor.
+So no cache update committed while the scans ran, and Review Search kept every File it read until the scans stopped.
+The 4 MiB floor protects the CPU of a large Review, but it gives a small Review no eviction during the scans.
+
+### Rule
+
+The floor is the smaller of 4 MiB and an eighth of the bytes of the Review, once Storage knows the bytes of every File.
+Before that, the floor stays at 4 MiB.
+
+- `StoredFile.known_bytes` holds the retained bytes of the File from its last admission. An eviction keeps it. A File with no side to fetch, such as a binary File, starts at 0.
+- `Storage.cachePressure` adds `known_bytes` over all Files. One File without it makes the size of the Review unknown.
+- A small Review evicts while the scans run as soon as each File was admitted once. File Enrichment can admit Files ahead of the scans, so this can happen in the first pass.
+- A Review keeps the 4 MiB floor while Storage does not know it, and also after, when the Review holds 32 MiB or more.
+- Each cache update while the scans run frees more than the floor. So a pass costs at most about eight cache updates, or one for each 4 MiB, plus one for each stop.
+- The inactive bytes stay at or below the budget plus the larger of the budget and 4 MiB, plus one File, as before.
+
+### Rejected forms
+
+An eighth of the inactive bytes, the example in the request, does not work.
+With a budget below one File, one inactive File is more than the budget plus an eighth of itself.
+So each released File would cost a full Buffer build again, as on commit `6f2917c7`.
+
+An eighth of the Files, counted as inactive Files that hold content, passed the tests and M28.
+But the live run below doubled the cache updates of the large Review at 1 MiB, from 8 to 9 to 18 to 19.
+Its first 348 Files hold only about 5.3 MiB, so an eighth of the Files, 60 Files, held about 2 MiB, well below 4 MiB.
+
+The size of the Review while it is not known yet does not work either.
+The large Review holds 348 Files in 5.3 MiB before its first cache update, so an eighth of the bytes known so far is below 1 MiB.
+
+So only a complete size of the Review can lower the floor.
+
+A quarter of the Review fails M28.
+With `/ 4`, the M28 merge fails the same S5 check (39 of 40 tests), because the floor of 2,077 bytes needs two inactive M28 Files.
+The large local Review holds 22.6 MiB, so it keeps the 4 MiB floor only with a divisor of 5.6 or less.
+A divisor between 4 and 5.6 could pass both, but that would fit the divisor to one fixture and one Review. No run tested it.
+The rule keeps `/ 8`, the example of the request.
+
+### Commits
+
+- `9a61ed30` tui: test that a known small Review evicts while Review Search scans run
+- `8cb4b75e` tui: let a known small Review evict while Review Search scans run
+
+On commit `9a61ed30`, which adds the tests to `1a4ab72a`, `zig build test` fails both new tests:
+
+```
+error: 'tui.presentation.test.M21 kernel Review Search source scans of a small Review evict while the scans run once every File was admitted' failed:
+error: 'tui.file_enrichment.test.File cache pressure floor is an eighth of the Review once every File was admitted' failed:
+       expected .far_over_budget, found .over_budget
+```
+
+The Presentation test fails at the bound of the inactive bytes in the second pass.
+
+### Numbers
+
+The deterministic Presentation run over 40 Files, 80 source scans, two query edits at scans 20 and 40, and a one-byte budget. One run of each row, because the run is deterministic.
+
+| File size | Side | Enrichment builds | Cache updates | Peak inactive bytes |
+| --- | --- | ---: | ---: | ---: |
+| 1.18 MB | `1a4ab72a` | 10 | 16 | 4,724,976 (4 Files) |
+| 1.18 MB | this fix | 10 | 16 | 4,724,976 (4 Files) |
+| 608 B | `1a4ab72a` | 6 | 1 | 23,712 (39 Files) |
+| 608 B | this fix | 10 | 11 | 3,648 (6 Files) |
+
+The second pass of the new Presentation test, after a first pass over the same 40 Files of 608 B, keeps at most 18,848 bytes (31 Files) inactive on `1a4ab72a` and 3,040 bytes (5 Files) with this fix.
+The small Review pays 10 more cache updates of a 40-File Buffer for this. The large Files do not change.
+
+### M28
+
+A throwaway merge of `m28-full-review-file-cache-evaluation`, `origin/main` at `f6378a45`, and this branch passes `zig build test-file-cache` (40 of 40 tests). The conflicts in `AGENTS.md`, `tools/check_agent_docs.py`, and `tests/check_agent_docs_test.py` took the side of this branch, only to run the test. Two runs gave the same numbers.
+
+| Scenario | Side | refetches | requests | enrichments | peak_retained_bytes | retained_bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| S4 | before `ae39a66d` | 1 | 12 | 5 | 6744 | 6744 |
+| S4 | this fix | 1 | 12 | 5 | 8308 | 6744 |
+| S5 | before `ae39a66d` | 3 | 7 | 6 | 6744 | 5280 |
+| S5 | this fix | 3 | 6 | 6 | 8308 | 6744 |
+
+On `1a4ab72a` the merge fails the S5 check, because S5 has no refetch.
+S5 runs after S4 acquired every File, so Storage knows the Review.
+These are the numbers of the first fix and of option B.
+The S4 peak of 8308 comes from the batched admission of `ae39a66d`, as the first M28 table explains.
+
+### Live
+
+ReleaseFast, tmux 160×80, the local Review `fb701b11..18362616` (479 Files, 22.6 MiB retained), query `e` then `ee`. Two runs on each side, in the order before, after, before, after. An instrumented copy, never committed, prints a line for each accepted scan and each cache update. CPU is the process CPU time after the load.
+
+| Budget | Side | Peak inactive MiB | Cache updates (pass 1 / pass 2) | Retries | CPU s | Scan `e` / `ee` s |
+| --- | --- | ---: | --- | ---: | ---: | --- |
+| 1 MiB | `1a4ab72a` | 12.19, 12.15 | 9 (5 / 4), 8 (4 / 4) | 4, 4 | 34.8, 30.4 | 15.3 / 16.7, 15.5 / 12.7 |
+| 1 MiB | this fix | 10.21, 10.24 | 12 (7 / 5), 13 (7 / 6) | 3, 4 | 33.5, 37.4 | 17.3 / 13.7, 17.4 / 17.2 |
+| 8 MiB | `1a4ab72a` | 16.26, 16.26 | 2 (1 / 1), 2 (1 / 1) | 4, 3 | 24.7, 23.1 | 10.7 / 11.0, 10.7 / 9.7 |
+| 8 MiB | this fix | 16.26, 16.26 | 2 (1 / 1), 2 (1 / 1) | 3, 2 | 23.2, 23.4 | 10.7 / 9.7, 11.0 / 9.7 |
+
+At 8 MiB nothing changes, because the budget is larger than both floors.
+At 1 MiB the large Review is below 32 MiB, so its floor drops to 2.8 MiB.
+The first cache update fires at 4.0 MiB inactive instead of 5.3 MiB, which matches 1 MiB plus an eighth of 23,675,412 bytes.
+So Storage knew the whole Review during the first pass.
+The cache updates go up from 8 and 9 to 12 and 13, and the peak inactive bytes go down by 2 MiB.
+The CPU ranges overlap (30.4 to 34.8 s and 33.5 to 37.4 s). Two runs on each side cannot show a CPU change of this size.
+The physical footprint after close is 8.4 GB on every run.
+
+The rejected count of Files gave 18 and 19 cache updates at 1 MiB on the same Review, with the same method.
+
+### Open
+
+The large Review at 1 MiB does not keep its count of cache updates. Option a lowers the floor of every Review below 32 MiB, and this Review holds 22.6 MiB.
+A floor from the cost of a Buffer build, such as the rows of the Review, could separate a small Review from this one. No run tested it.

@@ -141,7 +141,7 @@ No check: a field check cannot tell a Hunk Line from a gap Line, because both ha
 
 ### Only a Review Search source scan moves the queued cache update
 
-A queued cache update keeps its place in the queue. Only a new Review Search source scan moves it to the end, and only while the cache is not far over the budget. Far over the budget is a byte limit that depends only on the budget, never on a File count. Another request that moves it can starve the cache update and hold the cache over the budget.
+A queued cache update keeps its place in the queue. Only a new Review Search source scan moves it to the end, and only while the cache is not far over the budget. Far over the budget is a byte limit that depends only on the budget and on the bytes of the Review, never on a File count. The bytes of the Review count only after each File was admitted once. Another request that moves it can starve the cache update and hold the cache over the budget.
 
 No check: a check would have to know every request that can reach the queue. Related checked rule: [Coalesced Buffer builds](docs/rules/tui-state.md#coalesced-buffer-builds).
 

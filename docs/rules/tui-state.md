@@ -221,10 +221,15 @@ A new request joins the queued build and keeps its place.
 `takeCommand` gives the build a new snapshot through `refreshQueuedBuild`.
 One exception exists.
 A new Review Search source scan moves the queued cache update to the end of the queue while `Storage.cachePressure` is not `far_over_budget`.
-Far over the budget means that the inactive Files exceed the budget by more than the larger of the budget and `Storage.far_over_budget_floor` (4 MiB).
+Far over the budget means that the inactive Files exceed the budget by more than the larger of the budget and the floor.
+The floor is `Storage.far_over_budget_floor` (4 MiB).
+After each File of the Review was admitted once, the floor is at most an eighth of the bytes of the Review.
+Storage keeps the bytes of each File from its last admission, also after an eviction.
 So while the scans run, the inactive bytes stay at or below the budget plus that excess, plus one File.
 Each cache update frees more than the excess. So the scans cost at most one full Buffer build for each excess that they release, plus one for each stop.
 The floor keeps a budget smaller than one File from costing a build for each released File.
+The eighth of the Review lets a small Review evict while the scans run, with about eight cache updates for each pass.
+Before Storage knows the bytes of every File, it cannot tell a small Review from a large one, so the floor stays at 4 MiB.
 When the scans stop, the cache update reaches the front and brings the cache within the budget.
 
 Enforcement: the switch in `refreshQueuedBuild` in `src/tui/presentation.zig` names every `DisclosureBuild.Kind`, so a new kind needs a decision about its snapshot at take (compile error). The build-counting and eviction tests of Review Search in `src/tui/presentation.zig` and the cache pressure test in `src/tui/file_enrichment.zig`, run by `zig build test`.
