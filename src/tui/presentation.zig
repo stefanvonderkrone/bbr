@@ -34462,6 +34462,51 @@ test "M21 kernel Review Search releases the hold of a File whose source scan can
     try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
 }
 
+test "M21 kernel Review Search starts a source scan when no allocation succeeds" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, std.heap.page_allocator, .on);
+    defer presentation.deinit();
+    const enrichment = &presentation.published.?.session.enrichment;
+    while (!enrichment.isTerminal(0) or !enrichment.isTerminal(1)) {
+        var command = presentation.takeCommand() orelse return error.MissingEnrichment;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+            },
+            .report_diagnostic => command.deinit(),
+            else => return error.UnexpectedCommand,
+        }
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command == .build_buffer_disclosure) {
+            command.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+        } else command.deinit();
+    }
+    try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        defer command.deinit();
+        if (command == .scan_review_source) return;
+    }
+    return error.MissingSourceScan;
+}
+
 test "Review Search admits an enrichment rebuild after a selection move with the current active ranges" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
