@@ -34726,6 +34726,51 @@ test "M21 kernel Review Search keeps the given-up Files of a query edit that rol
     }
 }
 
+test "M21 kernel Review Search admits an enrichment with the hold that its build counted" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .inactive_file_cache_max_bytes = 1 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 2) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    var buffer: [2]EnrichFile = undefined;
+    const commands = takeQueuedTestEnrichments(&presentation, &buffer);
+    try testing.expectEqual(@as(usize, 2), commands.len);
+    try deliverTestEnrichment(&presentation, commands[1]);
+    // Without a query, the build counts no Review Search hold for File 1.
+    const job = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.enrichment, job.kind);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    job.build();
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .build_buffer_disclosure => |built| {
+                built.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = built });
+            },
+            .scan_buffer_search => |*scan| {
+                const completed = executeBufferSearchScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .buffer_search_scanned = completed });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+            },
+            else => return error.UnexpectedCommand,
+        }
+    }
+    const published = presentation.published.?;
+    try testing.expectEqual(SourceScan.scanned, published.review_search.source_scans.?[1]);
+    // The Frame shows the content of File 1 exactly when the Storage keeps it.
+    try testing.expectEqual(published.session.enrichment.file(1).new == .content, published.disclosure_inputs.blobs[1].new != null);
+}
+
 test "Review Search admits an enrichment rebuild after a selection move with the current active ranges" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
