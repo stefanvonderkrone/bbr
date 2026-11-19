@@ -75,9 +75,11 @@ A published Session never changes its Diff, its Threads, or its mention names.
 A change makes a new Session with a new Session Epoch through Refresh or Reconciliation.
 The Buffer Search candidate key covers these inputs only by identity and the Session Epoch.
 A worker that retains the Session reads them while the Presentation thread owns it.
-The Session fields that hold them have `const` element types, so no code writes their contents through those fields.
+No mutable pointer is reachable from the Session fields that hold them, so no code writes their contents through those fields.
+A `*const` pointer alone does not give this: `getPtr` and the iterators of a `std` hash map take the map by value and return a mutable `*V`.
+So `Session.mention_names` points to a `std.StaticStringMap`, whose storage and accessors are `const`.
 
-Enforcement: the `const` types of the Session fields in `src/tui/session.zig` (compile error). These are `[]const File`, `[]const Hunk`, `[]const Line`, `*const Comment`, and `*const MentionNames` (`Session.mention_names`). The search candidate key in `src/tui/buffer.zig` sees a field reassignment through the new address. The types do not stop a field reassignment, a write through `@constCast`, or a write through a mutable alias that the producer keeps. [No change to a published Session](../../CODING_STANDARDS.md#no-change-to-a-published-session) covers those writes.
+Enforcement: the `comptime` block after `Session` in `src/tui/session.zig` calls `read_only.assert` from `src/tui/read_only.zig` on `diff`, `threads`, and `mention_names` (compile error). The assertion follows each field and the return type of each public non-generic function, and it names the first mutable pointer. A `*const std.StringHashMapUnmanaged` fails it. The search candidate key in `src/tui/buffer.zig` sees a field reassignment through the new address. The assertion does not stop a field reassignment, a write through `@constCast`, or a write through a mutable alias that the producer keeps. [No change to a published Session](../../CODING_STANDARDS.md#no-change-to-a-published-session) covers those writes.
 
 ## New List Overlay
 
