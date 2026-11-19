@@ -152,3 +152,9 @@ No check: a check would have to know every request that can reach the queue. Rel
 A surface that reads File content from the cache keeps that File out of eviction while it shows it. The DiffPane does this through the cache focus, and the Review Search Preview through its hold. A cache update evicts every other inactive File, and nothing acquires a File again only because a surface reads it.
 
 No check: a check cannot tell which projection field a painter reads as File content. Related checked rule: [Review Search Preview hold](docs/rules/tui-state.md#review-search-preview-hold).
+
+### Every scan hold site asks needsScanHold
+
+A site that adds a Review Search scan hold decides it through `ReviewSearchState.needsScanHold`. A hold that the site adds on its own can land on a File whose scan is not due. No scan then releases that hold, and the cache budget no longer covers the File.
+
+No check: a check would have to know every path that reaches `enrichment.hold` for Review Search. Related checked rule: [Review Search scan hold](docs/rules/tui-state.md#review-search-scan-hold).
