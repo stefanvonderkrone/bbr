@@ -16,6 +16,7 @@ const bbr = @import("bbr");
 const file_enrichment = @import("file_enrichment.zig");
 const buffer = @import("buffer.zig");
 const review_body = @import("review_body.zig");
+const read_only = @import("read_only.zig");
 
 const PullRequest = bbr.bitbucket.PullRequest;
 const Client = bbr.bitbucket.Client;
@@ -132,6 +133,12 @@ pub const Session = struct {
         };
     }
 };
+
+comptime {
+    read_only.assert(@FieldType(Session, "diff"), "Session.diff");
+    read_only.assert(@FieldType(Session, "threads"), "Session.threads");
+    read_only.assert(@FieldType(Session, "mention_names"), "Session.mention_names");
+}
 
 fn validMentionName(name: []const u8) bool {
     if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) return false;
