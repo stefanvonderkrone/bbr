@@ -182,18 +182,18 @@ Enforcement: `DisclosureBuild` has no `review_selected` or `accepted_active` fie
 ## Review Search source scan failures
 
 A File gets two source scans at most for one Review Search query.
-After its first failed scan, the File keeps its Review Search hold and waits behind every unscanned File.
-The next source scan of the File retries it.
-After its second failed scan, Review Search gives up on the File, releases its hold, and shows `buffer_search_scan_failed`.
-The other Files keep their scans in each case.
-A new query or a reopened Overlay scans a File again after Review Search gave up on it.
+After its first failed scan, the File keeps its Review Search hold, and the next source scan retries it.
+After its second failed scan, Review Search stops the source scans of the query and shows `buffer_search_scan_failed` once.
+Each File without a successful scan then stays unscanned and has no Review Search hold, so a lasting failure such as `OutOfMemory` costs two scans, not two scans for each File.
+The worker boundary records each failed scan once, and Presentation records each allocation failure of a publication once.
+A new query or a reopened Overlay scans these Files again.
 
 A source scan command always starts, because it needs no allocation.
 The command retains the published Session and reads its File there, because a published Session never changes its Diff.
 It retains the query, which Presentation allocates once for each query change.
 It waits in its own slot, `Presentation.queued_source_scan`, because at most one source scan is queued or running.
 
-Enforcement: `ScanReviewSource.create` returns no error union, so a fallible step in it does not compile. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search starts a source scan when no allocation succeeds", and "M21 authored failed source scan retries after reopening Review Search" in `src/tui/presentation.zig`, run by `zig build test`.
+Enforcement: `ScanReviewSource.create` returns no error union, so a fallible step in it does not compile. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search stops its source scans after it gives up on a File", "M21 kernel Review Search starts a source scan when no allocation succeeds", and "M21 authored failed source scan retries after reopening Review Search" in `src/tui/presentation.zig`, run by `zig build test`.
 
 ## Search occurrence index mapping
 

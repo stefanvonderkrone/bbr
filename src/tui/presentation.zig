@@ -4182,16 +4182,17 @@ const BufferSearchState = struct {
 };
 
 /// The source scan of one File for the current Review Search query. A File
-/// gets two scans at most, so a lasting failure such as OutOfMemory ends.
+/// gets two scans at most, and the pass stops when a File fails twice, so a
+/// lasting failure such as OutOfMemory ends after two scans.
 const SourceScan = enum {
     unscanned,
     scanning,
-    /// The first scan failed. The File keeps its hold and scans again after
-    /// every unscanned File.
+    /// The first scan failed. The File keeps its hold and scans again next.
     awaiting_retry,
     retrying,
     scanned,
-    /// A new query or a reopened Overlay scans the File again.
+    /// The pass stopped before the File had a scan that succeeded. The File
+    /// has no hold. A new query or a reopened Overlay scans it again.
     given_up,
 };
 
@@ -4306,6 +4307,7 @@ fn admissible(published: *const Published, job: *const DisclosureBuild, enriched
 /// Review Search holds the cache lease of each File it acquires for a query.
 fn reviewSearchHolds(published: *const Published, index: usize) bool {
     const state = &published.review_search;
+    if (state.source_scans) |scans| if (scans[index] == .given_up) return false;
     return state.open and state.query != null and state.held != null and !state.held.?[index];
 }
 
@@ -8806,7 +8808,7 @@ pub const Presentation = struct {
         const state = &published.review_search;
         if (!state.open or state.pending or state.query == null or state.source_scan_active) return;
         const scans = state.source_scans orelse return;
-        for ([_]SourceScan{ .unscanned, .awaiting_retry }) |due| for (scans, 0..) |scan, index| {
+        for ([_]SourceScan{ .awaiting_retry, .unscanned }) |due| for (scans, 0..) |scan, index| {
             if (scan != due or !published.session.enrichment.isTerminal(index)) continue;
             std.debug.assert(self.queued_source_scan == null);
             self.queued_source_scan = ScanReviewSource.create(published, index);
@@ -8818,11 +8820,11 @@ pub const Presentation = struct {
     }
 
     /// A first failure keeps the hold of its File, so its content stays for
-    /// the retry. A second failure gives up on the File.
+    /// the retry. A second failure stops the pass.
     fn reviewSourceScanFailed(self: *Presentation, published: *Published, file_index: usize) void {
         const state = &published.review_search;
         const scans = state.source_scans orelse return;
-        if (scans[file_index] != .scanning) return self.giveUpReviewSourceScan(published, file_index);
+        if (scans[file_index] != .scanning) return self.giveUpReviewSourceScans(published);
         scans[file_index] = .awaiting_retry;
         const held = state.held orelse return;
         if (held[file_index]) return;
@@ -8830,10 +8832,13 @@ pub const Presentation = struct {
         held[file_index] = true;
     }
 
-    fn giveUpReviewSourceScan(self: *Presentation, published: *Published, file_index: usize) void {
-        const state = &published.review_search;
-        if (state.source_scans) |scans| scans[file_index] = .given_up;
-        self.releaseReviewSearchHold(published, file_index);
+    /// Runs in the completion of the only source scan, so no other File
+    /// has a scan in flight.
+    fn giveUpReviewSourceScans(self: *Presentation, published: *Published) void {
+        if (published.review_search.source_scans) |scans| for (scans) |*scan| {
+            if (scan.* != .scanned) scan.* = .given_up;
+        };
+        self.releaseReviewSearchHolds(published);
         self.action_error = .buffer_search_scan_failed;
     }
 
@@ -34362,9 +34367,9 @@ fn openTestReviewSourceSearchWith(store: *bbr.review.InMemoryStore, allocator: A
 const TestSourceScanRun = struct {
     /// The source scans of the failing File.
     scans: usize = 0,
-    /// Whether Review Search held the failing File after each failed source scan.
-    /// Its length also ends an endless retry.
-    held_after_failure: [4]bool = @splat(false),
+    /// Whether a hold or the retry kept the failing File leased after each
+    /// failed source scan. Its length also ends an endless retry.
+    leased_after_failure: [4]bool = @splat(false),
     review_search_records: usize = 0,
 };
 
@@ -34387,7 +34392,7 @@ fn runTestSourceScans(presentation: *Presentation, file_index: usize, failures: 
                     continue;
                 }
                 run.scans += 1;
-                if (run.scans > run.held_after_failure.len) return error.EndlessRetry;
+                if (run.scans > run.leased_after_failure.len) return error.EndlessRetry;
                 if (run.scans > failures) {
                     try presentation.dispatch(.{ .review_source_scanned = completed });
                     continue;
@@ -34402,7 +34407,7 @@ fn runTestSourceScans(presentation: *Presentation, file_index: usize, failures: 
                 };
                 completed.deinit();
                 try presentation.dispatch(.{ .review_source_scanned = failed });
-                run.held_after_failure[run.scans - 1] = presentation.published.?.review_search.held.?[file_index];
+                run.leased_after_failure[run.scans - 1] = presentation.published.?.session.enrichment.files[file_index].leases > 0;
             },
             .report_diagnostic => |failure| {
                 if (failure.operation == .review_search) run.review_search_records += 1;
@@ -34431,7 +34436,7 @@ test "M21 kernel Review Search scans a File again after its source scan fails" {
     try testing.expectEqual(@as(usize, 2), run.scans);
     // The worker boundary records a failed scan, so Presentation adds no record.
     try testing.expectEqual(@as(usize, 0), run.review_search_records);
-    try testing.expect(run.held_after_failure[0]);
+    try testing.expect(run.leased_after_failure[0]);
     try testing.expect(testSourceOccurrences(&presentation, 0) > 0);
     try testing.expect(testSourceOccurrences(&presentation, 1) > 0);
     try testing.expect(presentation.projection().action_error == null);
@@ -34446,9 +34451,9 @@ test "M21 kernel Review Search gives up on a File after its second failed source
     try testing.expectEqual(@as(usize, 2), run.scans);
     // The worker boundary records a failed scan, so Presentation adds no record.
     try testing.expectEqual(@as(usize, 0), run.review_search_records);
-    try testing.expectEqualSlices(bool, &.{ true, false }, run.held_after_failure[0..2]);
+    try testing.expectEqualSlices(bool, &.{ true, false }, run.leased_after_failure[0..2]);
     try testing.expectEqual(@as(usize, 0), testSourceOccurrences(&presentation, 0));
-    try testing.expect(testSourceOccurrences(&presentation, 1) > 0);
+    try testing.expectEqual(@as(usize, 0), testSourceOccurrences(&presentation, 1));
     try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
 }
 
@@ -34820,10 +34825,10 @@ test "an allocation failure in a Review Search source publication keeps the prev
                         try testing.expectEqual(results.ptr, state.results.?.ptr);
                         try testing.expectEqual(selected, state.selected);
                         try testing.expectEqual(revision, presentation.projection().revision.frame);
-                        // The File waits for its retry, or gives up when the failing allocator also refuses the retry.
+                        // The retry of the File is the next source scan.
                         switch (state.source_scans.?[file_index]) {
-                            .awaiting_retry, .given_up => {},
-                            .unscanned, .scanning, .retrying, .scanned => return error.TestUnexpectedResult,
+                            .retrying => {},
+                            .unscanned, .scanning, .awaiting_retry, .scanned, .given_up => return error.TestUnexpectedResult,
                         }
                         failures += 1;
                     }
