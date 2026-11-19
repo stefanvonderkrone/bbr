@@ -9919,6 +9919,13 @@ pub const Presentation = struct {
             self.retryContentBuild(published, job);
             return;
         }
+        // The worker counted each recorded hold in its cache preview. A query
+        // or an Overlay change can change the decision without a Storage
+        // change.
+        for (job.enrichments.items) |enriched| if (enriched.hold != reviewSearchHolds(published, enriched.index)) {
+            self.retryContentBuild(published, job);
+            return;
+        };
         if (job.kind == .view) {
             const desired = published.pending_view orelse return;
             if (job.request_id != desired.request_id) return;
@@ -10047,7 +10054,7 @@ pub const Presentation = struct {
         }
         for (job.enrichments.items) |*enriched| if (!admissible(published, job, enriched)) return self.refuseEnrichments(published, job);
         for (job.enrichments.items) |*enriched| {
-            if (reviewSearchHolds(published, enriched.index)) {
+            if (enriched.hold) {
                 published.session.enrichment.hold(enriched.index);
                 published.review_search.held.?[enriched.index] = true;
             }
