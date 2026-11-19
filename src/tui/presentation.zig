@@ -34733,6 +34733,40 @@ test "M21 kernel Review Search keeps the given-up Files of a query edit that rol
     }
 }
 
+test "M21 kernel Review Search resumes the retry of a query edit that rolls back" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .review_source_scanned = try failNextTestSourceScan(&presentation) });
+    // The edit discards the queued retry of File 0.
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
+    var command = presentation.takeCommand() orelse return error.MissingBufferSearchScan;
+    defer command.deinit();
+    var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+    if (completed.outcome == .scanned) completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
+    try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        switch (queued) {
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |scan| {
+                const file_index = scan.file_index;
+                queued.deinit();
+                try testing.expectEqual(@as(usize, 0), file_index);
+                return;
+            },
+            else => queued.deinit(),
+        }
+    }
+    return error.MissingSourceScan;
+}
+
 test "M21 kernel Review Search admits an enrichment with the hold that its build counted" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
