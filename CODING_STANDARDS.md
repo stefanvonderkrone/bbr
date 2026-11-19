@@ -134,6 +134,12 @@ A `Nav` field whose type spans lines follows the Navigation across Frames rule t
 
 No check: a line check cannot tell a row number from another `usize`, and it reads a `Nav` field type only on one line. Related checked rule: [Navigation across Frames](docs/rules/tui-state.md#navigation-across-frames).
 
+### A source scan starts without an allocation
+
+The start of a Review Search source scan, `maybeQueueReviewSourceScan` and `ScanReviewSource.create`, allocates from no allocator.
+
+No check: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" fails only on an allocation from the Presentation allocator. An allocation from `std.heap.page_allocator` or from the Session allocator passes it, and a `catch` makes any allocation compile in a function that returns no error union. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+
 ### Make Line row identities through LineOwner.of
 
 No code writes a literal `.{ .hunk_line = line }` that bypasses `LineOwner.of`.

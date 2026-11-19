@@ -194,7 +194,7 @@ The scan result takes its own Session reference before the worker releases the c
 It retains the query, which Presentation allocates once for each query change in `std.heap.page_allocator`, because a worker can release its last reference.
 It waits in its own slot, `Presentation.queued_source_scan`, because at most one source scan is queued or running.
 
-Enforcement: `ScanReviewSource.create` returns no error union, so a fallible step in it does not compile. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search stops its source scans after it gives up on a File", "M21 kernel Review Search starts a source scan when no allocation succeeds", and "M21 authored failed source scan retries after reopening Review Search" in `src/tui/presentation.zig`, run by `zig build test`.
+Enforcement: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" in `src/tui/presentation.zig` fails when the start of a source scan allocates from the Presentation allocator, also behind a `catch`. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search stops its source scans after it gives up on a File", and "M21 authored failed source scan retries after reopening Review Search" in the same file check the retry and the stop. `zig build test` runs them. An allocation from another allocator is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#a-source-scan-starts-without-an-allocation).
 
 ## Search occurrence index mapping
 
