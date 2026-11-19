@@ -8714,12 +8714,6 @@ pub const Presentation = struct {
         // scan can stage a cache build into it.
         self.commands.insertAssumeCapacity(0, command);
         self.discardQueuedReviewSourceScans();
-        state.clearSource(self.allocator);
-        holdReviewSearchFiles(published);
-        if (state.acquired) |acquired| for (acquired, 0..) |*done, index| {
-            if (published.session.enrichment.needsEnrichment(index)) done.* = false;
-        };
-        self.pumpReviewSearchAcquisition(published);
         if (state.rollback_query == null and state.batch != null) {
             state.rollback_query = state.query;
         } else if (state.query) |old| old.release();
@@ -8736,12 +8730,40 @@ pub const Presentation = struct {
         self.queued_source_scan = null;
         if (self.published) |published| {
             if (published.epoch == removed.session_epoch) {
+                undoReviewSourceScan(published, removed.file_index);
                 self.finishSearchLease(published, removed.file_index);
-                if (published.review_search.source_scans) |scans| scans[removed.file_index] = .unscanned;
             }
             published.review_search.source_scan_active = false;
         }
         removed.deinit();
+    }
+
+    /// A source scan without a result returns its File to the state before
+    /// the scan, so a rolled-back query keeps the attempts of each File.
+    fn undoReviewSourceScan(published: *Published, file_index: usize) void {
+        const state = &published.review_search;
+        const scans = state.source_scans orelse return;
+        scans[file_index] = switch (scans[file_index]) {
+            .scanning => .unscanned,
+            .retrying => .awaiting_retry,
+            .unscanned, .awaiting_retry, .scanned, .given_up => |scan| scan,
+        };
+        if (!reviewSearchHolds(published, file_index) or !published.session.enrichment.isTerminal(file_index)) return;
+        published.session.enrichment.hold(file_index);
+        state.held.?[file_index] = true;
+    }
+
+    /// The source scans start again when the results of a new query
+    /// publish, so a rolled-back query keeps its pass.
+    fn restartReviewSourceScans(self: *Presentation, published: *Published) void {
+        const state = &published.review_search;
+        state.clearSource(self.allocator);
+        holdReviewSearchFiles(published);
+        if (state.acquired) |acquired| for (acquired, 0..) |*done, index| {
+            if (published.session.enrichment.needsEnrichment(index)) done.* = false;
+        };
+        self.pumpReviewSearchAcquisition(published);
+        self.maybeQueueReviewSourceScan(published);
     }
 
     fn discardQueuedSearchEnrichments(self: *Presentation, published: *Published) void {
@@ -8900,7 +8922,7 @@ pub const Presentation = struct {
         const state = &published.review_search;
         state.source_scan_active = false;
         if (!state.open or state.query == null or state.pending or state.request_id != completed.request_id) {
-            if (state.source_scans) |scans| scans[completed.file_index] = .unscanned;
+            undoReviewSourceScan(published, completed.file_index);
             self.maybeQueueReviewSourceScan(published);
             return;
         }
@@ -9172,7 +9194,7 @@ pub const Presentation = struct {
         }
         published.frame_revision += 1;
         self.action_error = null;
-        self.maybeQueueReviewSourceScan(published);
+        self.restartReviewSourceScans(published);
     }
 
     fn rollbackReviewSearchQuery(state: *ReviewSearchState) void {
@@ -34604,7 +34626,7 @@ fn failNextTestSourceScan(presentation: *Presentation) !ReviewSourceScanned {
     return error.MissingSourceScan;
 }
 
-test "M21 kernel Review Search keeps a command slot for its query scan when a discarded source scan stages a cache build" {
+test "M21 kernel Review Search inserts its query scan into the reserved slot and holds the File of a discarded source scan" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .{ .inactive_file_cache_max_bytes = 1 });
@@ -34622,7 +34644,9 @@ test "M21 kernel Review Search keeps a command slot for its query scan when a di
         else => {},
     };
     try testing.expectEqual(@as(usize, 1), query_scans);
-    try testing.expectEqual(@as(usize, 1), cache_builds);
+    // The discarded scan holds its File again, so its release stages no cache build.
+    try testing.expectEqual(@as(usize, 0), cache_builds);
+    try testing.expect(presentation.published.?.review_search.held.?[1]);
     try testing.expectEqualStrings("newe", presentation.published.?.review_search.query.?.query.text);
 }
 

@@ -186,7 +186,9 @@ After its first failed scan, the File keeps its Review Search hold, and the next
 After its second failed scan, Review Search stops the source scans of the query and shows `buffer_search_scan_failed` once.
 Each File without a successful scan then stays unscanned and has no Review Search hold, so a lasting failure such as `OutOfMemory` costs two scans, not two scans for each File.
 The worker boundary records each failed scan once, and Presentation records each allocation failure of a publication once.
-A new query or a reopened Overlay scans these Files again.
+The results of a new query, or a reopened Overlay, start the source scans again.
+Until the results of a query edit publish, each File keeps its source scan state, so a query that rolls back keeps the attempts and the given-up Files of its pass.
+A source scan without a result, such as a queued scan that a query edit discards, returns its File to the state and the hold that it had before the scan.
 
 A source scan command always starts, because it needs no allocation.
 The command retains the published Session and reads its File there, because a published Session never changes its Diff.
@@ -194,7 +196,7 @@ The scan result takes its own Session reference before the worker releases the c
 It retains the query, which Presentation allocates once for each query change in `std.heap.page_allocator`, because a worker can release its last reference.
 It waits in its own slot, `Presentation.queued_source_scan`, because at most one source scan is queued or running.
 
-Enforcement: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" in `src/tui/presentation.zig` fails when the start of a source scan allocates from the Presentation allocator, also behind a `catch`. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search stops its source scans after it gives up on a File", and "M21 authored failed source scan retries after reopening Review Search" in the same file check the retry and the stop. `zig build test` runs them. An allocation from another allocator is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#a-source-scan-starts-without-an-allocation).
+Enforcement: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" in `src/tui/presentation.zig` fails when the start of a source scan allocates from the Presentation allocator, also behind a `catch`. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search stops its source scans after it gives up on a File", "M21 authored failed source scan retries after reopening Review Search", and "M21 kernel Review Search keeps the given-up Files of a query edit that rolls back" in the same file check the retry, the stop, and the rollback. `zig build test` runs them. An allocation from another allocator is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#a-source-scan-starts-without-an-allocation).
 
 ## Search occurrence index mapping
 
