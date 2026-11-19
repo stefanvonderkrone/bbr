@@ -13,7 +13,7 @@ Blocked by: none
 
 - Give each production spawn site a stable identity, for example its `@src()` at the call of `diagnostics.concurrent` or `diagnostics.selectConcurrent`.
 - In a test build, record each site that a test reaches.
-- Add a check that fails when a production spawn site has no record after the test run. `tools/check_task_spawns.py` already finds every production spawn, so it can supply the list of sites. Triage decides how the test run hands its records to the check, and whether `zig build test` can run the check after all test binaries.
+- Add a check that fails when a production spawn site has no record after the test run. The check needs an inventory of every production spawn site, allowed and rejected. That is each call of `diagnostics.concurrent` and `diagnostics.selectConcurrent`, and each other `.concurrent(`, `.async(`, or `.selectConcurrent(` call. `tools/check_task_spawns.py` cannot supply that inventory as it is. It reports only the spawns that it rejects, and it skips each allowed call. Its receiver walk can supply the sites if it also yields the allowed calls. Triage decides how the test run hands its records to the check, and whether `zig build test` can run the check after all test binaries.
 - Add the missing tests for the existing spawns, first for `drainPresentationCommands`.
 - When the check exists, move the rule from `CODING_STANDARDS.md` to `docs/rules/diagnostics.md` with its enforcement.
 

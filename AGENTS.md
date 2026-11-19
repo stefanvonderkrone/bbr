@@ -22,8 +22,8 @@
 
 Each rule names the check that enforces it. Read the area doc before you change its code.
 
-- [Diagnostics](docs/rules/diagnostics.md): before you write a `catch`, an `errdefer`, an error return, a failure record, or a task spawn.
-- [Build and checks](docs/rules/build-and-checks.md): before you change `build.zig`, `tools/`, `tests/`, a benchmark, or the release publication.
+- [Diagnostics](docs/rules/diagnostics.md): before you write a `catch`, an `errdefer`, an error return, an error comparison, a failure record, diagnostic evidence, or a task spawn.
+- [Build and checks](docs/rules/build-and-checks.md): before you change `build.zig`, `tools/`, `tests/`, a benchmark, a library or system call of the core module, or the release publication.
 - [CLI](docs/rules/cli.md): before you change `bbr api`, stdout or stderr output, or a config path.
 - [TUI paint](docs/rules/tui-paint.md): before you change what the TUI paints, such as a layout, a border, a Title, a Theme color, the status, or a ReviewCard.
 - [TUI state](docs/rules/tui-state.md): before you change Presentation, a Session, a Buffer or Frame build, search, navigation, or an Overlay.

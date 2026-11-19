@@ -74,13 +74,14 @@ def check(root):
         number = re.match(r"(\d+)-", path.name)
         if not number:
             continue
-        if number[1] in adrs:
-            error(path, f"ADR number {number[1]} is also used by {adrs[number[1]].name}. "
+        key = int(number[1])
+        if key in adrs:
+            error(path, f"ADR number {number[1]} is also used by {adrs[key].name}. "
                   "Give the newer ADR the next free number and update its links. "
                   "This check only sees one tree, so two branches that add the same number "
                   "fail only after the merge")
         else:
-            adrs[number[1]] = path
+            adrs[key] = path
 
     documents = {root / "AGENTS.md", root / "GLOSSARY-MAP.md", root / "docs/code-navigation.md"}
     for pattern in ("docs/agents/*.md", "docs/rules/*.md", "CODING_STANDARDS.md", "src/**/GLOSSARY.md", "src/**/IMPLEMENTATION.md",

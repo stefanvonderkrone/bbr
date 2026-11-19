@@ -1,6 +1,6 @@
 # Build and checks rules
 
-This doc holds the checked rules for `build.zig`, `tools/`, `tests/`, the benchmarks, the module setup of `src/root.zig`, and the release publication. The parts that no check covers are in [`CODING_STANDARDS.md`](../../CODING_STANDARDS.md).
+This doc holds the checked rules for `build.zig`, `tools/`, `tests/`, the benchmarks, the libraries and system calls of the core module of `src/root.zig`, and the release publication. The parts that no check covers are in [`CODING_STANDARDS.md`](../../CODING_STANDARDS.md).
 
 ## Core module without libc
 

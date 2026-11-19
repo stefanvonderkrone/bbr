@@ -84,8 +84,10 @@ No check: a line check cannot see who reads a map entry. Related checked rule: [
 ### No change to a published Session
 
 No code uses `@constCast` or a field reassignment on a Session after publication.
+After publication, no code writes the Diff, Threads, or mention names of a Session through a mutable alias.
+A buffer that the producer keeps to free later is such an alias.
 
-No check: test fixtures change a Session legitimately before `Presentation.init`, and no text check can see publication. Related checked rule: [Published Session content](docs/rules/tui-state.md#published-session-content).
+No check: the `const` field types stop a write only through the Session fields. They do not stop a write through a mutable alias. Test fixtures change a Session before `Presentation.init`, and no text check can see publication or follow an alias. Related checked rule: [Published Session content](docs/rules/tui-state.md#published-session-content).
 
 ### No scan of every row for one File
 

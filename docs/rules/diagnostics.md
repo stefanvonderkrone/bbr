@@ -27,7 +27,7 @@ A task spawn goes through `diagnostics.concurrent` or `diagnostics.selectConcurr
 
 Zig rejects a local that shadows a top-level name, so that declaration names the receiver in the whole file. A receiver such as `task_diagnostics`, a parameter named `diagnostics`, or a field `self.diagnostics` is not the wrapper. A call chain can break before each `.`.
 
-Enforcement: `tools/check_task_spawns.py` reads the whole receiver chain before each spawn and the top-level declarations of the file. `zig build test` runs it.
+Enforcement: `tools/check_task_spawns.py` reads the whole receiver chain before each `.concurrent(`, `.selectConcurrent(`, and `.async(` call, and the top-level declarations of the file. `zig build test` runs it.
 
 ## A merged record keeps the boundary error and the leaf cause
 
@@ -120,7 +120,7 @@ A concurrent fan-out of one client gives each task its own slot by pointer. The 
 
 Every production task starts through `diagnostics.concurrent` or `diagnostics.selectConcurrent`. No task argument holds a `Handle` that carries a slot.
 
-Enforcement: `diagnostics.concurrent` and `diagnostics.selectConcurrent` in `src/diagnostics.zig` panic in a Debug build when a task argument holds a `Handle` with a slot. The search finds it by value, in a field, an optional, an array, or a tagged union. `tools/check_task_spawns.py` rejects every other production `.concurrent(` or `.async(` call. `zig build test` runs the check and the tests that reach each spawn.
+Enforcement: `diagnostics.concurrent` and `diagnostics.selectConcurrent` in `src/diagnostics.zig` panic in a Debug build when a task argument holds a `Handle` with a slot. The search finds it by value, in a field, an optional, an array, or a tagged union. `tools/check_task_spawns.py` rejects every other production `.concurrent(`, `.selectConcurrent(`, or `.async(` call. `zig build test` runs the check and the tests that reach each spawn.
 
 ## A Bitbucket client error return notes fresh evidence
 
