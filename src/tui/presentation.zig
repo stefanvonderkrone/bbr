@@ -8710,6 +8710,9 @@ pub const Presentation = struct {
             return;
         };
         self.discardQueuedReviewSearchScans();
+        // The query scan takes the reserved slot before a discarded source
+        // scan can stage a cache build into it.
+        self.commands.insertAssumeCapacity(0, command);
         self.discardQueuedReviewSourceScans();
         state.clearSource(self.allocator);
         holdReviewSearchFiles(published);
@@ -8717,7 +8720,6 @@ pub const Presentation = struct {
             if (published.session.enrichment.needsEnrichment(index)) done.* = false;
         };
         self.pumpReviewSearchAcquisition(published);
-        self.commands.insertAssumeCapacity(0, command);
         if (state.rollback_query == null and state.batch != null) {
             state.rollback_query = state.query;
         } else if (state.query) |old| old.release();
