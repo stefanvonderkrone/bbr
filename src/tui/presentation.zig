@@ -31002,6 +31002,49 @@ test "M21 kernel the Review Search Preview keeps its File content while cache up
     }
 }
 
+test "M21 kernel a scanned File that the Review Search Preview acquires again is evictable after the selection leaves it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 16) },
+    });
+    defer presentation.deinit();
+    const storage = &presentation.published.?.session.enrichment;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+
+    var evicted: ?usize = null;
+    for (0..64) |_| {
+        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+        const view = presentation.projection().review_search.?;
+        const location = view.results[view.selected.?].occurrence.location;
+        if (location != .source) continue;
+        const index = location.source.file_index;
+        if (!storage.focused.contains(index) and storage.file(index).new != .content) {
+            evicted = index;
+            break;
+        }
+    }
+    const file_index = evicted orelse return error.TestUnexpectedResult;
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+    try testing.expect(storage.file(file_index).new == .content);
+
+    for (0..64) |_| {
+        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+        const view = presentation.projection().review_search.?;
+        const location = view.results[view.selected.?].occurrence.location;
+        if (location == .source and location.source.file_index != file_index) break;
+    } else return error.TestUnexpectedResult;
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+    try testing.expect(presentation.projection().review_search != null);
+    try testing.expectEqual(@as(usize, 0), storage.files[file_index].leases);
+    try testing.expect(storage.file(file_index).new != .content);
+}
+
 test "a failed enrichment rebuild releases each File and reports only demanded Files" {
     for ([_]bool{ false, true }) |demanded| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
