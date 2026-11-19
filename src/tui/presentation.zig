@@ -31045,6 +31045,30 @@ test "M21 kernel a scanned File that the Review Search Preview acquires again is
     try testing.expect(storage.file(file_index).new != .content);
 }
 
+test "M21 kernel reopening Review Search holds no File that its query already scanned" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 16) },
+    });
+    defer presentation.deinit();
+    const storage = &presentation.published.?.session.enrichment;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+
+    try testing.expect(presentation.projection().review_search != null);
+    const preview = presentation.published.?.review_search.preview_held;
+    for (storage.files, 0..) |*stored, index|
+        try testing.expectEqual(@as(usize, @intFromBool(std.meta.eql(preview, @as(?usize, index)))), stored.leases);
+}
+
 test "a failed enrichment rebuild releases each File and reports only demanded Files" {
     for ([_]bool{ false, true }) |demanded| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
