@@ -4258,6 +4258,14 @@ const ReviewSearchState = struct {
         return if (source.file_index < files) source else null;
     }
 
+    /// Only a source scan releases a scan hold, so a File whose scan is
+    /// done, queued, or running gets none.
+    fn needsScanHold(self: *const ReviewSearchState, index: usize) bool {
+        const held = self.held orelse return false;
+        const scanned = self.source_scanned orelse return false;
+        return !held[index] and !scanned[index];
+    }
+
     fn clearSource(self: *ReviewSearchState, allocator: Allocator) void {
         _ = allocator;
         if (self.source_scanned) |scanned| @memset(scanned, false);
@@ -4295,10 +4303,11 @@ fn admissible(published: *const Published, job: *const DisclosureBuild, enriched
     return job.enrichedFile(enriched.index).? == enriched;
 }
 
-/// Review Search holds the cache lease of each File it acquires for a query.
+/// Review Search holds the cache lease of each File it acquires for a query
+/// until the source scan of that File releases it.
 fn reviewSearchHolds(published: *const Published, index: usize) bool {
     const state = &published.review_search;
-    return state.open and state.query != null and state.held != null and !state.held.?[index];
+    return state.open and state.query != null and state.needsScanHold(index);
 }
 
 fn reviewSearchOpeningFile(state: *const ReviewSearchState) ?usize {
@@ -8552,7 +8561,7 @@ pub const Presentation = struct {
         const held = published.review_search.held orelse return;
         for (published.session.diff.files, 0..) |_, index| {
             const view = published.session.enrichment.file(index);
-            if (published.session.enrichment.isTerminal(index) and !held[index] and
+            if (published.session.enrichment.isTerminal(index) and published.review_search.needsScanHold(index) and
                 (view.old == .content or view.new == .content))
             {
                 published.session.enrichment.hold(index);
