@@ -51,7 +51,7 @@ pub const Session = struct {
     diff: bbr.diff.Diff,
     threads: []const bbr.review.Thread,
     /// `resolveMentions` sets it once, so a published Session never changes it.
-    mention_names: *const review_body.MentionNames = &.empty,
+    mention_names: *const review_body.MentionNames = &.{},
     enrichment: file_enrichment.Storage,
     emphasis_cache: ?buffer.EmphasisCache = null,
     /// Built by the first SideBySide build. Only the Presentation thread reads
@@ -92,14 +92,14 @@ pub const Session = struct {
         const a = self.arena.allocator();
         var scratch = std.heap.ArenaAllocator.init(self.arena.child_allocator);
         defer scratch.deinit();
-        const names = try a.create(review_body.MentionNames);
-        names.* = .empty;
+        var labels: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer labels.deinit(self.arena.child_allocator);
         for (comments) |comment| {
             if (comment.deleted or std.mem.indexOf(u8, comment.body, "@{") == null) continue;
             const body = try review_body.ReviewBody.parse(scratch.allocator(), comment.body);
             for (body.blocks) |block| for (block.spans) |span| {
                 if (span.mention.len == 0) continue;
-                const entry = try names.getOrPut(a, span.mention);
+                const entry = try labels.getOrPut(self.arena.child_allocator, span.mention);
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try a.dupe(u8, span.mention);
                 entry.value_ptr.* = "";
@@ -116,6 +116,14 @@ pub const Session = struct {
             };
             if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
         }
+        const pairs = try scratch.allocator().alloc(review_body.MentionName, labels.count());
+        var entries = labels.iterator();
+        for (pairs) |*pair| {
+            const entry = entries.next().?;
+            pair.* = .{ entry.key_ptr.*, entry.value_ptr.* };
+        }
+        const names = try a.create(review_body.MentionNames);
+        names.* = try review_body.MentionNames.init(pairs, a);
         self.mention_names = names;
     }
 
@@ -157,7 +165,7 @@ pub fn create(backing: Allocator) !*Session {
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
     s.side_by_side_plans = null;
-    s.mention_names = &.empty;
+    s.mention_names = &.{};
     errdefer s.arena.deinit();
     s.threads = &.{};
     s.enrichment = try file_enrichment.Storage.init(s.arena.allocator(), &.{});
@@ -276,7 +284,7 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
     s.side_by_side_plans = null;
-    s.mention_names = &.empty;
+    s.mention_names = &.{};
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -330,7 +338,7 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
     s.side_by_side_plans = null;
-    s.mention_names = &.empty;
+    s.mention_names = &.{};
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -444,7 +452,7 @@ pub fn loadLocalWith(
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
     s.side_by_side_plans = null;
-    s.mention_names = &.empty;
+    s.mention_names = &.{};
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -558,7 +566,7 @@ test "remote Session resolves each prose mention once and retains failed mention
         try testing.expectEqualStrings("", s.mention_names.get("missing").?);
         try testing.expectEqualStrings("", s.mention_names.get("control").?);
         try testing.expectEqualStrings("@Bo", s.mention_names.get("fallback").?);
-        try testing.expectEqual(@as(usize, 5), s.mention_names.count());
+        try testing.expectEqual(@as(usize, 5), s.mention_names.keys().len);
         try testing.expectEqual(@as(usize, 9), fake.callCount());
         try testing.expect(fake.maxActiveRequests() <= 2);
         try testing.expect(std.mem.startsWith(u8, s.threads[0].root.body, "@{id} @{id}"));
