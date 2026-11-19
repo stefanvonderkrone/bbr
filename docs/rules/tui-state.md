@@ -254,3 +254,12 @@ It acquires the File again when a cache update evicted it before the selection r
 `Published.releaseReviewSearchHolds` releases the hold with the scan holds.
 
 Enforcement: the test "M21 kernel the Review Search Preview keeps its File content while cache updates evict" in `src/tui/presentation.zig`, run by `zig build test`.
+
+## Review Search scan hold
+
+A Review Search scan hold exists only while a source scan of its File is due.
+Queueing the source scan of a File releases its scan hold, and a scanned File never gets a scan hold again.
+`ReviewSearchState.needsScanHold` makes this decision for every site that adds a scan hold: admission through `reviewSearchHolds`, and opening or a query change through `holdReviewSearchFiles`.
+Otherwise a scanned File that the Preview acquires again, or that the Overlay holds again when it opens, keeps a hold that no scan releases, and the cache budget no longer covers it.
+
+Enforcement: the tests "M21 kernel a scanned File that the Review Search Preview acquires again is evictable after the selection leaves it" and "M21 kernel reopening Review Search holds no File that its query already scanned" in `src/tui/presentation.zig`, run by `zig build test`. A new site that adds a scan hold without `needsScanHold` is a convention (no check).
