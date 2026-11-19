@@ -1748,15 +1748,19 @@ pub const OwnedCommand = union(enum) {
                 .mode = scan.mode,
                 .outcome = .failed,
             } },
-            .scan_review_source => |scan| .{ .review_source_scanned = .{
-                .evidence = failure,
-                .allocator = std.heap.page_allocator,
-                .command_id = scan.command_id,
-                .session_epoch = scan.session_epoch,
-                .request_id = scan.request_id,
-                .file_index = scan.file_index,
-                .outcome = .failed,
-            } },
+            .scan_review_source => |scan| retained: {
+                scan.session.retain();
+                break :retained .{ .review_source_scanned = .{
+                    .evidence = failure,
+                    .allocator = std.heap.page_allocator,
+                    .session = scan.session,
+                    .command_id = scan.command_id,
+                    .session_epoch = scan.session_epoch,
+                    .request_id = scan.request_id,
+                    .file_index = scan.file_index,
+                    .outcome = .failed,
+                } };
+            },
         };
         self.deinit();
         return input;
@@ -1895,7 +1899,7 @@ const LaunchFailureFixture = struct {
                 return error.MissingDisclosureBuild;
             },
             .scan_review_source => blk: {
-                const query = try SharedQuery.create(a, "query");
+                const query = try SharedQuery.create("query");
                 const session = disclosure.published.?.session;
                 session.retain();
                 break :blk .{ .scan_review_source = .{
@@ -3462,16 +3466,17 @@ pub fn executeBufferSearchScan(allocator: Allocator, command: *const ScanBufferS
 }
 
 /// A Review Search query. A source scan command keeps it after the query
-/// changes, so a scan starts without an allocation.
+/// changes, so a scan starts without an allocation. A worker can release the
+/// last reference, so it lives in `std.heap.page_allocator`.
 const SharedQuery = struct {
     references: std.atomic.Value(usize) = .init(1),
-    allocator: Allocator,
     query: search.Query,
 
-    fn create(allocator: Allocator, text: []const u8) !*SharedQuery {
+    fn create(text: []const u8) !*SharedQuery {
+        const allocator = std.heap.page_allocator;
         const shared = try allocator.create(SharedQuery);
         errdefer allocator.destroy(shared);
-        shared.* = .{ .allocator = allocator, .query = try search.Query.init(allocator, text) };
+        shared.* = .{ .query = try search.Query.init(allocator, text) };
         return shared;
     }
 
@@ -3482,8 +3487,8 @@ const SharedQuery = struct {
 
     fn release(self: *SharedQuery) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
-        self.query.deinit(self.allocator);
-        self.allocator.destroy(self);
+        self.query.deinit(std.heap.page_allocator);
+        std.heap.page_allocator.destroy(self);
     }
 };
 
@@ -3518,9 +3523,12 @@ pub const ScanReviewSource = struct {
     }
 };
 
+/// Holds a Session reference, so the Presentation thread, not a worker,
+/// releases the last reference of a replaced Session.
 pub const ReviewSourceScanned = struct {
     evidence: ?bbr.diagnostic.Failure = null,
     allocator: Allocator,
+    session: *Session,
     command_id: CommandId,
     session_epoch: SessionEpoch,
     request_id: u64,
@@ -3529,6 +3537,7 @@ pub const ReviewSourceScanned = struct {
 
     pub fn deinit(self: *ReviewSourceScanned) void {
         if (self.outcome == .scanned) self.outcome.scanned.deinit(self.allocator);
+        self.session.destroy();
         self.* = undefined;
     }
 };
@@ -3540,9 +3549,11 @@ pub fn executeReviewSourceScan(allocator: Allocator, command: *const ScanReviewS
         evidence = bbr.diagnostic.Failure.capture(.review_search, .execute, .{ .command_id = command.command_id, .session_epoch = command.session_epoch, .file_index = command.file_index }, .{ .zig = err }, @src());
         break :blk .failed;
     };
+    command.session.retain();
     return .{
         .evidence = evidence,
         .allocator = allocator,
+        .session = command.session,
         .command_id = command.command_id,
         .session_epoch = command.session_epoch,
         .request_id = command.request_id,
@@ -8629,7 +8640,7 @@ pub const Presentation = struct {
         const state = &published.review_search;
         state.opening_source = false;
         state.opening_identity = null;
-        const query = SharedQuery.create(self.allocator, text) catch |err| {
+        const query = SharedQuery.create(text) catch |err| {
             switch (err) {
                 error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
                 error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
@@ -17250,16 +17261,10 @@ test "M21 authored failed source scan retries after reopening Review Search" {
     try completeDisclosureBuild(&presentation);
     for (0..2) |_| {
         command = presentation.takeCommand().?;
-        const scan_id = command.scan_review_source.command_id;
+        var failed = executeReviewSourceScan(testing.allocator, &command.scan_review_source);
         command.deinit();
-        try presentation.dispatch(.{ .review_source_scanned = .{
-            .allocator = testing.allocator,
-            .command_id = scan_id,
-            .session_epoch = 1,
-            .request_id = presentation.published.?.review_search.request_id,
-            .file_index = 0,
-            .outcome = .failed,
-        } });
+        failTestSourceScan(&failed);
+        try presentation.dispatch(.{ .review_source_scanned = failed });
     }
     try testing.expect(presentation.takeCommand() == null);
     try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
@@ -34397,16 +34402,8 @@ fn runTestSourceScans(presentation: *Presentation, file_index: usize, failures: 
                     try presentation.dispatch(.{ .review_source_scanned = completed });
                     continue;
                 }
-                const failed: ReviewSourceScanned = .{
-                    .allocator = completed.allocator,
-                    .command_id = completed.command_id,
-                    .session_epoch = completed.session_epoch,
-                    .request_id = completed.request_id,
-                    .file_index = completed.file_index,
-                    .outcome = .failed,
-                };
-                completed.deinit();
-                try presentation.dispatch(.{ .review_source_scanned = failed });
+                failTestSourceScan(&completed);
+                try presentation.dispatch(.{ .review_source_scanned = completed });
                 run.leased_after_failure[run.scans - 1] = presentation.published.?.session.enrichment.files[file_index].leases > 0;
             },
             .report_diagnostic => |failure| {
@@ -34417,6 +34414,11 @@ fn runTestSourceScans(presentation: *Presentation, file_index: usize, failures: 
         }
     }
     return run;
+}
+
+fn failTestSourceScan(completed: *ReviewSourceScanned) void {
+    if (completed.outcome == .scanned) completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
 }
 
 fn testSourceOccurrences(presentation: *const Presentation, file_index: usize) usize {
@@ -34472,18 +34474,12 @@ test "M21 kernel Review Search stops its source scans after it gives up on a Fil
                 job.build();
                 try presentation.dispatch(.{ .buffer_disclosure_built = job });
             },
-            .scan_review_source => |scan| {
+            .scan_review_source => |*scan| {
                 scans += 1;
                 if (scans > 6) return error.EndlessRetry;
-                const failed: ReviewSourceScanned = .{
-                    .allocator = testing.allocator,
-                    .command_id = scan.command_id,
-                    .session_epoch = scan.session_epoch,
-                    .request_id = scan.request_id,
-                    .file_index = scan.file_index,
-                    .outcome = .failed,
-                };
+                var failed = executeReviewSourceScan(testing.allocator, scan);
                 command.deinit();
+                failTestSourceScan(&failed);
                 try presentation.dispatch(.{ .review_source_scanned = failed });
             },
             .report_diagnostic => {
@@ -34497,6 +34493,7 @@ test "M21 kernel Review Search stops its source scans after it gives up on a Fil
     try testing.expectEqual(@as(usize, 2), scans);
     try testing.expectEqual(@as(usize, 0), records);
     try testing.expectEqualSlices(bool, &.{ false, false, false }, presentation.published.?.review_search.held.?);
+    for (presentation.published.?.session.enrichment.files) |file| try testing.expectEqual(@as(usize, 0), file.leases);
     try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try presentation.dispatch(.{ .action = .open_review_search });

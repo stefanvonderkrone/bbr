@@ -190,7 +190,8 @@ A new query or a reopened Overlay scans these Files again.
 
 A source scan command always starts, because it needs no allocation.
 The command retains the published Session and reads its File there, because a published Session never changes its Diff.
-It retains the query, which Presentation allocates once for each query change.
+The scan result takes its own Session reference before the worker releases the command, so the Presentation thread releases the last reference of a replaced Session.
+It retains the query, which Presentation allocates once for each query change in `std.heap.page_allocator`, because a worker can release its last reference.
 It waits in its own slot, `Presentation.queued_source_scan`, because at most one source scan is queued or running.
 
 Enforcement: `ScanReviewSource.create` returns no error union, so a fallible step in it does not compile. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search stops its source scans after it gives up on a File", "M21 kernel Review Search starts a source scan when no allocation succeeds", and "M21 authored failed source scan retries after reopening Review Search" in `src/tui/presentation.zig`, run by `zig build test`.
