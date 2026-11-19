@@ -34349,17 +34349,22 @@ fn publishCheckedReviewSources(presentation: *Presentation, hide_rows: bool, bet
 }
 
 fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize) !Presentation {
-    return openTestReviewSourceSearchWith(store, allocator, file_count, .off);
+    return openTestReviewSourceSearchWith(store, allocator, file_count, .{});
 }
 
-fn openTestReviewSourceSearchWith(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize, diagnostic_state: bbr.diagnostic.State) !Presentation {
+const TestReviewSourceOptions = struct {
+    diagnostic_state: bbr.diagnostic.State = .off,
+    inactive_file_cache_max_bytes: usize = std.meta.fieldInfo(Dependencies, .inactive_file_cache_max_bytes).defaultValue().?,
+};
+
+fn openTestReviewSourceSearchWith(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize, options: TestReviewSourceOptions) !Presentation {
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     // The emphasis splits one ReviewBody match into two ranges.
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "a new idea\n\nn**e**w again" });
-    var presentation = try Presentation.init(allocator, .{ .reviews = store.store() }, .{
+    var presentation = try Presentation.init(allocator, .{ .reviews = store.store(), .inactive_file_cache_max_bytes = options.inactive_file_cache_max_bytes }, .{
         .initial = .{ .key = key, .session = try testManyFileSession(testing.allocator, 1, file_count) },
         .geometry = .{ .cols = 100, .rows = 40 },
-        .diagnostic_state = diagnostic_state,
+        .diagnostic_state = options.diagnostic_state,
     });
     errdefer presentation.deinit();
     try presentation.dispatch(.{ .action = .open_review_search });
@@ -34432,7 +34437,7 @@ fn testSourceOccurrences(presentation: *const Presentation, file_index: usize) u
 test "M21 kernel Review Search scans a File again after its source scan fails" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .on);
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .{ .diagnostic_state = .on });
     defer presentation.deinit();
     const run = try runTestSourceScans(&presentation, 0, 1);
     try testing.expectEqual(@as(usize, 2), run.scans);
@@ -34447,7 +34452,7 @@ test "M21 kernel Review Search scans a File again after its source scan fails" {
 test "M21 kernel Review Search gives up on a File after its second failed source scan" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .on);
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .{ .diagnostic_state = .on });
     defer presentation.deinit();
     const run = try runTestSourceScans(&presentation, 0, std.math.maxInt(usize));
     try testing.expectEqual(@as(usize, 2), run.scans);
@@ -34462,7 +34467,7 @@ test "M21 kernel Review Search gives up on a File after its second failed source
 test "M21 kernel Review Search stops its source scans after it gives up on a File" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 3, .on);
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 3, .{ .diagnostic_state = .on });
     defer presentation.deinit();
     var scans: usize = 0;
     var records: usize = 0;
@@ -34509,7 +34514,7 @@ test "M21 kernel Review Search starts a source scan when no allocation succeeds"
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .on);
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
     defer presentation.deinit();
     const enrichment = &presentation.published.?.session.enrichment;
     while (!enrichment.isTerminal(0) or !enrichment.isTerminal(1)) {
@@ -34548,6 +34553,149 @@ test "M21 kernel Review Search starts a source scan when no allocation succeeds"
         if (command == .scan_review_source) return;
     }
     return error.MissingSourceScan;
+}
+
+/// Runs queued work until the source scan of `file_index` waits in its slot
+/// behind an empty command queue.
+fn runTestUntilSourceScanWaits(presentation: *Presentation, file_index: usize) !void {
+    while (presentation.queued_source_scan == null or presentation.queued_source_scan.?.file_index != file_index or presentation.commands.items.len > 0) {
+        var command = presentation.takeCommand() orelse return error.MissingSourceScan;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+            },
+            .report_diagnostic => command.deinit(),
+            else => return error.UnexpectedCommand,
+        }
+    }
+}
+
+/// Runs queued work until a source scan starts and fails it.
+fn failNextTestSourceScan(presentation: *Presentation) !ReviewSourceScanned {
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                var failed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                failTestSourceScan(&failed);
+                return failed;
+            },
+            .report_diagnostic => command.deinit(),
+            else => return error.UnexpectedCommand,
+        }
+    }
+    return error.MissingSourceScan;
+}
+
+test "M21 kernel Review Search keeps a command slot for its query scan when a discarded source scan stages a cache build" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .{ .inactive_file_cache_max_bytes = 1 });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 1);
+    // The query edit reserves the only free slot of a full queue.
+    presentation.commands.clearAndFree(presentation.allocator);
+    try presentation.commands.ensureTotalCapacityPrecise(presentation.allocator, 1);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    var query_scans: usize = 0;
+    var cache_builds: usize = 0;
+    for (presentation.commands.items) |command| switch (command) {
+        .scan_buffer_search => query_scans += 1,
+        .build_buffer_disclosure => |job| cache_builds += @intFromBool(job.kind == .cache_update),
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), query_scans);
+    try testing.expectEqual(@as(usize, 1), cache_builds);
+    try testing.expectEqualStrings("newe", presentation.published.?.review_search.query.?.query.text);
+}
+
+test "M21 kernel Review Search shows its scan failure when the cache build of the released File cannot stage" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .inactive_file_cache_max_bytes = 1 });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 1);
+    try presentation.dispatch(.{ .review_source_scanned = try failNextTestSourceScan(&presentation) });
+    const second = try failNextTestSourceScan(&presentation);
+    try testing.expectEqual(@as(usize, 1), second.file_index);
+    // A cache build cannot stage, because the full queue cannot grow.
+    try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .review_source_scanned = second });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+}
+
+test "M21 kernel Review Search keeps the given-up Files of a query edit that rolls back" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 3);
+    defer presentation.deinit();
+    // File 2 stays without content, so its enrichment publishes after the rollback.
+    var late: ?EnrichFile = null;
+    var scans: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| if (file.file_index == 2) {
+                late = file;
+            } else try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                scans += 1;
+                var failed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                failTestSourceScan(&failed);
+                try presentation.dispatch(.{ .review_source_scanned = failed });
+            },
+            .report_diagnostic => command.deinit(),
+            else => return error.UnexpectedCommand,
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), scans);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
+    var command = presentation.takeCommand() orelse return error.MissingBufferSearchScan;
+    defer command.deinit();
+    var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+    if (completed.outcome == .scanned) completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
+    try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    try testing.expectEqualStrings("new", presentation.published.?.review_search.query.?.query.text);
+    try deliverTestEnrichment(&presentation, late orelse return error.MissingEnrichment);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        switch (queued) {
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |scan| {
+                std.debug.print("File {d} starts a source scan after the rollback\n", .{scan.file_index});
+                queued.deinit();
+                return error.GivenUpFileScannedAgain;
+            },
+            else => queued.deinit(),
+        }
+    }
 }
 
 test "Review Search admits an enrichment rebuild after a selection move with the current active ranges" {
