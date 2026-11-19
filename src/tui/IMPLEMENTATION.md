@@ -35,7 +35,7 @@ When the Frame lost the row, the cursor goes to the top of the Buffer.
 The cursor restoration of every admission after a rebuild goes through the anchor.
 State that outlives a Frame stores an anchor, not a `Nav`.
 An example is the start of the Buffer Search input in `input.start`.
-[The rule details](../../docs/agents/rule-details.md#navigation-across-frames) name the check and the tests.
+[The TUI state rules](../../docs/rules/tui-state.md#navigation-across-frames) name the check.
 
 ## Acquisition concurrency
 

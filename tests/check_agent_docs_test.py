@@ -114,6 +114,33 @@ class AgentDocsTest(unittest.TestCase):
         self.write("AGENTS.md", "Text[^note].\n\n[^note]: [Reference](docs/code-navigation.md)\n")
         self.assertEqual(checker.check(self.root), [])
 
+    def test_agents_md_above_the_size_cap_names_the_area_docs(self):
+        self.write("docs/rules/cli.md", "# CLI rules\n")
+        self.write("AGENTS.md", "x" * (checker.AGENTS_MD_CAP + 1))
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("AGENTS.md: 5,001 bytes, above the cap of 5,000", errors)
+        self.assertIn("docs/rules/cli.md", errors)
+        self.assertIn("CODING_STANDARDS.md", errors)
+
+    def test_agents_md_at_the_size_cap_passes(self):
+        self.write("AGENTS.md", "x" * checker.AGENTS_MD_CAP)
+        self.assertEqual(checker.check(self.root), [])
+
+    def test_two_adrs_with_one_number_fail(self):
+        self.write("docs/adr/0016-first.md", "# First\n")
+        self.write("docs/adr/0017-second.md", "# Second\n")
+        self.write("docs/adr/0017-third.md", "# Third\n")
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("docs/adr/0017-third.md: ADR number 0017 is also used by 0017-second.md", errors)
+        self.assertIn("only sees one tree", errors)
+        self.assertNotIn("0016", errors)
+
+    def test_two_adrs_with_one_number_and_different_zero_padding_fail(self):
+        self.write("docs/adr/0017-first.md", "# First\n")
+        self.write("docs/adr/017-second.md", "# Second\n")
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("docs/adr/017-second.md: ADR number 017 is also used by 0017-first.md", errors)
+
 
 if __name__ == "__main__":
     unittest.main()
