@@ -39,3 +39,17 @@ Review: the standards and spec reviews found no defect. The review fixes are the
 ## Comments
 
 Resolved. Open point: a scan command that cannot start now shows "Review Search failed" instead of "Out of memory". The record keeps the cause.
+
+Follow-up, round 2. The user wants the cause of a scan that cannot start fixed, and a bounded pass under a lasting failure.
+
+A source scan always starts now. `ScanReviewSource.create` copied the File into an arena, cloned the query, and grew the command queue, so each step could fail with `OutOfMemory`. The command now retains the published Session and reads its File there, retains a reference-counted `SharedQuery` that Presentation allocates once for each query change, and waits in its own slot, `Presentation.queued_source_scan`. Reserved capacity in the command queue does not work, because every other command takes the spare capacity before it appends. The give-up path for a scan that cannot start, its record, and the `source_scan_allocator` test seam are gone. Red test: "M21 kernel Review Search starts a source scan when no allocation succeeds".
+
+A second failed scan now stops the pass. The retry runs in the next source scan, not after every unscanned File. Each File without a successful scan becomes `given_up`, has no hold, and takes no new hold until a new query or a reopened Overlay. A lasting failure costs two scans and two worker records, one for each failed scan, because `docs/adr/0014` records each failure once. Red test: "M21 kernel Review Search stops its source scans after it gives up on a File".
+
+The scan result takes its own Session reference, so the Presentation thread releases the last reference of a replaced Session. `SharedQuery` lives in `std.heap.page_allocator`, because a worker can release it last.
+
+Commits: `62e3d445` (red A), `1258e1cd` (fix A), `3ed40bc1` (red B), `2e8ab1e7` (fix B), `e3d4234e` (review fix: thread ownership).
+
+Checks: `zig build test` exit 0. `zig fmt --check src build.zig tests` passes. `python3 tools/check_agent_docs.py` passes.
+
+Open point: a lasting failure writes two records, not one, because each failed scan has its own record.
