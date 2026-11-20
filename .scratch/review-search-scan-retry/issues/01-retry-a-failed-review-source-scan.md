@@ -81,3 +81,15 @@ Rollback test (4635473862). The test now checks that File 0 resumes as a retry.
 Commits: `75421ffa`, `d078c143` (red), `46bd4d03`, `b33bbd67` (red), `c4735972`, `6e4e68d8`, `43b6a502` (a test that results without a match start the source scans).
 
 Checks: `zig build test` exit 0. `zig fmt --check src build.zig tests` passes. `python3 tools/check_agent_docs.py` passes.
+
+Follow-up, round 5. CodeRabbit posted two comments on PR #36.
+
+Cache staging after a stopped pass (4644422867). The behavior holds, but the rule named the wrong mechanism. No lease release follows a pass that stops. The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows, and `ensureFocusedEnrichment` stages the cache build while the cache is over the budget, also while Review Search is open. The staging test now releases File 11, which is outside the focus, and checks that the focus check after the failure queues the cache update. When the check stops staging, the test fails. A staging failure in the focus check returns `OutOfMemory` from `dispatch` and ends the event loop. This was already the behavior, and the rule now says so.
+
+Source scan of a reopened query (4644422882). The comment holds. A query edit that the Overlay closed before its results published keeps the batch of `rollback_query`. When the reopen could not queue the query scan, a source scan of the new query started and merged into the old batch. `ReviewSearchState.currentQueryResultsPublished` now states that the batch holds the results of the current query, and the start and the merge of a source result both use it. A published batch without a match stays eligible. This is the second case of a source scan that starts against a batch of another query, so one predicate now decides both cases.
+
+Open point: after a failed reopen, the Overlay shows the new query over the results of the previous query, without a pending state, until the next edit or reopen.
+
+Commits: `9e19335e` (red), `ee5d3a7d`, `21eb2fbf`, and a docs commit that states the pending update and the failure of the focus check.
+
+Checks: `zig build test` exit 0. `zig fmt --check src build.zig tests` passes. `python3 tools/check_agent_docs.py` passes.
