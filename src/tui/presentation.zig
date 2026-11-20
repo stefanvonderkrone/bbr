@@ -34762,6 +34762,7 @@ test "M21 kernel Review Search resumes the retry of a query edit that rolls back
                 const file_index = scan.file_index;
                 queued.deinit();
                 try testing.expectEqual(@as(usize, 0), file_index);
+                try testing.expectEqual(SourceScan.retrying, presentation.published.?.review_search.source_scans.?[0]);
                 return;
             },
             else => queued.deinit(),
