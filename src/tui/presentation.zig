@@ -8839,9 +8839,11 @@ pub const Presentation = struct {
         }
     }
 
+    /// A source result merges into the published batch, so the source scans
+    /// wait for the first query results.
     fn maybeQueueReviewSourceScan(self: *Presentation, published: *Published) void {
         const state = &published.review_search;
-        if (!state.open or state.pending or state.query == null or state.source_scan_active) return;
+        if (!state.open or state.pending or state.query == null or state.batch == null or state.source_scan_active) return;
         const scans = state.source_scans orelse return;
         for ([_]SourceScan{ .awaiting_retry, .unscanned }) |due| for (scans, 0..) |scan, index| {
             if (scan != due or !published.session.enrichment.isTerminal(index)) continue;
