@@ -50,6 +50,18 @@ class TaskSpawnCheckTest(unittest.TestCase):
         ))
         self.assertEqual(self.check(text), [])
 
+    def test_a_select_spawn_through_a_receiver_that_is_not_the_wrapper_is_rejected(self):
+        text = "\n".join((
+            'const bbr = @import("bbr");',
+            "fn start(self: *Client) void {",
+            "    _ = self.diagnostics.selectConcurrent(&select, .page, fetch, .{});",
+            "    _ = bbr.diagnostics.selectConcurrent(&select, .page, fetch, .{});",
+            "}",
+        ))
+        found = self.check(text)
+        self.assertEqual(len(found), 1)
+        self.assertIn("src/bitbucket/client.zig:3: starts a task with `.selectConcurrent(`", found[0])
+
     def test_the_owner_test_blocks_strings_and_comments_are_allowed(self):
         self.assertEqual(self.check("    return io.concurrent(function, args);\n", "src/diagnostics.zig"), [])
         text = "\n".join((

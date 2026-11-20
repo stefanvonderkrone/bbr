@@ -18,7 +18,7 @@ from check_diagnostics import joined, production
 from source_lines import zig_files
 
 # A call chain can break across lines before each `.`, and zig fmt keeps the break.
-SPAWN = re.compile(r"\.\s*(concurrent|async)\s*\(")
+SPAWN = re.compile(r"\.\s*(concurrent|selectConcurrent|async)\s*\(")
 RECEIVER = re.compile(r"(?<!\w)[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*\s*$")
 OWNER = Path("src/diagnostics.zig")
 # Zig rejects a local that shadows a top-level name, so a top-level declaration names the
@@ -57,7 +57,7 @@ def violations(root):
         allowed = wrappers(literal_lines)
         text, line_of = joined(production(lines))
         for match in SPAWN.finditer(text):
-            if match[1] == "concurrent" and receiver(text[:match.start()]) in allowed:
+            if match[1] in ("concurrent", "selectConcurrent") and receiver(text[:match.start()]) in allowed:
                 continue
             yield f"{path}:{line_of(match.start(1))}: starts a task with `.{match[1]}(`. {FIX}"
 
