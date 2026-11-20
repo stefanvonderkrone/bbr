@@ -1,16 +1,12 @@
 """Regression checks for the agent-document validator."""
 
 from pathlib import Path
-import importlib.util
+import sys
 import tempfile
 import unittest
 
-
-spec = importlib.util.spec_from_file_location(
-    "check_agent_docs", Path(__file__).resolve().parents[1] / "tools/check_agent_docs.py"
-)
-checker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(checker)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import check_agent_docs as checker
 
 
 class AgentDocsTest(unittest.TestCase):
@@ -141,6 +137,57 @@ class AgentDocsTest(unittest.TestCase):
         errors = "\n".join(checker.check(self.root))
         self.assertIn("docs/adr/017-second.md: ADR number 017 is also used by 0017-first.md", errors)
 
+
+    def test_the_old_source_scan_return_type_claim_is_rejected(self):
+        self.write("docs/rules/tui-state.md", "## Review Search source scan failures\n\n"
+                   "Enforcement: `ScanReviewSource.create` returns no error union, so a fallible step in it does not compile. "
+                   "The tests \"M21 kernel Review Search scans a File again after its source scan fails\" in "
+                   "`src/tui/presentation.zig`, run by `zig build test`.\n")
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("lines 3: 1 Enforcement sentences claim a compile error without a mechanism", errors)
+        self.assertIn("Name the `comptime` assertion", errors)
+
+    def test_the_old_session_const_claim_is_rejected(self):
+        self.write("docs/rules/tui-state.md", "## Published Session content\n\n"
+                   "Enforcement: the `const` types of the Session fields in `src/tui/session.zig` (compile error). "
+                   "These are `[]const File`, `[]const Hunk`, and `[]const Line`.\n")
+        self.assertTrue(any("claim a compile error without a mechanism" in e for e in checker.check(self.root)))
+
+    def test_compile_claims_with_a_mechanism_pass(self):
+        self.write("docs/rules/tui-paint.md", "## Rules\n\n"
+                   "Enforcement: the exhaustive switch in `view.walk` (compile error).\n\n"
+                   "Enforcement: the `comptime` block after `theme.value`. Its compile error names the Theme.\n\n"
+                   "Enforcement: the `@compileError` calls of the `flag_sets` block give a compile error.\n\n"
+                   "Enforcement: `tests/read_only_test.py` compiles a write and expects that it does not compile.\n")
+        self.assertEqual(checker.check(self.root), [])
+
+    def test_a_fenced_example_is_not_an_enforcement_paragraph(self):
+        self.write("docs/rules/tui-state.md", "## Rules\n\n```markdown\n"
+                   "Enforcement: `Thing` has no field (compile error).\n```\n")
+        self.assertEqual(checker.check(self.root), [])
+
+    def test_a_claim_on_a_continuation_line_is_rejected_at_its_line(self):
+        self.write("docs/rules/tui-state.md", "## Rules\n\n"
+                   "Enforcement: the test \"x\" in `src/tui/session.zig`.\n"
+                   "`Thing` has no field (compile error).\n")
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("lines 4: 1 Enforcement sentences claim a compile error without a mechanism", errors)
+
+    def test_a_mechanism_on_a_continuation_line_passes(self):
+        self.write("docs/rules/tui-state.md", "## Rules\n\n"
+                   "Enforcement: `Thing` gives a compile error through the\n"
+                   "`comptime` block after `theme.value`.\n")
+        self.assertEqual(checker.check(self.root), [])
+
+    def test_the_baseline_allows_its_count_and_no_more(self):
+        claim = "Enforcement: `Thing` has no field (compile error).\n\n"
+        self.write("tools/compile_claim_baseline.txt", "# header\n1 docs/rules/tui-state.md\n")
+        self.write("docs/rules/tui-state.md", claim)
+        self.assertEqual(checker.check(self.root), [])
+        self.write("docs/rules/tui-state.md", claim * 2)
+        self.assertTrue(any("allows 1" in e for e in checker.check(self.root)))
+        self.write("docs/rules/tui-state.md", "Enforcement: the test \"x\".\n")
+        self.assertTrue(any("Lower its count" in e for e in checker.check(self.root)))
 
 if __name__ == "__main__":
     unittest.main()
