@@ -35333,7 +35333,7 @@ test "M21 kernel Review Search starts no source scan before its first query publ
     }
 }
 
-test "M21 kernel Review Search rolls back a reopened query whose scan cannot queue" {
+test "M21 kernel Review Search retries a reopened query scan that cannot queue at the next event" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
@@ -35342,23 +35342,37 @@ test "M21 kernel Review Search rolls back a reopened query whose scan cannot que
     try runTestUntilSourceScanWaits(&presentation, 0);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
-    // The query scan of the reopen cannot queue, because the full queue cannot grow.
-    presentation.commands.clearAndFree(presentation.allocator);
-    failing.fail_index = failing.alloc_index;
-    try presentation.dispatch(.{ .action = .open_review_search });
-    failing.fail_index = std.math.maxInt(usize);
-    const view = presentation.projection();
-    try testing.expectEqual(ActionError.out_of_memory, view.action_error.?);
-    try testing.expectEqualStrings("new", view.review_search.?.query);
-    try testing.expect(!view.review_search.?.pending);
-    try testing.expectEqual(@as(usize, 2), view.review_search.?.occurrences.len);
-    var records: usize = 0;
-    while (presentation.takeCommand()) |next| {
-        var queued = next;
-        defer queued.deinit();
-        if (queued == .report_diagnostic) records += 1;
+    const inputs = [_]OwnedInput{ .{ .action = .open_review_search }, .ensure_focused_enrichment };
+    for (inputs) |input| {
+        // The query scan cannot queue, because the full queue cannot grow.
+        presentation.commands.clearAndFree(presentation.allocator);
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(input);
+        failing.fail_index = std.math.maxInt(usize);
+        const view = presentation.projection();
+        try testing.expectEqual(ActionError.out_of_memory, view.action_error.?);
+        try testing.expectEqualStrings("newe", view.review_search.?.query);
+        try testing.expect(view.review_search.?.pending);
+        try testing.expectEqual(@as(usize, 2), presentation.published.?.review_search.batch.?.occurrences.len);
+        try testing.expect(presentation.queued_source_scan == null);
+        var records: usize = 0;
+        while (presentation.takeCommand()) |next| {
+            var queued = next;
+            defer queued.deinit();
+            switch (queued) {
+                .report_diagnostic => records += 1,
+                .scan_buffer_search, .scan_review_source => return error.UnexpectedScan,
+                else => {},
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), records);
     }
-    try testing.expectEqual(@as(usize, 1), records);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try completeBufferSearchScan(&presentation);
+    const view = presentation.projection();
+    try testing.expectEqualStrings("newe", view.review_search.?.query);
+    try testing.expect(!view.review_search.?.pending);
+    try testing.expect(view.action_error == null);
 }
 
 test "M21 kernel Review Search starts no source scan while a query edit is pending" {
