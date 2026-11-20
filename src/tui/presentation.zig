@@ -6802,10 +6802,7 @@ pub const Presentation = struct {
             .ensure_focused_enrichment => {
                 // The App dispatches this after each event, so a failed
                 // retry waits for the next event.
-                if (self.published) |published| {
-                    const state = &published.review_search;
-                    if (state.open and state.pending and state.needs_scan) self.retryReviewSearchQuery(published);
-                }
+                self.retryReviewSearchQuery();
                 try self.ensureFocusedEnrichment();
             },
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
@@ -8625,16 +8622,22 @@ pub const Presentation = struct {
         published.navigation.count = 0;
         self.action_error = null;
         if (state.needs_scan) {
-            self.retryReviewSearchQuery(published);
-            // A query scan that cannot queue keeps `needs_scan`, and the
-            // next event retries it.
+            const text = (state.query orelse unreachable).query.text;
+            self.replaceReviewSearchQuery(text);
+            // The query must not show over the results of another query
+            // without the pending mark, also when its scan cannot queue.
             state.pending = true;
         }
         published.frame_revision += 1;
     }
 
-    fn retryReviewSearchQuery(self: *Presentation, published: *Published) void {
-        self.replaceReviewSearchQuery((published.review_search.query orelse unreachable).query.text);
+    /// A reopened query whose scan could not queue stays pending with
+    /// `needs_scan`.
+    fn retryReviewSearchQuery(self: *Presentation) void {
+        const published = self.published orelse return;
+        const state = &published.review_search;
+        if (!state.open or !state.pending or !state.needs_scan) return;
+        self.replaceReviewSearchQuery((state.query orelse unreachable).query.text);
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
@@ -35384,6 +35387,7 @@ test "M21 kernel Review Search retries a reopened query scan that cannot queue a
     try testing.expectEqualStrings("newe", view.review_search.?.query);
     try testing.expect(!view.review_search.?.pending);
     try testing.expect(view.action_error == null);
+    try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
 }
 
 test "M21 kernel Review Search starts no source scan while a query edit is pending" {
