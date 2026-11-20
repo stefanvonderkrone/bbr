@@ -8847,7 +8847,12 @@ pub const Presentation = struct {
             if (scan != due or !published.session.enrichment.isTerminal(index)) continue;
             std.debug.assert(self.queued_source_scan == null);
             self.queued_source_scan = ScanReviewSource.create(published, index);
-            self.releaseReviewSearchHold(published, index);
+            // The lease of the scan keeps the File, so the hold release frees
+            // nothing that a cache build must stage.
+            if (state.held) |held| if (held[index]) {
+                published.session.enrichment.finishLeaseDeferred(index);
+                held[index] = false;
+            };
             scans[index] = if (due == .unscanned) .scanning else .retrying;
             state.source_scan_active = true;
             return;
@@ -8875,13 +8880,6 @@ pub const Presentation = struct {
         };
         self.releaseReviewSearchHolds(published);
         self.action_error = .buffer_search_scan_failed;
-    }
-
-    fn releaseReviewSearchHold(self: *Presentation, published: *Published, file_index: usize) void {
-        const held = published.review_search.held orelse return;
-        if (!held[file_index]) return;
-        self.finishSearchLease(published, file_index);
-        held[file_index] = false;
     }
 
     fn finishSearchLease(self: *Presentation, published: *Published, file_index: usize) void {
