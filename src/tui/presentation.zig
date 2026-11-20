@@ -8619,6 +8619,8 @@ pub const Presentation = struct {
         if (state.needs_scan) {
             const text = (state.query orelse unreachable).query.text;
             self.replaceReviewSearchQuery(text);
+            // A scan that cannot queue leaves the query without its results.
+            if (!state.pending) self.rollbackReviewSearchQuery(published);
         }
         published.frame_revision += 1;
     }
@@ -35356,6 +35358,24 @@ test "M21 kernel Review Search rolls back a reopened query whose scan cannot que
         if (queued == .report_diagnostic) records += 1;
     }
     try testing.expectEqual(@as(usize, 1), records);
+}
+
+test "M21 kernel Review Search starts no source scan while a query edit is pending" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    var in_flight = presentation.takeCommand() orelse return error.MissingSourceScan;
+    const completed = executeReviewSourceScan(testing.allocator, &in_flight.scan_review_source);
+    in_flight.deinit();
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .review_source_scanned = completed });
+    try testing.expect(presentation.projection().review_search.?.pending);
+    if (presentation.queued_source_scan) |scan| {
+        std.debug.print("File {d} starts a source scan into the results of the previous query\n", .{scan.file_index});
+        return error.StaleSourceScan;
+    }
 }
 
 test "M21 kernel Review Search starts its source scans after first query results without a match" {
