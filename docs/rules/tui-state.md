@@ -238,3 +238,53 @@ The identity of a gap Line is its File, side, and line number.
 A `*const bbr.diff.Line` field that holds a gap Line is valid only beside the rows of its own Frame, such as `VisualHalf.line` and `YankCandidates`.
 
 Enforcement: the `LineOwner` type of `RowOwner.line` and `SurvivingRow.line` (compile error for a Line pointer). The `M21 kernel` Whole File gap Line tests in `src/tui/presentation.zig`, run by `zig build test`. The test "M21 kernel no Line row identity of a Whole File Frame holds a gap Line pointer" fails when a visual row owner holds a gap Line in `.hunk_line`.
+
+## Coalesced Buffer builds
+
+A Buffer build that a background stream requests has at most one queued build of its kind, so a stream never costs one full Buffer build for each item.
+The streams are File Enrichment results and Review Search lease and hold releases.
+A new request joins the queued build and keeps its place.
+`takeCommand` gives the build a new snapshot through `refreshQueuedBuild`.
+One exception exists.
+`takeCommand` gives the queued Review Search source scan before a cache update at the front of the queue while `Storage.cachePressure` is not `far_over_budget`.
+Far over the budget means that the inactive Files exceed the budget by more than the larger of the budget and the floor.
+The floor is `Storage.far_over_budget_floor` (4 MiB).
+After each File of the Review was admitted once, the floor is at most an eighth of the bytes of the Review.
+Storage keeps the bytes of each File from its last admission, also after an eviction.
+So while the scans run, the inactive bytes stay at or below the budget plus that excess, plus one File.
+Each cache update frees more than the excess. So the scans cost at most one full Buffer build for each excess that they release, plus one for each stop.
+The floor keeps a budget smaller than one File from costing a build for each released File.
+The eighth of the Review lets a small Review evict while the scans run, with about eight cache updates for each pass.
+Before Storage knows the bytes of every File, it cannot tell a small Review from a large one, so the floor stays at 4 MiB.
+When the scans stop, the cache update reaches the front and brings the cache within the budget.
+
+Enforcement: the exhaustive switch in `refreshQueuedBuild` in `src/tui/presentation.zig` names every `DisclosureBuild.Kind`, so a new kind needs a decision about its snapshot at take (compile error). The build-counting and eviction tests of Review Search in `src/tui/presentation.zig` and the cache pressure test in `src/tui/file_enrichment.zig`, run by `zig build test`.
+
+## Published Frame snapshots
+
+A Buffer build retains the current search Batches only so that acceptance can tell whether the build is still current.
+The accepted build stays alive as `Published.worker_frame`, because its arena holds the Buffer.
+`acceptBufferDisclosure` releases its snapshots when it becomes the published Frame.
+A later scan can replace the Batch of a snapshot. A snapshot in the Frame then keeps the replaced Batch alive, and a Review Search Batch can hold gigabytes.
+
+Enforcement: the test "M21 kernel a Buffer build during Review Search keeps no replaced Batch after the Overlay closes" in `src/tui/presentation.zig`, run by `zig build test`.
+
+## Review Search Preview hold
+
+The File that the Review Search Preview shows has a hold, so a cache update never evicts the content on screen.
+`holdReviewSearchPreview` runs at the end of each dispatch. It gets the held File from `ReviewSearchState.previewSource`, which the Preview projection also reads.
+It acquires the File again when a cache update evicted it before the selection reached it.
+`Published.releaseReviewSearchHolds` releases the hold with the scan holds.
+
+Enforcement: the test "M21 kernel the Review Search Preview keeps its File content while cache updates evict" in `src/tui/presentation.zig`, run by `zig build test`.
+
+## Review Search scan hold
+
+A Review Search scan hold exists only while a source scan of its File is due.
+A scan is due while the `SourceScan` of the File is `unscanned`, or `awaiting_retry` after a first failed scan.
+The start of the source scan of a File releases its scan hold, and the lease of the queued or running scan keeps the File.
+A `scanned` or `given_up` File gets no scan hold until the results of a new query, or a reopened Overlay, start the source scans again.
+`ReviewSearchState.needsScanHold` makes this decision for every site that adds a scan hold: admission through `reviewSearchHolds`, and opening or a query change through `holdReviewSearchFiles`.
+Otherwise a scanned File that the Preview acquires again, or that the Overlay holds again when it opens, keeps a hold that no scan releases, and the cache budget no longer covers it.
+
+Enforcement: the tests "M21 kernel a scanned File that the Review Search Preview acquires again is evictable after the selection leaves it" and "M21 kernel reopening Review Search holds no File that its query already scanned" in `src/tui/presentation.zig`, run by `zig build test`. [The coding standard](../../CODING_STANDARDS.md#every-scan-hold-site-asks-needsscanhold) covers a new site that adds a scan hold.
