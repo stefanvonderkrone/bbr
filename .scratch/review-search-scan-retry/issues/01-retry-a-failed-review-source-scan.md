@@ -101,3 +101,9 @@ Rollback of a reopened query. When the reopen cannot queue the query scan, `open
 The failed cache staging in the focus check that ends bbr is a separate effort: [01-keep-the-session-after-a-failed-focus-check-staging.md](../../focus-check-staging-failure/issues/01-keep-the-session-after-a-failed-focus-check-staging.md).
 
 Commits: `1730bf39` (red), `5914bf57`.
+
+Follow-up, round 7. The user rejected the rollback of round 6, because the typed text left the input without a user action.
+
+Retry of a reopened query. When the reopen cannot queue the query scan, the edited query stays in the input and the Overlay stays pending over the results of the previous query, as during a query edit. `needs_scan` stays set. The `ensure_focused_enrichment` input, which the App dispatches after each event while a Review shows, queues the query scan again when the open Overlay is pending with `needs_scan`. A lasting `OutOfMemory` retries only once per event, and each failed attempt records one failure and shows the out-of-memory message. `rollback_query` stays set while the query is pending, so `currentQueryResultsPublished` starts no source scan. The test "M21 kernel Review Search retries a reopened query scan that cannot queue at the next event" replaces the rollback test of round 6. The test "M21 kernel Review Search starts no source scan while a query edit is pending" stays.
+
+Commits: `2c464d66` (red) and the fix on top of it.

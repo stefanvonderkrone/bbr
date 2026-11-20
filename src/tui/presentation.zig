@@ -6799,7 +6799,15 @@ pub const Presentation = struct {
             .unknown_resolution => |resolution_input| self.applyUnknownResolutionInput(resolution_input),
             .reanchor => |reanchor_input| self.applyReanchorInput(reanchor_input),
             .delete_confirmation => |confirmation_input| self.applyDeleteConfirmationInput(confirmation_input),
-            .ensure_focused_enrichment => try self.ensureFocusedEnrichment(),
+            .ensure_focused_enrichment => {
+                // The App dispatches this after each event, so a failed
+                // retry waits for the next event.
+                if (self.published) |published| {
+                    const state = &published.review_search;
+                    if (state.open and state.pending and state.needs_scan) self.retryReviewSearchQuery(published);
+                }
+                try self.ensureFocusedEnrichment();
+            },
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
             .code_highlight_completed => |completed| self.acceptCodeHighlight(completed),
             .post_draft_completed => |completed| self.acceptPostDraft(completed),
@@ -8617,13 +8625,16 @@ pub const Presentation = struct {
         published.navigation.count = 0;
         self.action_error = null;
         if (state.needs_scan) {
-            const text = (state.query orelse unreachable).query.text;
-            self.replaceReviewSearchQuery(text);
-            // `pending` stays false when the query scan cannot queue. The
-            // rollback shows the query of the shown results.
-            if (!state.pending) self.rollbackReviewSearchQuery(published);
+            self.retryReviewSearchQuery(published);
+            // A query scan that cannot queue keeps `needs_scan`, and the
+            // next event retries it.
+            state.pending = true;
         }
         published.frame_revision += 1;
+    }
+
+    fn retryReviewSearchQuery(self: *Presentation, published: *Published) void {
+        self.replaceReviewSearchQuery((published.review_search.query orelse unreachable).query.text);
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
