@@ -1605,6 +1605,7 @@ test {
     _ = @import("list_overlay.zig");
     _ = @import("theme_id.zig");
     _ = @import("session.zig");
+    _ = @import("read_only.zig");
     _ = @import("arena_ring.zig");
     _ = @import("composer.zig");
     _ = @import("file_enrichment.zig");
