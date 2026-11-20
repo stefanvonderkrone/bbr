@@ -1589,8 +1589,10 @@ fn reviewerVerdictLabel(verdict: ?bbr.bitbucket.ReviewerVerdict) []const u8 {
 // Force the presentation modules' tests into the exe test binary.
 test {
     _ = @import("cell_metrics.zig");
+    _ = @import("terminal_cell_metrics.zig");
     _ = @import("buffer.zig");
     _ = @import("frame.zig");
+    _ = @import("key_lists.zig");
     _ = @import("view.zig");
     _ = @import("layouts.zig");
     _ = @import("view_paint.zig");
@@ -1603,6 +1605,7 @@ test {
     _ = @import("list_overlay.zig");
     _ = @import("theme_id.zig");
     _ = @import("session.zig");
+    _ = @import("read_only.zig");
     _ = @import("arena_ring.zig");
     _ = @import("composer.zig");
     _ = @import("file_enrichment.zig");

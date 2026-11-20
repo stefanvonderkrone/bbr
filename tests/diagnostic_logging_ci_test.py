@@ -34,6 +34,7 @@ def verify(phase):
         def toggle(label, expected=None):
             control("keys", "C-p")
             control("text", "Toggle diagnostic logging")
+            control("wait", "Enable or disable private error records")
             selection = control("capture", label + "-command")
             assert "Toggle diagnostic logging" in selection, selection
             assert "no matching commands" not in selection, selection
