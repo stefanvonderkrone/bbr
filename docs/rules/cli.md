@@ -32,7 +32,7 @@ A `bbr api` verb is one row of `verbs` in `src/api/cli.zig`. The row names its `
 
 The help usage shows exactly the flags of the row. `skills/bbr/VERBS.md` has one bullet for each verb.
 
-Enforcement: the `flag_sets` block in `src/api/cli.zig` gives a compile error for a global flag in a row, for a repeated flag, and for a flag that takes a value in one row and is a switch in another. The tests "every verb's help usage shows exactly the flags of its row" and "skills/bbr/VERBS.md lists every bbr api verb once" in `src/api/cli.zig`, run by `zig build test`.
+Enforcement: the `@compileError` calls of the `flag_sets` block in `src/api/cli.zig` give a compile error for a global flag in a row, for a repeated flag, and for a flag that takes a value in one row and is a switch in another. The tests "every verb's help usage shows exactly the flags of its row" and "skills/bbr/VERBS.md lists every bbr api verb once" in `src/api/cli.zig`, run by `zig build test`.
 
 ## Concurrency default in the help
 
