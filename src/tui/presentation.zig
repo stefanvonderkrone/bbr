@@ -8952,8 +8952,8 @@ pub const Presentation = struct {
         if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
         self.queueCacheBuild(published, focused) catch |err| {
             self.reportFailure(.buffer_build, .prepare, err, @src());
-            // A later `finishSearchLease` or `releaseReviewSearchHolds` stages
-            // again, so this failure does not replace the shown outcome.
+            // The focus check after the event stages again, so this failure
+            // does not replace the shown outcome.
             if (self.action_error == null) self.action_error = .out_of_memory;
         };
     }
@@ -35135,12 +35135,14 @@ test "M21 kernel Review Search shows its scan failure when the cache build of th
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .inactive_file_cache_max_bytes = 1 });
+    // File 11 is outside the focus of the first Files on screen.
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 12, .{ .inactive_file_cache_max_bytes = 1 });
     defer presentation.deinit();
-    try runTestUntilSourceScanWaits(&presentation, 1);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try runTestUntilSourceScanWaits(&presentation, 11);
     try presentation.dispatch(.{ .review_source_scanned = try failNextTestSourceScan(&presentation) });
     const second = try failNextTestSourceScan(&presentation);
-    try testing.expectEqual(@as(usize, 1), second.file_index);
+    try testing.expectEqual(@as(usize, 11), second.file_index);
     // A cache build cannot stage, because the full queue cannot grow.
     try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
     presentation.commands.clearAndFree(presentation.allocator);
@@ -35148,6 +35150,12 @@ test "M21 kernel Review Search shows its scan failure when the cache build of th
     try presentation.dispatch(.{ .review_source_scanned = second });
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+    const epoch = presentation.published.?.epoch;
+    try testing.expect(presentation.queuedBuildIndex(.cache_update, epoch) == null);
+    // No lease release follows the stopped pass. The focus check that the
+    // event loop runs after each event stages the cache build.
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expect(presentation.queuedBuildIndex(.cache_update, epoch) != null);
 }
 
 test "M21 kernel Review Search keeps the given-up Files of a query edit that rolls back" {

@@ -144,9 +144,11 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 ### A cache staging failure keeps the shown message
 
 A lease release that cannot stage its cache build records the cause and shows `out_of_memory` only when no message shows.
-A later lease release through `finishSearchLease` or `releaseReviewSearchHolds` stages again, so the failure loses no work, and the message of the event outcome stays, such as `buffer_search_scan_failed` after a second failed source scan.
+The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows, and `ensureFocusedEnrichment` stages the cache build again while the cache is over the budget.
+So the failure loses no work, also when no lease release follows, such as after a second failed source scan stops the pass.
+The message of the event outcome stays, such as `buffer_search_scan_failed`.
 
-No check: the test "M21 kernel Review Search shows its scan failure when the cache build of the released File cannot stage" covers only `stageReleasedSearchLeases`. A new site that stages a cache build and sets `action_error` passes every check. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+No check: the test "M21 kernel Review Search shows its scan failure when the cache build of the released File cannot stage" covers only `stageReleasedSearchLeases`, and it dispatches `ensure_focused_enrichment` itself. A new site that stages a cache build and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
 ### Make Line row identities through LineOwner.of
 
