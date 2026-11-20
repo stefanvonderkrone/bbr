@@ -34771,6 +34771,46 @@ test "M21 kernel Review Search resumes the retry of a query edit that rolls back
     return error.MissingSourceScan;
 }
 
+test "M21 kernel Review Search starts a source scan without superseding a cache build in flight" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    while (!published.session.enrichment.isTerminal(0) or !published.session.enrichment.isTerminal(1)) {
+        var command = presentation.takeCommand() orelse return error.MissingEnrichment;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+            },
+            else => command.deinit(),
+        }
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command == .build_buffer_disclosure) {
+            command.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+        } else command.deinit();
+    }
+    // A cache build runs on the worker when Review Search opens again.
+    const in_flight = published.cache_update_generation;
+    published.pending_cache_update = in_flight;
+    published.pending_cache_focus = published.session.enrichment.focused;
+    defer published.pending_cache_update = null;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try testing.expect(presentation.queued_source_scan != null);
+    try testing.expectEqual(in_flight, published.cache_update_generation);
+}
+
 test "M21 kernel Review Search admits an enrichment with the hold that its build counted" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
