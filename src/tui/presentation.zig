@@ -8849,8 +8849,8 @@ pub const Presentation = struct {
             if (scan != due or !published.session.enrichment.isTerminal(index)) continue;
             std.debug.assert(self.queued_source_scan == null);
             self.queued_source_scan = ScanReviewSource.create(published, index);
-            // The lease of the scan keeps the File, so the hold release frees
-            // nothing that a cache build must stage.
+            // The lease of the scan keeps the File, so no cache build must
+            // stage.
             if (state.held) |held| if (held[index]) {
                 published.session.enrichment.finishLeaseDeferred(index);
                 held[index] = false;
@@ -8900,8 +8900,8 @@ pub const Presentation = struct {
         if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
         self.queueCacheBuild(published, focused) catch |err| {
             self.reportFailure(.buffer_build, .prepare, err, @src());
-            // The next lease release stages again, so this failure does not
-            // replace the outcome that the event shows.
+            // A later `finishSearchLease` or `releaseReviewSearchHolds` stages
+            // again, so this failure does not replace the shown outcome.
             if (self.action_error == null) self.action_error = .out_of_memory;
         };
     }
@@ -34801,7 +34801,7 @@ test "M21 kernel Review Search starts a source scan without superseding a cache 
             try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
         } else command.deinit();
     }
-    // A cache build runs on the worker when Review Search opens again.
+    // A pending update without a queued command stands for a cache build on the worker.
     const in_flight = published.cache_update_generation;
     published.pending_cache_update = in_flight;
     published.pending_cache_focus = published.session.enrichment.focused;
@@ -34849,6 +34849,37 @@ test "M21 kernel Review Search starts no source scan before its first query publ
             return error.UnpublishedSourceScan;
         }
     }
+}
+
+test "M21 kernel Review Search starts its source scans after first query results without a match" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 2) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            else => command.deinit(),
+        }
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'q', .text = "qqqq" } });
+    try completeBufferSearchScan(&presentation);
+    try testing.expectEqual(@as(usize, 0), presentation.published.?.review_search.batch.?.occurrences.len);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        defer queued.deinit();
+        if (queued == .scan_review_source) return;
+    }
+    return error.MissingSourceScan;
 }
 
 test "M21 kernel Review Search admits an enrichment with the hold that its build counted" {

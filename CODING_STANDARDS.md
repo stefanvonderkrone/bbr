@@ -144,7 +144,7 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 ### A cache staging failure keeps the shown message
 
 A lease release that cannot stage its cache build records the cause and shows `out_of_memory` only when no message shows.
-The next lease release stages again, so the failure loses no work, and the message of the event outcome stays, such as `buffer_search_scan_failed` after a second failed source scan.
+A later lease release through `finishSearchLease` or `releaseReviewSearchHolds` stages again, so the failure loses no work, and the message of the event outcome stays, such as `buffer_search_scan_failed` after a second failed source scan.
 
 No check: the test "M21 kernel Review Search shows its scan failure when the cache build of the released File cannot stage" covers only `stageReleasedSearchLeases`. A new site that stages a cache build and sets `action_error` passes every check. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
