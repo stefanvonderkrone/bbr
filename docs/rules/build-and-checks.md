@@ -49,6 +49,7 @@ Enforcement: `CheckersTest` in `tests/source_lines_test.py`, run by `zig build t
 
 An Enforcement sentence in `docs/rules/` that claims a compile error names a mechanism that fails on the violation: a `comptime` assertion, an exhaustive switch, a `@compileError`, or a `tests/*_test.py` or `tests/*_test.sh` that compiles the violation.
 A sentence that starts with "Its" or "Their" continues the sentence before it.
+The check reads each whole Enforcement paragraph, up to the next blank line, and skips fenced examples.
 A type that only lacks a way to write, such as a `const` pointer, a missing field, or a return type without an error union, is not such a mechanism, because a cast, a new field, or a `catch` compiles.
 
 Enforcement: `tools/check_agent_docs.py` counts the sentences without a mechanism in each area doc and fails when a count differs from `tools/compile_claim_baseline.txt`. CI runs the check. The tests in `tests/check_agent_docs_test.py`, run by `zig build test`, reject the old return type claim of `ScanReviewSource.create` and the old `const` claim of the Session fields. The check reads the name of a mechanism, not what the mechanism fails on.

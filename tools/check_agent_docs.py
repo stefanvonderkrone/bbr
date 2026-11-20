@@ -27,24 +27,46 @@ SENTENCE_END = re.compile(r"(?<=[.)])\s+(?=[A-Z`\"])")
 def unbacked_compile_claims(text):
     """The line of each Enforcement sentence that claims a compile error and names no mechanism that fails."""
     lines = []
-    for number, line in enumerate(text.splitlines(), 1):
-        if not line.startswith("Enforcement:"):
-            continue
+    for paragraph in enforcement_paragraphs(text):
+        starts, joined = [], ""
+        for number, line in paragraph:
+            starts.append((len(joined), number))
+            joined += line.strip() + " "
         sentences = []
-        for sentence in SENTENCE_END.split(line):
+        begin = 0
+        for boundary in [*SENTENCE_END.finditer(joined), None]:
+            end = boundary.start() if boundary else len(joined)
+            sentence = joined[begin:end]
             # "Its compile error ..." continues the sentence that names the mechanism.
             if sentences and re.match(r"(?:Its|Their) ", sentence):
-                sentences[-1] += " " + sentence
+                sentences[-1][1] += " " + sentence
             else:
-                sentences.append(sentence)
-        for sentence in sentences:
+                sentences.append([begin, sentence])
+            begin = boundary.end() if boundary else end
+        for offset, sentence in sentences:
             if COMPILE_CLAIM.search(sentence) and not COMPILE_MECHANISM.search(sentence):
-                lines.append(number)
+                lines.append(max(number for start, number in starts if start <= offset))
     return lines
 
 
-def prose(text):
-    """Exclude fenced examples and inline code from link checks."""
+def enforcement_paragraphs(text):
+    """Each Enforcement paragraph outside fenced examples, as its numbered lines."""
+    paragraph = None
+    for number, line in enumerate(prose(text, inline_code=True), 1):
+        if not line.strip():
+            if paragraph:
+                yield paragraph
+            paragraph = None
+        elif paragraph is not None:
+            paragraph.append((number, line))
+        elif line.startswith("Enforcement:"):
+            paragraph = [(number, line)]
+    if paragraph:
+        yield paragraph
+
+
+def prose(text, inline_code=False):
+    """Exclude fenced examples, and inline code unless inline_code, from Markdown text."""
     fence = None
     for line in text.splitlines():
         match = re.match(r"^\s*(`{3,}|~{3,})", line)
@@ -56,7 +78,7 @@ def prose(text):
                 fence = None
             yield ""
         elif fence is None:
-            yield re.sub(r"(`+).*?\1", "", line)
+            yield line if inline_code else re.sub(r"(`+).*?\1", "", line)
         else:
             yield ""
 
