@@ -1616,8 +1616,8 @@ test "mention labels and filtered emoji paint in Review Search previews" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var names: @import("review_body.zig").MentionNames = .empty;
-    try names.put(a, "id", "@Ada");
+    const review_body = @import("review_body.zig");
+    const names = try review_body.MentionNames.init(&[_]review_body.MentionName{.{ "id", "@Ada" }}, a);
     const raw = "@{id} :pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }";
     const ranges = [_]@import("search.zig").Range{.{ .start = 0, .end = 5 }};
     const result: presentation.ReviewSearchResult = .{
@@ -6394,7 +6394,7 @@ test "M29 overview a cut excerpt keeps whole graphemes and ends with … on a wi
         .threads = try bbr.review.buildThreads(a, &comments),
         .drafts = &.{},
         .scope_projections = &.{},
-        .mention_names = &.empty,
+        .mention_names = &.{},
         .authenticated_account_uuid = null,
         .cell_metrics = terminal_cell_metrics,
     });

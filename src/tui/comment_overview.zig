@@ -539,7 +539,7 @@ const Fixture = struct {
             .threads = threads,
             .drafts = self.drafts,
             .scope_projections = self.scope_projections,
-            .mention_names = &.empty,
+            .mention_names = &.{},
             .authenticated_account_uuid = self.account,
             .cell_metrics = .bytes,
         });
@@ -730,7 +730,7 @@ test "M29 overview the index lists the DiffPane ReviewCards with every disclosur
         .threads = threads,
         .drafts = &drafts,
         .scope_projections = &projections,
-        .mention_names = &.empty,
+        .mention_names = &.{},
         .authenticated_account_uuid = null,
         .cell_metrics = .bytes,
     });
