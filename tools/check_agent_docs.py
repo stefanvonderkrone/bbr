@@ -6,6 +6,9 @@ import re
 import sys
 from urllib.parse import unquote, urlsplit
 
+import count_baseline
+from source_lines import zig_files
+
 
 TRIAGE = {"needs-triage", "needs-info", "ready-for-agent", "ready-for-human", "wontfix"}
 RESOLVED = {"resolved", "done", "completed"}
@@ -14,13 +17,60 @@ TYPES = {"research", "prototype", "grilling", "task", "implementation"}
 FIELD = re.compile(r"^(?:\*\*)?([\w ]+):(?:\*\*)?\s*(.*?)\s*$")
 LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 REFERENCE = re.compile(r"^\s{0,3}\[(?!\^)[^\]\n]+\]:\s*(<[^>]+>|\S+)")
+AGENTS_MD_CAP = 5000
+COMPILE_CLAIM = re.compile(r"compile error|does not compile|do not compile|fails to compile")
+# A mechanism that fails on the violation, not a type that only lacks a way to write it.
+COMPILE_MECHANISM = re.compile(r"comptime|exhaustive switch|@compileError|tests/\w+_test\.(?:py|sh)")
+COMPILE_CLAIM_BASELINE = "tools/compile_claim_baseline.txt"
+SENTENCE_END = re.compile(r"(?<=[.)])\s+(?=[A-Z`\"])")
 QUOTED = re.compile(r'(?<!step )"([^"\n]+)"')
 ZIG_FILE = re.compile(r"in `([^`\n]+\.zig)`")
 CODE_SPAN = re.compile(r"`[^`\n]*`")
 
 
-def prose(text):
-    """Exclude fenced examples and inline code from link checks."""
+def unbacked_compile_claims(text):
+    """The line of each Enforcement sentence that claims a compile error and names no mechanism that fails."""
+    lines = []
+    for paragraph in enforcement_paragraphs(text):
+        starts, joined = [], ""
+        for number, line in paragraph:
+            starts.append((len(joined), number))
+            joined += line.strip() + " "
+        sentences = []
+        begin = 0
+        for boundary in [*SENTENCE_END.finditer(joined), None]:
+            end = boundary.start() if boundary else len(joined)
+            sentence = joined[begin:end]
+            # "Its compile error ..." continues the sentence that names the mechanism.
+            if sentences and re.match(r"(?:Its|Their) ", sentence):
+                sentences[-1][1] += " " + sentence
+            else:
+                sentences.append([begin, sentence])
+            begin = boundary.end() if boundary else end
+        for offset, sentence in sentences:
+            if COMPILE_CLAIM.search(sentence) and not COMPILE_MECHANISM.search(sentence):
+                lines.append(max(number for start, number in starts if start <= offset))
+    return lines
+
+
+def enforcement_paragraphs(text):
+    """Each Enforcement paragraph outside fenced examples, as its numbered lines."""
+    paragraph = None
+    for number, line in enumerate(prose(text, inline_code=True), 1):
+        if not line.strip():
+            if paragraph:
+                yield paragraph
+            paragraph = None
+        elif paragraph is not None:
+            paragraph.append((number, line))
+        elif line.startswith("Enforcement:"):
+            paragraph = [(number, line)]
+    if paragraph:
+        yield paragraph
+
+
+def prose(text, inline_code=False):
+    """Exclude fenced examples, and inline code unless inline_code, from Markdown text."""
     fence = None
     for line in text.splitlines():
         match = re.match(r"^\s*(`{3,}|~{3,})", line)
@@ -32,7 +82,7 @@ def prose(text):
                 fence = None
             yield ""
         elif fence is None:
-            yield re.sub(r"(`+).*?\1", "", line)
+            yield line if inline_code else re.sub(r"(`+).*?\1", "", line)
         else:
             yield ""
 
@@ -63,8 +113,48 @@ def check(root):
     def error(path, message):
         errors.append(f"{path.relative_to(root)}: {message}")
 
+    agents = root / "AGENTS.md"
+    if agents.is_file() and agents.stat().st_size > AGENTS_MD_CAP:
+        areas = ", ".join(str(path.relative_to(root)) for path in sorted(root.glob("docs/rules/*.md")))
+        error(agents, f"{agents.stat().st_size:,} bytes, above the cap of {AGENTS_MD_CAP:,}. "
+              "Every session loads AGENTS.md, so it holds only pointer lines. "
+              f"Put the rule in its area doc ({areas or 'docs/rules/'}) or, "
+              "when no check enforces it, in CODING_STANDARDS.md")
+
+    baseline = count_baseline.read(root / COMPILE_CLAIM_BASELINE)
+    for path in sorted(root.glob("docs/rules/*.md")):
+        name = str(path.relative_to(root))
+        claims = unbacked_compile_claims(path.read_text())
+        allowed = baseline.get(name, 0)
+        if len(claims) > allowed:
+            error(path, f"lines {', '.join(map(str, claims))}: {len(claims)} Enforcement sentences claim a compile error "
+                  f"without a mechanism that fails, and {COMPILE_CLAIM_BASELINE} allows {allowed}. "
+                  "A type that lacks a field, an error union, or a mutable pointer stops nothing that a catch, "
+                  "a new field, or a cast adds. Name the `comptime` assertion, the exhaustive switch, the @compileError, "
+                  "or the tests/*_test.py that compiles the violation, or name the behavior test that fails. "
+                  "See docs/agents/rule-areas.md#write-a-rule-section")
+        elif len(claims) < allowed:
+            error(path, f"{len(claims)} Enforcement sentences claim a compile error without a mechanism. "
+                  f"Lower its count in {COMPILE_CLAIM_BASELINE} to {len(claims)}")
+    for name in sorted(set(baseline) - {str(path.relative_to(root)) for path in root.glob("docs/rules/*.md")}):
+        error(root / COMPILE_CLAIM_BASELINE, f"{name} is not a rule area doc. Remove its line")
+
+    adrs = {}
+    for path in sorted(root.glob("docs/adr/*.md")):
+        number = re.match(r"(\d+)-", path.name)
+        if not number:
+            continue
+        key = int(number[1])
+        if key in adrs:
+            error(path, f"ADR number {number[1]} is also used by {adrs[key].name}. "
+                  "Give the newer ADR the next free number and update its links. "
+                  "This check only sees one tree, so two branches that add the same number "
+                  "fail only after the merge")
+        else:
+            adrs[key] = path
+
     documents = {root / "AGENTS.md", root / "GLOSSARY-MAP.md", root / "docs/code-navigation.md"}
-    for pattern in ("docs/agents/*.md", "src/**/GLOSSARY.md", "src/**/IMPLEMENTATION.md",
+    for pattern in ("docs/agents/*.md", "docs/rules/*.md", "CODING_STANDARDS.md", "src/**/GLOSSARY.md", "src/**/IMPLEMENTATION.md",
                     ".scratch/**/*.md", ".agents/skills/**/*.md"):
         documents.update(root.glob(pattern))
     for path in sorted(documents):
@@ -88,25 +178,25 @@ def check(root):
                     if not destination.exists():
                         error(path, f"line {number}: broken link {target}")
 
-    agents = root / "AGENTS.md"
-    if agents.is_file():
-        for number, line in enumerate(agents.read_text().splitlines(), 1):
-            if not line.startswith("| "):
-                continue
-            enforcement = line.rstrip().rstrip("|").rsplit(" | ", 1)[-1]
+    for path in sorted(root.glob("docs/rules/*.md")):
+        for paragraph in enforcement_paragraphs(path.read_text()):
+            starts, enforcement = [], ""
+            for number, line in paragraph:
+                starts.append((len(enforcement), number))
+                enforcement += line.strip() + " "
             prose_only = CODE_SPAN.sub(lambda span: " " * len(span[0]), enforcement)
             for match in QUOTED.finditer(prose_only):
                 name = match[1]
+                number = max(line for start, line in starts if start <= match.start())
                 file = ZIG_FILE.search(enforcement, match.end()) or (
                     list(ZIG_FILE.finditer(enforcement, 0, match.start())) or [None])[-1]
                 if file is None:
-                    error(agents, f'line {number}: test "{name}" names no file. Add "in `<file>.zig`" to its Enforcement cell')
+                    error(path, f'line {number}: test "{name}" names no file. Add "in `<file>.zig`" to its Enforcement paragraph')
                     continue
-                source = root / file[1]
-                if not source.is_file():
-                    error(agents, f'line {number}: test "{name}" names the missing file {file[1]}')
-                elif f'test "{name}"' not in source.read_text():
-                    error(agents, f'line {number}: {file[1]} has no test "{name}"; cite the exact test name')
+                if not (root / file[1]).is_file():
+                    error(path, f'line {number}: test "{name}" names the missing file {file[1]}')
+                elif not any(f'test "{name}"' in line for _, lines in zig_files(root, (file[1],), literals=True) for line in lines):
+                    error(path, f'line {number}: {file[1]} has no test "{name}"; cite the exact test name')
 
     tickets = {}
     groups = {}

@@ -55,7 +55,7 @@ class ZigCodeWithoutLiteralsTest(unittest.TestCase):
 
 
 NO_ZIG_SOURCE = {
-    "check_agent_docs.py": "reads the Markdown agent documents, not Zig source",
+    "check_agent_docs.py": "reads the Markdown agent documents. It reads Zig source only through zig_files",
 }
 RAW_READS = ("read_text(", "read_bytes(", "open(", ".splitlines()")
 

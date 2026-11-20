@@ -1367,8 +1367,7 @@ test "both searches map mention labels and filtered emoji to complete authored t
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var names: review_body.MentionNames = .empty;
-    try names.put(a, "id", "@Stefan von der Krone");
+    const names = try review_body.MentionNames.init(&[_]review_body.MentionName{.{ "id", "@Stefan von der Krone" }}, a);
     const suffix = ":pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }";
     const raw = "π **@{id}** thanks " ++ suffix ++ " tail";
     const body = try review_body.ReviewBody.parseWithMentions(a, raw, &names);
