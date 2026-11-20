@@ -256,7 +256,7 @@ pub const BuildOptions = struct {
     emphasis_cache: ?*const EmphasisCache = null,
     /// A block without a plan here plans itself, as without plans.
     side_by_side_plans: ?*const SideBySidePlans = null,
-    mention_names: *const MentionNames = &.empty,
+    mention_names: *const MentionNames = &.{},
 };
 
 /// One SideBySide row of a change block. A pair row holds the emphasis of
@@ -1262,14 +1262,16 @@ pub const SearchCandidateInputs = struct {
     diff: model.Diff,
     threads: []const Thread,
     /// `key` reads the pointer, not the names. The Session loader sets
-    /// `Session.mention_names` once, and the pointer is `*const`, so a
-    /// published Session cannot change the names in place.
+    /// `Session.mention_names` once, and `read_only.assert` in
+    /// `session.zig` rejects a type that allows a write through it.
     mention_names: *const MentionNames,
     /// Names the Session. A published Session never changes its Diff, its
-    /// Threads, or its mention names: `[]const File`, `[]const Hunk`,
-    /// `[]const Line`, `*const Comment`, and `*const MentionNames` make an
-    /// in-place change a compile error. A change makes a new Session with a
-    /// new epoch through Refresh or Reconciliation.
+    /// Threads, or its mention names. `read_only.assert` in `session.zig`
+    /// makes a write through a pointer in those fields a compile error,
+    /// other than through `@constCast`. It does not stop a reassignment of
+    /// a field through a mutable `*Session`. A change
+    /// makes a new Session with a new epoch through Refresh or
+    /// Reconciliation.
     session_epoch: u64,
     layout: Layout,
     scope: SearchCandidateScope,
@@ -5188,7 +5190,7 @@ test "M21 kernel Buffer Candidates include hidden semantic content and one share
     const candidates = try buildSearchCandidates(allocator, .{
         .diff = diff,
         .threads = threads,
-        .mention_names = &.empty,
+        .mention_names = &.{},
         .session_epoch = 9,
         .layout = .side_by_side,
         .scope = .hunks,
@@ -5228,7 +5230,7 @@ test "M21 kernel Buffer Candidate corpus follows Layout Scope and File isolation
         const candidates = try buildSearchCandidates(allocator, .{
             .diff = diff,
             .threads = &.{},
-            .mention_names = &.empty,
+            .mention_names = &.{},
             .session_epoch = 1,
             .layout = layout,
             .scope = scope,
@@ -5266,7 +5268,7 @@ test "the search candidate key changes with each input that the candidates read"
     const base: SearchCandidateInputs = .{
         .diff = diff,
         .threads = &.{},
-        .mention_names = &.empty,
+        .mention_names = &.{},
         .session_epoch = 1,
         .layout = .unified,
         .scope = .{ .whole_file = .{ .selected_version = .new, .blobs = &blobs } },

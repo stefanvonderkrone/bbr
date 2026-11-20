@@ -15,7 +15,7 @@ After ticket 06, a build keeps an occurrence only in two optional fields.
 `destination_active` serves a build whose `Kind.opensOccurrence` holds.
 Both fields exist on every build kind.
 So an `.enrichment` or `.view` build can still set or read one, and the compiler accepts it.
-Only the tests that `AGENTS.md` names fail.
+Only the tests that [the TUI state rules](../../../docs/rules/tui-state.md#search-selection-in-a-buffer-rebuild) name fail.
 
 ## Question for triage
 
