@@ -164,3 +164,21 @@ No check: a field check cannot tell a Hunk Line from a gap Line, because both ha
 Only `Published.toggleFileRead` writes or deletes File Read Receipts.
 
 No check: the test covers Candidate Session preparation only, and a new caller of the `FileReadStore` write elsewhere fails no test. Related checked rule: [File Read Receipts in Candidate Session preparation](docs/rules/tui-state.md#file-read-receipts-in-candidate-session-preparation).
+
+### Only a Review Search source scan moves the queued cache update
+
+A queued cache update keeps its place in the queue. Only a new Review Search source scan moves it to the end, and only while the cache is not far over the budget. Far over the budget is a byte limit that depends only on the budget and on the bytes of the Review, never on a File count. The bytes of the Review count only after each File was admitted once. Another request that moves it can starve the cache update and hold the cache over the budget.
+
+No check: a check would have to know every request that can reach the queue. Related checked rule: [Coalesced Buffer builds](docs/rules/tui-state.md#coalesced-buffer-builds).
+
+### A surface that shows File content protects it from eviction
+
+A surface that reads File content from the cache keeps that File out of eviction while it shows it. The DiffPane does this through the cache focus, and the Review Search Preview through its hold. A cache update evicts every other inactive File, and nothing acquires a File again only because a surface reads it.
+
+No check: a check cannot tell which projection field a painter reads as File content. Related checked rule: [Review Search Preview hold](docs/rules/tui-state.md#review-search-preview-hold).
+
+### Every scan hold site asks needsScanHold
+
+A site that adds a Review Search scan hold decides it through `ReviewSearchState.needsScanHold`. A hold that the site adds on its own can land on a File whose scan is not due. No scan then releases that hold, and the cache budget no longer covers the File.
+
+No check: a check would have to know every path that reaches `enrichment.hold` for Review Search. Related checked rule: [Review Search scan hold](docs/rules/tui-state.md#review-search-scan-hold).
