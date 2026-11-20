@@ -35330,11 +35330,11 @@ test "M21 kernel Review Search starts no source scan before its first query publ
     }
 }
 
-test "M21 kernel Review Search starts no source scan for a reopened query whose scan cannot queue" {
+test "M21 kernel Review Search rolls back a reopened query whose scan cannot queue" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
     defer presentation.deinit();
     try runTestUntilSourceScanWaits(&presentation, 0);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
@@ -35344,16 +35344,18 @@ test "M21 kernel Review Search starts no source scan for a reopened query whose 
     failing.fail_index = failing.alloc_index;
     try presentation.dispatch(.{ .action = .open_review_search });
     failing.fail_index = std.math.maxInt(usize);
-    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
-    try testing.expectEqualStrings("newe", presentation.published.?.review_search.query.?.query.text);
+    const view = presentation.projection();
+    try testing.expectEqual(ActionError.out_of_memory, view.action_error.?);
+    try testing.expectEqualStrings("new", view.review_search.?.query);
+    try testing.expect(!view.review_search.?.pending);
+    try testing.expectEqual(@as(usize, 2), view.review_search.?.occurrences.len);
+    var records: usize = 0;
     while (presentation.takeCommand()) |next| {
         var queued = next;
         defer queued.deinit();
-        if (queued == .scan_review_source) {
-            std.debug.print("File {d} starts a source scan into the results of the previous query\n", .{queued.scan_review_source.file_index});
-            return error.StaleSourceScan;
-        }
+        if (queued == .report_diagnostic) records += 1;
     }
+    try testing.expectEqual(@as(usize, 1), records);
 }
 
 test "M21 kernel Review Search starts its source scans after first query results without a match" {
