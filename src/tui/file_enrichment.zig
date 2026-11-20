@@ -450,13 +450,17 @@ const StoredFile = struct {
     new: StoredSide = .pending,
     last_used: u64 = 0,
     leases: usize = 0,
+    /// The retained bytes of the File at its last admission. An eviction
+    /// keeps them, so Storage knows the size of the Review once each File
+    /// was admitted. Null until then.
+    known_bytes: ?usize = null,
 
     fn deinit(self: *StoredFile) void {
         self.old.deinit();
         self.new.deinit();
     }
 
-    fn retainedBytes(self: *const StoredFile) usize {
+    pub fn retainedBytes(self: *const StoredFile) usize {
         var total: usize = 0;
         if (self.old == .content) total +|= self.old.content.retained_bytes;
         if (self.new == .content) total +|= self.new.content.retained_bytes;
@@ -619,6 +623,7 @@ pub const Storage = struct {
                 .old = initialStoredSide(diff_file, .old),
                 .new = initialStoredSide(diff_file, .new),
             };
+            if (files[i].old != .pending and files[i].new != .pending) files[i].known_bytes = 0;
         }
         const blobs = try allocator.alloc(bbr.diff.FileBlob, diff_files.len);
         errdefer allocator.free(blobs);
@@ -696,6 +701,7 @@ pub const Storage = struct {
         const stored = &self.files[file_idx];
         stored.old = transfer(&result.old);
         stored.new = transfer(&result.new);
+        stored.known_bytes = stored.retainedBytes();
         self.projectSide(file_idx, .old);
         self.projectSide(file_idx, .new);
         self.revision +%= 1;
@@ -807,13 +813,32 @@ pub const Storage = struct {
     }
 
     pub fn requiresCacheEnforcement(self: *const Storage, focused: FileRange) bool {
+        return self.cachePressure(focused) != .within_budget;
+    }
+
+    /// Far over the budget means that the inactive Files exceed the budget by
+    /// more than the larger of the budget and the floor. One cache update
+    /// from there frees more than that excess. So the full Buffer build that
+    /// publishes it pays for itself, also when the budget is smaller than
+    /// one File. The floor is `far_over_budget_floor`. When Storage knows
+    /// the bytes of every File, the floor is at most an eighth of them, so
+    /// a small Review evicts too.
+    pub const CachePressure = enum { within_budget, over_budget, far_over_budget };
+    pub const far_over_budget_floor = 4 * 1024 * 1024;
+
+    pub fn cachePressure(self: *const Storage, focused: FileRange) CachePressure {
         const budget = if (!self.cache.enabled) 0 else if (self.cache.max_retained_bytes == 0) std.math.maxInt(usize) else self.cache.max_retained_bytes;
         var total: usize = 0;
+        var review_bytes: ?usize = 0;
         for (self.files, 0..) |*stored, index| {
+            if (review_bytes) |bytes| review_bytes = if (stored.known_bytes) |known| bytes +| known else null;
             if (focused.contains(index) or stored.leases > 0) continue;
             total +|= stored.retainedBytes();
         }
-        return total > budget;
+        const floor = if (review_bytes) |bytes| @min(far_over_budget_floor, bytes / 8) else far_over_budget_floor;
+        if (total > budget +| @max(budget, floor)) return .far_over_budget;
+        if (total > budget) return .over_budget;
+        return .within_budget;
     }
 
     pub fn len(self: *const Storage) usize {
@@ -941,6 +966,7 @@ pub const Storage = struct {
                 .new = retainedTerminalSide(self.files[victim].new),
                 .last_used = self.files[victim].last_used,
                 .leases = self.files[victim].leases,
+                .known_bytes = self.files[victim].known_bytes,
             };
             self.projectSide(victim, .old);
             self.projectSide(victim, .new);
@@ -2290,6 +2316,68 @@ test "File content cache budget includes Highlight Spans" {
 
     storage.focus(.single(1));
     try testing.expect(storage.file(0).new == .pending);
+}
+
+test "File cache pressure is far over the budget only above the budget plus the larger of the budget and the floor" {
+    var files: [24]bbr.diff.File = undefined;
+    @memset(&files, test_files[0]);
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = true, .max_retained_bytes = 1 });
+    storage.focus(.{ .first = 0, .end = 4 });
+    var results: [3]Result = undefined;
+    for (&results, 1..) |*result, index| {
+        result.* = try ownedAddedResult(testing.allocator, "aaaaaa");
+        try storage.admit(index, result);
+    }
+    defer for (&results) |*result| result.deinit();
+
+    try testing.expectEqual(Storage.CachePressure.within_budget, storage.cachePressure(.{ .first = 0, .end = 4 }));
+    // Three small Files are an eighth of the Files, but far below the floor.
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.single(0)));
+
+    const floor = Storage.far_over_budget_floor;
+    storage.files[3].new.content.retained_bytes = 1 + floor;
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
+    storage.files[3].new.content.retained_bytes = 1 + floor + 1;
+    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
+
+    // Above the floor, the budget sets the excess.
+    storage.cache.max_retained_bytes = 2 * floor;
+    storage.files[3].new.content.retained_bytes = 4 * floor;
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
+    storage.files[3].new.content.retained_bytes = 4 * floor + 1;
+    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.{ .first = 0, .end = 3 }));
+}
+
+test "File cache pressure floor is an eighth of the Review once every File was admitted" {
+    var files: [8]bbr.diff.File = undefined;
+    @memset(&files, test_files[0]);
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = true, .max_retained_bytes = 1 });
+    storage.focus(.{ .first = 0, .end = files.len });
+    var results: [files.len]Result = undefined;
+    for (&results, 0..) |*result, index| {
+        result.* = try ownedAddedResult(testing.allocator, "aaaaaa");
+        if (index + 1 < files.len) try storage.admit(index, result);
+    }
+    defer for (&results) |*result| result.deinit();
+    const file_bytes = storage.files[0].retainedBytes();
+
+    // Seven of eight Files are known. The 4 MiB floor still applies.
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.single(0)));
+
+    try storage.admit(files.len - 1, &results[files.len - 1]);
+    // An eighth of the Review is one File, so one inactive File is not far over and two are.
+    try testing.expectEqual(file_bytes, storage.retainedBytes() / files.len);
+    try testing.expectEqual(Storage.CachePressure.over_budget, storage.cachePressure(.{ .first = 0, .end = files.len - 1 }));
+    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.{ .first = 0, .end = files.len - 2 }));
+
+    // An eviction keeps the known size of the Review.
+    storage.focus(.{ .first = 0, .end = 4 });
+    try testing.expect(storage.files[files.len - 1].retainedBytes() == 0);
+    try testing.expectEqual(Storage.CachePressure.far_over_budget, storage.cachePressure(.single(0)));
 }
 
 test "zero File cache budget retains unlimited inactive content and excludes the focused File" {
