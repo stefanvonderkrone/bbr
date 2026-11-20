@@ -10837,7 +10837,7 @@ pub const Presentation = struct {
             // A user action queues these kinds once. Their intent includes
             // fields that `create` also sets, so a new snapshot needs its own
             // rule for each kind.
-            .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => return,
+            .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .overview_destination, .card_destination => return,
         };
         const job = created catch |err| switch (err) {
             // The stale build still runs, and its rejection retries it.
