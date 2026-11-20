@@ -2318,7 +2318,7 @@ test "M21 kernel a Buffer Search corpus is reused only for equal inputs, also wh
         var inputs: buffer_mod.SearchCandidateInputs = .{
             .diff = .{ .files = &.{} },
             .threads = &.{},
-            .mention_names = &.empty,
+            .mention_names = &.{},
             .session_epoch = 1,
             .layout = .unified,
             .scope = .hunks,
@@ -3911,7 +3911,7 @@ pub const BufferSearchProjection = struct {
 };
 
 pub const ReviewSearchResult = struct {
-    mention_names: *const @import("review_body.zig").MentionNames = &.empty,
+    mention_names: *const @import("review_body.zig").MentionNames = &.{},
     code_highlights: []const code_highlighting.View = &.{},
     kind: []const u8,
     source: []const u8,
@@ -22568,9 +22568,9 @@ test "mention display survives reprojection and both searches while yank keeps a
         try store.store().put(.{ .workspace = "workspace", .repository = "repo", .pull_request_id = 1 }, .{ .local_id = 1, .kind = .comment, .body = raw });
         const session = try testCommentSession(testing.allocator, 1);
         @constCast(session.threads[0].root).body = raw;
-        const mention_names = try session.arena.allocator().create(@import("review_body.zig").MentionNames);
-        mention_names.* = .empty;
-        try mention_names.put(session.arena.allocator(), "id", "@Stefan von der Krone");
+        const review_body = @import("review_body.zig");
+        const mention_names = try session.arena.allocator().create(review_body.MentionNames);
+        mention_names.* = try review_body.MentionNames.init(&[_]review_body.MentionName{.{ "id", "@Stefan von der Krone" }}, session.arena.allocator());
         session.mention_names = mention_names;
         var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
             .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
