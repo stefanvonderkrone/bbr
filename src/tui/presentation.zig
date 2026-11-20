@@ -34809,6 +34809,46 @@ test "M21 kernel Review Search starts a source scan without superseding a cache 
     try testing.expectEqual(in_flight, published.cache_update_generation);
 }
 
+test "M21 kernel Review Search starts no source scan before its first query publishes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 2) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            else => command.deinit(),
+        }
+    }
+    try testing.expect(published.session.enrichment.isTerminal(0));
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    var command = presentation.takeCommand() orelse return error.MissingBufferSearchScan;
+    defer command.deinit();
+    var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+    if (completed.outcome == .scanned) completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
+    try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    try testing.expect(published.review_search.batch == null);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        defer queued.deinit();
+        if (queued == .scan_review_source) {
+            std.debug.print("File {d} starts a source scan before the first query publishes\n", .{queued.scan_review_source.file_index});
+            return error.UnpublishedSourceScan;
+        }
+    }
+}
+
 test "M21 kernel Review Search admits an enrichment with the hold that its build counted" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
