@@ -69,3 +69,15 @@ Stale hold (4634097603). After the rollback fix, a given-up state clears only wi
 Commits: `5b31dda7`, `c26229e1` (red), `c39ac446`, `81787495`, `6ac7b91a`, `96d5075a` (red), `6c0379bf`, `fd4b29c4`, `814612aa` (red), `2ab56ef0`.
 
 Checks: `zig build test` exit 0. `zig fmt --check src build.zig tests` passes. `python3 tools/check_agent_docs.py` passes.
+
+Follow-up, round 4. CodeRabbit posted three comments on PR #36. Each one holds.
+
+Cache staging at the scan start (4635473845). The start of a source scan released the Review Search hold of its File through the lease release that stages a cache build. The scan takes its own lease first, so the release freed nothing, but the staging ran when a cache update was pending. Opening Review Search while a cache build ran on the worker queued a second build and made the first result stale. The start now drops the hold without a staging, and the completion of the scan stages as before. The enforcement sentence also claimed that the allocation test fails on an allocation behind any `catch`. An allocation whose failure the start ignores passes it, so the sentence now names only a failed allocation that stops the start.
+
+Scans before the first results (4635473853). A first query that rolled back kept the query without results and still started a source scan, and each result failed to publish until the pass gave up. The source scans now wait for published results.
+
+Rollback test (4635473862). The test now checks that File 0 resumes as a retry.
+
+Commits: `75421ffa`, `d078c143` (red), `46bd4d03`, `b33bbd67` (red), `c4735972`, `6e4e68d8`, `43b6a502` (a test that results without a match start the source scans).
+
+Checks: `zig build test` exit 0. `zig fmt --check src build.zig tests` passes. `python3 tools/check_agent_docs.py` passes.
