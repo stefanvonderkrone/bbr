@@ -4,13 +4,15 @@ const std = @import("std");
 const emoji = @import("emoji.zig");
 
 /// Session-owned account IDs and their display labels, including the leading @.
-pub const MentionNames = std.StringHashMapUnmanaged([]const u8);
+/// The storage is const, so no write through a published Session compiles.
+pub const MentionNames = std.StaticStringMap([]const u8);
+/// One account ID and its display label, the input of `MentionNames.init`.
+pub const MentionName = struct { []const u8, []const u8 };
 
 test "mentions resolve prose and link labels without changing authored bytes or code" {
     const a = std.testing.allocator;
-    var names: MentionNames = .empty;
+    const names = try MentionNames.init(&[_]MentionName{.{ "63ac09cbfa5fbde2ba44ac24", "@Stefan von der Krone" }}, a);
     defer names.deinit(a);
-    try names.put(a, "63ac09cbfa5fbde2ba44ac24", "@Stefan von der Krone");
     const token = "@{63ac09cbfa5fbde2ba44ac24}";
     const raw = "# **" ++ token ++ "**\n\n> " ++ token ++ "\n\n- [" ++ token ++ "](url/" ++ token ++ ")\n\n| Who |\n| --- |\n| " ++ token ++ " |\n\n\\" ++ token ++ " `" ++ token ++ "` @{missing} @{} @{bad id}\n\n```\n" ++ token ++ "\n```\n\n    " ++ token ++ "\n\n```suggestion\n" ++ token ++ "\n```";
     const body = try ReviewBody.parseWithMentions(a, raw, &names);
@@ -78,9 +80,8 @@ test "emoji metadata belongs to its catalog emoji and leaves unsupported text li
 test "mention and emoji metadata parsing releases partial allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(a: std.mem.Allocator) !void {
-            var names: MentionNames = .empty;
+            const names = try MentionNames.init(&[_]MentionName{.{ "id", "@Ada" }}, a);
             defer names.deinit(a);
-            try names.put(a, "id", "@Ada");
             const body = try ReviewBody.parseWithMentions(a, "**@{id}** :pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }\n\n| Who |\n| --- |\n| [@{id}][user] |\n\n[user]: /account", &names);
             defer freeBlocks(a, body.blocks);
         }
@@ -254,7 +255,7 @@ pub const ReviewBody = struct {
 
     /// Labels borrow Session storage. Authored ranges and source never change.
     pub fn applyMentionNames(self: ReviewBody, names: *const MentionNames) void {
-        if (names.count() == 0) return;
+        if (names.keys().len == 0) return;
         for (self.blocks) |block| for (@constCast(block.spans)) |*span| {
             if (span.mention.len == 0) continue;
             if (names.get(span.mention)) |label| if (label.len > 0) {

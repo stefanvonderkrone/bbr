@@ -1,0 +1,4 @@
+# Enforcement sentences in docs/rules/ that claim a compile error without a mechanism that fails. Lower only.
+1 docs/rules/diagnostics.md
+1 docs/rules/tui-paint.md
+2 docs/rules/tui-state.md
