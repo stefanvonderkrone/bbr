@@ -35320,6 +35320,32 @@ test "M21 kernel Review Search starts no source scan before its first query publ
     }
 }
 
+test "M21 kernel Review Search starts no source scan for a reopened query whose scan cannot queue" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{});
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    // The query scan of the reopen cannot queue, because the full queue cannot grow.
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    try testing.expectEqualStrings("newe", presentation.published.?.review_search.query.?.query.text);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        defer queued.deinit();
+        if (queued == .scan_review_source) {
+            std.debug.print("File {d} starts a source scan into the results of the previous query\n", .{queued.scan_review_source.file_index});
+            return error.StaleSourceScan;
+        }
+    }
+}
+
 test "M21 kernel Review Search starts its source scans after first query results without a match" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
