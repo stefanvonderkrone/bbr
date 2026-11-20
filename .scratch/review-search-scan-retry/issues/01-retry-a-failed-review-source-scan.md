@@ -93,3 +93,11 @@ Open point: after a failed reopen, the Overlay shows the new query over the resu
 Commits: `9e19335e` (red), `ee5d3a7d`, `21eb2fbf`, and a docs commit that states the pending update and the failure of the focus check.
 
 Checks: `zig build test` exit 0. `zig fmt --check src build.zig tests` passes. `python3 tools/check_agent_docs.py` passes.
+
+Follow-up, round 6. The user decided the open point of round 5.
+
+Rollback of a reopened query. When the reopen cannot queue the query scan, `openReviewSearch` now rolls the query back through `rollbackReviewSearchQuery`, as a failed query edit does. The Overlay shows the query of its results, keeps the out-of-memory message, and records the failure once. The rollback also resumes the source pass of that query. The test "M21 kernel Review Search rolls back a reopened query whose scan cannot queue" replaces the test of round 5 for this path. A new test, "M21 kernel Review Search starts no source scan while a query edit is pending", keeps a check on `currentQueryResultsPublished`. The mutation `batch != null` fails that test.
+
+The failed cache staging in the focus check that ends bbr is a separate effort: [01-keep-the-session-after-a-failed-focus-check-staging.md](../../focus-check-staging-failure/issues/01-keep-the-session-after-a-failed-focus-check-staging.md).
+
+Commits: `1730bf39` (red), `5914bf57`.
