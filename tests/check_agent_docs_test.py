@@ -161,6 +161,24 @@ class AgentDocsTest(unittest.TestCase):
                    "Enforcement: `tests/read_only_test.py` compiles a write and expects that it does not compile.\n")
         self.assertEqual(checker.check(self.root), [])
 
+    def test_a_fenced_example_is_not_an_enforcement_paragraph(self):
+        self.write("docs/rules/tui-state.md", "## Rules\n\n```markdown\n"
+                   "Enforcement: `Thing` has no field (compile error).\n```\n")
+        self.assertEqual(checker.check(self.root), [])
+
+    def test_a_claim_on_a_continuation_line_is_rejected_at_its_line(self):
+        self.write("docs/rules/tui-state.md", "## Rules\n\n"
+                   "Enforcement: the test \"x\" in `src/tui/session.zig`.\n"
+                   "`Thing` has no field (compile error).\n")
+        errors = "\n".join(checker.check(self.root))
+        self.assertIn("lines 4: 1 Enforcement sentences claim a compile error without a mechanism", errors)
+
+    def test_a_mechanism_on_a_continuation_line_passes(self):
+        self.write("docs/rules/tui-state.md", "## Rules\n\n"
+                   "Enforcement: `Thing` gives a compile error through the\n"
+                   "`comptime` block after `theme.value`.\n")
+        self.assertEqual(checker.check(self.root), [])
+
     def test_the_baseline_allows_its_count_and_no_more(self):
         claim = "Enforcement: `Thing` has no field (compile error).\n\n"
         self.write("tools/compile_claim_baseline.txt", "# header\n1 docs/rules/tui-state.md\n")
