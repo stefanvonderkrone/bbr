@@ -137,8 +137,9 @@ No check: a line check cannot tell a row number from another `usize`, and it rea
 ### A source scan starts without an allocation
 
 The start of a Review Search source scan, `maybeQueueReviewSourceScan` and `ScanReviewSource.create`, allocates from no allocator.
+It also stages no cache build, because the lease of the scan keeps its File. The test "M21 kernel Review Search starts a source scan without superseding a cache build in flight" fails when the start stages a cache build while a cache update is pending, whatever its allocator.
 
-No check: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" fails only on an allocation from the Presentation allocator. An allocation from `std.heap.page_allocator` or from the Session allocator passes it, and a `catch` makes any allocation compile in a function that returns no error union. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+No check: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" fails only when a failed allocation from the Presentation allocator stops the start. An allocation from `std.heap.page_allocator` or from the Session allocator passes it, and so does an allocation whose failure the start ignores. A `catch` makes any allocation compile in a function that returns no error union. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
 ### A cache staging failure keeps the shown message
 
