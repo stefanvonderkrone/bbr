@@ -4300,6 +4300,13 @@ const ReviewSearchState = struct {
         return if (source.file_index < files) source else null;
     }
 
+    /// A source result merges into the batch, so it must hold the results of
+    /// the current query. A query edit keeps the batch of `rollback_query`
+    /// until its own results publish, also when the Overlay closes first.
+    fn queryResultsPublished(self: *const ReviewSearchState) bool {
+        return self.batch != null and self.rollback_query == null;
+    }
+
     /// A scan hold ends when the source scan of its File starts, so a File
     /// gets one only while its scan is due. A queued or running scan holds
     /// its own lease, and a scanned or given-up File gets no scan.
@@ -8886,11 +8893,9 @@ pub const Presentation = struct {
         }
     }
 
-    /// A source result merges into the published batch, so the source scans
-    /// wait for the first query results.
     fn maybeQueueReviewSourceScan(self: *Presentation, published: *Published) void {
         const state = &published.review_search;
-        if (!state.open or state.pending or state.query == null or state.batch == null or state.source_scan_active) return;
+        if (!state.open or !state.queryResultsPublished() or state.source_scan_active) return;
         const scans = state.source_scans orelse return;
         for ([_]SourceScan{ .awaiting_retry, .unscanned }) |due| for (scans, 0..) |scan, index| {
             if (scan != due or !published.session.enrichment.isTerminal(index)) continue;
@@ -8968,7 +8973,7 @@ pub const Presentation = struct {
         defer self.finishSearchLease(published, completed.file_index);
         const state = &published.review_search;
         state.source_scan_active = false;
-        if (!state.open or state.query == null or state.pending or state.request_id != completed.request_id) {
+        if (!state.open or !state.queryResultsPublished() or state.request_id != completed.request_id) {
             undoReviewSourceScan(published, completed.file_index);
             self.maybeQueueReviewSourceScan(published);
             return;
@@ -8985,10 +8990,7 @@ pub const Presentation = struct {
             var transferred = false;
             defer if (!transferred) part.deinit(self.allocator);
             search.rank(&part);
-            const old = state.batch orelse {
-                self.reviewSourcePublicationFailed(published, completed.file_index);
-                return;
-            };
+            const old = state.batch.?;
             var old_copy: ?search.Batch = if (old.references != null) old.clone(std.heap.page_allocator) catch |err| switch (err) {
                 error.OutOfMemory => {
                     self.reportFailure(.review_search, .prepare, err, @src());
