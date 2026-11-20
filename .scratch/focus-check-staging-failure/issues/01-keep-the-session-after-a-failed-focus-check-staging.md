@@ -12,7 +12,7 @@ A failed cache staging in the focus check ends bbr. The behavior predates PR #36
 3. `ensureFocusedEnrichment` calls `try self.queueCacheBuild(published, range.focused)` in two places. The first place is a pending cache update with a changed focus. The second place is a cache that `requiresCacheEnforcement` marks as over the budget.
 4. `queueCacheBuild` returns `OutOfMemory` when `commands.ensureUnusedCapacity` or `createCacheBuild` fails. No record names the failure before the error returns.
 
-A cache staging is maintenance. `stageReleasedSearchLeases` already catches its own `OutOfMemory`, records it once as `.buffer_build`, `.prepare`, and relies on the next focus check to stage again. The focus check has no such catch, so the same failure ends the session in one place and not in the other.
+A cache staging is maintenance. `stageReleasedSearchLeases` already catches its own `OutOfMemory`, records it once as `.buffer_build`, `.prepare`, sets `action_error` to `.out_of_memory` when no other message shows, and relies on the next focus check to stage again. The focus check has no such catch, so the same failure ends the session in one place and not in the other.
 
 The test "M21 kernel cache focus failure preserves content and focus before retry" in `src/tui/presentation.zig` expects `error.OutOfMemory` from `dispatch(.ensure_focused_enrichment)`. `CODING_STANDARDS.md` says that a failed staging in the focus check returns `OutOfMemory` from `dispatch` and ends the event loop. Both describe the current behavior, so both change with the fix.
 
@@ -20,7 +20,7 @@ Related site to check: the active File path, `return self.queueFileEnrichment(pu
 
 ## Proposal
 
-Catch the `OutOfMemory` of `queueCacheBuild` in `ensureFocusedEnrichment`, as `stageReleasedSearchLeases` does. Record it once with `reportFailure(.buffer_build, .prepare, ...)` and return. The next focus check stages again, because the cache stays over the budget. Read `docs/rules/diagnostics.md` before the `catch`. Decide in triage whether a failed staging also sets `action_error`. A failure in maintenance that the next event retries does not need a message on screen.
+Catch the `OutOfMemory` of `queueCacheBuild` in `ensureFocusedEnrichment`, as `stageReleasedSearchLeases` does. Record it once with `reportFailure(.buffer_build, .prepare, ...)` and return. The next focus check stages again, because the cache stays over the budget. Read `docs/rules/diagnostics.md` before the `catch`. Decide in triage whether the focus check also sets `action_error` as `stageReleasedSearchLeases` does, or deliberately shows no message because the next event retries the staging.
 
 ## Acceptance criteria
 

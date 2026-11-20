@@ -8619,7 +8619,8 @@ pub const Presentation = struct {
         if (state.needs_scan) {
             const text = (state.query orelse unreachable).query.text;
             self.replaceReviewSearchQuery(text);
-            // A scan that cannot queue leaves the query without its results.
+            // `pending` stays false when the query scan cannot queue. The
+            // rollback shows the query of the shown results.
             if (!state.pending) self.rollbackReviewSearchQuery(published);
         }
         published.frame_revision += 1;
