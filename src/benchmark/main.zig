@@ -145,8 +145,11 @@ fn run(writer: *std.Io.Writer, init: std.process.Init) !void {
         .body = "## Review\n\nThis **change** keeps [the contract](https://example.test).\n\n```suggestion\nconst value = 2;\n```\n",
         .count = 4_000,
     };
-    const visual_rows_wide_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows };
-    const visual_rows_narrow_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows, .width = 24 };
+    var visual_rows_arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer visual_rows_arena.deinit();
+    const unified_source_rows = try p1_actions.sourceRows(visual_rows_arena.allocator(), &ascii_source_texts, 50_000, .unified);
+    const side_by_side_source_rows = try p1_actions.sourceRows(visual_rows_arena.allocator(), &ascii_source_texts, 50_000, .side_by_side);
+    const unicode_source_rows = try p1_actions.sourceRows(visual_rows_arena.allocator(), &unicode_source_texts, 50_000, .unified);
     const file_tree_tallies = try tui.buffer.fileTallies(comment_arena.allocator(), parsed, comment_contexts[2].threads, comment_contexts[2].drafts, .{ .drafts = comment_contexts[2].drafts });
     const file_tree_context: p1_actions.FileTreeContext = .{ .diff = parsed, .tallies = file_tree_tallies };
     var matched = false;
@@ -236,8 +239,10 @@ fn run(writer: *std.Io.Writer, init: std.process.Init) !void {
         if (repeat_count) |count| try harness.repeatSplit(writer, init.gpa, "whole_file_line_starts_5000", count, .reclaimable, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum) else try harness.runSplit(writer, init.io, init.gpa, calibrations, "whole_file_line_starts_5000", .memory_bandwidth, whole_file_blob.len, .reclaimable, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum);
     }
     const visual_benchmarks = [_]struct { name: []const u8, context: p1_actions.VisualRowsContext }{
-        .{ .name = "visual_rows_wide_50000", .context = visual_rows_wide_context },
-        .{ .name = "visual_rows_narrow_50000", .context = visual_rows_narrow_context },
+        .{ .name = "visual_rows_terminal_wide_50000", .context = .{ .rows = unified_source_rows } },
+        .{ .name = "visual_rows_terminal_narrow_50000", .context = .{ .rows = unified_source_rows, .width = 40 } },
+        .{ .name = "visual_rows_terminal_side_by_side_50000", .context = .{ .rows = side_by_side_source_rows, .layout = .side_by_side, .width = 160 } },
+        .{ .name = "visual_rows_terminal_unicode_50000", .context = .{ .rows = unicode_source_rows } },
     };
     for (&visual_benchmarks) |*benchmark| {
         if (selected == null or std.mem.eql(u8, selected.?, benchmark.name)) {
@@ -448,6 +453,26 @@ fn sourceFixture(allocator: std.mem.Allocator, minimum_bytes: usize, line: []con
     for (0..line_count) |index| @memcpy(content[index * line.len ..][0..line.len], line);
     return content;
 }
+
+/// Printable ASCII source of the lengths a review shows, so some Lines wrap
+/// at 120 columns and more at 40.
+const ascii_source_texts = [_][]const u8{
+    "",
+    "}",
+    "    const value = try allocator.alloc(u8, count);",
+    "    if (options.layout == .unified and options.width <= unified_gutter_cols) return buildUnwrappedVisualRows(allocator, rows);",
+    "        // A faulty adapter must not make projection loop forever or step beyond the source it was asked to measure, so clamp it.",
+    "export const selectReviewSummary = createSelector([selectReview, selectComments, selectDrafts], (review, comments, drafts) => ({ review, total: comments.length + drafts.length }));",
+};
+
+/// Source with tabs, combining marks, wide characters, and emoji, so the
+/// benchmark shows the grapheme measurement of non-ASCII text.
+const unicode_source_texts = [_][]const u8{
+    "\tconst name = \"Gr\u{fc}\u{df}e\"; // caf\u{65}\u{301} na\u{ef}ve r\u{e9}sum\u{e9}",
+    "    label: \"\u{754c}\u{9762}\u{306e}\u{8a2d}\u{5b9a}\u{3092}\u{4fdd}\u{5b58}\u{3057}\u{307e}\u{3057}\u{305f}\", // \u{4fdd}\u{5b58}\u{5b8c}\u{4e86}\u{306e}\u{30e1}\u{30c3}\u{30bb}\u{30fc}\u{30b8}\u{3092}\u{8868}\u{793a}\u{3059}\u{308b}",
+    "    status: \"\u{2705} ready \u{1F469}\u{200D}\u{1F4BB} \u{1F1EC}\u{1F1E7} \u{270C}\u{FE0F}\", // emoji keep two cells in the terminal and never split",
+    "\t\treturn x \u{2264} y \u{2014} \u{201C}quoted\u{201D} \u{2026} \u{00A0}non-breaking\u{00A0}space",
+};
 
 fn asciiFixture(allocator: std.mem.Allocator, byte_count: usize) ![]u8 {
     const content = try allocator.alloc(u8, byte_count);
