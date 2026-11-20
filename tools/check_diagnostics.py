@@ -37,7 +37,7 @@ def production(lines):
     depth = 0
     test_depth = None
     for number, line in enumerate(lines, 1):
-        if re.match(r"\s*test\b", line):
+        if test_depth is None and re.match(r"\s*test\b", line):
             test_depth = depth
         if test_depth is None:
             yield number, line

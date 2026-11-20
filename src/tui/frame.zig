@@ -9,6 +9,7 @@ pub const file_tree = @import("file_tree.zig");
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 const view = @import("view.zig");
 const layouts = @import("layouts.zig");
+const KeyLists = @import("key_lists.zig").KeyLists;
 
 pub const Revision = u64;
 
@@ -134,11 +135,55 @@ pub const HitTarget = union(enum) {
     review_search_preview,
 };
 
+/// The identity of a Line row in every Frame of a Session. A Hunk Line lives
+/// as long as the Session, so its pointer is the identity. Each Buffer build
+/// makes its own Whole File gap Lines, so a gap Line is its File, side, and
+/// line number.
+pub const LineOwner = union(enum) {
+    hunk_line: *const bbr.diff.Line,
+    gap: struct { file: *const bbr.diff.File, side: SelectedVersion, number: u32 },
+
+    /// `file` is the File of the row. Only a gap Line reads it, and every gap
+    /// Line row follows the header of its File.
+    pub fn of(file: ?*const bbr.diff.File, line: *const bbr.diff.Line) LineOwner {
+        if (line.in_hunk) return .{ .hunk_line = line };
+        std.debug.assert((line.old_no == 0) != (line.new_no == 0));
+        return .{ .gap = .{
+            .file = file.?,
+            .side = if (line.old_no != 0) .old else .new,
+            .number = @max(line.old_no, line.new_no),
+        } };
+    }
+
+    /// The owner of the other half of a SideBySide pair. A pair holds two
+    /// Hunk Lines or two gap Lines of one File.
+    fn sibling(self: LineOwner, line: *const bbr.diff.Line) LineOwner {
+        return of(switch (self) {
+            .hunk_line => null,
+            .gap => |gap| gap.file,
+        }, line);
+    }
+
+    pub fn oldNo(self: LineOwner) ?u32 {
+        return switch (self) {
+            .hunk_line => |line| line.oldNo(),
+            .gap => |gap| if (gap.side == .old) gap.number else null,
+        };
+    }
+
+    pub fn newNo(self: LineOwner) ?u32 {
+        return switch (self) {
+            .hunk_line => |line| line.newNo(),
+            .gap => |gap| if (gap.side == .new) gap.number else null,
+        };
+    }
+};
+
 pub const RowOwner = union(enum) {
     file: *const bbr.diff.File,
     hunk: *const bbr.diff.model.Hunk,
     status_placeholder: struct { file: *const bbr.diff.File, old: bool, new: bool },
-    line: *const bbr.diff.Line,
+    line: LineOwner,
     disclosure: buffer_mod.DisclosureKey,
     comment: struct { id: bbr.review.CommentId, source_offset: usize, part: ?@import("review_card.zig").Part = null },
     draft: struct { id: bbr.review.TempId, source_offset: usize, part: ?@import("review_card.zig").Part = null },
@@ -151,7 +196,7 @@ pub const RowOwner = union(enum) {
             .file => |value| value == b.file,
             .hunk => |value| value == b.hunk,
             .status_placeholder => |value| value.file == b.status_placeholder.file and value.old == b.status_placeholder.old and value.new == b.status_placeholder.new,
-            .line => |value| value == b.line,
+            .line => |value| std.meta.eql(value, b.line),
             .disclosure => |value| std.meta.eql(value, b.disclosure),
             .comment => |value| value.id == b.comment.id and value.source_offset == b.comment.source_offset and value.part == b.comment.part,
             .draft => |value| value.id == b.draft.id and value.source_offset == b.draft.source_offset and value.part == b.draft.part,
@@ -201,14 +246,6 @@ pub const Halves = struct {
 pub const VisualRowOptions = struct {
     layout: buffer_mod.Layout,
     width: usize,
-};
-
-pub const SourceMatch = struct {
-    old_line: ?*const bbr.diff.Line = null,
-    new_line: ?*const bbr.diff.Line = null,
-    relation: search.VersionRelation,
-    ranges: []const search.Range,
-    active: bool = false,
 };
 
 pub const ProjectedSourceRange = struct {
@@ -318,97 +355,43 @@ pub fn buildVisualRowsWithOptions(
 
     var visual_rows: std.ArrayList(VisualRow) = .empty;
     errdefer visual_rows.deinit(allocator);
+    // SideBySide makes about 1.44 visual rows per Buffer row. The unused tail is never touched.
+    try visual_rows.ensureTotalCapacityPrecise(allocator, rows.len + rows.len / 2);
     if (options.layout == .side_by_side) {
         const widths = sideBodyWidths(options.width).?;
+        var file: ?*const bbr.diff.File = null;
         for (rows, 0..) |row, buffer_index| switch (row) {
-            .line_pair => |pair| try appendWrappedLinePair(allocator, &visual_rows, buffer_index, pair, widths, metrics),
-            else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index)),
+            .line_pair => |pair| try appendWrappedLinePair(allocator, &visual_rows, buffer_index, pair, widths, metrics, file),
+            else => {
+                if (row == .file_header) file = row.file_header.file;
+                try visual_rows.append(allocator, makeVisualRow(row, buffer_index, file));
+            },
         };
         return visual_rows.toOwnedSlice(allocator);
     }
 
     const body_width = options.width - unified_gutter_cols;
+    var file: ?*const bbr.diff.File = null;
     for (rows, 0..) |row, buffer_index| switch (row) {
         .line => |line_row| {
             if (line_row.line.text.len == 0) {
-                try visual_rows.append(allocator, makeVisualRow(row, buffer_index));
+                try visual_rows.append(allocator, makeVisualRow(row, buffer_index, file));
                 continue;
             }
+            const wrap: WrapLine = .init(line_row.line.text, metrics);
             var start: usize = 0;
             while (start < line_row.line.text.len) {
-                const end = wrapEnd(line_row.line.text, start, body_width, metrics);
-                try appendWrappedVisualRow(allocator, &visual_rows, row, buffer_index, start, end);
+                const end = wrap.end(start, body_width);
+                try appendWrappedVisualRow(allocator, &visual_rows, row, buffer_index, start, end, file);
                 start = end;
             }
         },
-        else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index)),
+        else => {
+            if (row == .file_header) file = row.file_header.file;
+            try visual_rows.append(allocator, makeVisualRow(row, buffer_index, file));
+        },
     };
     return visual_rows.toOwnedSlice(allocator);
-}
-
-pub fn projectSourceRanges(
-    allocator: std.mem.Allocator,
-    visual_rows: []const VisualRow,
-    matches: []const SourceMatch,
-) ![]ProjectedSourceRange {
-    var projected: std.ArrayList(ProjectedSourceRange) = .empty;
-    errdefer projected.deinit(allocator);
-    for (visual_rows, 0..) |visual_row, visual_index| {
-        if (visual_row.halves) |halves| {
-            if (halves.left) |half| try projectHalf(allocator, &projected, matches, visual_index, .old, half);
-            if (halves.right) |half| try projectHalf(allocator, &projected, matches, visual_index, .new, half);
-            continue;
-        }
-        for (matches) |match| {
-            const old_matches = match.old_line != null and visual_row.yank_candidates.old == match.old_line;
-            const new_matches = match.new_line != null and visual_row.yank_candidates.new == match.new_line;
-            const applicable = switch (match.relation) {
-                .neutral => old_matches or new_matches,
-                .old => old_matches,
-                .new => new_matches,
-            };
-            if (applicable) try appendRangeIntersections(allocator, &projected, match, visual_index, match.relation, visual_row.source_start, visual_row.source_end);
-        }
-    }
-    return projected.toOwnedSlice(allocator);
-}
-
-fn projectHalf(
-    allocator: std.mem.Allocator,
-    projected: *std.ArrayList(ProjectedSourceRange),
-    matches: []const SourceMatch,
-    visual_index: usize,
-    relation: search.VersionRelation,
-    half: VisualHalf,
-) !void {
-    for (matches) |match| {
-        const line = if (relation == .old) match.old_line else match.new_line;
-        if (line != half.line or (match.relation != .neutral and match.relation != relation)) continue;
-        try appendRangeIntersections(allocator, projected, match, visual_index, relation, half.source_start, half.source_end);
-    }
-}
-
-fn appendRangeIntersections(
-    allocator: std.mem.Allocator,
-    projected: *std.ArrayList(ProjectedSourceRange),
-    match: SourceMatch,
-    visual_index: usize,
-    relation: search.VersionRelation,
-    row_start: usize,
-    row_end: usize,
-) !void {
-    for (match.ranges) |range| {
-        const start = @max(range.start, row_start);
-        const end = @min(range.end, row_end);
-        if (start >= end) continue;
-        try projected.append(allocator, .{
-            .visual_row = visual_index,
-            .relation = relation,
-            .source = .{ .start = start, .end = end },
-            .row = .{ .start = start - row_start, .end = end - row_start },
-            .active = match.active,
-        });
-    }
 }
 
 const SideBodyWidths = struct { left: usize, right: usize };
@@ -434,19 +417,22 @@ fn appendWrappedLinePair(
     pair: buffer_mod.LinePair,
     widths: SideBodyWidths,
     metrics: CellMetrics,
+    file: ?*const bbr.diff.File,
 ) !void {
     var left_start: usize = 0;
     var right_start: usize = 0;
     var left_done = pair.left == null;
     var right_done = pair.right == null;
+    const left_wrap: ?WrapLine = if (pair.left) |half| .init(half.line.text, metrics) else null;
+    const right_wrap: ?WrapLine = if (pair.right) |half| .init(half.line.text, metrics) else null;
     while (!left_done or !right_done) {
-        const left = if (!left_done) makeVisualHalf(pair.left.?, left_start, widths.left, metrics) else null;
-        const right = if (!right_done) makeVisualHalf(pair.right.?, right_start, widths.right, metrics) else null;
+        const left = if (!left_done) makeVisualHalf(pair.left.?, left_start, widths.left, left_wrap.?) else null;
+        const right = if (!right_done) makeVisualHalf(pair.right.?, right_start, widths.right, right_wrap.?) else null;
         const target = right orelse left.?;
         try visual_rows.append(allocator, .{
             .buffer_index = buffer_index,
             .kind = .line_pair,
-            .owner = .{ .line = target.line },
+            .owner = .{ .line = .of(file, target.line) },
             .source_start = target.source_start,
             .source_end = target.source_end,
             .continuation = target.continuation,
@@ -467,8 +453,8 @@ fn appendWrappedLinePair(
     }
 }
 
-fn makeVisualHalf(line_row: buffer_mod.LineRow, start: usize, width: usize, metrics: CellMetrics) VisualHalf {
-    const end = if (line_row.line.text.len == 0) 0 else wrapEnd(line_row.line.text, start, width, metrics);
+fn makeVisualHalf(line_row: buffer_mod.LineRow, start: usize, width: usize, wrap: WrapLine) VisualHalf {
+    const end = if (line_row.line.text.len == 0) 0 else wrap.end(start, width);
     return .{
         .line = line_row.line,
         .source_start = start,
@@ -484,11 +470,12 @@ fn appendWrappedVisualRow(
     buffer_index: usize,
     start: usize,
     end: usize,
+    file: ?*const bbr.diff.File,
 ) !void {
     try visual_rows.append(allocator, .{
         .buffer_index = buffer_index,
         .kind = .line,
-        .owner = owner(row),
+        .owner = owner(row, file),
         .source_start = start,
         .source_end = end,
         .continuation = start != 0,
@@ -498,15 +485,19 @@ fn appendWrappedVisualRow(
 
 fn buildUnwrappedVisualRows(allocator: std.mem.Allocator, rows: []const buffer_mod.Row) ![]const VisualRow {
     const visual_rows = try allocator.alloc(VisualRow, rows.len);
-    for (rows, visual_rows, 0..) |row, *visual_row, buffer_index| visual_row.* = makeVisualRow(row, buffer_index);
+    var file: ?*const bbr.diff.File = null;
+    for (rows, visual_rows, 0..) |row, *visual_row, buffer_index| {
+        if (row == .file_header) file = row.file_header.file;
+        visual_row.* = makeVisualRow(row, buffer_index, file);
+    }
     return visual_rows;
 }
 
-fn makeVisualRow(row: buffer_mod.Row, buffer_index: usize) VisualRow {
+fn makeVisualRow(row: buffer_mod.Row, buffer_index: usize, file: ?*const bbr.diff.File) VisualRow {
     return .{
         .buffer_index = buffer_index,
         .kind = std.meta.activeTag(row),
-        .owner = owner(row),
+        .owner = owner(row, file),
         .source_start = rowSourceStart(row),
         .source_end = rowSourceEnd(row),
         .yank_candidates = yankCandidates(row),
@@ -533,22 +524,43 @@ fn candidatesForLine(line: *const bbr.diff.Line) YankCandidates {
 
 pub const unified_gutter_cols: usize = anchor_cols + 10;
 
-fn wrapEnd(text: []const u8, start: usize, width: usize, metrics: CellMetrics) usize {
-    var pos = start;
-    var cells: usize = 0;
-    var whitespace_end: ?usize = null;
-    while (pos < text.len) {
-        const measured = metrics.next(text[pos..]);
-        if (cells + measured.cell_width > width) {
-            if (whitespace_end) |end| if (end > start) return end;
-            return if (pos > start) pos else @min(pos + measured.byte_len, text.len);
-        }
-        pos += measured.byte_len;
-        cells += measured.cell_width;
-        if (isUnicodeWhitespace(text[pos - measured.byte_len .. pos])) whitespace_end = pos;
+/// One Line to wrap. `init` checks the Line once for printable ASCII, not
+/// once for each visual row.
+const WrapLine = struct {
+    text: []const u8,
+    metrics: CellMetrics,
+    narrow_ascii: bool,
+
+    fn init(text: []const u8, metrics: CellMetrics) WrapLine {
+        return .{ .text = text, .metrics = metrics, .narrow_ascii = metrics.narrowAscii(text) };
     }
-    return text.len;
-}
+
+    /// The end of the visual row that starts at `start`. On a printable ASCII
+    /// Line each byte is one grapheme of one cell and the space is the only
+    /// whitespace, so the end is the one the grapheme loop gives.
+    fn end(self: WrapLine, start: usize, width: usize) usize {
+        const text = self.text;
+        if (self.narrow_ascii) {
+            if (text.len - start <= width) return text.len;
+            if (std.mem.lastIndexOfScalar(u8, text[start .. start + width], ' ')) |space| return start + space + 1;
+            return start + @max(width, 1);
+        }
+        var pos = start;
+        var cells: usize = 0;
+        var whitespace_end: ?usize = null;
+        while (pos < text.len) {
+            const measured = self.metrics.next(text[pos..]);
+            if (cells + measured.cell_width > width) {
+                if (whitespace_end) |whitespace| if (whitespace > start) return whitespace;
+                return if (pos > start) pos else @min(pos + measured.byte_len, text.len);
+            }
+            pos += measured.byte_len;
+            cells += measured.cell_width;
+            if (isUnicodeWhitespace(text[pos - measured.byte_len .. pos])) whitespace_end = pos;
+        }
+        return text.len;
+    }
+};
 
 fn isUnicodeWhitespace(grapheme: []const u8) bool {
     const first_len = std.unicode.utf8ByteSequenceLength(grapheme[0]) catch |err| switch (err) {
@@ -583,39 +595,31 @@ pub const NavigationIndex = struct {
     };
     const Span = struct { start: usize, end: usize, row: usize, prefix_end: usize = 0 };
     const Owners = std.HashMapUnmanaged(RowOwner, usize, OwnerContext, 80);
-    const Spans = std.HashMapUnmanaged(RowOwner, std.ArrayList(Span), OwnerContext, 80);
+    const Spans = KeyLists(RowOwner, Span, OwnerContext);
 
+    /// The first row of each owner that is not a Line. A Line row resolves
+    /// through `spans`, because its rows differ by source offset.
     owners: Owners = .empty,
-    spans: Spans = .empty,
+    spans: Spans = .{},
 
     /// The caller owns all allocations through its Frame arena.
     pub fn build(a: std.mem.Allocator, rows: []const VisualRow) !NavigationIndex {
         var result: NavigationIndex = .{};
-        for (rows, 0..) |row, index| {
+        var owner_rows: u32 = 0;
+        for (rows) |row| owner_rows += @intFromBool(row.owner != .line);
+        try result.owners.ensureTotalCapacity(a, owner_rows);
+        for (rows, 0..) |row, index| if (row.owner != .line) {
             var key = row.owner;
             if (key == .section) key.section.path = try a.dupe(u8, key.section.path);
             const exact = try result.owners.getOrPut(a, key);
             if (!exact.found_existing) exact.value_ptr.* = index;
-            if (row.halves) |halves| {
-                if (halves.right) |half| try result.add(a, .{ .line = half.line }, half.source_start, half.source_end, index);
-                if (halves.left) |half| if (halves.right == null or halves.right.?.line != half.line)
-                    try result.add(a, .{ .line = half.line }, half.source_start, half.source_end, index);
-            } else switch (row.owner) {
-                .line => try result.add(a, row.owner, row.source_start, row.source_end, index),
-                .comment => |value| if (value.part != .header) {
-                    try result.add(a, .{ .comment = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
-                },
-                .draft => |value| if (value.part != .header) {
-                    try result.add(a, .{ .draft = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
-                },
-                else => {},
-            }
-        }
-        var groups = result.spans.valueIterator();
+        };
+        result.spans = try Spans.build(a, 2 * rows.len, @intCast(rows.len), SpanSource{ .rows = rows });
+        var groups = result.spans.lists();
         while (groups.next()) |group| {
-            std.mem.sort(Span, group.items, {}, spanLess);
+            std.mem.sort(Span, group, {}, spanLess);
             var end: usize = 0;
-            for (group.items) |*span| {
+            for (group) |*span| {
                 end = @max(end, span.end);
                 span.prefix_end = end;
             }
@@ -623,11 +627,29 @@ pub const NavigationIndex = struct {
         return result;
     }
 
-    fn add(self: *NavigationIndex, a: std.mem.Allocator, key: RowOwner, start: usize, end: usize, row: usize) !void {
-        const group = try self.spans.getOrPut(a, key);
-        if (!group.found_existing) group.value_ptr.* = .empty;
-        try group.value_ptr.append(a, .{ .start = start, .end = end, .row = row });
-    }
+    /// Each row adds at most two spans, one for each half.
+    const SpanSource = struct {
+        rows: []const VisualRow,
+
+        pub fn each(self: SpanSource, sink: anytype) !void {
+            for (self.rows, 0..) |row, index| {
+                if (row.halves) |halves| {
+                    if (halves.right) |half| try sink.add(.{ .line = row.owner.line.sibling(half.line) }, .{ .start = half.source_start, .end = half.source_end, .row = index });
+                    if (halves.left) |half| if (halves.right == null or halves.right.?.line != half.line)
+                        try sink.add(.{ .line = row.owner.line.sibling(half.line) }, .{ .start = half.source_start, .end = half.source_end, .row = index });
+                } else switch (row.owner) {
+                    .line => try sink.add(row.owner, .{ .start = row.source_start, .end = row.source_end, .row = index }),
+                    .comment => |value| if (value.part != .header) {
+                        try sink.add(.{ .comment = .{ .id = value.id, .source_offset = 0 } }, .{ .start = value.source_offset, .end = row.source_end, .row = index });
+                    },
+                    .draft => |value| if (value.part != .header) {
+                        try sink.add(.{ .draft = .{ .id = value.id, .source_offset = 0 } }, .{ .start = value.source_offset, .end = row.source_end, .row = index });
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
 
     fn spanLess(_: void, a: Span, b: Span) bool {
         return a.start < b.start or a.start == b.start and a.row < b.row;
@@ -646,7 +668,7 @@ pub const NavigationIndex = struct {
             .draft => |value| value.source_offset,
             else => wanted.source_start,
         };
-        const spans = (self.spans.get(key) orelse return null).items;
+        const spans = self.spans.get(key);
         if (wanted.owner == .line) {
             var containing_low: usize = 0;
             var containing_high = spans.len;
@@ -677,35 +699,79 @@ pub fn visualIndexForBufferIndex(rows: []const VisualRow, buffer_index: usize) ?
     return if (low < rows.len and rows[low].buffer_index == buffer_index) low else null;
 }
 
+/// A navigation held by the identity of its rows, so that any later Frame of
+/// the same Session can resolve it. State that outlives a Frame stores this,
+/// not a `Nav`, because only `resolve` against a Frame yields its row numbers.
+pub const NavigationAnchor = struct {
+    count: usize,
+    /// The rows between the top of the viewport and the cursor.
+    cursor_offset: usize,
+    cursor: ?VisualRow,
+    mark: ?Mark,
+
+    const Mark = struct {
+        row: VisualRow,
+        /// The mark and cursor rows of the capture Frame. A mark that is not
+        /// on a Line keeps only when it resolves to the same range.
+        captured_range: [2]usize,
+    };
+
+    pub fn capture(navigation: Nav, visual_rows: []const VisualRow) NavigationAnchor {
+        const cursor = visualRowAt(visual_rows, navigation.cursor);
+        const mark: ?Mark = if (navigation.mark) |mark| if (visualRowAt(visual_rows, mark)) |row| .{
+            .row = identity(row),
+            .captured_range = .{ @min(mark, navigation.cursor), @max(mark, navigation.cursor) },
+        } else null else null;
+        return .{
+            .count = navigation.count,
+            .cursor_offset = navigation.cursor -| navigation.scroll,
+            .cursor = if (cursor) |row| identity(row) else null,
+            .mark = mark,
+        };
+    }
+
+    /// The navigation in the Frame of `visual_rows`. A cursor row that the
+    /// Frame lost puts the cursor at the top of the Buffer.
+    pub fn resolve(self: NavigationAnchor, visual_rows: []const VisualRow, geometry: Geometry, index: NavigationIndex) Nav {
+        return self.resolveWith(visual_rows, geometry, index);
+    }
+
+    fn resolveWith(self: NavigationAnchor, visual_rows: []const VisualRow, geometry: Geometry, index: ?NavigationIndex) Nav {
+        const viewport = paneRects(geometry).diff_content.height;
+        var restored = Nav.init(visual_rows.len, viewport);
+        restored.count = self.count;
+        const cursor_row = self.cursor orelse return restored;
+        const cursor = findRow(visual_rows, index, cursor_row) orelse return restored;
+        restored.jumpTo(cursor);
+        restored.count = self.count;
+        restored.scroll = cursor -| self.cursor_offset;
+        restored.setViewport(viewport);
+
+        const mark = self.mark orelse return restored;
+        const restored_mark = findRow(visual_rows, index, mark.row) orelse return restored;
+        const range = [2]usize{ @min(restored_mark, cursor), @max(restored_mark, cursor) };
+        if ((mark.row.owner == .line and cursor_row.owner == .line) or std.meta.eql(mark.captured_range, range)) restored.mark = restored_mark;
+        return restored;
+    }
+
+    fn findRow(visual_rows: []const VisualRow, index: ?NavigationIndex, row: VisualRow) ?usize {
+        return if (index) |lookup| lookup.find(row) else findVisualRow(visual_rows, row);
+    }
+
+    /// Row lookup reads only the owner and the source start. The other fields,
+    /// such as `buffer_index`, are positions in the capture Frame.
+    fn identity(row: VisualRow) VisualRow {
+        return .{ .owner = row.owner, .source_start = row.source_start };
+    }
+};
+
 pub fn restoreNavigationIndexed(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry, index: NavigationIndex) Nav {
-    return restoreNavigationWith(previous, visual_rows, geometry, index);
+    return NavigationAnchor.capture(previous.navigation, previous.visual_rows).resolve(visual_rows, geometry, index);
 }
 
 /// Linear benchmark control and reference for indexed restoration.
 pub fn restoreNavigation(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry) Nav {
-    return restoreNavigationWith(previous, visual_rows, geometry, @as(?NavigationIndex, null));
-}
-
-fn restoreNavigationWith(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry, index: ?NavigationIndex) Nav {
-    var restored = Nav.init(visual_rows.len, paneRects(geometry).diff_content.height);
-    restored.count = previous.navigation.count;
-    const cursor_row = visualRowAt(previous.visual_rows, previous.navigation.cursor) orelse return restored;
-    const cursor = (if (index) |lookup| lookup.find(cursor_row) else findVisualRow(visual_rows, cursor_row)) orelse return restored;
-    restored.jumpTo(cursor);
-    restored.count = previous.navigation.count;
-
-    const old_offset = previous.navigation.cursor -| previous.navigation.scroll;
-    restored.scroll = cursor -| old_offset;
-    restored.setViewport(paneRects(geometry).diff_content.height);
-
-    if (previous.navigation.mark) |mark| {
-        const mark_row = visualRowAt(previous.visual_rows, mark) orelse return restored;
-        const restored_mark = (if (index) |lookup| lookup.find(mark_row) else findVisualRow(visual_rows, mark_row)) orelse return restored;
-        const old_range = [2]usize{ @min(mark, previous.navigation.cursor), @max(mark, previous.navigation.cursor) };
-        const new_range = [2]usize{ @min(restored_mark, cursor), @max(restored_mark, cursor) };
-        if ((mark_row.owner == .line and cursor_row.owner == .line) or std.meta.eql(old_range, new_range)) restored.mark = restored_mark;
-    }
-    return restored;
+    return NavigationAnchor.capture(previous.navigation, previous.visual_rows).resolveWith(visual_rows, geometry, null);
 }
 
 pub fn resizeViewports(navigation: *Nav, tree: *file_tree.Projection, geometry: Geometry) void {
@@ -734,10 +800,11 @@ fn findVisualRow(visual_rows: []const VisualRow, wanted: VisualRow) ?usize {
 
 const SourceRange = struct { start: usize, end: usize };
 
-fn lineRangeForOwner(visual_row: VisualRow, line: *const bbr.diff.Line) ?SourceRange {
+fn lineRangeForOwner(visual_row: VisualRow, line: LineOwner) ?SourceRange {
     if (visual_row.halves) |halves| {
-        if (halves.right) |half| if (half.line == line) return .{ .start = half.source_start, .end = half.source_end };
-        if (halves.left) |half| if (half.line == line) return .{ .start = half.source_start, .end = half.source_end };
+        const row_line = visual_row.owner.line;
+        if (halves.right) |half| if (std.meta.eql(row_line.sibling(half.line), line)) return .{ .start = half.source_start, .end = half.source_end };
+        if (halves.left) |half| if (std.meta.eql(row_line.sibling(half.line), line)) return .{ .start = half.source_start, .end = half.source_end };
         return null;
     }
     if (!visual_row.owner.eql(.{ .line = line })) return null;
@@ -772,14 +839,14 @@ fn visualRowAt(visual_rows: []const VisualRow, index: usize) ?VisualRow {
     return visual_rows[index];
 }
 
-fn owner(row: buffer_mod.Row) RowOwner {
+fn owner(row: buffer_mod.Row, file: ?*const bbr.diff.File) RowOwner {
     if (buffer_mod.disclosureKey(row)) |key| if (key == .resolved_thread) return .{ .disclosure = key };
     return switch (row) {
         .file_header => |header| .{ .file = header.file },
         .hunk_header => |hunk| .{ .hunk = hunk },
         .status_placeholder => |value| .{ .status_placeholder = .{ .file = value.file, .old = value.old != null, .new = value.new != null } },
-        .line => |line| .{ .line = line.line },
-        .line_pair => |pair| .{ .line = if (pair.right) |right| right.line else pair.left.?.line },
+        .line => |line| .{ .line = .of(file, line.line) },
+        .line_pair => |pair| .{ .line = .of(file, if (pair.right) |right| right.line else pair.left.?.line) },
         .disclosure => |value| .{ .disclosure = value.key },
         .comment => |card| switch (card.owner) {
             .comment => |id| .{ .comment = .{ .id = id, .source_offset = card.source_range.start, .part = anchorPart(card.part) } },
@@ -869,11 +936,11 @@ test "Presentation Frame projects Diff Lines as complete visual rows" {
     defer testing.allocator.free(visual_rows);
 
     try testing.expectEqual(rows.len, visual_rows.len);
-    try testing.expect(visual_rows[0].owner.eql(.{ .line = &line }));
+    try testing.expect(visual_rows[0].owner.eql(.{ .line = .{ .hunk_line = &line } }));
     try testing.expectEqual(@as(usize, 0), visual_rows[0].source_start);
     try testing.expectEqual(line.text.len, visual_rows[0].source_end);
     try testing.expectEqual(@as(usize, 0), visual_rows[0].buffer_index);
-    try testing.expect(visual_rows[1].owner.eql(.{ .line = &line }));
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk_line = &line } }));
     try testing.expectEqual(line.text.len, visual_rows[1].source_end);
     try testing.expectEqual(@as(usize, 1), visual_rows[1].buffer_index);
     try testing.expectEqual(@as(usize, 2), visual_rows[2].buffer_index);
@@ -891,10 +958,10 @@ test "semantic row ownership exposes old and new yank candidates without changin
     const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .side_by_side, .width = 80 });
     defer testing.allocator.free(visual_rows);
 
-    try testing.expect(visual_rows[0].owner.eql(.{ .line = &new_line }));
+    try testing.expect(visual_rows[0].owner.eql(.{ .line = .{ .hunk_line = &new_line } }));
     try testing.expectEqual(&old_line, visual_rows[0].yank_candidates.old.?);
     try testing.expectEqual(&new_line, visual_rows[0].yank_candidates.new.?);
-    try testing.expect(visual_rows[1].owner.eql(.{ .line = &context }));
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk_line = &context } }));
     try testing.expectEqual(&context, visual_rows[1].yank_candidates.old.?);
     try testing.expectEqual(&context, visual_rows[1].yank_candidates.new.?);
 }
@@ -964,6 +1031,261 @@ test "Unified hard wrapping keeps wide and combining graphemes complete" {
     try testing.expectEqualStrings("界", line.text[visual_rows[1].source_start..visual_rows[1].source_end]);
 }
 
+test "a printable ASCII Line wraps at the same positions as the grapheme loop" {
+    const terminal = @import("terminal_cell_metrics.zig").metrics;
+    const cases = [_][]const u8{
+        "short",
+        "abcdef",
+        "abcdefghijklmnopqrstuvwxyz",
+        "abcdef ghi",
+        "abc def ghi jkl ",
+        "trailing space ",
+        "  leading and  double  spaces  ",
+        "ascii then e\xcc\x81 combining",
+        "ascii then \xe7\x95\x8c\xe9\x9d\xa2 wide",
+        "abcde\xcc\x81",
+        "emoji \xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb and flag \xf0\x9f\x87\xac\xf0\x9f\x87\xa7 here",
+        "\tindented with a tab",
+        "a\tb\tc d\te",
+        "bell\x07 escape\x1b[0m nul\x00 del\x7f",
+        "carriage return\r",
+        "cr lf\r\n",
+        "~!@#$%^&*()_+{}|:\"<>? `-=[]\\;',./",
+    };
+    var prng = std.Random.DefaultPrng.init(0x7405);
+    const random = prng.random();
+    const ascii_parts = [_][]const u8{ "a", "Z", "0", "~", " ", "  ", "abc", "(x)" };
+    const mixed_parts = ascii_parts ++ [_][]const u8{ "\t", "\r", "\x01", "e\xcc\x81", "\xe7\x95\x8c", "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb", "\xc2\xa0" };
+    var generated: [400][64]u8 = undefined;
+    var generated_lens: [400]usize = undefined;
+    for (&generated, &generated_lens, 0..) |*storage, *len, index| {
+        const parts: []const []const u8 = if (index % 2 == 0) &ascii_parts else &mixed_parts;
+        len.* = 0;
+        while (true) {
+            const part = parts[random.uintLessThan(usize, parts.len)];
+            if (len.* + part.len > storage.len) break;
+            @memcpy(storage[len.*..][0..part.len], part);
+            len.* += part.len;
+            if (random.uintLessThan(u8, 8) == 0) break;
+        }
+    }
+
+    var texts: [cases.len + generated.len][]const u8 = undefined;
+    for (cases, 0..) |text, index| texts[index] = text;
+    for (&generated, generated_lens, cases.len..) |*storage, len, index| texts[index] = storage[0..len];
+    var ascii_texts: usize = 0;
+    for (texts) |text| {
+        if (terminal.narrowAscii(text)) ascii_texts += 1;
+    }
+    try testing.expect(ascii_texts > 200);
+
+    const short: bbr.diff.Line = .{ .old_no = 2, .new_no = 2, .kind = .context, .text = "x y" };
+    const short_row: buffer_mod.LineRow = .{ .line = &short, .decoration = .{ .runs = &.{} } };
+    for ([_]CellMetrics{ terminal, .bytes }) |metrics| {
+        var grapheme_loop = metrics;
+        grapheme_loop.ascii_is_narrow = false;
+        for (texts) |text| {
+            const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = text };
+            const line_row: buffer_mod.LineRow = .{ .line = &line, .decoration = .{ .runs = &.{} } };
+            const unified = [_]buffer_mod.Row{.{ .line = line_row }};
+            const side_by_side = [_]buffer_mod.Row{
+                .{ .line_pair = .{ .left = line_row, .right = line_row } },
+                .{ .line_pair = .{ .left = line_row } },
+                .{ .line_pair = .{ .right = line_row } },
+                .{ .line_pair = .{ .left = short_row, .right = line_row } },
+            };
+            for (1..text.len + 3) |body_width| {
+                try expectSameVisualRows(&unified, metrics, grapheme_loop, .{ .layout = .unified, .width = unified_gutter_cols + body_width });
+                const side_width = 2 * (side_gutter_cols + body_width) + side_divider_cols;
+                try expectSameVisualRows(&side_by_side, metrics, grapheme_loop, .{ .layout = .side_by_side, .width = side_width });
+                try expectSameVisualRows(&side_by_side, metrics, grapheme_loop, .{ .layout = .side_by_side, .width = side_width + 1 });
+            }
+        }
+    }
+}
+
+test "a printable ASCII Line wraps after the last space that fits" {
+    const terminal = @import("terminal_cell_metrics.zig").metrics;
+    const expectations = [_]struct { text: []const u8, width: usize, rows: []const []const u8 }{
+        .{ .text = "abcdef", .width = 6, .rows = &.{"abcdef"} },
+        .{ .text = "abcdefg", .width = 6, .rows = &.{ "abcdef", "g" } },
+        .{ .text = "abcdef ghi", .width = 6, .rows = &.{ "abcdef", " ghi" } },
+        .{ .text = "abcde fghi", .width = 6, .rows = &.{ "abcde ", "fghi" } },
+        .{ .text = "ab cd ef gh", .width = 6, .rows = &.{ "ab cd ", "ef gh" } },
+        .{ .text = "abc   ", .width = 4, .rows = &.{ "abc ", "  " } },
+    };
+    for (expectations) |expected| {
+        const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = expected.text };
+        const rows = [_]buffer_mod.Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{} } } }};
+        const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, terminal, .{ .layout = .unified, .width = unified_gutter_cols + expected.width });
+        defer testing.allocator.free(visual_rows);
+        try testing.expectEqual(expected.rows.len, visual_rows.len);
+        for (expected.rows, visual_rows) |text, visual_row| try testing.expectEqualStrings(text, line.text[visual_row.source_start..visual_row.source_end]);
+    }
+}
+
+fn expectSameVisualRows(rows: []const buffer_mod.Row, fast: CellMetrics, grapheme_loop: CellMetrics, options: VisualRowOptions) !void {
+    const expected = try buildVisualRowsWithOptions(testing.allocator, rows, grapheme_loop, options);
+    defer testing.allocator.free(expected);
+    const actual = try buildVisualRowsWithOptions(testing.allocator, rows, fast, options);
+    defer testing.allocator.free(actual);
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| {
+        try testing.expectEqual(want.buffer_index, got.buffer_index);
+        try testing.expectEqual(want.source_start, got.source_start);
+        try testing.expectEqual(want.source_end, got.source_end);
+        try testing.expectEqual(want.continuation, got.continuation);
+        try testing.expectEqual(want.halves, got.halves);
+    }
+}
+
+fn exerciseVisualRowCapacityHint(allocator: std.mem.Allocator) !void {
+    const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "abcdefghij" };
+    const rows = [_]buffer_mod.Row{.{ .line = .{
+        .line = &line,
+        .decoration = .{ .runs = &.{.{ .text = line.text }} },
+    } }};
+    const visual = try buildVisualRowsWithOptions(allocator, &rows, .bytes, .{
+        .layout = .unified,
+        .width = unified_gutter_cols + 2,
+    });
+    defer allocator.free(visual);
+    try testing.expectEqual(@as(usize, 5), visual.len);
+    try testing.expect(visual.len > rows.len + rows.len / 2);
+    for (visual, 0..) |row, index| {
+        try testing.expectEqual(@as(usize, 0), row.buffer_index);
+        try testing.expectEqual(index * 2, row.source_start);
+        try testing.expectEqual(index * 2 + 2, row.source_end);
+    }
+}
+
+test "a narrow Unified Line grows beyond the visual row capacity hint without leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, exerciseVisualRowCapacityHint, .{});
+}
+
+/// Counts what a build asks of its arena. A failed remap is a growth that
+/// copies the list into new memory.
+const GrowthCount = struct {
+    child: std.mem.Allocator,
+    allocations: usize = 0,
+    failed_remaps: usize = 0,
+    frees: usize = 0,
+
+    fn allocator(self: *GrowthCount) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *GrowthCount = @ptrCast(@alignCast(ptr));
+        self.allocations += 1;
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *GrowthCount = @ptrCast(@alignCast(ptr));
+        const resized = self.child.rawResize(memory, alignment, new_len, ret_addr);
+        if (!resized and new_len > memory.len) self.failed_remaps += 1;
+        return resized;
+    }
+
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *GrowthCount = @ptrCast(@alignCast(ptr));
+        const result = self.child.rawRemap(memory, alignment, new_len, ret_addr);
+        if (result == null and new_len > memory.len) self.failed_remaps += 1;
+        return result;
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *GrowthCount = @ptrCast(@alignCast(ptr));
+        self.frees += 1;
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "visual rows build in one allocation without a growth copy in both Layouts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = 4096;
+    const lines = try a.alloc(bbr.diff.Line, 2 * count);
+    const rows = try a.alloc(buffer_mod.Row, count);
+    for (rows, 0..) |*row, index| {
+        const text = if (index % 8 < 2) "alpha beta gamma delta epsilon zeta" else "short";
+        lines[2 * index] = .{ .old_no = @intCast(index + 1), .new_no = 0, .kind = .removed, .text = text };
+        lines[2 * index + 1] = .{ .old_no = 0, .new_no = @intCast(index + 1), .kind = .added, .text = text };
+        row.* = if (index % 2 == 0)
+            .{ .line = .{ .line = &lines[2 * index + 1], .decoration = .{ .runs = &.{} } } }
+        else
+            .{ .line_pair = .{
+                .left = .{ .line = &lines[2 * index], .decoration = .{ .runs = &.{} } },
+                .right = .{ .line = &lines[2 * index + 1], .decoration = .{ .runs = &.{} } },
+            } };
+    }
+    for ([_]VisualRowOptions{
+        .{ .layout = .unified, .width = unified_gutter_cols + 12 },
+        .{ .layout = .side_by_side, .width = 2 * (side_gutter_cols + 12) + side_divider_cols },
+    }) |options| {
+        var growth: GrowthCount = .{ .child = a };
+        const visual_rows = try buildVisualRowsWithOptions(growth.allocator(), rows, .bytes, options);
+        try testing.expect(visual_rows.len > rows.len);
+        try testing.expectEqual(@as(usize, 1), growth.allocations);
+        try testing.expectEqual(@as(usize, 0), growth.failed_remaps);
+    }
+}
+
+test "a NavigationIndex whose keys each have one span grows nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = 4096;
+    const lines = try a.alloc(bbr.diff.Line, count);
+    const rows = try a.alloc(buffer_mod.Row, count);
+    for (rows, lines, 0..) |*row, *line, index| {
+        line.* = .{ .old_no = 0, .new_no = @intCast(index + 1), .kind = .added, .text = "short" };
+        row.* = .{ .line = .{ .line = line, .decoration = .{ .runs = &.{} } } };
+    }
+    const visual_rows = try buildVisualRowsWithOptions(a, rows, .bytes, .{ .layout = .unified, .width = unified_gutter_cols + 12 });
+    var growth: GrowthCount = .{ .child = a };
+    const index = try NavigationIndex.build(growth.allocator(), visual_rows);
+    try testing.expectEqual(@as(usize, 0), growth.failed_remaps);
+    // The two frees are the scratch key numbers and cursors of `KeyLists`. A
+    // hash table that grows frees its old table too.
+    try testing.expectEqual(@as(usize, 2), growth.frees);
+    // No reader asks `owners` for a Line, so Line rows add no entry.
+    try testing.expectEqual(@as(u32, 0), index.owners.count());
+    for (visual_rows, 0..) |row, expected| try testing.expectEqual(@as(?usize, expected), index.find(row));
+}
+
+fn sideBySideIndexGrowth(a: std.mem.Allocator, count: usize) !GrowthCount {
+    const lines = try a.alloc(bbr.diff.Line, 2 * count);
+    const rows = try a.alloc(buffer_mod.Row, count);
+    for (rows, 0..) |*row, index| {
+        const text = "alpha beta gamma delta epsilon zeta";
+        lines[2 * index] = .{ .old_no = @intCast(index + 1), .new_no = 0, .kind = .removed, .text = text };
+        lines[2 * index + 1] = .{ .old_no = 0, .new_no = @intCast(index + 1), .kind = .added, .text = text };
+        row.* = .{ .line_pair = .{
+            .left = .{ .line = &lines[2 * index], .decoration = .{ .runs = &.{} } },
+            .right = .{ .line = &lines[2 * index + 1], .decoration = .{ .runs = &.{} } },
+        } };
+    }
+    const visual_rows = try buildVisualRowsWithOptions(a, rows, .bytes, .{ .layout = .side_by_side, .width = 2 * (side_gutter_cols + 12) + side_divider_cols });
+    try testing.expect(visual_rows.len >= 2 * count);
+    var growth: GrowthCount = .{ .child = a };
+    const index = try NavigationIndex.build(growth.allocator(), visual_rows);
+    for (visual_rows, 0..) |row, expected| try testing.expectEqual(@as(?usize, expected), index.find(row));
+    return growth;
+}
+
+test "a NavigationIndex build allocates the same for any key count and grows no key list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Each SideBySide half wraps, so each key has two spans.
+    const small = try sideBySideIndexGrowth(arena.allocator(), 512);
+    const large = try sideBySideIndexGrowth(arena.allocator(), 4096);
+    try testing.expectEqual(small.allocations, large.allocations);
+    try testing.expectEqual(@as(usize, 0), large.failed_remaps);
+}
+
 test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {
     const file: bbr.diff.File = .{ .old_path = "a.txt", .new_path = "a.txt", .status = .modified, .hunks = &.{} };
     const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "long source" };
@@ -1006,7 +1328,7 @@ test "SideBySide halves wrap independently and align absent continuations" {
     try testing.expectEqualStrings("new", right.text[first_right.source_start..first_right.source_end]);
     try testing.expect(visual_rows[1].halves.?.left.?.continuation);
     try testing.expect(visual_rows[1].halves.?.right == null);
-    try testing.expect(visual_rows[1].owner.eql(.{ .line = &left }));
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = .{ .hunk_line = &left } }));
     try testing.expectEqual(@as(usize, 8), visual_rows[1].source_start);
 }
 
@@ -1051,72 +1373,6 @@ test "SideBySide resize restores an old-only continuation by source offset" {
     };
 
     try testing.expectEqual(@as(usize, 0), restoreNavigation(previous, new_rows, .{ .cols = 35, .rows = 5 }).cursor);
-}
-
-test "M21 kernel source ranges project across every wrapped visual row without changing wrapping" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "abcdefgh" };
-    const rows = [_]buffer_mod.Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{.{ .text = line.text }} } } }};
-    const visual_rows = try buildVisualRowsWithOptions(allocator, &rows, .bytes, .{ .layout = .unified, .width = unified_gutter_cols + 4 });
-    const projected = try projectSourceRanges(allocator, visual_rows, &.{.{
-        .old_line = &line,
-        .new_line = &line,
-        .relation = .neutral,
-        .ranges = &.{.{ .start = 2, .end = 6 }},
-        .active = true,
-    }});
-
-    try testing.expectEqual(@as(usize, 2), visual_rows.len);
-    try testing.expectEqual(@as(usize, 2), projected.len);
-    try testing.expectEqual(search.Range{ .start = 2, .end = 4 }, projected[0].source);
-    try testing.expectEqual(search.Range{ .start = 2, .end = 4 }, projected[0].row);
-    try testing.expectEqual(search.Range{ .start = 4, .end = 6 }, projected[1].source);
-    try testing.expectEqual(search.Range{ .start = 0, .end = 2 }, projected[1].row);
-    try testing.expect(projected[0].active and projected[1].active);
-}
-
-test "M21 kernel neutral source ranges project onto distinct SideBySide context Lines" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const old: bbr.diff.Line = .{ .old_no = 3, .new_no = 3, .kind = .context, .text = "same" };
-    const new: bbr.diff.Line = .{ .old_no = 3, .new_no = 3, .kind = .context, .text = "same" };
-    const rows = [_]buffer_mod.Row{.{ .line_pair = .{
-        .left = .{ .line = &old, .decoration = .{ .runs = &.{.{ .text = old.text }} } },
-        .right = .{ .line = &new, .decoration = .{ .runs = &.{.{ .text = new.text }} } },
-    } }};
-    const visual_rows = try buildVisualRowsWithOptions(allocator, &rows, .bytes, .{ .layout = .side_by_side, .width = 40 });
-    const projected = try projectSourceRanges(allocator, visual_rows, &.{.{
-        .old_line = &old,
-        .new_line = &new,
-        .relation = .neutral,
-        .ranges = &.{.{ .start = 1, .end = 3 }},
-    }});
-
-    try testing.expectEqual(@as(usize, 2), projected.len);
-    try testing.expectEqual(search.VersionRelation.old, projected[0].relation);
-    try testing.expectEqual(search.VersionRelation.new, projected[1].relation);
-}
-
-test "source ranges do not match absent Line candidates" {
-    const matched: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "first" };
-    const other: bbr.diff.Line = .{ .old_no = 2, .new_no = 0, .kind = .removed, .text = "other" };
-    const visual_rows = [_]VisualRow{
-        .{ .owner = .{ .line = &matched }, .source_end = 5, .yank_candidates = .{ .old = &matched } },
-        .{ .owner = .{ .line = &other }, .source_end = 5, .yank_candidates = .{ .old = &other } },
-        .{ .kind = .comment, .owner = .{ .comment = .{ .id = 1, .source_offset = 0 } }, .source_end = 5 },
-    };
-    const projected = try projectSourceRanges(testing.allocator, &visual_rows, &.{.{
-        .old_line = &matched,
-        .relation = .neutral,
-        .ranges = &.{.{ .start = 1, .end = 3 }},
-    }});
-    defer testing.allocator.free(projected);
-
-    try testing.expectEqual(@as(usize, 1), projected.len);
-    try testing.expectEqual(@as(usize, 0), projected[0].visual_row);
 }
 
 test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {

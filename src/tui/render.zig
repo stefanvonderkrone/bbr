@@ -1412,8 +1412,8 @@ test "mention labels and filtered emoji paint in Review Search previews" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var names: @import("review_body.zig").MentionNames = .empty;
-    try names.put(a, "id", "@Ada");
+    const review_body = @import("review_body.zig");
+    const names = try review_body.MentionNames.init(&[_]review_body.MentionName{.{ "id", "@Ada" }}, a);
     const raw = "@{id} :pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }";
     const ranges = [_]@import("search.zig").Range{.{ .start = 0, .end = 5 }};
     const result: presentation.ReviewSearchResult = .{
@@ -1515,18 +1515,7 @@ fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result
     }
 }
 
-pub const terminal_cell_metrics: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
-const metrics_context: u8 = 0;
-const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme, .width = widthVaxisText };
-fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
-    var iterator = vaxis.unicode.graphemeIterator(text);
-    const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
-    return .{ .byte_len = grapheme.len, .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode) };
-}
-
-fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
-    return vaxis.gwidth.gwidth(text, .unicode);
-}
+pub const terminal_cell_metrics = @import("terminal_cell_metrics.zig").metrics;
 
 test "M23 emoji ReviewCards and Preview paint complete sequences with shared terminal columns" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2930,8 +2919,8 @@ test "an added or removed Line paints its band from the first gutter cell of eve
                     try testing.expectEqual(theme.lineStyle(value.line.kind).bg, win.readCell(x, row).?.style.bg);
                     banded += 1;
                 }
-            } else if (visual.owner == .line and visual.owner.line.kind != .context) {
-                try testing.expectEqual(theme.lineStyle(visual.owner.line.kind).bg, win.readCell(0, row).?.style.bg);
+            } else if (visual.owner == .line and visual.owner.line.hunk_line.kind != .context) {
+                try testing.expectEqual(theme.lineStyle(visual.owner.line.hunk_line.kind).bg, win.readCell(0, row).?.style.bg);
                 banded += 1;
             }
         }
@@ -3249,7 +3238,7 @@ test "cursor and Selection paint only Selected Version across complete wrapped s
             for (visual_rows, 0..) |row, index| {
                 if (row.owner != .line) continue;
                 if (layout == .unified) {
-                    const candidate = row.owner.line;
+                    const candidate = row.owner.line.hunk_line;
                     const band = backgrounds[index][0];
                     const expected = if (candidate == line) theme_dark.cursorBg(band) else band;
                     try testing.expectEqual(expected, win.readCell(gutter_cols, @intCast(index)).?.style.bg);
@@ -4253,20 +4242,6 @@ test "M23 ancestry renders shared offsets and visible capped depth with search c
 }
 
 test "ReviewCard wide grapheme keeps the DiffPane right border" {
-    const Metrics = struct {
-        fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
-            var iterator = vaxis.unicode.graphemeIterator(text);
-            const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
-            return .{
-                .byte_len = grapheme.len,
-                .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode),
-            };
-        }
-
-        const context: u8 = 0;
-        const value: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &context, .vtable = &.{ .next = next } };
-    };
-
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const session = try @import("session.zig").create(testing.allocator);
@@ -4307,7 +4282,7 @@ test "ReviewCard wide grapheme keeps the DiffPane right border" {
 
     var state = try presentation.Presentation.init(testing.allocator, .{
         .reviews = store.store(),
-        .cell_metrics = Metrics.value,
+        .cell_metrics = terminal_cell_metrics,
     }, .{
         .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
         .geometry = .{ .cols = 59, .rows = 16 },
