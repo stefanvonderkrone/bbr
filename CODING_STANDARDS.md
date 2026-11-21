@@ -150,7 +150,9 @@ A failed enrichment build uses `buffer_build_failed`.
 A File Enrichment or a query retry that succeeds clears only the `out_of_memory` message of an earlier failed attempt.
 A cache staging or a cache update commit writes no message.
 A user action that hands its work to maintenance work clears an older message before it does so.
-`openReviewSearchOccurrence` clears it before the acquisition pump for an evicted File only for a user input, and a completion that opens the occurrence keeps the shown message. [Each OwnedInput kind has an event class](docs/rules/tui-state.md#each-ownedinput-kind-has-an-event-class) says how `dispatch` decides it.
+`openReviewSearchOccurrence` clears it before the acquisition pump for an evicted File only for a user input.
+A completion that opens the occurrence keeps the shown message.
+[Each OwnedInput kind has an event class](docs/rules/tui-state.md#each-ownedinput-kind-has-an-event-class) says how `dispatch` decides the class.
 
 These sites are maintenance work:
 
@@ -174,7 +176,11 @@ A File that the acquisition cannot queue stays pending and unacquired, so the ne
 So a failure loses no work and keeps the session.
 The message of the event outcome stays, such as `buffer_search_scan_failed` or `file_enrichment_launch_failed`.
 
-No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+No check: a wrong class for an existing kind in the `dispatch` switch compiles. Only the user-input test of the occurrence opening checks a class.
+No completion reaches the clear in `openReviewSearchOccurrence`, so no test can show that a completion keeps the message there.
+Both completion callers open the selected occurrence only while it matches the opened one.
+The Review Search Preview holds the File of that occurrence, so the File keeps its content.
+The tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
 ### A dropped user input shows its failure
 

@@ -1017,7 +1017,8 @@ pub const SessionLoaded = struct {
 
 /// Whether a person asked for the event. The failure of a user input is the
 /// outcome of that input, so it can replace the shown message. A completion
-/// is every other event, such as a worker result, a tick, or the focus check.
+/// is every other event, such as a worker result, a tick, the focus check, or
+/// the geometry sync that the App sends after each event.
 const EventClass = enum { user_input, completion };
 
 pub const OwnedInput = union(enum) {
@@ -6761,8 +6762,6 @@ pub const Presentation = struct {
             .key,
             .mouse,
             .push_count_digit,
-            .resize_viewport,
-            .resize,
             .action,
             .composer,
             .unknown_resolution,
@@ -6771,6 +6770,8 @@ pub const Presentation = struct {
             .dismiss_submission_result,
             .request_shutdown,
             => .user_input,
+            .resize_viewport,
+            .resize,
             .diagnostics_changed,
             .session_loaded,
             .session_prepared,

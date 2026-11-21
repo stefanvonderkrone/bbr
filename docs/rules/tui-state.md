@@ -205,13 +205,15 @@ Enforcement: the test "M21 kernel Review Search starts a source scan when no all
 ## Each OwnedInput kind has an event class
 
 `Presentation.dispatch` gives each event one `EventClass` before it handles the event.
-A key, a mouse event, an Action, a resize, and the other inputs of a person are `.user_input`.
+A key, a mouse event, an Action, and the other inputs of a person are `.user_input`.
 A worker result, a tick, and the focus check `ensure_focused_enrichment` are `.completion`.
+A `resize` is also `.completion`, because the App sends it after each event to sync the geometry.
 The class lives in `Presentation.event_class` until `dispatch` returns, and it is `.completion` outside `dispatch`.
-Code that must know whether a person asked for the event reads `event_class`. It takes no parameter for this choice, so no caller can choose the wrong class.
+Code that must know whether a person asked for the event reads `event_class`. It takes no parameter for this choice, so no caller chooses the class.
+A field set once for each event is the smallest form, because a parameter would go through every function between `dispatch` and the reader.
 `openReviewSearchOccurrence` clears the shown message before the acquisition pump for an evicted File only when the class is `.user_input`.
 
-Enforcement: the exhaustive switch over `OwnedInput` at the start of `Presentation.dispatch` (compile error for a new `OwnedInput` kind without a class). The test "M21 kernel opening a Review Search hit in an evicted File clears an older message" in `src/tui/presentation.zig` fails when a user input keeps the older message. `zig build test` runs it. The completion callers of `openReviewSearchOccurrence` open only a File with content, so no completion reaches the clear. The test "M21 kernel Review Search completion openings keep the shown message" covers both completion callers.
+Enforcement: the exhaustive switch over `OwnedInput` at the start of `Presentation.dispatch` (compile error for a new `OwnedInput` kind without a class). The test "M21 kernel opening a Review Search hit in an evicted File clears an older message" in `src/tui/presentation.zig` fails when a user input keeps the older message. `zig build test` runs it. A wrong class for an existing kind is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message).
 
 ## Search occurrence index mapping
 
