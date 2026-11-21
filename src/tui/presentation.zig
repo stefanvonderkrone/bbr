@@ -9319,6 +9319,7 @@ pub const Presentation = struct {
                 if (side == .pending) {
                     state.opening_source = true;
                     if (state.acquired) |acquired| acquired[source.file_index] = false;
+                    self.action_error = null;
                     self.pumpReviewSearchAcquisition(published);
                 } else if (published.session.enrichment.status(source.file_index).old != .loading and published.session.enrichment.status(source.file_index).new != .loading) {
                     state.opening_source = false;
