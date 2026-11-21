@@ -35796,6 +35796,44 @@ test "M21 kernel Review Search retries a reopened query scan that cannot queue a
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
 }
 
+test "Review recovery a failed view build survives a successful Review Search query retry" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+
+    const published = presentation.published.?;
+    try presentation.queueViewBuild(published, presentation.preferences, published.isolated_file, published.geometry, .restore);
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    worker.failed = true;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?);
+    try testing.expect(published.review_search.open);
+    try testing.expect(published.review_search.pending);
+    try testing.expect(published.review_search.needs_scan);
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(@as(?ActionError, .buffer_build_failed), presentation.projection().action_error);
+    try completeBufferSearchScan(&presentation);
+    const view = presentation.projection();
+    try testing.expectEqualStrings("newe", view.review_search.?.query);
+    try testing.expect(!view.review_search.?.pending);
+    try testing.expectEqual(@as(?ActionError, .buffer_build_failed), view.action_error);
+}
+
 test "M21 kernel Review Search keeps another message of the same event when a reopened query retry succeeds" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
