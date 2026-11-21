@@ -31783,8 +31783,8 @@ test "M21 kernel reopening Review Search holds no File that its query already sc
         try testing.expectEqual(@as(usize, @intFromBool(std.meta.eql(preview, @as(?usize, index)))), stored.leases);
 }
 
-test "a failed enrichment rebuild releases each File and reports only demanded Files" {
-    for ([_]bool{ false, true }) |demanded| {
+test "M21 kernel a failed enrichment rebuild keeps a shown message and reports only demanded Files" {
+    for ([_]bool{ false, true }) |demanded| for ([_]bool{ false, true }) |message_shown| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -31814,18 +31814,24 @@ test "a failed enrichment rebuild releases each File and reports only demanded F
         worker.arena = std.heap.ArenaAllocator.init(failing.allocator());
         worker.build();
         try testing.expect(worker.failed);
+        if (message_shown) {
+            try presentation.dispatch(.{ .action = .recover_submission });
+            try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+        }
         try presentation.dispatch(.{ .buffer_disclosure_built = worker });
 
         for (batch[0..2]) |command| {
             try testing.expect(presentation.published.?.session.enrichment.file(command.file_index).new == .pending);
             try testing.expect(presentation.published.?.session.enrichment.needsEnrichment(command.file_index));
         }
-        if (demanded)
+        if (message_shown)
+            try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error)
+        else if (demanded)
             try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?)
         else
             try testing.expect(presentation.projection().action_error == null);
         for (batch[2..]) |command| try deliverTestEnrichment(&presentation, command);
-    }
+    };
 }
 
 test "a File focused while its result waits in an enrichment rebuild reports the failed rebuild" {
