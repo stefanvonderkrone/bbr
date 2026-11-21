@@ -4341,6 +4341,7 @@ const ReviewSearchState = struct {
     }
 };
 
+/// Returns true if the release cancels the pending reading location.
 fn releaseEnrichments(published: *Published, enrichments: []const EnrichedFile) bool {
     const restoring_location = published.pending_review_location != null;
     for (enrichments) |enriched| {
@@ -30949,6 +30950,45 @@ test "M21 kernel dropped enrichment that cancels a Refresh location shows its fa
     try expectDroppedInputRecord(&presentation);
 }
 
+test "M21 kernel failed enrichment build that cancels a Refresh location shows its failure" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try presentation.dispatch(.{ .action = .next_file });
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    try refreshRecoverySession(&presentation, try testTwoFileSession(testing.allocator, 1));
+    try testing.expect(cursorOwner(&presentation) == .file);
+    const waiting = try takeTestEnrichment(&presentation);
+    try deliverTestEnrichment(&presentation, waiting);
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    var saved_arena = worker.arena;
+    defer saved_arena.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    worker.arena = std.heap.ArenaAllocator.init(failing.allocator());
+    worker.build();
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(worker.failed);
+    try testing.expect(presentation.published.?.pending_review_location != null);
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+
+    try testing.expectEqual(@as(?ActionError, .buffer_build_failed), presentation.projection().action_error);
+    try testing.expect(presentation.published.?.pending_review_location == null);
+    try testing.expect(cursorOwner(&presentation) == .file);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
 test "M21 kernel Review Search acquisition queue keeps the shown message" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -31755,7 +31795,7 @@ test "M21 kernel opening a Review Search hit in an evicted File clears an older 
     try testing.expect(presentation.projection().review_search == null);
 }
 
-test "M21 kernel Review Search completion openings keep the selected File from eviction" {
+test "M21 kernel Review Search completion openings keep the shown message" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{
