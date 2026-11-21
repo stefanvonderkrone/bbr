@@ -122,3 +122,47 @@ The longer run completed all checks.
 The format, agent document, diagnostics, and diff checks exit 0.
 The source debug marker grep exits 1 with no matches.
 The repository-wide grep still finds the 45 unchanged documentation and skill references described above.
+
+### 2026-11-21 review-gap follow-up
+
+The two-axis review found missing behavior evidence and unclear standards text.
+This round adds that evidence without a behavior change.
+
+The test "M21 kernel dropped Selected Version enrichment retries and restores the reading location" passes before any behavior fix.
+The test takes the enrichment command directly after `select_old_version`.
+It fails the result queue with the Presentation allocator and reads one completion admission record.
+The later focus check queues the same File again.
+The accepted enrichment restores Selected Version `old` and puts `old b` under the cursor in File 1.
+Thus, the dropped result does not lose the Selected Version input.
+Commit `40f19e37` adds the test.
+Commit `beec6ebd` strengthens the first command assertion after review.
+The first version used a helper that could queue enrichment before it read the command.
+The strengthened test passes without a behavior fix too.
+
+The test "M21 kernel failed enrichment build that cancels a Refresh location shows its failure" also passes before any behavior fix.
+It fails the enrichment build while the reading location remains pending.
+The completion cancels that location and replaces `action_refused` with `buffer_build_failed`.
+The cursor stays at the File header, and the completion emits no second diagnostic command.
+Commit `18b89d79` adds this test and documents the boolean return from `releaseEnrichments`.
+That commit also renames the probe to "M21 kernel Review Search completion openings keep the shown message".
+
+Commit `e8f6c1b9` scopes the completion rule to an occurrence opening.
+It removes the duplicate record-once text and names the operation and phase of the drop record.
+It uses active voice and names the refresh or Reconciliation instead of "that input".
+The Presentation glossary uses "reading location" but defines no Refresh term.
+The standards therefore use plain "refresh" and identify `pending_review_location` once.
+No glossary change is needed.
+
+The first follow-up review found the initial command assertion gap on the Spec axis.
+The final independent review reports no findings on either the Standards or Spec axis.
+Both reviews are static reviews.
+The final review includes the strengthened assertion and the standards edits.
+
+Both new tests pass before any behavior fix, so this round needs no red-to-green behavior fix.
+The final `zig build test-search-kernel --summary all` run exits 0 with 167 of 167 tests passing.
+The final `zig build test --summary all` run exits 0 with 59 of 59 steps and 1726 of 1726 tests passing.
+The native host is aarch64 macOS, and the build target is `native-macos.15.0`.
+`zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, and `python3 tools/check_diagnostics.py` exit 0.
+`git diff --check` exits 0.
+The source, build, and tests debug-marker grep exits 1 with no matches.
+The final Worktree status is clean after the completion commit.
