@@ -30411,6 +30411,35 @@ test "M21 kernel cache focus failure preserves content and focus before retry" {
     try testing.expect(published.session.enrichment.file(0).new == .pending);
 }
 
+test "M21 kernel cache focus staging failure keeps the session and stages again" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .to_bottom });
+        if (message_shown) try presentation.dispatch(.{ .action = .recover_submission });
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.ensure_focused_enrichment);
+        failing.fail_index = std.math.maxInt(usize);
+        const shown: ActionError = if (message_shown) .action_refused else .out_of_memory;
+        try testing.expectEqual(shown, presentation.projection().action_error.?);
+        const failure = presentation.takeCommand().?.report_diagnostic;
+        try testing.expectEqual(bbr.diagnostic.Operation.buffer_build, failure.operation);
+        try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+        try testing.expect(presentation.takeCommand() == null);
+        const epoch = presentation.published.?.epoch;
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try testing.expect(presentation.queuedBuildIndex(.cache_update, epoch) != null);
+    }
+}
+
 test "M21 kernel cache focus supersedes queued and issued focus changes" {
     for ([_]bool{ false, true }) |issued| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
