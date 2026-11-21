@@ -30523,6 +30523,74 @@ test "M21 kernel focus check File Enrichment of the active File keeps the shown 
     }
 }
 
+/// Opens the Review Search on ten Files and takes the File Enrichments that
+/// its acquisition queues, so a completion opens a slot for the ninth File.
+fn openTestReviewSearchAcquisition(presentation: *Presentation, taken: []EnrichFile) !void {
+    try presentation.dispatch(.{ .action = .open_review_search });
+    var count: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        defer command.deinit();
+        if (command != .enrich_file) continue;
+        if (count < taken.len) taken[count] = command.enrich_file;
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 8), count);
+}
+
+fn failTestEnrichment(presentation: *Presentation, enrich: EnrichFile) !void {
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = enrich.command_id,
+        .work_id = enrich.work_id,
+        .session_epoch = enrich.session_epoch,
+        .file_index = enrich.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    } });
+}
+
+test "M21 kernel Review Search acquisition queue keeps the shown message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+    });
+    defer presentation.deinit();
+    var taken: [1]EnrichFile = undefined;
+    try openTestReviewSearchAcquisition(&presentation, &taken);
+    try failTestEnrichment(&presentation, taken[0]);
+    try testing.expectEqual(@as(?ActionError, .file_enrichment_launch_failed), presentation.projection().action_error);
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqual(@as(usize, 8), command.enrich_file.file_index);
+}
+
+test "M21 kernel Review Search acquisition queue failure records once and keeps the shown message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+    });
+    defer presentation.deinit();
+    var taken: [2]EnrichFile = undefined;
+    try openTestReviewSearchAcquisition(&presentation, &taken);
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    failing.fail_index = failing.alloc_index;
+    try failTestEnrichment(&presentation, taken[0]);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(?ActionError, .file_enrichment_launch_failed), presentation.projection().action_error);
+    const failure = (presentation.takeCommand() orelse return error.TestExpectedRecord).report_diagnostic;
+    try testing.expectEqual(bbr.diagnostic.Operation.file_enrichment, failure.operation);
+    try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+    try testing.expect(presentation.takeCommand() == null);
+    try failTestEnrichment(&presentation, taken[1]);
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqual(@as(usize, 8), command.enrich_file.file_index);
+}
+
 test "M21 kernel cache focus supersedes queued and issued focus changes" {
     for ([_]bool{ false, true }) |issued| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
