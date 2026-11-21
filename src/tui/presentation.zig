@@ -30440,6 +30440,36 @@ test "M21 kernel cache focus staging failure keeps the session and stages again"
     }
 }
 
+test "M21 kernel focus check keeps the session when the read of the active File cannot queue" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        });
+        defer presentation.deinit();
+        if (message_shown) try presentation.dispatch(.{ .action = .recover_submission });
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.ensure_focused_enrichment);
+        failing.fail_index = std.math.maxInt(usize);
+        const shown: ActionError = if (message_shown) .action_refused else .out_of_memory;
+        try testing.expectEqual(shown, presentation.projection().action_error.?);
+        const failure = presentation.takeCommand().?.report_diagnostic;
+        try testing.expectEqual(bbr.diagnostic.Operation.file_enrichment, failure.operation);
+        try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+        try testing.expect(presentation.takeCommand() == null);
+        try presentation.dispatch(.ensure_focused_enrichment);
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqual(@as(usize, 0), command.enrich_file.file_index);
+        try testing.expect(!command.enrich_file.speculative);
+    }
+}
+
 test "M21 kernel cache focus supersedes queued and issued focus changes" {
     for ([_]bool{ false, true }) |issued| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
