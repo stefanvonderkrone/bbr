@@ -30465,6 +30465,64 @@ test "M21 kernel cache focus staging failure keeps the session and stages again"
     }
 }
 
+test "M21 kernel stale cache update retry failure records once and keeps the shown message" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .to_bottom });
+        try presentation.dispatch(.ensure_focused_enrichment);
+        const job = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.cache_update, job.kind);
+        job.build();
+        try testing.expect(!job.failed);
+        presentation.published.?.session.enrichment.hold(0);
+        if (message_shown) try presentation.dispatch(.{ .action = .recover_submission });
+        try testing.expect(presentation.takeCommand() == null);
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        const shown: ActionError = if (message_shown) .action_refused else .out_of_memory;
+        try testing.expectEqual(shown, presentation.projection().action_error.?);
+        const failure = (presentation.takeCommand() orelse return error.TestExpectedRecord).report_diagnostic;
+        try testing.expectEqual(bbr.diagnostic.Operation.buffer_build, failure.operation);
+        try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+        try testing.expect(presentation.takeCommand() == null);
+        const epoch = presentation.published.?.epoch;
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try testing.expect(presentation.queuedBuildIndex(.cache_update, epoch) != null);
+    }
+}
+
+test "M21 kernel cache update commit keeps the shown message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .to_bottom });
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const job = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.cache_update, job.kind);
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.action_refused, presentation.projection().action_error.?);
+    job.build();
+    try testing.expect(!job.failed);
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    try testing.expect(presentation.published.?.pending_cache_update == null);
+    try testing.expect(presentation.published.?.session.enrichment.file(0).new == .pending);
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+}
+
 test "M21 kernel focus check keeps the session when the File Enrichment of the active File cannot queue" {
     for ([_]bool{ false, true }) |message_shown| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
