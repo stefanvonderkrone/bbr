@@ -2870,6 +2870,14 @@ pub const DisclosureBuild = struct {
         review_destination,
         card_destination,
 
+        /// The path whose errors a build of this kind shows and clears.
+        fn errorOrigin(kind: Kind) ErrorOrigin {
+            return switch (kind) {
+                .enrichment, .cache_update => .file_enrichment,
+                .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => .buffer,
+            };
+        }
+
         /// Whether a build of this kind opens the Buffer Search occurrence in
         /// `destination_active`. Every other kind keeps the current occurrence.
         fn opensOccurrence(kind: Kind) bool {
@@ -4038,6 +4046,28 @@ pub const DeleteConfirmationProjection = struct {
     comment_id: ?bbr.review.CommentId = null,
     descendant_count: usize,
     root_has_replies: bool = false,
+};
+
+/// The path that shows an action error. A completion of background work
+/// clears only an error of its own path, so it keeps an error that the user
+/// has not read yet. A key, a mouse action, or an Overlay action is `.user`
+/// and clears any error.
+const ErrorOrigin = enum {
+    user,
+    picker,
+    submission,
+    comment_edit,
+    comment_delete,
+    reviewer_verdict,
+    reconciliation,
+    theme,
+    file_enrichment,
+    buffer,
+};
+
+const ShownError = struct {
+    err: ActionError,
+    origin: ErrorOrigin,
 };
 
 pub const ActionError = enum {
@@ -6659,7 +6689,7 @@ pub const Presentation = struct {
     delete_confirmation: ?DeleteConfirmation = null,
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
-    action_error: ?ActionError = null,
+    action_error: ?ShownError = null,
     diagnostic_state: bbr.diagnostic.State = .off,
     diagnostic_pending: bool = false,
     fatal_error: ?FatalError = null,
@@ -6824,7 +6854,6 @@ pub const Presentation = struct {
             .clipboard_completed => |completed| {
                 if (!self.consumeCommand(completed.command_id, .copy_clipboard)) return;
                 self.clipboard_status = if (completed.success) .copied else .failed;
-                self.action_error = null;
             },
             .external_edit_completed => |completed| self.acceptExternalEdit(completed),
             .buffer_search_scanned => |completed| if (completed.mode == .fuzzy) self.acceptReviewSearchScanned(completed) else self.acceptBufferSearchScanned(completed),
@@ -6938,6 +6967,15 @@ pub const Presentation = struct {
         return command;
     }
 
+    fn showError(self: *Presentation, origin: ErrorOrigin, err: ActionError) void {
+        self.action_error = .{ .err = err, .origin = origin };
+    }
+
+    fn clearError(self: *Presentation, origin: ErrorOrigin) void {
+        const shown = self.action_error orelse return;
+        if (origin == .user or shown.origin == origin) self.action_error = null;
+    }
+
     fn reportFailure(self: *Presentation, operation: bbr.diagnostic.Operation, phase: bbr.diagnostic.Phase, err: anyerror, comptime source: std.builtin.SourceLocation) void {
         const failure = bbr.diagnostic.Failure.capture(operation, phase, .{ .session_epoch = if (self.published) |published| published.epoch else null }, .{ .zig = err }, source);
         self.reportEvidence(failure);
@@ -7026,7 +7064,7 @@ pub const Presentation = struct {
             } else null else null,
             .replacing = self.replacement != null,
             .replacement_error = self.replacement_error,
-            .action_error = self.action_error,
+            .action_error = if (self.action_error) |shown| shown.err else null,
             .buffer_search = if (self.published) |published| if (published.active_search == .buffer) published.buffer_search.projection() else null else null,
             .review_search = if (self.published) |published| blk: {
                 var search_view = published.review_search.projection(self.geometry) orelse break :blk null;
@@ -7219,7 +7257,7 @@ pub const Presentation = struct {
                 clampSelectionAtUnavailableRow(published, previous_cursor, self.preferences.scope);
                 if (published.navigation.cursor != previous_cursor) self.clearBufferSearchActive(published) catch |err| {
                     published.navigation.jumpTo(previous_cursor);
-                    self.action_error = normalizeActionError(err);
+                    self.showError(.user, normalizeActionError(err));
                     return;
                 };
                 self.selectFocusedFileVersion(published);
@@ -7290,24 +7328,24 @@ pub const Presentation = struct {
         defer arena.deinit();
         const run = self.dependencies.reviews.activeSubmission(arena.allocator()) catch |err| {
             self.reportFailure(.recovery_check, .read, err, @src());
-            self.action_error = .recovery_claim_failed;
+            self.showError(.submission, .recovery_claim_failed);
             return;
         } orelse return;
         const key = OwnedReviewIdentity.init(run.key.workspace, run.key.repository, run.key.pull_request_id) catch |err| switch (err) {
             error.NameTooLong => {
-                self.action_error = .recovery_claim_failed;
+                self.showError(.submission, .recovery_claim_failed);
                 return;
             },
         };
         const source_commit = BoundedText(64).init(run.source_commit) catch |err| switch (err) {
             error.ValueTooLong => {
-                self.action_error = .recovery_claim_failed;
+                self.showError(.submission, .recovery_claim_failed);
                 return;
             },
         };
         self.recovery_participants.ensureTotalCapacity(self.allocator, run.items.len) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .recovery_claim_failed;
+                self.showError(.submission, .recovery_claim_failed);
                 return;
             },
         };
@@ -7315,7 +7353,7 @@ pub const Presentation = struct {
         for (run.items) |item| self.recovery_participants.appendAssumeCapacity(item.temp_id);
         var probe = locks.tryAcquire(run.key) catch |err| {
             self.reportFailure(.submission_lock, .open, err, @src());
-            self.action_error = .recovery_claim_failed;
+            self.showError(.submission, .recovery_claim_failed);
             return;
         };
         const ownership: RecoveryOwnership = if (probe != null) .recoverable else .running_elsewhere;
@@ -7335,30 +7373,30 @@ pub const Presentation = struct {
             return;
         }
         const notice = self.recovery orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         if (notice.ownership == .running_elsewhere) {
-            self.action_error = .submission_owned_elsewhere;
+            self.showError(.user, .submission_owned_elsewhere);
             return;
         }
         const locks = self.dependencies.submission_locks orelse {
-            self.action_error = .recovery_claim_failed;
+            self.showError(.user, .recovery_claim_failed);
             return;
         };
         if (notice.current_temp_id != null) self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
         var lock = (locks.tryAcquire(notice.key.storeKey()) catch |err| {
             self.reportFailure(.submission_lock, .open, err, @src());
-            self.action_error = .recovery_claim_failed;
+            self.showError(.user, .recovery_claim_failed);
             return;
         }) orelse {
             self.recovery.?.ownership = .running_elsewhere;
-            self.action_error = .submission_owned_elsewhere;
+            self.showError(.user, .submission_owned_elsewhere);
             return;
         };
         var validation_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -7366,18 +7404,18 @@ pub const Presentation = struct {
         const active = self.dependencies.reviews.activeSubmission(validation_arena.allocator()) catch |err| {
             self.reportFailure(.recovery_check, .read, err, @src());
             lock.release();
-            self.action_error = .recovery_claim_failed;
+            self.showError(.user, .recovery_claim_failed);
             return;
         } orelse {
             lock.release();
             self.recovery = null;
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         if (!recoveryMatches(notice, active)) {
             lock.release();
             self.discoverRecovery();
-            self.action_error = .recovery_claim_failed;
+            self.showError(.user, .recovery_claim_failed);
             return;
         }
         if (notice.current_temp_id == null) {
@@ -7387,7 +7425,7 @@ pub const Presentation = struct {
         const recovered = DurableSubmission.recover(self.allocator, self.dependencies.reviews, active, notice.key, lock) catch |err| {
             self.reportFailure(.recovery_check, .prepare, err, @src());
             lock.ptr = null;
-            self.action_error = .recovery_claim_failed;
+            self.showError(.user, .recovery_claim_failed);
             return;
         };
         lock.ptr = null;
@@ -7401,7 +7439,7 @@ pub const Presentation = struct {
             .source_commit = notice.source_commit,
         } });
         self.syncSubmissionTree(recovered.durable);
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn completeRecoveredTerminal(self: *Presentation, notice: RecoveryNotice, run: bbr.review.ActiveSubmissionRun, lock: *bbr.review.SubmissionLockGuard) void {
@@ -7410,7 +7448,7 @@ pub const Presentation = struct {
         defer arena.deinit();
         const review = self.dependencies.reviews.loadReview(arena.allocator(), notice.key.storeKey()) catch |err| {
             self.reportFailure(.recovery_check, .read, err, @src());
-            self.action_error = .recovery_claim_failed;
+            self.showError(.user, .recovery_claim_failed);
             return;
         };
         var result: SubmissionResultProjection = .{
@@ -7443,30 +7481,30 @@ pub const Presentation = struct {
         result.completion = if (clean) .clean else .partial;
         const tree = SubmissionTree.createPersisted(self.allocator, notice.key, notice.operation_id, &review, run.items, result.completion) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
             error.DraftNotFound => {
                 self.reportFailure(.recovery_check, .prepare, err, @src());
-                self.action_error = .recovery_claim_failed;
+                self.showError(.user, .recovery_claim_failed);
                 return;
             },
         };
         self.dependencies.reviews.completeSubmission(notice.operation_id, notice.key.storeKey(), result.completion) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
             tree.destroy();
-            self.action_error = .recovery_claim_failed;
+            self.showError(.user, .recovery_claim_failed);
             return;
         };
         if (self.submission_tree) |previous| previous.destroy();
         self.submission_tree = tree;
         self.recovery = null;
         self.submission_result = result;
-        self.action_error = null;
+        self.clearError(.user);
         if (result.completion == .clean) if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, notice.key)) {
             const run_ids = arena.allocator().alloc(bbr.review.TempId, run.items.len) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -7479,7 +7517,7 @@ pub const Presentation = struct {
         const source_commit = durable.recovery_source_commit orelse return;
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         durable.phase = .recovery_check_queued;
@@ -7488,7 +7526,7 @@ pub const Presentation = struct {
             .identity = .init(durable.key),
             .source_commit = source_commit,
         } });
-        self.action_error = null;
+        self.clearError(.submission);
     }
 
     fn queueDuplicateCheck(self: *Presentation, durable: *DurableSubmission) void {
@@ -7496,17 +7534,17 @@ pub const Presentation = struct {
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
             durable.phase = .duplicate_check_paused;
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         const command = durable.materializeDuplicateCheck(self.allocator) catch |err| {
             self.reportFailure(.duplicate_check, .prepare, err, @src());
             durable.phase = .duplicate_check_paused;
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         self.commands.appendAssumeCapacity(.{ .find_duplicate = command });
-        self.action_error = if (source_changed) .recovery_source_changed else null;
+        if (source_changed) self.showError(.submission, .recovery_source_changed) else self.clearError(.submission);
     }
 
     fn requestShutdown(self: *Presentation) void {
@@ -7741,11 +7779,11 @@ pub const Presentation = struct {
         // Already armed: `D` neither re-targets nor confirms the deletion.
         if (self.delete_confirmation != null) return;
         if (self.deleteRefusal(published)) |refusal| {
-            self.action_error = mutationRefusalError(refusal);
+            self.showError(.user, mutationRefusalError(refusal));
             return;
         }
         const target = reviewCardTarget(published) orelse {
-            self.action_error = .no_review_item;
+            self.showError(.user, .no_review_item);
             return;
         };
         self.delete_confirmation = switch (target) {
@@ -7761,7 +7799,7 @@ pub const Presentation = struct {
                 .root_has_replies = (findPublishedComment(published, comment_id) orelse unreachable).parent_id == null and publishedReplyCount(published, comment_id) > 0,
             },
         };
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn applyDeleteConfirmationInput(self: *Presentation, input: DeleteConfirmationInput) void {
@@ -7770,7 +7808,7 @@ pub const Presentation = struct {
         if (input == .cancel) {
             if (self.published) |published| self.cancelDraftMutation(published);
             self.delete_confirmation = null;
-            self.action_error = null;
+            self.clearError(.user);
             return;
         }
         const published = self.published orelse {
@@ -7785,37 +7823,37 @@ pub const Presentation = struct {
         const temp_id = confirmation.target.draft;
         if (published.review.getConst(temp_id) == null) {
             self.delete_confirmation = null;
-            self.action_error = .no_review_item;
+            self.showError(.user, .no_review_item);
             return;
         }
         if (self.draftDeleteRefusal(published, temp_id)) |refusal| {
-            self.action_error = mutationRefusalError(refusal);
+            self.showError(.user, mutationRefusalError(refusal));
             return;
         }
 
         if (published.pending_draft_mutation != null) return;
         self.queueDraftMutation(published, .{ .temp_id = temp_id, .change = .delete }, null) catch |err| {
             self.reportFailure(.mutation, .prepare, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn confirmCommentDelete(self: *Presentation, published: *Published, confirmation: DeleteConfirmation) void {
         const comment_id = confirmation.target.comment;
         if (self.commentDeleteRefusal(published, comment_id)) |refusal| {
-            self.action_error = mutationRefusalError(refusal);
+            self.showError(.user, mutationRefusalError(refusal));
             return;
         }
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
         const durable = self.allocator.create(DurableCommentDelete) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -7828,7 +7866,7 @@ pub const Presentation = struct {
         const command = DeleteComment.create(self.allocator, published.key, comment_id) catch |err| switch (err) {
             error.OutOfMemory => {
                 durable.destroy();
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -7837,7 +7875,7 @@ pub const Presentation = struct {
         self.reviewer_verdict_result = null;
         self.durable_comment_delete = durable;
         self.commands.appendAssumeCapacity(.{ .delete_comment = command });
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn reanchorProjection(self: *const Presentation) ?ReanchorProjection {
@@ -7870,15 +7908,15 @@ pub const Presentation = struct {
         // Already armed: `a` neither re-targets nor cancels the interaction.
         if (self.reanchor != null) return;
         if (self.reanchorRefusal(published)) |refusal| {
-            self.action_error = mutationRefusalError(refusal);
+            self.showError(.user, mutationRefusalError(refusal));
             return;
         }
         const target = reviewCardTarget(published) orelse {
-            self.action_error = .no_review_item;
+            self.showError(.user, .no_review_item);
             return;
         };
         self.reanchor = .{ .key = published.key, .temp_id = target.draft };
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn applyReanchorInput(self: *Presentation, input: ReanchorInput) void {
@@ -7887,7 +7925,7 @@ pub const Presentation = struct {
         if (input == .cancel) {
             if (self.published) |published| self.cancelDraftMutation(published);
             self.reanchor = null;
-            self.action_error = null;
+            self.clearError(.user);
             return;
         }
         const published = self.published orelse {
@@ -7900,15 +7938,15 @@ pub const Presentation = struct {
         }
         const draft = published.review.getConst(capture.temp_id) orelse {
             self.reanchor = null;
-            self.action_error = .no_review_item;
+            self.showError(.user, .no_review_item);
             return;
         };
         if (self.draftReanchorRefusal(published, capture.temp_id)) |refusal| {
-            self.action_error = mutationRefusalError(refusal);
+            self.showError(.user, mutationRefusalError(refusal));
             return;
         }
         const candidate = reanchorCandidate(published, draft.kind, self.preferences) catch |err| {
-            self.action_error = candidateError(err);
+            self.showError(.user, candidateError(err));
             return;
         };
         if (published.pending_draft_mutation != null) return;
@@ -7916,7 +7954,7 @@ pub const Presentation = struct {
             self.reanchor = null;
             published.navigation.clearMark();
             followDraftCard(published, capture.temp_id);
-            self.action_error = null;
+            self.clearError(.user);
             return;
         }
         // A LocalReview replaces its authored evidence from the newly selected
@@ -7927,16 +7965,16 @@ pub const Presentation = struct {
             candidate.lines.items(),
         ) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
         self.queueDraftMutation(published, .{ .temp_id = capture.temp_id, .change = .{ .reanchor = .{ .anchor = candidate.anchor, .snapshot = snapshot } } }, null) catch |err| {
             self.reportFailure(.mutation, .prepare, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     /// True while an active or recovered SubmissionRun holds this Draft in its
@@ -8008,7 +8046,7 @@ pub const Presentation = struct {
         }
         if (self.published) |published| if (published.buffer_search.input != null) {
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.cancelBufferSearch();
-            if (key.matches(keymap_mod.special.enter, .{})) return self.acceptBufferSearch();
+            if (key.matches(keymap_mod.special.enter, .{})) return self.acceptBufferSearch(.user);
             if (key.matches(keymap_mod.special.backspace, .{})) return try self.editBufferSearch(.backspace);
             if (key.matches('w', .{ .ctrl = true })) return try self.editBufferSearch(.delete_word);
             if (key.matches('u', .{ .ctrl = true })) return try self.editBufferSearch(.delete_all);
@@ -8049,7 +8087,7 @@ pub const Presentation = struct {
         if (key.matches(keymap_mod.special.enter, .{})) {
             const item = tree.selectedItem() orelse return;
             if (self.replacement != null) {
-                self.action_error = .replacement_pending;
+                self.showError(.reconciliation, .replacement_pending);
                 return;
             }
             const published = self.published orelse return;
@@ -8101,15 +8139,15 @@ pub const Presentation = struct {
         } else if (key.matches('a', .{})) {
             if (!item.repair_eligible) return;
             if (self.draftReanchorRefusal(published, item.temp_id)) |refusal| {
-                self.action_error = mutationRefusalError(refusal);
+                self.showError(.user, mutationRefusalError(refusal));
                 return;
             }
             self.reanchor = .{ .key = published.key, .temp_id = item.temp_id };
-            self.action_error = null;
+            self.clearError(.user);
         } else if (key.matches('D', .{})) {
             if (!item.repair_eligible) return;
             if (self.draftDeleteRefusal(published, item.temp_id)) |refusal| {
-                self.action_error = mutationRefusalError(refusal);
+                self.showError(.user, mutationRefusalError(refusal));
                 return;
             }
             self.delete_confirmation = .{
@@ -8117,7 +8155,7 @@ pub const Presentation = struct {
                 .target = .{ .draft = item.temp_id },
                 .descendant_count = descendantCount(published, item.temp_id),
             };
-            self.action_error = null;
+            self.clearError(.user);
         } else if (key.matches('X', .{})) {
             if (!item.retry_eligible) return;
             self.startSubmissionSelection(published, item.temp_id);
@@ -8129,14 +8167,14 @@ pub const Presentation = struct {
         const page = frame_mod.helpBodyRows(self.geometry, state.view().layout());
         const result = state.applyKey(self.dependencies.keymap, key, page) catch |err| {
             self.reportFailure(.help, .execute, err, @src());
-            self.action_error = switch (err) {
+            self.showError(.user, switch (err) {
                 error.OutOfMemory => .out_of_memory,
                 error.TooLong => .buffer_search_query_too_long,
                 else => .buffer_search_invalid_query,
-            };
+            });
             return;
         };
-        self.action_error = null;
+        self.clearError(.user);
         if (result == .close) self.closeHelp();
     }
 
@@ -8151,13 +8189,13 @@ pub const Presentation = struct {
         else
             .{ .draft = item.temp_id };
         if (owner == .draft and published.review.getConst(owner.draft) == null) {
-            self.action_error = .no_review_item;
+            self.showError(.user, .no_review_item);
             return;
         }
         tree.hidden = true;
-        self.action_error = null;
+        self.clearError(.user);
         if (published.search_projection.navigation.owners.get(cardHeaderOwner(owner))) |row| {
-            self.landOnCard(published, row);
+            self.landOnCard(published, row, .user);
             return;
         }
         const required = published.search_projection.body_disclosures.get(owner) orelse SearchDisclosureSet{};
@@ -8172,7 +8210,7 @@ pub const Presentation = struct {
 
     fn failCardDestination(self: *Presentation, published: *Published, err: ActionError) void {
         published.pending_card_destination = null;
-        self.action_error = err;
+        self.showError(.buffer, err);
         if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) {
             tree.hidden = false;
         };
@@ -8199,7 +8237,7 @@ pub const Presentation = struct {
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
 
-    fn landOnCard(self: *Presentation, published: *Published, row: usize) void {
+    fn landOnCard(self: *Presentation, published: *Published, row: usize, origin: ErrorOrigin) void {
         published.pending_review_location = null;
         if (published.buffer_search.active != null) {
             published.buffer_search.active = null;
@@ -8211,11 +8249,11 @@ pub const Presentation = struct {
         published.focus = .diff;
         published.frame_revision += 1;
         self.revealActiveFile(published);
-        self.action_error = null;
+        self.clearError(origin);
     }
 
     fn setMutationActionError(self: *Presentation, refusal: MutationRefusal) void {
-        self.action_error = mutationRefusalError(refusal);
+        self.showError(.user, mutationRefusalError(refusal));
     }
 
     fn dismissSubmissionTree(self: *Presentation) void {
@@ -8239,7 +8277,7 @@ pub const Presentation = struct {
         const temp_id = durable.current_temp_id orelse return;
         self.dependencies.reviews.abandonSubmission(durable.operation_id, durable.key.storeKey()) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
-            self.action_error = .persistence_failed;
+            self.showError(.user, .persistence_failed);
             return;
         };
         durable.review.setState(temp_id, .outcome_unknown);
@@ -8256,7 +8294,7 @@ pub const Presentation = struct {
         durable.destroy();
         self.submission_result = result;
         self.refreshStaleRepairTree();
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn removeQueuedSubmissionCommands(self: *Presentation, operation_id: bbr.review.OperationId) void {
@@ -8304,7 +8342,7 @@ pub const Presentation = struct {
         const desired = published.pending_view;
         self.queueViewBuild(published, if (desired) |value| value.preferences else self.preferences, if (desired) |value| value.isolated_file else published.isolated_file, geometry, .center) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
             },
         };
     }
@@ -8361,7 +8399,7 @@ pub const Presentation = struct {
         } else 0;
         const selected_version = if (self.published) |published| published.selected_version else self.preferences.selected_version;
         if (visible_key != null and !availability.available(action)) {
-            self.action_error = switch (action) {
+            self.showError(.user, switch (action) {
                 .open_pull_request_picker => .local_review_no_picker,
                 .submit => .local_review_no_submission,
                 .inline_comment => inlineCommentRefusalError(availability.inline_comment_refusal, selected_version),
@@ -8376,7 +8414,7 @@ pub const Presentation = struct {
                 .set_verdict_changes_requested => reviewerVerdictRefusalError(availability.changes_requested_refusal),
                 .set_verdict_none => reviewerVerdictRefusalError(availability.no_verdict_refusal),
                 else => .local_review_remote_action_unavailable,
-            };
+            });
             return;
         }
         if (self.shutdown_requested) {
@@ -8387,7 +8425,7 @@ pub const Presentation = struct {
             if (self.diagnostic_pending) return;
             self.commands.append(self.allocator, .{ .set_diagnostics = .{ .enabled = self.diagnostic_state != .on } }) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -8401,7 +8439,7 @@ pub const Presentation = struct {
         if (action == .help) {
             const next = help_mod.State.init(self.allocator, self.dependencies.keymap) catch |err| {
                 self.reportFailure(.help, .prepare, err, @src());
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             };
             self.closeHelp();
@@ -8419,7 +8457,7 @@ pub const Presentation = struct {
         if (action == .open_command_palette) {
             const overlay = ListOverlay.openCommandPalette(self.allocator, self.paneContext()) catch |err| {
                 self.reportFailure(.completion, .prepare, err, @src());
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             };
             self.showListOverlay(overlay);
@@ -8428,7 +8466,7 @@ pub const Presentation = struct {
         if (action == .open_theme_overlay) {
             const overlay = ListOverlay.openTheme(self.allocator, self.configured_theme) catch |err| {
                 self.reportFailure(.configuration, .prepare, err, @src());
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             };
             self.showListOverlay(overlay);
@@ -8436,7 +8474,7 @@ pub const Presentation = struct {
         }
         if (self.replacement != null) return;
         const published = self.published orelse return;
-        self.action_error = null;
+        self.clearError(.user);
         const active_before = published.activeFile();
         const navigation_before = published.navigation;
         const selection_cursor_before = published.navigation.cursor;
@@ -8461,7 +8499,7 @@ pub const Presentation = struct {
             .scroll_row_down => self.scrollPane(published, published.focus, 1),
             .select_down => {
                 if (!canStartSelection(self.preferences.scope, published.cursorRow())) {
-                    self.action_error = .source_action_unavailable;
+                    self.showError(.user, .source_action_unavailable);
                     return;
                 }
                 published.navigation.ensureMark();
@@ -8469,7 +8507,7 @@ pub const Presentation = struct {
             },
             .select_up => {
                 if (!canStartSelection(self.preferences.scope, published.cursorRow())) {
-                    self.action_error = .source_action_unavailable;
+                    self.showError(.user, .source_action_unavailable);
                     return;
                 }
                 published.navigation.ensureMark();
@@ -8479,9 +8517,9 @@ pub const Presentation = struct {
                 if (published.navigation.hasSelection()) {
                     published.navigation.clearMark();
                 } else if (published.cursorRow()) |row| {
-                    if (row != .status_placeholder) published.navigation.toggleMark() else self.action_error = .source_action_unavailable;
+                    if (row != .status_placeholder) published.navigation.toggleMark() else self.showError(.user, .source_action_unavailable);
                 } else {
-                    self.action_error = .source_action_unavailable;
+                    self.showError(.user, .source_action_unavailable);
                 }
             },
             .open_buffer_search => self.openBufferSearch(),
@@ -8540,7 +8578,7 @@ pub const Presentation = struct {
             self.clearBufferSearchActive(published) catch |err| {
                 self.reportFailure(.buffer_search, .execute, err, @src());
                 published.navigation = navigation_before;
-                self.action_error = normalizeActionError(err);
+                self.showError(.user, normalizeActionError(err));
                 return;
             };
         }
@@ -8557,7 +8595,7 @@ pub const Presentation = struct {
             const corpus = published.reviewSearchCorpus() catch |err| switch (err) {
                 error.OutOfMemory => {
                     self.reportFailure(.review_search, .prepare, err, @src());
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -8567,7 +8605,7 @@ pub const Presentation = struct {
         if (state.source_scans == null) {
             state.source_scans = self.allocator.alloc(SourceScan, published.session.diff.files.len) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -8576,7 +8614,7 @@ pub const Presentation = struct {
                 error.OutOfMemory => {
                     self.allocator.free(state.source_scans.?);
                     state.source_scans = null;
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -8586,7 +8624,7 @@ pub const Presentation = struct {
                     self.allocator.free(state.source_scans.?);
                     state.acquired = null;
                     state.source_scans = null;
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -8599,7 +8637,7 @@ pub const Presentation = struct {
                     state.held = null;
                     state.acquired = null;
                     state.source_scans = null;
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -8620,10 +8658,10 @@ pub const Presentation = struct {
         self.maybeQueueReviewSourceScan(published);
         published.active_search = .review;
         published.navigation.count = 0;
-        self.action_error = null;
+        self.clearError(.user);
         if (state.needs_scan) {
             const text = (state.query orelse unreachable).query.text;
-            self.replaceReviewSearchQuery(text);
+            self.replaceReviewSearchQuery(text, .buffer);
             // The query must not show over the results of another query
             // without the pending mark, also when its scan cannot queue.
             state.pending = true;
@@ -8638,9 +8676,7 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (!state.open or !state.pending or !state.needs_scan) return;
-        const shown = self.action_error;
-        self.replaceReviewSearchQuery((state.query orelse unreachable).query.text);
-        if (!state.needs_scan and shown != .out_of_memory) self.action_error = shown;
+        self.replaceReviewSearchQuery((state.query orelse unreachable).query.text, .buffer);
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
@@ -8688,14 +8724,14 @@ pub const Presentation = struct {
         const current = if (state.query) |query| query.query.text else "";
         const joined = self.allocator.alloc(u8, current.len + text.len) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
         defer self.allocator.free(joined);
         @memcpy(joined[0..current.len], current);
         @memcpy(joined[current.len..], text);
-        self.replaceReviewSearchQuery(joined);
+        self.replaceReviewSearchQuery(joined, .user);
     }
 
     fn editReviewSearch(self: *Presentation, edit: SearchEdit) void {
@@ -8706,10 +8742,10 @@ pub const Presentation = struct {
             .delete_word => search.wordStart(text),
             .delete_all => 0,
         };
-        self.replaceReviewSearchQuery(text[0..end]);
+        self.replaceReviewSearchQuery(text[0..end], .user);
     }
 
-    fn replaceReviewSearchQuery(self: *Presentation, text: []const u8) void {
+    fn replaceReviewSearchQuery(self: *Presentation, text: []const u8, origin: ErrorOrigin) void {
         const published = self.published orelse return;
         const state = &published.review_search;
         state.opening_source = false;
@@ -8719,11 +8755,11 @@ pub const Presentation = struct {
                 error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
                 error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
-            self.action_error = switch (err) {
+            self.showError(origin, switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
                 error.OutOfMemory => .out_of_memory,
                 else => .buffer_search_invalid_query,
-            };
+            });
             return;
         };
         if (text.len == 0) {
@@ -8748,7 +8784,7 @@ pub const Presentation = struct {
             self.discardQueuedReviewSearchScans();
             self.discardQueuedReviewSourceScans();
             published.frame_revision += 1;
-            self.action_error = null;
+            self.clearError(origin);
             return;
         }
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
@@ -8757,10 +8793,10 @@ pub const Presentation = struct {
                 error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
             query.release();
-            self.action_error = switch (err) {
+            self.showError(origin, switch (err) {
                 error.OutOfMemory => .out_of_memory,
                 else => .buffer_search_invalid_query,
-            };
+            });
             return;
         };
         const corpus = state.corpus orelse {
@@ -8780,7 +8816,7 @@ pub const Presentation = struct {
             self.reportFailure(.completion, .admission, err, @src());
             command.deinit();
             query.release();
-            self.action_error = .out_of_memory;
+            self.showError(origin, .out_of_memory);
             return;
         };
         self.discardQueuedReviewSearchScans();
@@ -8795,7 +8831,7 @@ pub const Presentation = struct {
         state.request_id +%= 1;
         state.pending = true;
         state.needs_scan = false;
-        self.action_error = null;
+        self.clearError(origin);
         published.frame_revision += 1;
     }
 
@@ -8882,7 +8918,7 @@ pub const Presentation = struct {
             if (next != null) {
                 self.queueFileEnrichment(published, next.?, false) catch |err| switch (err) {
                     error.OutOfMemory => {
-                        self.action_error = .out_of_memory;
+                        self.showError(.buffer, .out_of_memory);
                         published.review_search.opening_source = false;
                         break;
                     },
@@ -8903,7 +8939,7 @@ pub const Presentation = struct {
             if (next == null) break;
             self.queueFileEnrichment(published, next.?, false) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.buffer, .out_of_memory);
                     break;
                 },
             };
@@ -8953,7 +8989,7 @@ pub const Presentation = struct {
             if (scan.* != .scanned) scan.* = .given_up;
         };
         self.releaseReviewSearchHolds(published);
-        self.action_error = .buffer_search_scan_failed;
+        self.showError(.buffer, .buffer_search_scan_failed);
     }
 
     fn finishSearchLease(self: *Presentation, published: *Published, file_index: usize) void {
@@ -8974,7 +9010,7 @@ pub const Presentation = struct {
             self.reportFailure(.buffer_build, .prepare, err, @src());
             // The focus check after the event stages again, so this failure
             // does not replace the shown outcome.
-            if (self.action_error == null) self.action_error = .out_of_memory;
+            if (self.action_error == null) self.showError(.file_enrichment, .out_of_memory);
         };
     }
 
@@ -9161,7 +9197,7 @@ pub const Presentation = struct {
         } else {
             state.ranges = published.projectReviewRanges(batch, index) catch |err| {
                 self.reportFailure(.review_search, .prepare, err, @src());
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             };
         }
@@ -9215,7 +9251,7 @@ pub const Presentation = struct {
         const worker_batch = switch (completed.outcome) {
             .failed => {
                 self.rollbackReviewSearchQuery(published);
-                self.action_error = .buffer_search_scan_failed;
+                self.showError(.buffer, .buffer_search_scan_failed);
                 published.frame_revision += 1;
                 return;
             },
@@ -9236,7 +9272,7 @@ pub const Presentation = struct {
             self.reportFailure(.review_search, .prepare, err, @src());
             batch.deinit(self.allocator);
             self.rollbackReviewSearchQuery(published);
-            self.action_error = .out_of_memory;
+            self.showError(.buffer, .out_of_memory);
             published.frame_revision += 1;
             return;
         };
@@ -9245,7 +9281,7 @@ pub const Presentation = struct {
                 batch.deinit(self.allocator);
                 std.heap.page_allocator.free(ranges);
                 self.rollbackReviewSearchQuery(published);
-                self.action_error = .out_of_memory;
+                self.showError(.buffer, .out_of_memory);
                 published.frame_revision += 1;
                 return;
             },
@@ -9275,7 +9311,7 @@ pub const Presentation = struct {
             };
         }
         published.frame_revision += 1;
-        self.action_error = null;
+        self.clearError(.buffer);
         self.restartReviewSourceScans(published);
     }
 
@@ -9321,7 +9357,7 @@ pub const Presentation = struct {
                     self.pumpReviewSearchAcquisition(published);
                 } else if (published.session.enrichment.status(source.file_index).old != .loading and published.session.enrichment.status(source.file_index).new != .loading) {
                     state.opening_source = false;
-                    self.action_error = .source_action_unavailable;
+                    self.showError(.buffer, .source_action_unavailable);
                 } else state.opening_source = true;
                 return;
             }
@@ -9403,7 +9439,7 @@ pub const Presentation = struct {
     }
 
     fn reviewSearchAllocationFailed(self: *Presentation) void {
-        self.action_error = .out_of_memory;
+        self.showError(.buffer, .out_of_memory);
     }
 
     fn openBufferSearch(self: *Presentation) void {
@@ -9424,7 +9460,7 @@ pub const Presentation = struct {
                     corpus.release();
                     saved_expanded.release();
                     if (saved_search) |keys| keys.release();
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -9463,7 +9499,7 @@ pub const Presentation = struct {
         if (!sameDisclosures(published.expanded_disclosures.items, input_disclosures.items())) {
             const job = self.queueAcceptedDisclosure(published, .{ .base = input_disclosures }, published.buffer_search.active, .restore, null) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -9476,7 +9512,7 @@ pub const Presentation = struct {
             var input = published.buffer_search.input.?;
             published.buffer_search.input = null;
             input.deinit(self.allocator);
-            self.action_error = null;
+            self.clearError(.user);
             published.frame_revision += 1;
             return;
         }
@@ -9492,16 +9528,16 @@ pub const Presentation = struct {
         published.navigation = published.resolveNavigation(start);
         input.deinit(self.allocator);
         self.discardQueuedBufferSearchScans(null);
-        self.action_error = null;
+        self.clearError(.user);
         published.frame_revision += 1;
     }
 
-    fn acceptBufferSearch(self: *Presentation) void {
+    fn acceptBufferSearch(self: *Presentation, origin: ErrorOrigin) void {
         const published = self.published orelse return;
         if (published.buffer_search.input) |*input| if (input.restoring_review_disclosures and !input.pending) {
             self.queueBufferSearchOpening(published, input.saved_expanded_disclosures) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(origin, .out_of_memory);
                     return;
                 },
             };
@@ -9516,7 +9552,7 @@ pub const Presentation = struct {
         if (input.query == null) {
             const count = input.count;
             input.deinit(self.allocator);
-            self.traverseBufferSearchBy(count, .forward);
+            self.traverseBufferSearchBy(count, .forward, origin);
             return;
         }
         if (published.buffer_search.accepted_query) |*query| query.deinit(self.allocator);
@@ -9539,7 +9575,7 @@ pub const Presentation = struct {
             } else _ = published.jumpToSearchOccurrence(batch.occurrences[active]);
         };
         input.deinit(self.allocator);
-        self.action_error = null;
+        self.clearError(origin);
         published.frame_revision += 1;
     }
 
@@ -9548,7 +9584,7 @@ pub const Presentation = struct {
 
     fn insertBufferSearch(self: *Presentation, text: []const u8) !void {
         if (!std.unicode.utf8ValidateSlice(text)) {
-            self.action_error = .buffer_search_invalid_query;
+            self.showError(.user, .buffer_search_invalid_query);
             return;
         }
         const published = self.published orelse return;
@@ -9556,7 +9592,7 @@ pub const Presentation = struct {
         const current = if (input.query) |query| query.text else "";
         const joined = self.allocator.alloc(u8, current.len + text.len) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -9583,17 +9619,17 @@ pub const Presentation = struct {
         const input = &(published.buffer_search.input orelse return);
         if (input.restoring_review_disclosures) {
             var query: ?search.Query = if (text.len == 0) null else search.Query.init(self.allocator, text) catch |err| {
-                self.action_error = switch (err) {
+                self.showError(.user, switch (err) {
                     error.TooLong => .buffer_search_query_too_long,
                     error.OutOfMemory => .out_of_memory,
                     else => .buffer_search_invalid_query,
-                };
+                });
                 return;
             };
             if (!input.pending) self.queueBufferSearchOpening(published, input.saved_expanded_disclosures) catch |err| switch (err) {
                 error.OutOfMemory => {
                     if (query) |*owned| owned.deinit(self.allocator);
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -9604,7 +9640,7 @@ pub const Presentation = struct {
             input.request_id = published.search_generation;
             input.pending = true;
             input.accept_when_ready = false;
-            self.action_error = null;
+            self.clearError(.user);
             published.frame_revision += 1;
             return;
         }
@@ -9629,7 +9665,7 @@ pub const Presentation = struct {
                 input.ranges = old_ranges;
                 input.navigation_rows = old_navigation_rows;
                 input.active = old_active;
-                self.action_error = normalizeActionError(err);
+                self.showError(.user, normalizeActionError(err));
                 return;
             };
             if (queued) |job| {
@@ -9654,7 +9690,7 @@ pub const Presentation = struct {
             if (old_ranges) |ranges| std.heap.page_allocator.free(ranges);
             if (old_navigation_rows) |rows| std.heap.page_allocator.free(rows);
             if (queued == null) published.navigation = published.resolveNavigation(input.start);
-            self.action_error = null;
+            self.clearError(.user);
             published.frame_revision += 1;
             return;
         }
@@ -9663,11 +9699,11 @@ pub const Presentation = struct {
                 error.OutOfMemory => self.reportFailure(.buffer_search, .prepare, err, @src()),
                 error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
-            self.action_error = switch (err) {
+            self.showError(.user, switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
                 error.OutOfMemory => .out_of_memory,
                 else => .buffer_search_invalid_query,
-            };
+            });
             return;
         };
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
@@ -9676,10 +9712,10 @@ pub const Presentation = struct {
                 error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
             query.deinit(self.allocator);
-            self.action_error = switch (err) {
+            self.showError(.user, switch (err) {
                 error.OutOfMemory => .out_of_memory,
                 else => .buffer_search_invalid_query,
-            };
+            });
             return;
         };
         const request_id = if (published.search_generation == std.math.maxInt(u64)) 1 else published.search_generation + 1;
@@ -9697,7 +9733,7 @@ pub const Presentation = struct {
             self.reportFailure(.completion, .admission, err, @src());
             command.deinit();
             query.deinit(self.allocator);
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
         worker_query = undefined;
@@ -9713,7 +9749,7 @@ pub const Presentation = struct {
             var owned = old;
             owned.deinit(self.allocator);
         }
-        self.action_error = null;
+        self.clearError(.user);
         published.frame_revision += 1;
     }
 
@@ -9768,7 +9804,7 @@ pub const Presentation = struct {
         var batch = switch (completed.outcome) {
             .failed => {
                 input.pending = false;
-                self.action_error = .buffer_search_scan_failed;
+                self.showError(.buffer, .buffer_search_scan_failed);
                 published.frame_revision += 1;
                 return;
             },
@@ -9787,7 +9823,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 batch.deinit(self.allocator);
                 input.pending = false;
-                self.action_error = .out_of_memory;
+                self.showError(.buffer, .out_of_memory);
                 published.frame_revision += 1;
                 return;
             },
@@ -9795,7 +9831,7 @@ pub const Presentation = struct {
         const ranges = completed.ranges orelse {
             batch.deinit(self.allocator);
             input.pending = false;
-            self.action_error = .buffer_search_scan_failed;
+            self.showError(.buffer, .buffer_search_scan_failed);
             published.frame_revision += 1;
             return;
         };
@@ -9820,9 +9856,9 @@ pub const Presentation = struct {
         if (old_navigation_rows) |old| std.heap.page_allocator.free(old);
         input.navigation_rows = completed.navigation_rows;
         completed.navigation_rows = null;
-        self.action_error = if (active == null) .buffer_search_no_matches else null;
+        if (active == null) self.showError(.buffer, .buffer_search_no_matches) else self.clearError(.buffer);
         published.frame_revision += 1;
-        if ((published.buffer_search.input orelse return).accept_when_ready) self.acceptBufferSearch();
+        if ((published.buffer_search.input orelse return).accept_when_ready) self.acceptBufferSearch(.buffer);
     }
 
     fn queueBufferDisclosure(self: *Presentation, published: *Published, batch: search.Batch, active: ?usize, request_id: u64, navigation_rows: ?[]SearchNavigationRow) !bool {
@@ -9875,7 +9911,7 @@ pub const Presentation = struct {
         }
         if (job.failed) {
             input.pending = false;
-            self.action_error = .buffer_build_failed;
+            self.showError(job.kind.errorOrigin(), .buffer_build_failed);
             published.frame_revision += 1;
             return;
         }
@@ -9913,7 +9949,7 @@ pub const Presentation = struct {
                 if (accepted_ranges) |old| std.heap.page_allocator.free(old);
                 if (review_ranges) |old| std.heap.page_allocator.free(old);
                 input.pending = false;
-                self.action_error = .out_of_memory;
+                self.showError(job.kind.errorOrigin(), .out_of_memory);
                 return;
             },
         };
@@ -9966,8 +10002,8 @@ pub const Presentation = struct {
         }
         published.frame_revision += 1;
         published.visual_rows_revision = published.frame_revision;
-        self.action_error = if (job.destination_active == null) .buffer_search_no_matches else null;
-        if (input.accept_when_ready) self.acceptBufferSearch();
+        if (job.destination_active == null) self.showError(job.kind.errorOrigin(), .buffer_search_no_matches) else self.clearError(job.kind.errorOrigin());
+        if (input.accept_when_ready) self.acceptBufferSearch(job.kind.errorOrigin());
     }
 
     fn acceptViewBuild(self: *Presentation, published: *Published, job: *DisclosureBuild, owned: *bool) void {
@@ -10065,7 +10101,7 @@ pub const Presentation = struct {
             if (job.kind == .draft_save) published.pending_draft_save = null;
             if (job.kind == .draft_mutation) published.pending_draft_mutation = null;
             if (job.kind == .card_destination) return self.failCardDestination(published, .buffer_build_failed);
-            if (job.kind != .enrichment or !EnrichedFile.allSpeculative(job.enrichments.items)) self.action_error = .buffer_build_failed;
+            if (job.kind != .enrichment or !EnrichedFile.allSpeculative(job.enrichments.items)) self.showError(job.kind.errorOrigin(), .buffer_build_failed);
             releaseEnrichments(published, job.enrichments.items);
             return;
         }
@@ -10076,13 +10112,13 @@ pub const Presentation = struct {
         if (job.kind == .review_destination) {
             if (job.destination_row == null) {
                 published.review_search.destination_pending = false;
-                self.action_error = .buffer_search_no_matches;
+                self.showError(job.kind.errorOrigin(), .buffer_search_no_matches);
                 return;
             }
             disclosures.appendSlice(self.allocator, job.disclosures) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.review_search.destination_pending = false;
-                    self.action_error = .out_of_memory;
+                    self.showError(job.kind.errorOrigin(), .out_of_memory);
                     return;
                 },
             };
@@ -10113,10 +10149,10 @@ pub const Presentation = struct {
         const parent_reposted = if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
             self.reportFailure(.composer, .write, err, @src());
             published.pending_draft_save = null;
-            self.action_error = switch (err) {
+            self.showError(job.kind.errorOrigin(), switch (err) {
                 error.Reported => .persistence_failed,
                 error.OutOfMemory => .out_of_memory,
-            };
+            });
             return;
         } else false;
         if (job.mutation) |mutation| {
@@ -10128,13 +10164,13 @@ pub const Presentation = struct {
             };
             if (refusal) |reason| {
                 published.pending_draft_mutation = null;
-                self.action_error = mutationRefusalError(reason);
+                self.showError(job.kind.errorOrigin(), mutationRefusalError(reason));
                 return;
             }
             published.persistDraftMutation(self.dependencies.reviews, job) catch |err| {
                 self.reportFailure(.mutation, .write, err, @src());
                 published.pending_draft_mutation = null;
-                self.action_error = draftMutationActionError(err);
+                self.showError(job.kind.errorOrigin(), draftMutationActionError(err));
                 return;
             };
         }
@@ -10263,7 +10299,7 @@ pub const Presentation = struct {
             self.discardQueuedReviewSourceScans();
             self.discardQueuedSearchEnrichments(published);
             self.releaseReviewSearchHolds(published);
-            self.action_error = null;
+            self.clearError(job.kind.errorOrigin());
             return;
         }
         if (job.kind == .card_destination) {
@@ -10273,7 +10309,7 @@ pub const Presentation = struct {
             published.disclosure_keys.release();
             published.disclosure_keys = job.disclosure_keys.?.retain();
             published.pending_card_destination = null;
-            self.landOnCard(published, job.destination_row.?);
+            self.landOnCard(published, job.destination_row.?, job.kind.errorOrigin());
             return;
         }
         if (job.kind == .draft_save) {
@@ -10313,11 +10349,7 @@ pub const Presentation = struct {
             };
             self.refreshStaleRepairTree();
         }
-        switch (job.kind) {
-            .enrichment => if (!EnrichedFile.allSpeculative(job.enrichments.items)) self.clearFileEnrichmentError(),
-            .cache_update => self.clearFileEnrichmentError(),
-            .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => self.action_error = null,
-        }
+        if (job.kind != .enrichment or !EnrichedFile.allSpeculative(job.enrichments.items)) self.clearError(job.kind.errorOrigin());
         // After the success reset, so a failure stays visible.
         if (parent_reposted) self.republishPostedParent(published);
         if (job.kind == .enrichment) {
@@ -10353,21 +10385,21 @@ pub const Presentation = struct {
             .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.pending_cache_update = null;
-                    self.action_error = .out_of_memory;
+                    self.showError(job.kind.errorOrigin(), .out_of_memory);
                 },
             },
             .draft_save => {
                 self.queueDraftBuild(published, job.new_draft.?) catch |err| switch (err) {
                     error.OutOfMemory => {
                         published.pending_draft_save = null;
-                        self.action_error = .out_of_memory;
+                        self.showError(job.kind.errorOrigin(), .out_of_memory);
                     },
                 };
             },
             .draft_mutation => self.queueDraftMutation(published, job.mutation.?, job.mutation_id) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.pending_draft_mutation = null;
-                    self.action_error = .out_of_memory;
+                    self.showError(job.kind.errorOrigin(), .out_of_memory);
                 },
             },
             .card_destination => self.queueCardDestination(published, job.destination_card.?, job.target.add, job.isolated_file, job.destination_attempt) catch |err| switch (err) {
@@ -10453,7 +10485,7 @@ pub const Presentation = struct {
         self.queueViewBuild(published, job.preferences, job.isolated_file, job.geometry, job.navigation_policy) catch |err| switch (err) {
             error.OutOfMemory => {
                 published.pending_view = null;
-                self.action_error = .out_of_memory;
+                self.showError(job.kind.errorOrigin(), .out_of_memory);
                 return;
             },
         };
@@ -10544,7 +10576,7 @@ pub const Presentation = struct {
     }
 
     fn dropEnrichments(self: *Presentation, published: *Published, enrichments: []EnrichedFile) void {
-        if (!EnrichedFile.allSpeculative(enrichments)) self.action_error = .out_of_memory;
+        if (!EnrichedFile.allSpeculative(enrichments)) self.showError(.file_enrichment, .out_of_memory);
         releaseEnrichments(published, enrichments);
         for (enrichments) |*enriched| enriched.result.deinit();
     }
@@ -10553,7 +10585,7 @@ pub const Presentation = struct {
     /// rebuild did. The worker preview included them, so the other Files
     /// need a new rebuild.
     fn refuseEnrichments(self: *Presentation, published: *Published, job: *DisclosureBuild) void {
-        self.action_error = .action_refused;
+        self.showError(.file_enrichment, .action_refused);
         var index = job.enrichments.items.len;
         while (index > 0) {
             index -= 1;
@@ -10569,7 +10601,7 @@ pub const Presentation = struct {
         const inputs = DisclosureInputs.create(published) catch |err| switch (err) {
             error.OutOfMemory => {
                 published.disclosure_inputs_current = false;
-                self.action_error = .out_of_memory;
+                self.showError(.buffer, .out_of_memory);
                 return;
             },
         };
@@ -10583,7 +10615,7 @@ pub const Presentation = struct {
             self.queueViewBuild(published, self.preferences, published.isolated_file, self.geometry, .restore);
         result catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.buffer, .out_of_memory);
             },
         };
     }
@@ -10643,7 +10675,7 @@ pub const Presentation = struct {
         }
         if (job.failed) {
             if (job.kind == .clear_input or job.kind == .open_input) published.buffer_search.input.?.pending = false;
-            self.action_error = .buffer_build_failed;
+            self.showError(job.kind.errorOrigin(), .buffer_build_failed);
             return;
         }
         const current = published.buffer_search.accepted_batch;
@@ -10675,7 +10707,7 @@ pub const Presentation = struct {
         disclosures.appendSlice(self.allocator, job.disclosures) catch |err| switch (err) {
             error.OutOfMemory => {
                 disclosures.deinit(self.allocator);
-                self.action_error = .out_of_memory;
+                self.showError(job.kind.errorOrigin(), .out_of_memory);
                 return;
             },
         };
@@ -10739,7 +10771,7 @@ pub const Presentation = struct {
         }
         published.frame_revision += 1;
         published.visual_rows_revision = published.frame_revision;
-        self.action_error = job.result_error;
+        if (job.result_error) |err| self.showError(job.kind.errorOrigin(), err) else self.clearError(job.kind.errorOrigin());
         if (job.kind == .open_input) {
             const input = &published.buffer_search.input.?;
             input.restoring_review_disclosures = false;
@@ -10754,10 +10786,10 @@ pub const Presentation = struct {
                 self.retryStaleBufferDisclosure(published);
             } else {
                 input.pending = false;
-                if (input.accept_when_ready) self.acceptBufferSearch();
+                if (input.accept_when_ready) self.acceptBufferSearch(job.kind.errorOrigin());
             }
         }
-        if (job.kind == .clear_input and published.buffer_search.input.?.accept_when_ready) self.acceptBufferSearch();
+        if (job.kind == .clear_input and published.buffer_search.input.?.accept_when_ready) self.acceptBufferSearch(job.kind.errorOrigin());
     }
 
     fn retryAcceptedDisclosure(self: *Presentation, published: *Published, job: *const DisclosureBuild) void {
@@ -10765,7 +10797,7 @@ pub const Presentation = struct {
             self.queueBufferSearchOpening(published, job.target.base) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.buffer_search.input.?.pending = false;
-                    self.action_error = .out_of_memory;
+                    self.showError(job.kind.errorOrigin(), .out_of_memory);
                 },
             };
             return;
@@ -10776,14 +10808,14 @@ pub const Presentation = struct {
             null;
         if ((job.kind == .accepted or job.kind == .restore) and job.restore_navigation == null and job.destination_active != null) {
             if (destination) |index| {
-                self.openBufferSearchOccurrence(published, index, job.result_error);
-            } else self.action_error = .buffer_search_no_matches;
+                self.openBufferSearchOccurrence(published, index, job.result_error, job.kind.errorOrigin());
+            } else self.showError(job.kind.errorOrigin(), .buffer_search_no_matches);
             return;
         }
         const replacement = self.queueAcceptedDisclosure(published, job.target, destination, job.kind, job.result_error) catch |err| switch (err) {
             error.OutOfMemory => {
                 if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
-                self.action_error = .out_of_memory;
+                self.showError(job.kind.errorOrigin(), .out_of_memory);
                 return;
             },
         };
@@ -10805,17 +10837,17 @@ pub const Presentation = struct {
         const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch |err| switch (err) {
             error.OutOfMemory => {
                 input.pending = false;
-                self.action_error = .out_of_memory;
+                self.showError(.buffer, .out_of_memory);
                 return;
             },
             error.TooLong => {
                 input.pending = false;
-                self.action_error = .buffer_search_query_too_long;
+                self.showError(.buffer, .buffer_search_query_too_long);
                 return;
             },
             error.InvalidUtf8, error.LineEnding, error.Nul => {
                 input.pending = false;
-                self.action_error = .buffer_search_invalid_query;
+                self.showError(.buffer, .buffer_search_invalid_query);
                 return;
             },
         };
@@ -10834,7 +10866,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 command.deinit();
                 input.pending = false;
-                self.action_error = .out_of_memory;
+                self.showError(.buffer, .out_of_memory);
                 return;
             },
         };
@@ -10849,15 +10881,15 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         const count = if (published.navigation.count == 0) 1 else published.navigation.count;
         published.navigation.count = 0;
-        self.traverseBufferSearchBy(count, direction);
+        self.traverseBufferSearchBy(count, direction, .user);
     }
 
-    fn traverseBufferSearchBy(self: *Presentation, count: usize, direction: SearchDirection) void {
+    fn traverseBufferSearchBy(self: *Presentation, count: usize, direction: SearchDirection, origin: ErrorOrigin) void {
         const published = self.published orelse return;
         const batch = if (published.buffer_search.accepted_batch) |*value| value else return;
         published.buffer_search.status_visible = true;
         if (batch.occurrences.len == 0) {
-            self.action_error = .buffer_search_no_matches;
+            self.showError(origin, .buffer_search_no_matches);
             return;
         }
         const current = published.buffer_search.active;
@@ -10880,17 +10912,17 @@ pub const Presentation = struct {
             .forward => .buffer_search_hit_bottom,
             .backward => .buffer_search_hit_top,
         } else null;
-        self.openBufferSearchOccurrence(published, next, status);
+        self.openBufferSearchOccurrence(published, next, status, origin);
     }
 
-    fn openBufferSearchOccurrence(self: *Presentation, published: *Published, index: usize, status: ?ActionError) void {
+    fn openBufferSearchOccurrence(self: *Presentation, published: *Published, index: usize, status: ?ActionError, origin: ErrorOrigin) void {
         const batch = published.buffer_search.accepted_batch.?;
         if (published.buffer_search.saved_disclosures == null) {
             const row = if (published.buffer_search.accepted_navigation_rows) |rows| rows[index].visible else published.occurrenceVisualRow(batch.occurrences[index]);
             if (row) |visible| {
                 published.buffer_search.active = index;
                 published.navigation.jumpTo(visible);
-                self.action_error = status;
+                if (status) |err| self.showError(origin, err) else self.clearError(origin);
                 published.frame_revision += 1;
                 return;
             }
@@ -10901,7 +10933,7 @@ pub const Presentation = struct {
         if (!target.matchesKeys(published.disclosure_keys)) {
             _ = self.queueAcceptedDisclosure(published, target, index, if (required.len == 0) .restore else .accepted, status) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(origin, .out_of_memory);
                 },
             };
             return;
@@ -10912,7 +10944,7 @@ pub const Presentation = struct {
             published.buffer_search.saved_disclosures = null;
         };
         _ = published.jumpToSearchOccurrence(batch.occurrences[index]);
-        self.action_error = status;
+        if (status) |err| self.showError(origin, err) else self.clearError(origin);
         published.frame_revision += 1;
     }
 
@@ -10985,14 +11017,14 @@ pub const Presentation = struct {
         if (entry.identity == .directory and entry.expanded) {
             published.collapseDirectory(entry.identity.directory) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
             published.rebuildFileTree() catch |err| {
                 const path = published.collapsed_directories.pop().?;
                 published.allocator.free(path);
-                self.action_error = normalizeActionError(err);
+                self.showError(.user, normalizeActionError(err));
             };
             return;
         }
@@ -11007,7 +11039,7 @@ pub const Presentation = struct {
             const removed = published.takeCollapsedDirectory(entry.identity.directory) orelse return;
             published.rebuildFileTree() catch |err| {
                 published.collapsed_directories.appendAssumeCapacity(removed);
-                self.action_error = normalizeActionError(err);
+                self.showError(.user, normalizeActionError(err));
                 return;
             };
             published.allocator.free(removed);
@@ -11039,7 +11071,7 @@ pub const Presentation = struct {
         if (isolated or candidate.selected_version != published.selected_version or published.pending_view != null) {
             self.queueViewBuild(published, candidate, if (isolated) file_index else null, if (published.pending_view) |desired| desired.geometry else published.geometry, .file_header) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -11080,7 +11112,7 @@ pub const Presentation = struct {
         defer removed.deinit(published.allocator);
         removed.ensureTotalCapacity(published.allocator, published.collapsed_directories.items.len) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.buffer, .out_of_memory);
                 return;
             },
         };
@@ -11093,7 +11125,7 @@ pub const Presentation = struct {
         }
         published.rebuildFileTree() catch |err| {
             published.collapsed_directories.appendSliceAssumeCapacity(removed.items);
-            self.action_error = normalizeActionError(err);
+            self.showError(.buffer, normalizeActionError(err));
             return;
         };
         for (removed.items) |candidate| published.allocator.free(candidate);
@@ -11112,7 +11144,7 @@ pub const Presentation = struct {
 
     fn resolveSelectedUnknownAsUnpublished(self: *Presentation, published: *Published) void {
         const draft = selectedUnknownDraft(published) orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         self.resolveUnknownAsUnpublished(published, draft.local_id);
@@ -11120,26 +11152,26 @@ pub const Presentation = struct {
 
     fn resolveUnknownAsUnpublished(self: *Presentation, published: *Published, temp_id: bbr.review.TempId) void {
         const draft = published.review.get(temp_id) orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         if (draft.state != .outcome_unknown) {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         }
         if (published.pending_draft_mutation != null) return;
         self.queueDraftMutation(published, .{ .temp_id = temp_id, .change = .unpublished }, null) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn openUnknownResolutionEditor(self: *Presentation, published: *Published) void {
         const draft = selectedUnknownDraft(published) orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         self.openUnknownResolutionEditorFor(published, draft.local_id);
@@ -11147,15 +11179,15 @@ pub const Presentation = struct {
 
     fn openUnknownResolutionEditorFor(self: *Presentation, published: *Published, temp_id: bbr.review.TempId) void {
         const draft = published.review.getConst(temp_id) orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         if (draft.state != .outcome_unknown) {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         }
         self.unknown_resolution = .{ .key = published.key, .temp_id = temp_id };
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn applyUnknownResolutionInput(self: *Presentation, input: UnknownResolutionInput) void {
@@ -11173,46 +11205,46 @@ pub const Presentation = struct {
                 if (editor.len == 0) return;
                 const comment_id = std.fmt.parseInt(bbr.review.CommentId, editor.text(), 10) catch |err| switch (err) {
                     error.InvalidCharacter, error.Overflow => {
-                        self.action_error = .action_refused;
+                        self.showError(.user, .action_refused);
                         return;
                     },
                 };
                 if (comment_id == 0) {
-                    self.action_error = .action_refused;
+                    self.showError(.user, .action_refused);
                     return;
                 }
                 const published = self.published orelse {
-                    self.action_error = .action_refused;
+                    self.showError(.user, .action_refused);
                     return;
                 };
                 if (!OwnedReviewIdentity.eql(published.key, editor.key)) {
-                    self.action_error = .action_refused;
+                    self.showError(.user, .action_refused);
                     return;
                 }
                 const comment = findPublishedComment(published, comment_id) orelse {
-                    self.action_error = .action_refused;
+                    self.showError(.user, .action_refused);
                     return;
                 };
                 const account = self.authenticated_account_uuid orelse {
-                    self.action_error = .authenticated_account_unknown;
+                    self.showError(.user, .authenticated_account_unknown);
                     return;
                 };
                 const author = comment.author_uuid orelse {
-                    self.action_error = .comment_author_unknown;
+                    self.showError(.user, .comment_author_unknown);
                     return;
                 };
                 if (!std.mem.eql(u8, account.slice(), author)) {
-                    self.action_error = .comment_owned_by_other;
+                    self.showError(.user, .comment_owned_by_other);
                     return;
                 }
                 self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
                     self.reportFailure(.completion, .admission, err, @src());
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 };
                 self.dependencies.reviews.resolveUnknown(editor.key.storeKey(), editor.temp_id, .{ .posted = comment_id }) catch |err| {
                     self.reportFailure(.submission, .write, err, @src());
-                    self.action_error = .persistence_failed;
+                    self.showError(.user, .persistence_failed);
                     return;
                 };
                 if (self.published) |current| if (OwnedReviewIdentity.eql(current.key, editor.key))
@@ -11220,7 +11252,7 @@ pub const Presentation = struct {
                 const key = editor.key;
                 self.unknown_resolution = null;
                 if (self.published) |current| if (OwnedReviewIdentity.eql(current.key, key)) self.queueReconciliation(key);
-                self.action_error = null;
+                self.clearError(.user);
             },
         }
     }
@@ -11235,7 +11267,7 @@ pub const Presentation = struct {
                 .comment => {},
             };
             tree.hidden = false;
-            self.action_error = null;
+            self.clearError(.user);
             return;
         };
         self.startSubmissionSelection(published, null);
@@ -11243,26 +11275,26 @@ pub const Presentation = struct {
 
     fn startSubmissionSelection(self: *Presentation, published: *Published, selected_root: ?bbr.review.TempId) void {
         if (!published.key.isRemote()) {
-            self.action_error = .local_review_no_submission;
+            self.showError(.user, .local_review_no_submission);
             return;
         }
         if (self.durable_comment_edit != null or self.durable_comment_delete != null or self.durable_reviewer_verdict != null) {
-            self.action_error = .remote_write_busy;
+            self.showError(.user, .remote_write_busy);
             return;
         }
         if (self.stale_repair) |gate| if (OwnedReviewIdentity.eql(gate.key, published.key)) {
             const root = selected_root orelse {
-                self.action_error = .recovery_source_changed;
+                self.showError(.user, .recovery_source_changed);
                 return;
             };
             if (!gate.reloaded or !staleSubtreeEligible(published, root)) {
-                self.action_error = .recovery_source_changed;
+                self.showError(.user, .recovery_source_changed);
                 return;
             }
         };
         if (self.durable_submission) |durable| {
             if (selected_root != null) {
-                self.action_error = .submission_already_active;
+                self.showError(.user, .submission_already_active);
                 return;
             }
             if (durable.phase == .post_retry_paused) {
@@ -11281,30 +11313,30 @@ pub const Presentation = struct {
                 self.resumeSubmissionPersistence(durable);
                 return;
             }
-            self.action_error = .submission_already_active;
+            self.showError(.user, .submission_already_active);
             return;
         }
         const locks = self.dependencies.submission_locks orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .submission_start_failed;
+            self.showError(.user, .submission_start_failed);
             return;
         };
         const lock = locks.tryAcquire(published.key.remote()) catch |err| {
             self.reportFailure(.submission_lock, .open, err, @src());
-            self.action_error = .submission_start_failed;
+            self.showError(.user, .submission_start_failed);
             return;
         } orelse {
-            self.action_error = .submission_owned_elsewhere;
+            self.showError(.user, .submission_owned_elsewhere);
             return;
         };
         const source_check = if (self.dependencies.require_source_check)
             BoundedText(64).init(published.session.header.source_commit) catch |err| {
                 self.reportFailure(.submission, .prepare, err, @src());
-                self.action_error = .submission_start_failed;
+                self.showError(.user, .submission_start_failed);
                 return;
             }
         else
@@ -11318,15 +11350,15 @@ pub const Presentation = struct {
             selected_root,
         ) catch |err| {
             switch (err) {
-                error.SubmissionAlreadyActive => self.action_error = .submission_already_active,
+                error.SubmissionAlreadyActive => self.showError(.user, .submission_already_active),
                 else => {
                     self.reportFailure(.submission, .prepare, err, @src());
-                    self.action_error = .submission_start_failed;
+                    self.showError(.user, .submission_start_failed);
                 },
             }
             return;
         } orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         if (self.dependencies.require_source_check) {
@@ -11352,7 +11384,7 @@ pub const Presentation = struct {
         self.submission_tree = started.tree;
         published.setDraftState(started.durable.current_temp_id.?, .submitting);
         self.syncSubmissionTree(started.durable);
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn resumeDurableSubmission(self: *Presentation) void {
@@ -11383,7 +11415,7 @@ pub const Presentation = struct {
             durable.pending_admission = .{ .post = completed };
             durable.phase = .admission_paused;
             self.syncSubmissionTree(durable);
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         self.processPostDraft(durable, completed);
@@ -11395,7 +11427,7 @@ pub const Presentation = struct {
         if (durable.operation_id != failed.operation_id or !durableIdentityMatches(durable.key, failed.identity) or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_post) return;
         durable.phase = .post_retry_paused;
         self.syncSubmissionTree(durable);
-        self.action_error = .submission_launch_failed;
+        self.showError(.submission, .submission_launch_failed);
     }
 
     fn acceptCommentEdit(self: *Presentation, completed: CommentEditCompleted) void {
@@ -11411,7 +11443,7 @@ pub const Presentation = struct {
             self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
             self.durable_comment_edit = null;
             durable.destroy();
-            self.action_error = .comment_edit_failed;
+            self.showError(.comment_edit, .comment_edit_failed);
             return;
         }
         durable.outcome = completed.outcome;
@@ -11427,7 +11459,7 @@ pub const Presentation = struct {
         }
         self.durable_comment_edit = null;
         durable.destroy();
-        self.action_error = null;
+        self.clearError(.comment_edit);
     }
 
     fn acceptCommentEditLaunchFailure(self: *Presentation, failed: CommentEditLaunchFailed) void {
@@ -11438,7 +11470,7 @@ pub const Presentation = struct {
         self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
         self.durable_comment_edit = null;
         durable.destroy();
-        self.action_error = .comment_edit_launch_failed;
+        self.showError(.comment_edit, .comment_edit_launch_failed);
     }
 
     fn acceptCommentDelete(self: *Presentation, completed: CommentDeleteCompleted) void {
@@ -11454,7 +11486,7 @@ pub const Presentation = struct {
             self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
             self.durable_comment_delete = null;
             durable.destroy();
-            self.action_error = .comment_delete_failed;
+            self.showError(.comment_delete, .comment_delete_failed);
             return;
         }
         durable.outcome = completed.outcome;
@@ -11470,7 +11502,7 @@ pub const Presentation = struct {
         }
         self.durable_comment_delete = null;
         durable.destroy();
-        self.action_error = null;
+        self.clearError(.comment_delete);
     }
 
     fn acceptCommentDeleteLaunchFailure(self: *Presentation, failed: CommentDeleteLaunchFailed) void {
@@ -11481,24 +11513,24 @@ pub const Presentation = struct {
         self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
         self.durable_comment_delete = null;
         durable.destroy();
-        self.action_error = .comment_delete_launch_failed;
+        self.showError(.comment_delete, .comment_delete_launch_failed);
     }
 
     fn startReviewerVerdictChange(self: *Presentation, published: *Published, target: bbr.bitbucket.ReviewerVerdict) void {
         if (self.reviewerVerdictRefusal(published, target)) |refusal| {
-            self.action_error = reviewerVerdictRefusalError(refusal);
+            self.showError(.user, reviewerVerdictRefusalError(refusal));
             return;
         }
         const account = self.authenticated_account_uuid.?;
         const expected_source_commit = BoundedText(64).init(published.session.header.source_commit) catch |err| switch (err) {
             error.ValueTooLong => {
-                self.action_error = .reviewer_verdict_failed;
+                self.showError(.user, .reviewer_verdict_failed);
                 return;
             },
         };
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
         self.durable_reviewer_verdict = .{
@@ -11514,7 +11546,7 @@ pub const Presentation = struct {
             .authenticated_account_uuid = account,
             .target = target,
         } });
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn acceptReviewerVerdict(self: *Presentation, completed: ReviewerVerdictChanged) void {
@@ -11526,12 +11558,12 @@ pub const Presentation = struct {
             .completed => |result| result,
             .launch_failed => {
                 self.durable_reviewer_verdict = null;
-                self.action_error = .reviewer_verdict_launch_failed;
+                self.showError(.reviewer_verdict, .reviewer_verdict_launch_failed);
                 return;
             },
             .adapter_failed => {
                 self.durable_reviewer_verdict = null;
-                self.action_error = .reviewer_verdict_failed;
+                self.showError(.reviewer_verdict, .reviewer_verdict_failed);
                 return;
             },
         };
@@ -11543,13 +11575,13 @@ pub const Presentation = struct {
                     (self.replacement == null or OwnedReviewIdentity.eql(self.replacement.?.key, durable.key));
                 if (!visible) {
                     self.durable_reviewer_verdict = null;
-                    self.action_error = null;
+                    self.clearError(.reviewer_verdict);
                     return;
                 }
                 self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
                     self.reportFailure(.completion, .admission, err, @src());
                     self.durable_reviewer_verdict = null;
-                    self.action_error = .out_of_memory;
+                    self.showError(.reviewer_verdict, .out_of_memory);
                     return;
                 };
                 self.durable_reviewer_verdict.?.result = result;
@@ -11557,15 +11589,15 @@ pub const Presentation = struct {
             },
             .stale_source_commit => {
                 self.durable_reviewer_verdict = null;
-                self.action_error = .reviewer_verdict_source_changed;
+                self.showError(.reviewer_verdict, .reviewer_verdict_source_changed);
             },
             .api_error => {
                 self.durable_reviewer_verdict = null;
-                self.action_error = .reviewer_verdict_failed;
+                self.showError(.reviewer_verdict, .reviewer_verdict_failed);
             },
             .unresolved => {
                 self.durable_reviewer_verdict = null;
-                self.action_error = .reviewer_verdict_unresolved;
+                self.showError(.reviewer_verdict, .reviewer_verdict_unresolved);
             },
         }
     }
@@ -11607,27 +11639,27 @@ pub const Presentation = struct {
     fn resumePostDraftLaunch(self: *Presentation, durable: *DurableSubmission) void {
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         const command = durable.retryPost(self.allocator) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.submission, .out_of_memory);
                 return;
             },
             error.DraftNotFound => {
                 self.reportFailure(.submission, .prepare, err, @src());
-                self.action_error = .persistence_failed;
+                self.showError(.submission, .persistence_failed);
                 return;
             },
             error.InvalidSubmissionState => {
                 self.reportFailure(.submission, .prepare, err, @src());
-                self.action_error = .submission_launch_failed;
+                self.showError(.submission, .submission_launch_failed);
                 return;
             },
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
-        self.action_error = null;
+        self.clearError(.submission);
     }
 
     fn processPostDraft(self: *Presentation, durable: *DurableSubmission, completed: PostDraftCompleted) void {
@@ -11635,18 +11667,18 @@ pub const Presentation = struct {
             self.reportFailure(.mutation, .write, err, @src());
             self.publishDurableCheckpoint(durable);
             self.syncSubmissionTree(durable);
-            self.action_error = .persistence_failed;
+            self.showError(.submission, .persistence_failed);
             return;
         };
         self.publishSubmissionProgress(durable, progress);
-        self.action_error = null;
+        self.clearError(.submission);
     }
 
     fn resumeSubmissionAdmission(self: *Presentation, durable: *DurableSubmission) void {
         const pending = durable.pending_admission orelse return;
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         switch (pending) {
@@ -11666,18 +11698,18 @@ pub const Presentation = struct {
     fn resumeSubmissionPersistence(self: *Presentation, durable: *DurableSubmission) void {
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch |err| {
             self.reportFailure(.mutation, .write, err, @src());
             self.publishDurableCheckpoint(durable);
             self.syncSubmissionTree(durable);
-            self.action_error = .persistence_failed;
+            self.showError(.submission, .persistence_failed);
             return;
         };
         self.publishSubmissionProgress(durable, progress);
-        self.action_error = null;
+        self.clearError(.submission);
     }
 
     fn publishSubmissionProgress(self: *Presentation, durable: *DurableSubmission, progress: DurableSubmission.AfterPost) void {
@@ -11714,7 +11746,7 @@ pub const Presentation = struct {
         const current_source = switch (checked.outcome) {
             .failed => {
                 durable.phase = .recovery_check_paused;
-                self.action_error = .recovery_check_failed;
+                self.showError(.submission, .recovery_check_failed);
                 return;
             },
             .current_source => |source| source,
@@ -11745,7 +11777,7 @@ pub const Presentation = struct {
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
             durable.phase = .recovery_check_paused;
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         switch (durable.machine.advance()) {
@@ -11758,7 +11790,7 @@ pub const Presentation = struct {
                     .ms = wait.ms,
                     .checkpoint = wait.checkpoint,
                 } });
-                self.action_error = null;
+                self.clearError(.submission);
             },
             .post => |post| {
                 if (durable.recovered) {
@@ -11767,25 +11799,25 @@ pub const Presentation = struct {
                 }
                 const draft = durable.review.getConst(post.temp_id) orelse {
                     durable.phase = .recovery_check_paused;
-                    self.action_error = .recovery_check_failed;
+                    self.showError(.submission, .recovery_check_failed);
                     return;
                 };
                 const command = PostDraft.create(self.allocator, durable.key, draft.*, post) catch |err| switch (err) {
                     error.OutOfMemory => {
                         durable.phase = .recovery_check_paused;
-                        self.action_error = .out_of_memory;
+                        self.showError(.submission, .out_of_memory);
                         return;
                     },
                 };
                 command.operation_id = durable.operation_id;
                 durable.phase = .post_queued;
                 self.commands.appendAssumeCapacity(.{ .post_draft = command });
-                self.action_error = null;
+                self.clearError(.submission);
             },
             .check => self.queueDuplicateCheck(durable),
             else => {
                 durable.phase = .recovery_check_paused;
-                self.action_error = .recovery_check_failed;
+                self.showError(.submission, .recovery_check_failed);
             },
         }
     }
@@ -11793,14 +11825,14 @@ pub const Presentation = struct {
     fn abortChangedSubmission(self: *Presentation, durable: *DurableSubmission) void {
         const observed = durable.observed_source_commit orelse {
             durable.phase = .recovery_check_paused;
-            self.action_error = .recovery_check_failed;
+            self.showError(.submission, .recovery_check_failed);
             return;
         };
         const completion: bbr.review.SubmissionCompletion = .{ .aborted = .draft };
         self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
             durable.phase = .recovery_check_paused;
-            self.action_error = .persistence_failed;
+            self.showError(.submission, .persistence_failed);
             return;
         };
         if (durable.current_temp_id) |temp_id| durable.review.setState(temp_id, .draft);
@@ -11817,7 +11849,7 @@ pub const Presentation = struct {
         durable.destroy();
         self.submission_result = result;
         self.refreshStaleRepairTree();
-        self.action_error = .recovery_source_changed;
+        self.showError(.submission, .recovery_source_changed);
     }
 
     fn acceptDuplicateCheck(self: *Presentation, checked: DuplicateChecked) void {
@@ -11841,7 +11873,7 @@ pub const Presentation = struct {
         }
         if (checked.outcome == .failed or checked.outcome == .rejected) {
             durable.phase = .duplicate_check_paused;
-            self.action_error = .duplicate_check_failed;
+            self.showError(.submission, .duplicate_check_failed);
             return;
         }
         durable.pending_duplicate = .{ .outcome = checked.outcome };
@@ -11854,7 +11886,7 @@ pub const Presentation = struct {
             self.reportFailure(.completion, .admission, err, @src());
             durable.phase = .duplicate_check_paused;
             durable.policy_check = true;
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         switch (durable.machine.advance()) {
@@ -11862,14 +11894,14 @@ pub const Presentation = struct {
                 const draft = durable.review.getConst(post.temp_id) orelse return;
                 const command = PostDraft.create(self.allocator, durable.key, draft.*, post) catch |err| switch (err) {
                     error.OutOfMemory => {
-                        self.action_error = .out_of_memory;
+                        self.showError(.submission, .out_of_memory);
                         return;
                     },
                 };
                 command.operation_id = durable.operation_id;
                 durable.phase = .post_queued;
                 self.commands.appendAssumeCapacity(.{ .post_draft = command });
-                self.action_error = null;
+                self.clearError(.submission);
             },
             .check => {
                 self.queueDuplicateCheck(durable);
@@ -11886,13 +11918,13 @@ pub const Presentation = struct {
                 durable.phase = .wait_retry_paused;
                 self.dependencies.reviews.checkpointSubmissionRetry(durable.operation_id, durable.key.storeKey(), wait.temp_id, wait.checkpoint) catch |err| {
                     self.reportFailure(.submission, .write, err, @src());
-                    self.action_error = .persistence_failed;
+                    self.showError(.submission, .persistence_failed);
                     return;
                 };
                 durable.pending_wait_retry = null;
                 durable.phase = .wait_queued;
                 self.commands.appendAssumeCapacity(.{ .wait_submission = command });
-                self.action_error = null;
+                self.clearError(.submission);
             },
             .done => {
                 const result = durable.machine.results[durable.machine.idx - 1].?;
@@ -11910,7 +11942,7 @@ pub const Presentation = struct {
                 durable.phase = .persistence_paused;
                 const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch |err| {
                     self.reportFailure(.submission, .write, err, @src());
-                    self.action_error = .persistence_failed;
+                    self.showError(.submission, .persistence_failed);
                     return;
                 };
                 self.publishSubmissionProgress(durable, progress);
@@ -11932,7 +11964,7 @@ pub const Presentation = struct {
             self.dependencies.reviews.checkpointSubmission(durable.operation_id, durable.key.storeKey(), temp_id, outcome, null) catch |err| {
                 self.reportFailure(.submission, .write, err, @src());
                 durable.phase = .duplicate_persistence_paused;
-                self.action_error = .persistence_failed;
+                self.showError(.submission, .persistence_failed);
                 return;
             };
             durable.recordCheckpoint(temp_id, outcome, null);
@@ -11947,7 +11979,7 @@ pub const Presentation = struct {
         self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
             durable.phase = .duplicate_persistence_paused;
-            self.action_error = .persistence_failed;
+            self.showError(.submission, .persistence_failed);
             return;
         };
         const result = durable.persistedResultProjection(completion);
@@ -11966,7 +11998,7 @@ pub const Presentation = struct {
         self.submission_result = result;
         if (reconcile) self.queueReconciliation(key);
         self.refreshStaleRepairTree();
-        self.action_error = null;
+        self.clearError(.submission);
     }
 
     fn acceptSubmissionWait(self: *Presentation, completed: WaitSubmission) void {
@@ -11978,7 +12010,7 @@ pub const Presentation = struct {
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
             self.syncSubmissionTree(durable);
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         self.processSubmissionWait(durable, completed);
@@ -11991,7 +12023,7 @@ pub const Presentation = struct {
         durable.pending_wait_retry = failed;
         durable.phase = .wait_retry_paused;
         self.syncSubmissionTree(durable);
-        self.action_error = .submission_launch_failed;
+        self.showError(.submission, .submission_launch_failed);
     }
 
     fn resumeSubmissionWaitLaunch(self: *Presentation, durable: *DurableSubmission) void {
@@ -12000,7 +12032,7 @@ pub const Presentation = struct {
         wait.evidence = null;
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.submission, .out_of_memory);
             return;
         };
         if (wait.checkpoint) |checkpoint| self.dependencies.reviews.checkpointSubmissionRetry(
@@ -12010,14 +12042,14 @@ pub const Presentation = struct {
             checkpoint,
         ) catch |err| {
             self.reportFailure(.persistence, .write, err, @src());
-            self.action_error = .persistence_failed;
+            self.showError(.submission, .persistence_failed);
             return;
         };
         durable.pending_wait_retry = null;
         durable.phase = .wait_queued;
         self.commands.appendAssumeCapacity(.{ .wait_submission = wait });
         self.syncSubmissionTree(durable);
-        self.action_error = null;
+        self.clearError(.submission);
     }
 
     fn processSubmissionWait(self: *Presentation, durable: *DurableSubmission, completed: WaitSubmission) void {
@@ -12025,15 +12057,15 @@ pub const Presentation = struct {
             self.reportFailure(.submission, .execute, err, @src());
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
-            self.action_error = switch (err) {
+            self.showError(.submission, switch (err) {
                 error.OutOfMemory => .out_of_memory,
                 else => .persistence_failed,
-            };
+            });
             return;
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
         self.syncSubmissionTree(durable);
-        self.action_error = null;
+        self.clearError(.submission);
     }
 
     fn syncSubmissionTree(self: *Presentation, durable: *const DurableSubmission) void {
@@ -12075,12 +12107,12 @@ pub const Presentation = struct {
         var targeted = request;
         targeted.target = if (published.key.isRemote()) .bitbucket else .local;
         published.composer = Composer.init(published.composer_arena.allocator(), targeted);
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn openFileComposer(self: *Presentation, published: *Published) void {
         const file_index = published.activeFile() orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         const file = published.session.diff.files[file_index];
@@ -12097,12 +12129,12 @@ pub const Presentation = struct {
     fn openEditComposer(self: *Presentation, published: *Published) void {
         if (published.composer != null) return;
         const target = reviewCardTarget(published) orelse {
-            self.action_error = .no_review_item;
+            self.showError(.user, .no_review_item);
             return;
         };
         if (target == .comment) {
             const comment = findPublishedComment(published, target.comment) orelse {
-                self.action_error = .no_review_item;
+                self.showError(.user, .no_review_item);
                 return;
             };
             _ = published.composer_arena.reset(.retain_capacity);
@@ -12118,11 +12150,11 @@ pub const Presentation = struct {
             published.composer.?.seed(comment.body) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.composer = null;
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
-            self.action_error = null;
+            self.clearError(.user);
             return;
         }
         self.openDraftEditComposer(published, target.draft);
@@ -12131,7 +12163,7 @@ pub const Presentation = struct {
     fn openDraftEditComposer(self: *Presentation, published: *Published, temp_id: bbr.review.TempId) void {
         if (published.composer != null) return;
         const draft = published.review.getConst(temp_id) orelse {
-            self.action_error = .no_review_item;
+            self.showError(.user, .no_review_item);
             return;
         };
         _ = published.composer_arena.reset(.retain_capacity);
@@ -12148,23 +12180,23 @@ pub const Presentation = struct {
         published.composer.?.seed(draft.editableBody()) catch |err| switch (err) {
             error.OutOfMemory => {
                 published.composer = null;
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn openReplyComposer(self: *Presentation, published: *Published) void {
         if (published.cursorRow() == null) {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         }
         const parent: bbr.review.draft.Parent = switch (published.cursorRow().?) {
             .comment => |row| .{ .comment = row.commentItem().id },
             .draft => |row| .{ .draft = row.draftItem().local_id },
             else => {
-                self.action_error = .action_refused;
+                self.showError(.user, .action_refused);
                 return;
             },
         };
@@ -12174,15 +12206,15 @@ pub const Presentation = struct {
     fn openInlineComposer(self: *Presentation, published: *Published, kind: bbr.review.DraftKind) void {
         if (published.composer != null) return;
         if (published.cursorRow() == null) {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         }
         const file_index = published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex()) orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         if (file_index >= published.session.diff.files.len) {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         }
 
@@ -12192,23 +12224,23 @@ pub const Presentation = struct {
         if (published.navigation.selection()) |selection| {
             collectSelectedLines(published, selection[0], selection[1], &lines, allocator) catch |err| switch (err) {
                 error.NonContiguous, error.OutOfMemory => {
-                    self.action_error = .invalid_selection;
+                    self.showError(.user, .invalid_selection);
                     return;
                 },
             };
         } else if (lineAtVisualRow(published.buffer, published.cursorVisualRow().?)) |line| {
             lines.append(allocator, line) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
         }
         const span = spanFromLines(lines.items, kind == .suggestion, wholeFileAnchorVersion(self.preferences, published)) catch |err| {
-            self.action_error = switch (err) {
+            self.showError(.user, switch (err) {
                 error.RangeTooLong => .anchor_range_too_long,
                 else => .invalid_selection,
-            };
+            });
             return;
         };
         const file = published.session.diff.files[file_index];
@@ -12218,7 +12250,7 @@ pub const Presentation = struct {
         const anchor: bbr.review.Anchor = .{
             .path = allocator.dupe(u8, path) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             },
@@ -12228,7 +12260,7 @@ pub const Presentation = struct {
             .start_to = span.start_to,
             .commit = allocator.dupe(u8, authored_commit) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             },
@@ -12241,13 +12273,13 @@ pub const Presentation = struct {
         else
             std.fmt.allocPrint(allocator, "{s} {s}:{d}", .{ noun, path, bottom })) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
         const snapshot = if (!published.key.isRemote()) captureAnchorSnapshot(allocator, file, lines.items) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         } else null;
@@ -12264,14 +12296,14 @@ pub const Presentation = struct {
                 if (index > 0) seed.append(allocator, '\n') catch |err| switch (err) {
                     error.OutOfMemory => {
                         published.composer = null;
-                        self.action_error = .out_of_memory;
+                        self.showError(.user, .out_of_memory);
                         return;
                     },
                 };
                 seed.appendSlice(allocator, line.text) catch |err| switch (err) {
                     error.OutOfMemory => {
                         published.composer = null;
-                        self.action_error = .out_of_memory;
+                        self.showError(.user, .out_of_memory);
                         return;
                     },
                 };
@@ -12279,13 +12311,13 @@ pub const Presentation = struct {
             published.composer.?.seed(seed.items) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.composer = null;
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
         }
         published.navigation.clearMark();
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn applyComposerInput(self: *Presentation, composer_input: ComposerInput) void {
@@ -12298,35 +12330,35 @@ pub const Presentation = struct {
             .insert => |chunk| {
                 composer.insert(chunk.slice()) catch |err| {
                     self.reportFailure(.composer, .execute, err, @src());
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 };
-                self.action_error = null;
+                self.clearError(.user);
             },
             .newline => {
                 composer.newline() catch |err| {
                     self.reportFailure(.composer, .execute, err, @src());
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 };
-                self.action_error = null;
+                self.clearError(.user);
             },
             .backspace => {
                 composer.backspace();
-                self.action_error = null;
+                self.clearError(.user);
             },
             .delete_word => {
                 composer.deleteWord();
-                self.action_error = null;
+                self.clearError(.user);
             },
             .delete_to_line_start => {
                 composer.deleteToLineStart();
-                self.action_error = null;
+                self.clearError(.user);
             },
             .cancel => {
                 composer.deinit();
                 published.composer = null;
-                self.action_error = null;
+                self.clearError(.user);
             },
             .save => self.saveComposer(published),
             .external_edit => {
@@ -12349,7 +12381,7 @@ pub const Presentation = struct {
                 };
                 self.external_edit_pending = published.epoch;
                 self.composer_footer.clearRetainingCapacity();
-                self.action_error = null;
+                self.clearError(.user);
             },
         }
     }
@@ -12679,10 +12711,6 @@ pub const Presentation = struct {
     fn queueFileEnrichment(self: *Presentation, published: *Published, file_index: usize, speculative: bool) !void {
         if (speculative and published.review_search.open) return;
         if (speculative and self.speculativeEnrichments() >= max_speculative_enrichments) return;
-        const previous_action_error = self.action_error;
-        defer if (speculative) {
-            self.action_error = previous_action_error;
-        };
 
         const file = published.session.diff.files[file_index];
         const work_id = self.next_work_id + 1;
@@ -12695,7 +12723,7 @@ pub const Presentation = struct {
             .source = switch (published.key.kind) {
                 .remote => .{ .remote = BoundedText(256).init(published.key.repository()) catch |err| switch (err) {
                     error.ValueTooLong => {
-                        self.action_error = .action_refused;
+                        if (!speculative) self.showError(.file_enrichment, .action_refused);
                         return;
                     },
                 } },
@@ -12703,25 +12731,25 @@ pub const Presentation = struct {
             },
             .source_commit = BoundedText(64).init(published.session.header.source_commit) catch |err| switch (err) {
                 error.ValueTooLong => {
-                    self.action_error = .action_refused;
+                    if (!speculative) self.showError(.file_enrichment, .action_refused);
                     return;
                 },
             },
             .destination_commit = BoundedText(64).init(published.session.header.base_commit) catch |err| switch (err) {
                 error.ValueTooLong => {
-                    self.action_error = .action_refused;
+                    if (!speculative) self.showError(.file_enrichment, .action_refused);
                     return;
                 },
             },
             .old_path = BoundedText(512).init(file.old_path) catch |err| switch (err) {
                 error.ValueTooLong => {
-                    self.action_error = .action_refused;
+                    if (!speculative) self.showError(.file_enrichment, .action_refused);
                     return;
                 },
             },
             .new_path = BoundedText(512).init(file.new_path) catch |err| switch (err) {
                 error.ValueTooLong => {
-                    self.action_error = .action_refused;
+                    if (!speculative) self.showError(.file_enrichment, .action_refused);
                     return;
                 },
             },
@@ -12749,13 +12777,7 @@ pub const Presentation = struct {
         }
         self.next_work_id = work_id;
         published.session.enrichment.markLoading(file_index);
-        self.clearFileEnrichmentError();
-    }
-
-    fn clearFileEnrichmentError(self: *Presentation) void {
-        if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
-            self.action_error = null;
-        };
+        if (!speculative) self.clearError(.file_enrichment);
     }
 
     /// Reads of a replaced Session also count. They run until they finish.
@@ -12827,12 +12849,12 @@ pub const Presentation = struct {
                 current.session.enrichment.resetLoading(completed.file_index);
                 if (issued.speculative) return;
                 switch (failure) {
-                    .launch_failed => self.action_error = .file_enrichment_launch_failed,
+                    .launch_failed => self.showError(.file_enrichment, .file_enrichment_launch_failed),
                     .out_of_memory => {
                         if (current.review_search.open) {
                             if (reviewSearchOpeningFile(&current.review_search) == completed.file_index)
                                 current.review_search.opening_source = false;
-                            self.action_error = .out_of_memory;
+                            self.showError(.file_enrichment, .out_of_memory);
                         } else {
                             self.requestShutdown();
                             self.fatal_error = .file_enrichment_out_of_memory;
@@ -12841,7 +12863,7 @@ pub const Presentation = struct {
                 }
                 if (current.review_search.opening_source and reviewSearchOpeningFile(&current.review_search) == completed.file_index) {
                     current.review_search.opening_source = false;
-                    self.action_error = .source_action_unavailable;
+                    self.showError(.file_enrichment, .source_action_unavailable);
                 }
             },
             .completed => |result_value| {
@@ -12867,12 +12889,12 @@ pub const Presentation = struct {
         if (published.pending_draft_save != null or published.pending_draft_mutation != null) return;
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
         const job = DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -12883,19 +12905,19 @@ pub const Presentation = struct {
                 error.AnchorRangeTooLong, error.InvalidDraftScope, error.Reported, error.BufferBuildFailed, error.SearchFailed => {},
             }
             job.destroy();
-            self.action_error = switch (err) {
+            self.showError(.user, switch (err) {
                 error.AnchorRangeTooLong => .anchor_range_too_long,
                 error.InvalidDraftScope => .invalid_selection,
                 error.Reported => .persistence_failed,
                 error.BufferBuildFailed => .buffer_build_failed,
                 error.SearchFailed => .buffer_search_scan_failed,
                 error.OutOfMemory => .out_of_memory,
-            };
+            });
             return;
         };
         published.pending_draft_save = job.new_draft.?.local_id;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn cancelDraftSave(self: *Presentation, published: *Published) void {
@@ -12922,53 +12944,53 @@ pub const Presentation = struct {
         };
         if (published.pending_draft_mutation != null) return;
         if (self.draftEditRefusal(published, temp_id)) |refusal| {
-            self.action_error = mutationRefusalError(refusal);
+            self.showError(.user, mutationRefusalError(refusal));
             return;
         }
         const draft = published.review.getConst(temp_id).?;
         const body = bbr.review.storedBody(published.composer_arena.allocator(), draft.kind, composer.body()) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
         if (std.mem.eql(u8, draft.body, body)) {
             composer.deinit();
             published.composer = null;
-            self.action_error = null;
+            self.clearError(.user);
             return;
         }
         self.queueDraftMutation(published, .{ .temp_id = temp_id, .change = .{ .body = body } }, null) catch |err| {
             self.reportFailure(.mutation, .prepare, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn startCommentEdit(self: *Presentation, published: *Published, comment_id: bbr.review.CommentId, body: []const u8) void {
         const comment = findPublishedComment(published, comment_id) orelse {
-            self.action_error = .no_review_item;
+            self.showError(.user, .no_review_item);
             return;
         };
         if (std.mem.eql(u8, comment.body, body)) {
             published.composer.?.deinit();
             published.composer = null;
-            self.action_error = null;
+            self.clearError(.user);
             return;
         }
         if (self.editRefusal(published)) |refusal| {
-            self.action_error = mutationRefusalError(refusal);
+            self.showError(.user, mutationRefusalError(refusal));
             return;
         }
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
         const durable = self.allocator.create(DurableCommentEdit) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -12980,7 +13002,7 @@ pub const Presentation = struct {
             .body = self.allocator.dupe(u8, body) catch |err| switch (err) {
                 error.OutOfMemory => {
                     self.allocator.destroy(durable);
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             },
@@ -12988,7 +13010,7 @@ pub const Presentation = struct {
         const command = UpdateComment.create(self.allocator, published.key, comment_id, body) catch |err| switch (err) {
             error.OutOfMemory => {
                 durable.destroy();
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -12998,13 +13020,13 @@ pub const Presentation = struct {
         self.reviewer_verdict_result = null;
         self.durable_comment_edit = durable;
         self.commands.appendAssumeCapacity(.{ .update_comment = command });
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn publishPreferences(self: *Presentation, published: *Published, candidate: Preferences) void {
         self.queueViewBuild(published, candidate, if (published.pending_view) |desired| desired.isolated_file else published.isolated_file, if (published.pending_view) |desired| desired.geometry else published.geometry, .restore) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
             },
         };
     }
@@ -13017,7 +13039,7 @@ pub const Presentation = struct {
         candidate.selected_version = requested;
         self.queueViewBuild(published, candidate, if (published.pending_view) |view| view.isolated_file else published.isolated_file, if (published.pending_view) |view| view.geometry else published.geometry, .version) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -13026,7 +13048,7 @@ pub const Presentation = struct {
             self.queueFileEnrichment(published, file_index.?, false) catch |err| switch (err) {
                 error.OutOfMemory => {
                     self.cancelQueuedViewBuild(published);
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                 },
             };
         }
@@ -13045,7 +13067,7 @@ pub const Presentation = struct {
         const candidate = if (previous) |_| null else published.buffer.fileIndexForRow(published.cursorBufferIndex());
         self.queueViewBuild(published, if (published.pending_view) |desired| desired.preferences else self.preferences, candidate, if (published.pending_view) |desired| desired.geometry else published.geometry, if (previous != null) .file_header else .reset) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
             },
         };
     }
@@ -13119,7 +13141,7 @@ pub const Presentation = struct {
         if (target.remove == null) target.add.append(key);
         const job = self.queueAcceptedDisclosure(published, target, null, .general, null) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -13128,41 +13150,41 @@ pub const Presentation = struct {
                 error.OutOfMemory => {
                     var queued = self.commands.pop().?;
                     queued.deinit();
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
         }
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn openPicker(self: *Presentation) void {
         const key = if (self.published) |published| published.key else if (self.replacement) |replacement| replacement.key else {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         if (!key.isRemote()) {
-            self.action_error = .local_review_no_picker;
+            self.showError(.user, .local_review_no_picker);
             return;
         }
         if (!self.dependencies.remote_enabled) {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         }
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
         const repository = BoundedText(256).init(key.repository()) catch |err| switch (err) {
             error.ValueTooLong => {
-                self.action_error = .action_refused;
+                self.showError(.user, .action_refused);
                 return;
             },
         };
         const picker_repository = list_overlay_mod.Repository.init(key.workspace(), key.repository()) catch |err| switch (err) {
             error.NameTooLong => {
-                self.action_error = .action_refused;
+                self.showError(.user, .action_refused);
                 return;
             },
         };
@@ -13172,17 +13194,17 @@ pub const Presentation = struct {
             .work_id = self.next_work_id,
             .repository = repository,
         } });
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn openFileFinder(self: *Presentation) void {
         const published = self.published orelse {
-            self.action_error = .action_refused;
+            self.showError(.user, .action_refused);
             return;
         };
         const overlay = ListOverlay.openFileFinder(self.allocator, published.session.diff.files) catch |err| {
             self.reportFailure(.completion, .prepare, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
         self.showListOverlay(overlay);
@@ -13192,7 +13214,7 @@ pub const Presentation = struct {
         if (published.navigation.selection()) |selection| {
             self.yankSelection(published, selection) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                 },
             };
             return;
@@ -13202,11 +13224,11 @@ pub const Presentation = struct {
             return;
         }
         if (published.cursorVisualRow() == null) {
-            self.action_error = .invalid_selection;
+            self.showError(.user, .invalid_selection);
             return;
         }
         const start_file = published.buffer.fileIndexForRow(published.cursorBufferIndex()) orelse {
-            self.action_error = .invalid_selection;
+            self.showError(.user, .invalid_selection);
             return;
         };
         const wanted = @max(count, 1);
@@ -13226,13 +13248,13 @@ pub const Presentation = struct {
             };
             if (!duplicate) candidates.append(self.allocator, candidate) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
         }
         if (candidates.items.len == 0) {
-            self.action_error = .source_action_unavailable;
+            self.showError(.user, .source_action_unavailable);
             return;
         }
         std.mem.sort(YankCandidate, candidates.items, {}, yankCandidateLessThan);
@@ -13242,13 +13264,13 @@ pub const Presentation = struct {
         for (candidates.items, 0..) |candidate, index| {
             if (index > 0) bytes.append(self.allocator, '\n') catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
             bytes.appendSlice(self.allocator, candidate.line.text) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
+                    self.showError(.user, .out_of_memory);
                     return;
                 },
             };
@@ -13293,7 +13315,7 @@ pub const Presentation = struct {
             needs_newline = contribution.text.len == 0 or contribution.text[contribution.text.len - 1] != '\n';
         }
         if (bytes.items.len == 0) {
-            self.action_error = .yank_no_source;
+            self.showError(.user, .yank_no_source);
             return;
         }
         self.queueClipboard(published, bytes.items);
@@ -13302,14 +13324,14 @@ pub const Presentation = struct {
     fn queueClipboard(self: *Presentation, published: *Published, text: []const u8) void {
         const command = self.allocator.create(ClipboardCopy) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
         const owned = self.allocator.dupe(u8, text) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.allocator.destroy(command);
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -13317,18 +13339,18 @@ pub const Presentation = struct {
         self.commands.append(self.allocator, .{ .copy_clipboard = command }) catch |err| {
             self.reportFailure(.clipboard, .admission, err, @src());
             command.destroy();
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
             return;
         };
         published.navigation.clearMark();
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     /// Opening one List Overlay closes any other, so two never coexist.
     fn showListOverlay(self: *Presentation, overlay: ListOverlay) void {
         self.closeListOverlay();
         self.list_overlay = overlay;
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn publishedFiles(self: *const Presentation) []const bbr.diff.File {
@@ -13361,7 +13383,7 @@ pub const Presentation = struct {
             .action => |action| if (keymap_mod.supportsContext(action, self.paneContext()))
                 self.applyAction(action)
             else {
-                self.action_error = .target_action_unavailable;
+                self.showError(.user, .target_action_unavailable);
             },
             .theme => |id| self.chooseTheme(id),
         }
@@ -13371,12 +13393,12 @@ pub const Presentation = struct {
     /// process and reports the failure, because a snap back would read as a
     /// bug.
     fn chooseTheme(self: *Presentation, id: ThemeId) void {
-        self.action_error = null;
+        self.clearError(.user);
         self.configured_theme = id;
         if (!self.dependencies.persist_theme) return;
         self.commands.append(self.allocator, .{ .persist_theme = .{ .theme = id } }) catch |err| {
             self.reportFailure(.configuration, .admission, err, @src());
-            self.action_error = .out_of_memory;
+            self.showError(.user, .out_of_memory);
         };
     }
 
@@ -13384,9 +13406,9 @@ pub const Presentation = struct {
         if (!self.consumeCommand(persisted.command_id, .persist_theme)) return;
         switch (persisted.outcome) {
             .saved => {},
-            .config_invalid => self.action_error = .theme_not_saved_invalid_config,
-            .read_failed => self.action_error = .theme_not_saved_unreadable,
-            .no_config_location, .write_failed => self.action_error = .theme_not_saved,
+            .config_invalid => self.showError(.theme, .theme_not_saved_invalid_config),
+            .read_failed => self.showError(.theme, .theme_not_saved_unreadable),
+            .no_config_location, .write_failed => self.showError(.theme, .theme_not_saved),
         }
     }
 
@@ -13407,7 +13429,7 @@ pub const Presentation = struct {
         switch (loaded.outcome) {
             .failed => if (overlay != null and overlay.?.tickScope() == loaded.work_id) {
                 self.closeListOverlay();
-                self.action_error = .picker_load_failed;
+                self.showError(.picker, .picker_load_failed);
             },
             .loaded => |summaries| {
                 (overlay orelse return summaries.destroy()).populatePullRequests(loaded.work_id, summaries) catch |err| {
@@ -13416,13 +13438,13 @@ pub const Presentation = struct {
                     switch (err) {
                         error.OutOfMemory => {
                             self.closeListOverlay();
-                            self.action_error = .out_of_memory;
+                            self.showError(.picker, .out_of_memory);
                         },
                         else => {},
                     }
                     return;
                 };
-                self.action_error = null;
+                self.clearError(.picker);
             },
         }
     }
@@ -13482,7 +13504,7 @@ pub const Presentation = struct {
         const intent = self.next_intent + 1;
         self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.showError(.user, .out_of_memory);
                 return;
             },
         };
@@ -13491,7 +13513,7 @@ pub const Presentation = struct {
         self.next_intent = intent;
         self.replacement = .{ .intent = intent, .key = key, .cause = .refresh };
         self.replacement_error = null;
-        self.action_error = null;
+        self.clearError(.user);
     }
 
     fn removeQueuedSessionLoads(self: *Presentation) void {
@@ -13572,7 +13594,7 @@ pub const Presentation = struct {
         if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
         self.replacement = null;
         self.replacement_error = err;
-        if (self.action_error == .replacement_pending) self.action_error = null;
+        self.clearError(.reconciliation);
         self.status_revision +%= 1;
     }
 
@@ -13717,7 +13739,7 @@ pub const Presentation = struct {
         self.interaction_revision +%= 1;
         self.replacement = null;
         self.replacement_error = null;
-        self.action_error = null;
+        self.clearError(.reconciliation);
         if (replacement.cause == .reconciliation) if (self.durable_comment_edit) |durable| {
             if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
                 self.durable_comment_edit = null;
@@ -13847,14 +13869,6 @@ fn captureAnchorSnapshot(allocator: Allocator, file: bbr.diff.File, selected: []
         };
     }
     return null;
-}
-
-/// The errors that `acceptFileEnrichment` and a failed enrichment build show.
-fn setByFileEnrichment(err: ActionError) bool {
-    return switch (err) {
-        .file_enrichment_launch_failed, .buffer_build_failed, .out_of_memory, .source_action_unavailable, .action_refused => true,
-        else => false,
-    };
 }
 
 fn normalizeActionError(err: BufferTransactionError) ActionError {
@@ -25856,7 +25870,7 @@ test "M21 hidden traversal publishes a complete worker Frame" {
     defer query.deinit(testing.allocator);
     published.buffer_search.accepted_batch = try search.scan(testing.allocator, query, published.search_corpus.?.candidates, .literal);
     const old_rows = published.visual_rows.ptr;
-    presentation.traverseBufferSearchBy(1, .forward);
+    presentation.traverseBufferSearchBy(1, .forward, .user);
     try testing.expectEqual(old_rows, published.visual_rows.ptr);
     try testing.expect(published.buffer_search.active == null);
     const job = presentation.takeCommand().?.build_buffer_disclosure;
@@ -27541,7 +27555,7 @@ test "M21 kernel Draft mutation write failures preserve the Frame and allow retr
             presentation.dependencies.reviews.vtable = &vtable;
         }
         try completeDisclosureBuild(&presentation);
-        try testing.expectEqual(ActionError.persistence_failed, presentation.action_error.?);
+        try testing.expectEqual(ActionError.persistence_failed, presentation.projection().action_error.?);
         try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
         try testing.expect(std.meta.eql(before.navigation, presentation.projection().review.?.navigation));
         try testing.expect(presentation.published.?.pending_draft_mutation == null);
@@ -27591,7 +27605,7 @@ test "M21 kernel Draft mutation admission allocation failures keep authored data
             if (!failing.has_induced_failure) break;
             failures += 1;
             failing.fail_index = std.math.maxInt(usize);
-            try testing.expectEqual(ActionError.out_of_memory, presentation.action_error.?);
+            try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
             try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
             try testing.expect(std.meta.eql(before.navigation, presentation.projection().review.?.navigation));
             try testing.expectEqualStrings("root", draftBody(&presentation, 1));
@@ -27727,7 +27741,7 @@ test "M21 kernel Draft mutations recheck DraftState before persistence" {
         job.build();
         try presentation.dispatch(.{ .buffer_disclosure_built = job });
         try completeDisclosureBuild(&presentation);
-        try testing.expectEqual(ActionError.draft_outcome_unresolved, presentation.action_error.?);
+        try testing.expectEqual(ActionError.draft_outcome_unresolved, presentation.projection().action_error.?);
         try testing.expect(presentation.published.?.pending_draft_mutation == null);
         try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
         try testing.expectEqualStrings("root", draftBody(&presentation, 1));
@@ -30516,7 +30530,7 @@ test "M21 kernel search lease release and Review Search hold release stage evict
             @memset(published.review_search.held.?, false);
             published.review_search.held.?[2] = true;
             published.review_search.open = true;
-            if (release == .close) presentation.closeReviewSearch() else presentation.replaceReviewSearchQuery("");
+            if (release == .close) presentation.closeReviewSearch() else presentation.replaceReviewSearchQuery("", .user);
         }
         try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
         try testing.expect(published.session.enrichment.file(2).new == .content);
@@ -33116,7 +33130,7 @@ test "Review recovery a completed cache update clears a failed build of its own 
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
     });
     defer state.deinit();
-    state.action_error = .buffer_build_failed;
+    state.showError(.file_enrichment, .buffer_build_failed);
     const published = state.published.?;
     try state.queueCacheBuild(published, published.session.enrichment.focused);
     try completeDisclosureBuild(&state);
@@ -33427,7 +33441,7 @@ test "Review recovery a successful POST clears an error of its own path" {
     try state.dispatch(.{ .action = .submit });
     var post = state.takeCommand().?;
     defer post.deinit();
-    state.action_error = .submission_launch_failed;
+    state.showError(.submission, .submission_launch_failed);
     try state.dispatch(.{ .post_draft_completed = .{
         .command_id = post.post_draft.command_id,
         .operation_id = post.post_draft.operation_id,
@@ -33459,7 +33473,7 @@ test "Review recovery a successful Comment delete clears an error of its own pat
         .intent = load.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
-    state.action_error = .comment_delete_failed;
+    state.showError(.comment_delete, .comment_delete_failed);
     try state.dispatch(.{ .comment_delete_completed = .{
         .command_id = deletion.delete_comment.command_id,
         .identity = deletion.delete_comment.identity,
@@ -36770,7 +36784,7 @@ test "M21 kernel Buffer Search retries a move into an isolated File without matc
 
     try testing.expectEqual(@as(?usize, 0), published.isolated_file);
     try testing.expectEqual(@as(usize, 0), published.buffer_search.accepted_batch.?.occurrences.len);
-    try testing.expectEqual(@as(?ActionError, .buffer_search_no_matches), presentation.action_error);
+    try testing.expectEqual(@as(?ActionError, .buffer_search_no_matches), presentation.projection().action_error);
     try testing.expectEqualDeep(before, published.expanded_disclosures.items);
     try testing.expect(published.buffer_search.saved_disclosures == null);
 }
