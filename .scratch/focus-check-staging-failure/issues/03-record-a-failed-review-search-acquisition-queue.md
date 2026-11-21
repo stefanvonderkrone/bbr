@@ -39,6 +39,7 @@ These sites stay open. Each needs a decision or a repro that costs more than a f
 - The success of a cache update commit in `acceptBufferDisclosure` sets `action_error` to null. That completion is maintenance work too, so it can clear a message of an earlier input.
 - `queueFileEnrichment` shows `action_refused` when a path or a commit is too long. For maintenance work this replaces a shown message after each event, because the File stays pending. It is a refusal, not a failure, so this change keeps it.
 - `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and `dropEnrichments` show `out_of_memory` without a record. They drop the pending work of a user input, so no later check does it again. They are not maintenance work by the rule. Whether each failure needs a record is a separate question.
+- `openReviewSearch` pumps the acquisition and then sets `action_error` to null. A failed pump at the open now writes its record, but the open clears its `out_of_memory` message. This clear is older than this change.
 - `openReviewSearchOccurrence` asks the acquisition to queue the File of a pending source. Before this change, that queue cleared an earlier message. Now the earlier message stays until the next input clears it. No test reads this case.
 
 ## Completion
@@ -52,3 +53,7 @@ These sites stay open. Each needs a decision or a repro that costs more than a f
 - Red proof: "M21 kernel Review Search acquisition queue keeps the shown message" failed with `expected .file_enrichment_launch_failed, found null`. "M21 kernel Review Search acquisition queue failure records once and keeps the shown message" failed with `expected .file_enrichment_launch_failed, found .out_of_memory`. Both pass now.
 - Commits: `5be3dd40` (red tests), `f8e47310` (fix), `73e89eea` (red retry test), `344546c6` (retry fix), and the standard commit after them.
 - Checks: `zig build test` exit 0, `zig fmt --check src build.zig tests` exit 0, `python3 tools/check_diagnostics.py` exit 0, `python3 tools/check_agent_docs.py` exit 0.
+
+### 2026-11-21 review
+
+The Standards and Spec reviews found no hard violation and no missing criterion. The review commit fixes the standard: a cache staging writes no message when it succeeds, and the query retry records through `replaceReviewSearchQuery`, not `failMaintenance`. Maintenance work is now a term in `src/tui/GLOSSARY.md`. Three judgement calls stay open. The restore of the shown message has two forms, in `retryReviewSearchQuery` and `queueMaintenanceFileEnrichment`, because they read different pending signals. A success clears every `out_of_memory` message, also one that a user input showed earlier in the same event, as in PR #36. The tests drive `dispatch`, `takeCommand`, and `projection`, but they also drop the command capacity, so that the queue allocates, as earlier tests do.

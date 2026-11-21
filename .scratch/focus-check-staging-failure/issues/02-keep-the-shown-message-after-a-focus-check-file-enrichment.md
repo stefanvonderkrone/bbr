@@ -34,4 +34,4 @@ The success of `queueFileEnrichment` sets `action_error` to null, also when a me
 - `queueMaintenanceFileEnrichment` records a failed queue once as `.file_enrichment`, `.prepare`, shows `out_of_memory` only when no message shows, and keeps the shown message after a success.
 - The test "M21 kernel focus check File Enrichment of the active File keeps the shown message" failed before the fix with `expected .action_refused, found null`. It passes now. Its second case shows that a success after a failed queue clears the `out_of_memory` message.
 - Commits: `b9b65640` (red test) and the fix commit after it.
-- Checks: `zig build test-search-kernel` exit 0, `zig build test` exit 0.
+- Checks: `zig build test-search-kernel` exit 0, `zig build test` exit 0, `zig fmt --check src build.zig tests` exit 0, `python3 tools/check_agent_docs.py` exit 0.

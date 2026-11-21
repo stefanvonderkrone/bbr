@@ -12762,7 +12762,7 @@ pub const Presentation = struct {
     /// Queues a File Enrichment that no input asked for. The File stays
     /// pending after a failure, so a later check queues it again. A
     /// success clears only the out-of-memory message of an earlier failed
-    /// queue. Returns false after a failure.
+    /// queue.
     fn queueMaintenanceFileEnrichment(self: *Presentation, published: *Published, file_index: usize) bool {
         const shown = self.action_error;
         self.queueFileEnrichment(published, file_index, false) catch |err| {

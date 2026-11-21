@@ -143,9 +143,10 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 
 ### Maintenance work keeps the shown message
 
-Maintenance work is work that no input asked for and that a later check does again. A failed queue or staging of maintenance work has exactly one record, and it never overwrites or clears another message.
+[Maintenance work](src/tui/GLOSSARY.md) is work that no input asked for and that a later check does again. A failed queue or staging of maintenance work has exactly one record, and it never overwrites or clears another message.
 A failure records its cause once and shows `out_of_memory` only when no message shows.
-A success clears only the `out_of_memory` message of an earlier failed attempt.
+A File Enrichment or a query retry that succeeds clears only the `out_of_memory` message of an earlier failed attempt.
+A cache staging writes no message when it succeeds.
 
 These sites are maintenance work:
 
@@ -154,6 +155,7 @@ These sites are maintenance work:
 - The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
 
 `failMaintenance` writes the record and the message of a failure, so a new site calls it in its `catch`.
+The query retry is the exception. `replaceReviewSearchQuery` also serves user input, so it records the failure, and `retryReviewSearchQuery` restores the shown message after it.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
 This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget, and it queues the File Enrichment of the active File again while the File is pending.
 While a cache update is pending, the focus check stages after that update commits.
