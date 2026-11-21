@@ -30894,7 +30894,9 @@ test "M21 kernel dropped Selected Version enrichment retries and restores the re
     try presentation.dispatch(.{ .action = .select_old_version });
     try completeDisclosureBuild(&presentation);
     try testing.expect(cursorOwner(&presentation) == .file);
-    const waiting = try takeTestEnrichment(&presentation);
+    const command = presentation.takeCommand() orelse return error.MissingEnrichment;
+    try testing.expect(command == .enrich_file);
+    const waiting = command.enrich_file;
     try testing.expectEqual(@as(usize, 1), waiting.file_index);
     presentation.commands.deinit(presentation.allocator);
     presentation.commands = .empty;
