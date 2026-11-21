@@ -151,7 +151,7 @@ A File Enrichment or a query retry that succeeds clears only the `out_of_memory`
 A cache staging or a cache update commit writes no message.
 A user action that hands its work to maintenance work clears an older message before it does so.
 `openReviewSearchOccurrence` clears it only on the user-input path before the acquisition pump for an evicted File.
-A completion keeps the shown message.
+A completion that opens the occurrence keeps the shown message.
 
 These sites are maintenance work:
 
@@ -159,12 +159,11 @@ These sites are maintenance work:
 - The retry of a stale cache update in `retryContentBuild`, and the commit of a cache update in `acceptBufferDisclosure`.
 - The File Enrichment of the active File in the focus check, and the File Enrichments of the Review Search acquisition, `pumpReviewSearchAcquisition`. Both go through `queueMaintenanceFileEnrichment`.
 - The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
-- A failed enrichment build in `acceptBufferDisclosure` or non-speculative results dropped by `dropEnrichments`, when they cancel no pending reading location.
+- A failed enrichment build in `acceptBufferDisclosure` that cancels no pending reading location, `pending_review_location`.
+- A non-speculative result that `dropEnrichments` drops when it cancels no pending reading location.
 
-`dropEnrichments` keeps its `.completion`, `.admission` record.
+`dropEnrichments` records with operation `.completion` and phase `.admission`.
 A speculative-only drop records the failure without a message.
-A worker records a failed enrichment build before its completion.
-That completion adds no record.
 
 `failMaintenance` writes the record and the message of a failed queue or staging, so a new such site calls it in its `catch`.
 The query retry is the exception.
@@ -184,7 +183,8 @@ A completion that finds its build stale queues the work of a user input again. W
 The failure of a user input is the outcome of that input. So the retry records the cause once and shows `out_of_memory` over another message.
 `failDroppedInput` does both.
 These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and the `.draft_save` and `.draft_mutation` prongs of `retryContentBuild`.
-An enrichment failure that cancels a pending reading location from Refresh or Reconciliation drops part of that input.
+An enrichment failure can cancel the pending reading location from a refresh or Reconciliation.
+That cancellation drops part of the refresh or Reconciliation.
 No later check restores the canceled location.
 `dropEnrichments` calls `failDroppedInput` for that case too.
 The completion of a failed enrichment build shows `buffer_build_failed` for that case.
