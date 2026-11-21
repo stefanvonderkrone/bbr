@@ -30544,6 +30544,213 @@ fn failTestEnrichment(presentation: *Presentation, enrich: EnrichFile) !void {
     } });
 }
 
+test "M21 kernel failed view retry records the dropped input once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    worker.build();
+    presentation.published.?.tree.cursor = 1;
+    const before = presentation.projection().review.?.frame;
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    presentation.action_error = .buffer_search_scan_failed;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.published.?.pending_view == null);
+    try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed accepted disclosure retry records the dropped input once" {
+    try expectFailedAcceptedDisclosureRetry(false);
+}
+
+test "M21 kernel failed Buffer Search opening retry records the dropped input once" {
+    try expectFailedAcceptedDisclosureRetry(true);
+}
+
+fn expectFailedAcceptedDisclosureRetry(opening: bool) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    if (opening) {
+        try revealTemporaryReviewFold(&presentation);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+    } else {
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+        try completeBufferSearchScan(&presentation);
+        try presentation.replaceBufferSearchQuery("");
+    }
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(if (opening) DisclosureBuild.Kind.open_input else .clear_input, worker.kind);
+    worker.build();
+    presentation.published.?.tree.scroll += 1;
+    const before = presentation.projection().review.?.frame;
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    presentation.action_error = .buffer_search_scan_failed;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(!presentation.projection().buffer_search.?.pending);
+    try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed stale Buffer Search retry records the dropped input once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+    var scan = presentation.takeCommand().?;
+    defer scan.deinit();
+    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.input, worker.kind);
+    worker.build();
+    presentation.published.?.tree.scroll += 1;
+    const before = presentation.projection().review.?.frame;
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    presentation.action_error = .buffer_search_scan_failed;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(!presentation.projection().buffer_search.?.pending);
+    try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed posted parent rebuild records the dropped input once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), try store.store().reserveTempId(key.storeKey()));
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reply });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("stale Reply") } });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }});
+    try store.store().checkpointSubmission(operation_id, key.storeKey(), 1, .{ .posted = 900 }, null);
+    try store.store().completeSubmission(operation_id, key.storeKey(), .clean);
+    try presentation.dispatch(.{ .composer = .save });
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    worker.build();
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expectEqual(@as(bbr.review.CommentId, 900), presentation.published.?.review.getConst(1).?.state.posted);
+    try testing.expect(presentation.published.?.disclosure_inputs_current);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed enrichment queue records its dropped results once" {
+    try expectFailedEnrichmentQueue(.queue);
+}
+
+test "M21 kernel failed enrichment snapshot records its dropped results once" {
+    try expectFailedEnrichmentQueue(.snapshot);
+}
+
+test "M21 kernel failed enrichment merge records its dropped results once" {
+    try expectFailedEnrichmentQueue(.merge);
+}
+
+fn expectFailedEnrichmentQueue(failure: enum { queue, snapshot, merge }) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 2) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    var buffer: [2]EnrichFile = undefined;
+    const commands = takeQueuedTestEnrichments(&presentation, &buffer);
+    try testing.expectEqual(@as(usize, 2), commands.len);
+    var saved_arena: ?std.heap.ArenaAllocator = null;
+    defer if (saved_arena) |*arena| arena.deinit();
+    var saved_enrichments: std.ArrayList(EnrichedFile) = .empty;
+    var merge_failing = testing.FailingAllocator.init(testing.allocator, .{});
+    if (failure == .merge) {
+        try deliverTestEnrichment(&presentation, commands[0]);
+        const queued = presentation.commands.items[0].build_buffer_disclosure;
+        saved_arena = queued.arena;
+        saved_enrichments = queued.enrichments;
+        queued.arena = std.heap.ArenaAllocator.init(merge_failing.allocator());
+        queued.enrichments = .fromOwnedSlice(try queued.arena.allocator().dupe(EnrichedFile, saved_enrichments.items));
+        _ = try queued.arena.allocator().alloc(u8, 1);
+        merge_failing.fail_index = merge_failing.alloc_index;
+    } else if (failure == .snapshot) {
+        presentation.published.?.disclosure_inputs_current = false;
+    } else {
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        failing.fail_index = failing.alloc_index;
+    }
+    presentation.action_error = .buffer_search_scan_failed;
+    const dropped = commands[if (failure == .merge) @as(usize, 1) else 0];
+    try deliverTestEnrichment(&presentation, dropped);
+    failing.fail_index = std.math.maxInt(usize);
+    if (failure == .merge) {
+        try testing.expect(merge_failing.has_induced_failure);
+        const queued = presentation.commands.orderedRemove(0).build_buffer_disclosure;
+        queued.arena.deinit();
+        queued.arena = saved_arena.?;
+        queued.enrichments = saved_enrichments;
+        saved_arena = null;
+        queued.destroy();
+    }
+    try testing.expect(presentation.published.?.session.enrichment.file(dropped.file_index).new == .pending);
+    try expectDroppedInputRecord(&presentation);
+}
+
+fn expectDroppedInputRecord(presentation: *Presentation) !void {
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+    const command = presentation.takeCommand() orelse return error.TestExpectedRecord;
+    try testing.expect(command == .report_diagnostic);
+    const failure = command.report_diagnostic;
+    try testing.expectEqual(bbr.diagnostic.Operation.completion, failure.operation);
+    try testing.expectEqual(bbr.diagnostic.Phase.admission, failure.phase);
+    try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
 test "M21 kernel Review Search acquisition queue keeps the shown message" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
