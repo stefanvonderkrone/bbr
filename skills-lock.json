@@ -100,6 +100,12 @@
       "skillPath": "skills/misc/migrate-to-shoehorn/SKILL.md",
       "computedHash": "6397731ced114f3657aa88b55ed13d1344a56d77ca449c568e3200c21740fa99"
     },
+    "open-code-review-delegate": {
+      "source": "alibaba/open-code-review",
+      "sourceType": "github",
+      "skillPath": "skills/open-code-review-delegate/SKILL.md",
+      "computedHash": "b59a81c5275d316c67c1faa5fa021e068d77db1be9fba6963f4d276d7d26af96"
+    },
     "pr": {
       "source": "mattpocock/skills",
       "sourceType": "github",

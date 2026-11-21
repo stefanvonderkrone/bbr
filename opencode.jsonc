@@ -8,6 +8,17 @@
       "/opt/homebrew/Cellar/zig/**": "allow"
     }
   },
+  "agents": {
+    "ocr-review": {
+      "description": "Reviews workspace changes, a commit, or a branch with Open Code Review in delegation mode and the bbr rules in .opencodereview/rule.json.",
+      "mode": "subagent",
+      "model": "anthropic/claude-sonnet-5-5",
+      "system": "Load the open-code-review-delegate skill and follow its workflow. Pass the mode flags that the request names: --commit, --from and --to, or none for workspace changes. Review every file that ocr delegate preview lists against the rule group that ocr delegate rule returns for it. Report the findings in the format of the skill. Do not edit files.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" }
+      ]
+    }
+  },
   "mcp": {
     "atlassian": { "enabled": false },
     "chrome-devtools": { "enabled": false },
