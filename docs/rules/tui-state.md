@@ -59,13 +59,18 @@ Enforcement: the `Review recovery` tests in `src/tui/presentation.zig`, run by `
 
 ## Background work keeps an unrelated action error
 
-A completion of background work clears only the action errors of its own path.
+Each shown action error records its origin, the path that showed it.
+`Presentation.action_error` holds a `ShownError`, which pairs the `ActionError` with an `ErrorOrigin`.
+Code writes it only through `showError` and `clearError`, and each call names an origin.
+A key, a mouse action, or an Overlay action passes `.user`, and its `clearError` clears any error.
+A completion of background work passes the origin of its own path, and its `clearError` clears only an error of that origin.
+Thus a completion keeps an error that another path showed and that the user has not read yet.
+A Buffer build takes its origin from `DisclosureBuild.Kind.errorOrigin`.
 The File Enrichment path includes enrichment builds, cache updates, and the focus check that starts a File Enrichment.
-This path clears only the errors that `setByFileEnrichment` names.
-A speculative enrichment build clears no action error.
-[The coding standard](../../CODING_STANDARDS.md#other-background-completions-keep-an-unrelated-action-error) covers other background completions.
+A speculative enrichment shows and clears no action error.
+The Projection still gives only the `ActionError`.
 
-Enforcement: the exhaustive switch over `DisclosureBuild.Kind` in `acceptViewBuild` in `src/tui/presentation.zig` causes a compile error for a missing kind. Each new kind must decide which errors it clears. The `Review recovery` tests in the same file check unrelated action errors during enrichment builds, cache updates, and the focus check. `zig build test` runs them.
+Enforcement: the exhaustive switch in `DisclosureBuild.Kind.errorOrigin` in `src/tui/presentation.zig` causes a compile error for a new build kind without an origin. `tools/check_action_errors.py` and `tests/check_action_errors_test.py` run under `zig build test`. The checker fails on a write of `action_error` in `src/tui/presentation.zig` outside `showError` and `clearError`, such as `self.action_error = null` in a completion. Both helpers take the origin as a required argument. The `Review recovery` tests in the same file check that each completion keeps an unrelated action error and that the Submission, a Comment delete, and a cache update still clear an error of their own origin. `zig build test` runs them.
 
 ## Reading location across Refresh and Reconciliation
 

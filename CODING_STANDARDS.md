@@ -68,13 +68,12 @@ No check: no check enforces it. `layouts.Scroll` is not optional in the existing
 
 ## TUI state
 
-### Other background completions keep an unrelated action error
+### Choose the origin of an action error
 
-A completion of background work clears only the action errors of its own path.
-The Submission, comment edit, comment delete, and reviewer verdict completions still clear every action error.
-[Ticket 03](.scratch/open-code-review-findings/issues/03-scope-the-action-error-resets-of-background-completions.md) tracks these resets.
+A completion handler passes the `ErrorOrigin` of its own path to `showError` and `clearError`, not `.user`.
+A helper that both user handlers and completions call takes the origin as a parameter, as `openBufferSearchOccurrence` does.
 
-No check: the recovery tests cover only the File Enrichment path, not these other completions. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
+No check: the type and the line check see that each write names an origin, but not that the origin is the path of the event. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
 
 ### Reserve storage in every rebuild
 
