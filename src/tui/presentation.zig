@@ -1787,15 +1787,19 @@ pub const OwnedCommand = union(enum) {
                 .mode = scan.mode,
                 .outcome = .failed,
             } },
-            .scan_review_source => |scan| .{ .review_source_scanned = .{
-                .evidence = failure,
-                .allocator = std.heap.page_allocator,
-                .command_id = scan.command_id,
-                .session_epoch = scan.session_epoch,
-                .request_id = scan.request_id,
-                .file_index = scan.file_index,
-                .outcome = .failed,
-            } },
+            .scan_review_source => |scan| retained: {
+                scan.session.retain();
+                break :retained .{ .review_source_scanned = .{
+                    .evidence = failure,
+                    .allocator = std.heap.page_allocator,
+                    .session = scan.session,
+                    .command_id = scan.command_id,
+                    .session_epoch = scan.session_epoch,
+                    .request_id = scan.request_id,
+                    .file_index = scan.file_index,
+                    .outcome = .failed,
+                } };
+            },
         };
         self.deinit();
         return input;
@@ -1933,15 +1937,19 @@ const LaunchFailureFixture = struct {
                 }
                 return error.MissingDisclosureBuild;
             },
-            .scan_review_source => .{ .scan_review_source = .{
-                .session_epoch = session_epoch,
-                .request_id = request_id,
-                .file_index = file_index,
-                .arena = .init(std.heap.page_allocator),
-                .file = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} },
-                .lease = .{ .view = .{ .old = .pending, .new = .pending }, .old = null, .new = null },
-                .query = try search.Query.init(std.heap.page_allocator, "query"),
-            } },
+            .scan_review_source => blk: {
+                const query = try SharedQuery.create("query");
+                const session = disclosure.published.?.session;
+                session.retain();
+                break :blk .{ .scan_review_source = .{
+                    .session_epoch = session_epoch,
+                    .request_id = request_id,
+                    .file_index = file_index,
+                    .session = session,
+                    .lease = .{ .view = .{ .old = .pending, .new = .pending }, .old = null, .new = null },
+                    .query = query,
+                } };
+            },
         };
     }
 
@@ -3505,54 +3513,70 @@ pub fn executeBufferSearchScan(allocator: Allocator, command: *const ScanBufferS
     return completed;
 }
 
+/// A Review Search query. A source scan command keeps it after the query
+/// changes, so a scan starts without an allocation. A worker can release the
+/// last reference, so it lives in `std.heap.page_allocator`.
+const SharedQuery = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    query: search.Query,
+
+    fn create(text: []const u8) !*SharedQuery {
+        const allocator = std.heap.page_allocator;
+        const shared = try allocator.create(SharedQuery);
+        errdefer allocator.destroy(shared);
+        shared.* = .{ .query = try search.Query.init(allocator, text) };
+        return shared;
+    }
+
+    fn retain(self: *SharedQuery) *SharedQuery {
+        _ = self.references.fetchAdd(1, .acq_rel);
+        return self;
+    }
+
+    fn release(self: *SharedQuery) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        self.query.deinit(std.heap.page_allocator);
+        std.heap.page_allocator.destroy(self);
+    }
+};
+
+/// The worker reads the File from the retained Session, which never changes
+/// its Diff.
 pub const ScanReviewSource = struct {
     command_id: CommandId = 0,
     session_epoch: SessionEpoch,
     request_id: u64,
     file_index: usize,
-    arena: std.heap.ArenaAllocator,
-    file: bbr.diff.File,
+    session: *Session,
     lease: file_enrichment.ReadLease,
-    query: search.Query,
+    query: *SharedQuery,
 
-    fn create(published: *Published, file_index: usize) !ScanReviewSource {
-        const state = &published.review_search;
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-        var file = published.session.diff.files[file_index];
-        file.old_path = try a.dupe(u8, file.old_path);
-        file.new_path = try a.dupe(u8, file.new_path);
-        const hunks = try a.dupe(bbr.diff.Hunk, file.hunks);
-        for (hunks) |*hunk| {
-            const lines = try a.dupe(bbr.diff.Line, hunk.lines);
-            for (lines) |*line| line.text = try a.dupe(u8, line.text);
-            hunk.lines = lines;
-        }
-        file.hunks = hunks;
-        const query = try search.Query.init(std.heap.page_allocator, state.query.?.text);
+    fn create(published: *Published, file_index: usize) ScanReviewSource {
+        published.session.retain();
         return .{
             .session_epoch = published.epoch,
-            .request_id = state.request_id,
+            .request_id = published.review_search.request_id,
             .file_index = file_index,
-            .arena = arena,
-            .file = file,
+            .session = published.session,
             .lease = published.session.enrichment.lease(file_index),
-            .query = query,
+            .query = published.review_search.query.?.retain(),
         };
     }
 
     pub fn deinit(self: *ScanReviewSource) void {
-        self.query.deinit(std.heap.page_allocator);
+        self.query.release();
         self.lease.release();
-        self.arena.deinit();
+        self.session.destroy();
         self.* = undefined;
     }
 };
 
+/// Holds a Session reference, so the Presentation thread, not a worker,
+/// releases the last reference of a replaced Session.
 pub const ReviewSourceScanned = struct {
     evidence: ?bbr.diagnostic.Failure = null,
     allocator: Allocator,
+    session: *Session,
     command_id: CommandId,
     session_epoch: SessionEpoch,
     request_id: u64,
@@ -3561,6 +3585,7 @@ pub const ReviewSourceScanned = struct {
 
     pub fn deinit(self: *ReviewSourceScanned) void {
         if (self.outcome == .scanned) self.outcome.scanned.deinit(self.allocator);
+        self.session.destroy();
         self.* = undefined;
     }
 };
@@ -3568,13 +3593,15 @@ pub const ReviewSourceScanned = struct {
 pub fn executeReviewSourceScan(allocator: Allocator, command: *const ScanReviewSource) ReviewSourceScanned {
     const view = command.lease.view;
     var evidence: ?bbr.diagnostic.Failure = null;
-    const outcome: BufferSearchScanOutcome = if (search.scanFile(allocator, command.query, command.file, command.file_index, command.session_epoch, if (view.old == .content) view.old.content.blob else null, if (view.new == .content) view.new.content.blob else null)) |batch| .{ .scanned = batch } else |err| blk: {
+    const outcome: BufferSearchScanOutcome = if (search.scanFile(allocator, command.query.query, command.session.diff.files[command.file_index], command.file_index, command.session_epoch, if (view.old == .content) view.old.content.blob else null, if (view.new == .content) view.new.content.blob else null)) |batch| .{ .scanned = batch } else |err| blk: {
         evidence = bbr.diagnostic.Failure.capture(.review_search, .execute, .{ .command_id = command.command_id, .session_epoch = command.session_epoch, .file_index = command.file_index }, .{ .zig = err }, @src());
         break :blk .failed;
     };
+    command.session.retain();
     return .{
         .evidence = evidence,
         .allocator = allocator,
+        .session = command.session,
         .command_id = command.command_id,
         .session_epoch = command.session_epoch,
         .request_id = command.request_id,
@@ -4213,10 +4240,25 @@ const BufferSearchState = struct {
     }
 };
 
+/// The source scan of one File for the current Review Search query. A File
+/// gets two scans at most, and the pass stops when a File fails twice, so a
+/// lasting failure such as OutOfMemory ends after two scans.
+const SourceScan = enum {
+    unscanned,
+    scanning,
+    /// The first scan failed. The File keeps its hold and scans again next.
+    awaiting_retry,
+    retrying,
+    scanned,
+    /// The pass stopped before the File had a scan that succeeded. The File
+    /// has no hold. A new query or a reopened Overlay scans it again.
+    given_up,
+};
+
 const ReviewSearchState = struct {
     open: bool = false,
-    query: ?search.Query = null,
-    rollback_query: ?search.Query = null,
+    query: ?*SharedQuery = null,
+    rollback_query: ?*SharedQuery = null,
     batch: ?search.Batch = null,
     results: ?[]ReviewSearchResult = null,
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
@@ -4241,7 +4283,7 @@ const ReviewSearchState = struct {
     pending: bool = false,
     needs_scan: bool = false,
     previous_selection: ?usize = null,
-    source_scanned: ?[]bool = null,
+    source_scans: ?[]SourceScan = null,
     source_scan_active: bool = false,
     authored_scan_active: bool = false,
     acquired: ?[]bool = null,
@@ -4253,12 +4295,12 @@ const ReviewSearchState = struct {
 
     fn deinit(self: *ReviewSearchState, allocator: Allocator) void {
         self.clearSource(allocator);
-        if (self.source_scanned) |scanned| allocator.free(scanned);
+        if (self.source_scans) |scans| allocator.free(scans);
         if (self.acquired) |acquired| allocator.free(acquired);
         if (self.held) |held| allocator.free(held);
         if (self.source_candidates) |counts| allocator.free(counts);
-        if (self.query) |*query| query.deinit(allocator);
-        if (self.rollback_query) |*query| query.deinit(allocator);
+        if (self.query) |query| query.release();
+        if (self.rollback_query) |query| query.release();
         if (self.batch) |*batch| batch.deinit(allocator);
         if (self.results) |results| allocator.free(results);
         if (self.ranges) |ranges| std.heap.page_allocator.free(ranges);
@@ -4269,7 +4311,7 @@ const ReviewSearchState = struct {
 
     fn invalidate(self: *ReviewSearchState, allocator: Allocator) void {
         self.clearSource(allocator);
-        if (self.rollback_query) |*query| query.deinit(allocator);
+        if (self.rollback_query) |query| query.release();
         self.rollback_query = null;
         if (self.corpus) |corpus| corpus.release();
         self.corpus = null;
@@ -4297,23 +4339,34 @@ const ReviewSearchState = struct {
         return if (source.file_index < files) source else null;
     }
 
-    /// Only a source scan releases a scan hold, so a File whose scan is
-    /// done, queued, or running gets none.
+    /// A source result merges into the batch, so it must hold the results of
+    /// the current query. A query edit keeps the batch of `rollback_query`
+    /// until its own results publish, also when the Overlay closes first.
+    fn currentQueryResultsPublished(self: *const ReviewSearchState) bool {
+        return self.batch != null and self.rollback_query == null;
+    }
+
+    /// A scan hold ends when the source scan of its File starts, so a File
+    /// gets one only while its scan is due. A queued or running scan holds
+    /// its own lease, and a scanned or given-up File gets no scan.
     fn needsScanHold(self: *const ReviewSearchState, index: usize) bool {
         const held = self.held orelse return false;
-        const scanned = self.source_scanned orelse return false;
-        return !held[index] and !scanned[index];
+        const scans = self.source_scans orelse return false;
+        return !held[index] and switch (scans[index]) {
+            .unscanned, .awaiting_retry => true,
+            .scanning, .retrying, .scanned, .given_up => false,
+        };
     }
 
     fn clearSource(self: *ReviewSearchState, allocator: Allocator) void {
         _ = allocator;
-        if (self.source_scanned) |scanned| @memset(scanned, false);
+        if (self.source_scans) |scans| @memset(scans, .unscanned);
     }
 
     fn projection(self: *const ReviewSearchState, geometry: frame_mod.Geometry) ?ReviewSearchProjection {
         if (!self.open) return null;
         return .{
-            .query = if (self.query) |query| query.text else "",
+            .query = if (self.query) |query| query.query.text else "",
             .occurrences = if (self.pending) &.{} else if (self.batch) |batch| batch.occurrences else &.{},
             .results = if (self.pending) &.{} else self.results orelse &.{},
             .candidate_count = self.candidate_count,
@@ -6607,6 +6660,9 @@ pub const Presentation = struct {
     next_work_id: WorkId = 0,
     next_command_id: CommandId = 0,
     commands: std.ArrayList(OwnedCommand) = .empty,
+    /// The one queued source scan has its own slot, so queueing it cannot
+    /// fail. `takeCommand` issues it when `commands` is empty.
+    queued_source_scan: ?ScanReviewSource = null,
     issued_commands: std.ArrayList(IssuedCommand) = .empty,
     code_work: ?code_highlighting.Identity = null,
     outstanding_loads: usize = 0,
@@ -6710,6 +6766,7 @@ pub const Presentation = struct {
     pub fn deinit(self: *Presentation) void {
         self.closeHelp();
         for (self.commands.items) |*command| command.deinit();
+        if (self.queued_source_scan) |*scan| scan.deinit();
         if (self.durable_submission) |durable| durable.destroy();
         if (self.submission_tree) |tree| tree.destroy();
         if (self.durable_comment_edit) |edit| edit.destroy();
@@ -6781,7 +6838,12 @@ pub const Presentation = struct {
             .unknown_resolution => |resolution_input| self.applyUnknownResolutionInput(resolution_input),
             .reanchor => |reanchor_input| self.applyReanchorInput(reanchor_input),
             .delete_confirmation => |confirmation_input| self.applyDeleteConfirmationInput(confirmation_input),
-            .ensure_focused_enrichment => try self.ensureFocusedEnrichment(),
+            .ensure_focused_enrichment => {
+                // The App dispatches this after each event, so a failed
+                // retry waits for the next event.
+                self.retryReviewSearchQuery();
+                try self.ensureFocusedEnrichment();
+            },
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
             .code_highlight_completed => |completed| self.acceptCodeHighlight(completed),
             .post_draft_completed => |completed| self.acceptPostDraft(completed),
@@ -6814,6 +6876,18 @@ pub const Presentation = struct {
         if (self.code_work != null or (self.published != null and self.published.?.code_highlighting.bodies.items.len > 0)) self.refreshCodeVisibility();
     }
 
+    /// A cache update is a full Buffer build, so a queued source scan goes
+    /// before it until the released Files are far over the budget.
+    fn sourceScanIsNext(self: *const Presentation) bool {
+        if (self.queued_source_scan == null) return false;
+        if (self.commands.items.len == 0) return true;
+        const published = self.published orelse return false;
+        const first = self.commands.items[0];
+        if (first != .build_buffer_disclosure or first.build_buffer_disclosure.kind != .cache_update or
+            first.build_buffer_disclosure.epoch != published.epoch) return false;
+        return published.session.enrichment.cachePressure(published.pending_cache_focus) != .far_over_budget;
+    }
+
     pub fn takeCommand(self: *Presentation) ?OwnedCommand {
         if (self.emergency_diagnostic_count > 0) {
             const failure = self.emergency_diagnostics[0];
@@ -6822,10 +6896,15 @@ pub const Presentation = struct {
             return .{ .report_diagnostic = failure };
         }
         if (self.commands.items.len > 0 and self.commands.items[0] == .report_diagnostic) return self.commands.orderedRemove(0);
-        if (self.commands.items.len == 0 and self.code_work == null and !self.shutdown_requested) self.scheduleCodeHighlight();
+        if (self.commands.items.len == 0 and self.queued_source_scan == null and self.code_work == null and !self.shutdown_requested) self.scheduleCodeHighlight();
         if (self.commands.items.len > 0 and self.commands.items[0] == .report_diagnostic) return self.commands.orderedRemove(0);
-        if (self.commands.items.len == 0) return null;
-        const next = self.commands.items[0];
+        const take_scan = self.sourceScanIsNext();
+        const next: OwnedCommand = if (take_scan)
+            .{ .scan_review_source = self.queued_source_scan.? }
+        else if (self.commands.items.len > 0)
+            self.commands.items[0]
+        else
+            return null;
         if (next == .scan_buffer_search or next == .scan_review_source or next == .build_buffer_disclosure) {
             for (self.issued_commands.items) |issued| {
                 if (issued.target == .scan_review_source or
@@ -6834,9 +6913,9 @@ pub const Presentation = struct {
             }
         }
         if (self.published) |published| {
-            if (self.commands.items[0] == .scan_buffer_search and self.commands.items[0].scan_buffer_search.mode == .fuzzy and
+            if (next == .scan_buffer_search and next.scan_buffer_search.mode == .fuzzy and
                 (published.review_search.authored_scan_active or published.review_search.source_scan_active)) return null;
-            if (self.commands.items[0] == .scan_review_source and published.review_search.authored_scan_active) return null;
+            if (next == .scan_review_source and published.review_search.authored_scan_active) return null;
         }
         self.issued_commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
@@ -6847,7 +6926,8 @@ pub const Presentation = struct {
         if (next == .build_buffer_disclosure) {
             if (self.published) |published| self.refreshQueuedBuild(published, 0);
         }
-        var command = self.commands.orderedRemove(0);
+        var command = if (take_scan) next else self.commands.orderedRemove(0);
+        if (command == .scan_review_source) self.queued_source_scan = null;
         self.next_command_id +%= 1;
         if (self.next_command_id == 0) self.next_command_id = 1;
         const command_id = self.next_command_id;
@@ -7010,8 +7090,8 @@ pub const Presentation = struct {
         if (builtin.is_test) for (self.issued_commands.items) |issued| {
             if (issued.target == .scan_buffer_search or issued.target == .scan_review_source or issued.target == .build_buffer_disclosure or issued.target == .prepare_session) return false;
         };
-        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
-        return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
+        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.queued_source_scan == null and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
+        return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.queued_source_scan == null and self.issued_commands.items.len == 0;
     }
 
     fn reviewProjection(self: *const Presentation, published: *const Published) ReviewProjection {
@@ -8523,18 +8603,18 @@ pub const Presentation = struct {
             state.corpus = corpus;
             state.candidate_count = corpus.candidates.len;
         }
-        if (state.source_scanned == null) {
-            state.source_scanned = self.allocator.alloc(bool, published.session.diff.files.len) catch |err| switch (err) {
+        if (state.source_scans == null) {
+            state.source_scans = self.allocator.alloc(SourceScan, published.session.diff.files.len) catch |err| switch (err) {
                 error.OutOfMemory => {
                     self.action_error = .out_of_memory;
                     return;
                 },
             };
-            @memset(state.source_scanned.?, false);
+            @memset(state.source_scans.?, .unscanned);
             state.acquired = self.allocator.alloc(bool, published.session.diff.files.len) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.allocator.free(state.source_scanned.?);
-                    state.source_scanned = null;
+                    self.allocator.free(state.source_scans.?);
+                    state.source_scans = null;
                     self.action_error = .out_of_memory;
                     return;
                 },
@@ -8542,9 +8622,9 @@ pub const Presentation = struct {
             state.held = self.allocator.alloc(bool, published.session.diff.files.len) catch |err| switch (err) {
                 error.OutOfMemory => {
                     self.allocator.free(state.acquired.?);
-                    self.allocator.free(state.source_scanned.?);
+                    self.allocator.free(state.source_scans.?);
                     state.acquired = null;
-                    state.source_scanned = null;
+                    state.source_scans = null;
                     self.action_error = .out_of_memory;
                     return;
                 },
@@ -8554,10 +8634,10 @@ pub const Presentation = struct {
                 error.OutOfMemory => {
                     self.allocator.free(state.held.?);
                     self.allocator.free(state.acquired.?);
-                    self.allocator.free(state.source_scanned.?);
+                    self.allocator.free(state.source_scans.?);
                     state.held = null;
                     state.acquired = null;
-                    state.source_scanned = null;
+                    state.source_scans = null;
                     self.action_error = .out_of_memory;
                     return;
                 },
@@ -8565,6 +8645,9 @@ pub const Presentation = struct {
             @memset(state.source_candidates.?, 0);
         }
         @memset(state.acquired.?, false);
+        for (state.source_scans.?) |*scan| if (scan.* == .given_up) {
+            scan.* = .unscanned;
+        };
         for (published.session.diff.files, 0..) |_, index| {
             const view = published.session.enrichment.file(index);
             countFileCandidates(state, index, view);
@@ -8578,10 +8661,25 @@ pub const Presentation = struct {
         published.navigation.count = 0;
         self.action_error = null;
         if (state.needs_scan) {
-            const text = (state.query orelse unreachable).text;
+            const text = (state.query orelse unreachable).query.text;
             self.replaceReviewSearchQuery(text);
+            // The query must not show over the results of another query
+            // without the pending mark, also when its scan cannot queue.
+            state.pending = true;
         }
         published.frame_revision += 1;
+    }
+
+    /// A reopened query whose scan could not queue stays pending with
+    /// `needs_scan`. The retry runs after the inputs of an event, so a
+    /// success clears only the out-of-memory message of the failed scan.
+    fn retryReviewSearchQuery(self: *Presentation) void {
+        const published = self.published orelse return;
+        const state = &published.review_search;
+        if (!state.open or !state.pending or !state.needs_scan) return;
+        const shown = self.action_error;
+        self.replaceReviewSearchQuery((state.query orelse unreachable).query.text);
+        if (!state.needs_scan and shown != .out_of_memory) self.action_error = shown;
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
@@ -8626,7 +8724,7 @@ pub const Presentation = struct {
 
     fn insertReviewSearch(self: *Presentation, text: []const u8) void {
         const state = &((self.published orelse return).review_search);
-        const current = if (state.query) |query| query.text else "";
+        const current = if (state.query) |query| query.query.text else "";
         const joined = self.allocator.alloc(u8, current.len + text.len) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.action_error = .out_of_memory;
@@ -8641,7 +8739,7 @@ pub const Presentation = struct {
 
     fn editReviewSearch(self: *Presentation, edit: SearchEdit) void {
         const state = &((self.published orelse return).review_search);
-        const text = if (state.query) |query| query.text else return;
+        const text = if (state.query) |query| query.query.text else return;
         const end = switch (edit) {
             .backspace => search.lastScalarStart(text),
             .delete_word => search.wordStart(text),
@@ -8655,7 +8753,7 @@ pub const Presentation = struct {
         const state = &published.review_search;
         state.opening_source = false;
         state.opening_identity = null;
-        var query = search.Query.init(self.allocator, text) catch |err| {
+        const query = SharedQuery.create(text) catch |err| {
             switch (err) {
                 error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
                 error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
@@ -8668,10 +8766,10 @@ pub const Presentation = struct {
             return;
         };
         if (text.len == 0) {
-            query.deinit(self.allocator);
-            if (state.query) |*old| old.deinit(self.allocator);
+            query.release();
+            if (state.query) |old| old.release();
             state.query = null;
-            if (state.rollback_query) |*old| old.deinit(self.allocator);
+            if (state.rollback_query) |old| old.release();
             state.rollback_query = null;
             if (state.batch) |*batch| batch.deinit(self.allocator);
             state.batch = null;
@@ -8697,7 +8795,7 @@ pub const Presentation = struct {
                 error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
                 error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
             }
-            query.deinit(self.allocator);
+            query.release();
             self.action_error = switch (err) {
                 error.OutOfMemory => .out_of_memory,
                 else => .buffer_search_invalid_query,
@@ -8705,7 +8803,7 @@ pub const Presentation = struct {
             return;
         };
         const corpus = state.corpus orelse {
-            query.deinit(self.allocator);
+            query.release();
             worker_query.deinit(std.heap.page_allocator);
             return;
         };
@@ -8720,22 +8818,18 @@ pub const Presentation = struct {
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.reportFailure(.completion, .admission, err, @src());
             command.deinit();
-            query.deinit(self.allocator);
+            query.release();
             self.action_error = .out_of_memory;
             return;
         };
         self.discardQueuedReviewSearchScans();
-        self.discardQueuedReviewSourceScans();
-        state.clearSource(self.allocator);
-        holdReviewSearchFiles(published);
-        if (state.acquired) |acquired| for (acquired, 0..) |*done, index| {
-            if (published.session.enrichment.needsEnrichment(index)) done.* = false;
-        };
-        self.pumpReviewSearchAcquisition(published);
+        // The query scan takes the reserved slot before a discarded source
+        // scan can stage a cache build into it.
         self.commands.insertAssumeCapacity(0, command);
+        self.discardQueuedReviewSourceScans();
         if (state.rollback_query == null and state.batch != null) {
             state.rollback_query = state.query;
-        } else if (state.query) |*old| old.deinit(self.allocator);
+        } else if (state.query) |old| old.release();
         state.query = query;
         state.request_id +%= 1;
         state.pending = true;
@@ -8745,20 +8839,44 @@ pub const Presentation = struct {
     }
 
     fn discardQueuedReviewSourceScans(self: *Presentation) void {
-        var index: usize = 0;
-        while (index < self.commands.items.len) {
-            if (self.commands.items[index] == .scan_review_source) {
-                var removed = self.commands.orderedRemove(index);
-                if (self.published) |published| {
-                    if (published.epoch == removed.scan_review_source.session_epoch) {
-                        self.finishSearchLease(published, removed.scan_review_source.file_index);
-                        if (published.review_search.source_scanned) |scanned| scanned[removed.scan_review_source.file_index] = false;
-                    }
-                    published.review_search.source_scan_active = false;
-                }
-                removed.deinit();
-            } else index += 1;
+        var removed = self.queued_source_scan orelse return;
+        self.queued_source_scan = null;
+        if (self.published) |published| {
+            if (published.epoch == removed.session_epoch) {
+                undoReviewSourceScan(published, removed.file_index);
+                self.finishSearchLease(published, removed.file_index);
+            }
+            published.review_search.source_scan_active = false;
         }
+        removed.deinit();
+    }
+
+    /// A source scan without a result returns its File to the state before
+    /// the scan, so a rolled-back query keeps the attempts of each File.
+    fn undoReviewSourceScan(published: *Published, file_index: usize) void {
+        const state = &published.review_search;
+        const scans = state.source_scans orelse return;
+        scans[file_index] = switch (scans[file_index]) {
+            .scanning => .unscanned,
+            .retrying => .awaiting_retry,
+            .unscanned, .awaiting_retry, .scanned, .given_up => |scan| scan,
+        };
+        if (!reviewSearchHolds(published, file_index) or !published.session.enrichment.isTerminal(file_index)) return;
+        published.session.enrichment.hold(file_index);
+        state.held.?[file_index] = true;
+    }
+
+    /// The source scans start again when the results of a new query
+    /// publish, so a rolled-back query keeps its pass.
+    fn restartReviewSourceScans(self: *Presentation, published: *Published) void {
+        const state = &published.review_search;
+        state.clearSource(self.allocator);
+        holdReviewSearchFiles(published);
+        if (state.acquired) |acquired| for (acquired, 0..) |*done, index| {
+            if (published.session.enrichment.needsEnrichment(index)) done.* = false;
+        };
+        self.pumpReviewSearchAcquisition(published);
+        self.maybeQueueReviewSourceScan(published);
     }
 
     fn discardQueuedSearchEnrichments(self: *Presentation, published: *Published) void {
@@ -8836,45 +8954,45 @@ pub const Presentation = struct {
 
     fn maybeQueueReviewSourceScan(self: *Presentation, published: *Published) void {
         const state = &published.review_search;
-        if (!state.open or state.pending or state.query == null or state.source_scan_active or state.source_scanned == null) return;
-        for (published.session.diff.files, 0..) |_, index| {
-            if (state.source_scanned.?[index] or !published.session.enrichment.isTerminal(index)) continue;
-            var command: OwnedCommand = .{ .scan_review_source = ScanReviewSource.create(published, index) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
-                    return;
-                },
-                error.TooLong => {
-                    self.action_error = .buffer_search_query_too_long;
-                    return;
-                },
-                error.InvalidUtf8, error.LineEnding, error.Nul => {
-                    self.action_error = .buffer_search_invalid_query;
-                    return;
-                },
-            } };
-            self.commands.append(self.allocator, command) catch |err| {
-                self.reportFailure(.review_search, .admission, err, @src());
-                self.finishSearchLease(published, index);
-                command.deinit();
-                self.action_error = .out_of_memory;
-                return;
-            };
+        if (!state.open or !state.currentQueryResultsPublished() or state.source_scan_active) return;
+        const scans = state.source_scans orelse return;
+        for ([_]SourceScan{ .awaiting_retry, .unscanned }) |due| for (scans, 0..) |scan, index| {
+            if (scan != due or !published.session.enrichment.isTerminal(index)) continue;
+            std.debug.assert(self.queued_source_scan == null);
+            self.queued_source_scan = ScanReviewSource.create(published, index);
+            // The lease of the scan keeps the File, so no cache build must
+            // stage.
             if (state.held) |held| if (held[index]) {
-                self.finishSearchLease(published, index);
+                published.session.enrichment.finishLeaseDeferred(index);
                 held[index] = false;
             };
-            // A cache update is a full Buffer build, so it waits behind the
-            // scans until the released Files are far over the budget or the
-            // scans stop.
-            if (self.queuedBuildIndex(.cache_update, published.epoch)) |cache_index| {
-                if (published.session.enrichment.cachePressure(published.pending_cache_focus) != .far_over_budget)
-                    self.commands.appendAssumeCapacity(self.commands.orderedRemove(cache_index));
-            }
-            state.source_scanned.?[index] = true;
+            scans[index] = if (due == .unscanned) .scanning else .retrying;
             state.source_scan_active = true;
             return;
-        }
+        };
+    }
+
+    /// A first failure keeps the hold of its File, so its content stays for
+    /// the retry. A second failure stops the pass.
+    fn reviewSourceScanFailed(self: *Presentation, published: *Published, file_index: usize) void {
+        const state = &published.review_search;
+        const scans = state.source_scans orelse return;
+        if (scans[file_index] != .scanning) return self.giveUpReviewSourceScans(published);
+        scans[file_index] = .awaiting_retry;
+        const held = state.held orelse return;
+        if (held[file_index]) return;
+        published.session.enrichment.hold(file_index);
+        held[file_index] = true;
+    }
+
+    /// Runs in the completion of the only source scan, so no other File
+    /// has a scan in flight.
+    fn giveUpReviewSourceScans(self: *Presentation, published: *Published) void {
+        if (published.review_search.source_scans) |scans| for (scans) |*scan| {
+            if (scan.* != .scanned) scan.* = .given_up;
+        };
+        self.releaseReviewSearchHolds(published);
+        self.action_error = .buffer_search_scan_failed;
     }
 
     fn finishSearchLease(self: *Presentation, published: *Published, file_index: usize) void {
@@ -8893,7 +9011,9 @@ pub const Presentation = struct {
         if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
         self.queueCacheBuild(published, focused) catch |err| {
             self.reportFailure(.buffer_build, .prepare, err, @src());
-            self.action_error = .out_of_memory;
+            // The focus check after the event stages again, so this failure
+            // does not replace the shown outcome.
+            if (self.action_error == null) self.action_error = .out_of_memory;
         };
     }
 
@@ -8908,17 +9028,19 @@ pub const Presentation = struct {
             published.review_search.source_scan_active = false;
             return;
         }
-        self.finishSearchLease(published, completed.file_index);
+        // A failed scan holds its File again before the command lets go of it.
+        defer self.finishSearchLease(published, completed.file_index);
         const state = &published.review_search;
         state.source_scan_active = false;
-        if (!state.open or state.query == null or state.pending or state.request_id != completed.request_id) {
-            if (state.source_scanned) |scanned| scanned[completed.file_index] = false;
+        if (!state.open or !state.currentQueryResultsPublished() or state.request_id != completed.request_id) {
+            undoReviewSourceScan(published, completed.file_index);
             self.maybeQueueReviewSourceScan(published);
             return;
         }
         if (completed.outcome == .scanned) {
             var part = completed.outcome.scanned.clone(std.heap.page_allocator) catch |err| switch (err) {
                 error.OutOfMemory => {
+                    self.reportFailure(.review_search, .prepare, err, @src());
                     self.reviewSourcePublicationFailed(published, completed.file_index);
                     return;
                 },
@@ -8927,12 +9049,10 @@ pub const Presentation = struct {
             var transferred = false;
             defer if (!transferred) part.deinit(self.allocator);
             search.rank(&part);
-            const old = state.batch orelse {
-                self.reviewSourcePublicationFailed(published, completed.file_index);
-                return;
-            };
+            const old = state.batch.?;
             var old_copy: ?search.Batch = if (old.references != null) old.clone(std.heap.page_allocator) catch |err| switch (err) {
                 error.OutOfMemory => {
+                    self.reportFailure(.review_search, .prepare, err, @src());
                     self.reviewSourcePublicationFailed(published, completed.file_index);
                     return;
                 },
@@ -8941,12 +9061,14 @@ pub const Presentation = struct {
             defer if (old_copy) |*copy| copy.deinit(self.allocator);
             const occurrences = std.heap.page_allocator.alloc(search.Occurrence, old.occurrences.len + part.occurrences.len) catch |err| switch (err) {
                 error.OutOfMemory => {
+                    self.reportFailure(.review_search, .prepare, err, @src());
                     self.reviewSourcePublicationFailed(published, completed.file_index);
                     return;
                 },
             };
             const merged_index = self.allocator.alloc(usize, occurrences.len) catch |err| switch (err) {
                 error.OutOfMemory => {
+                    self.reportFailure(.review_search, .prepare, err, @src());
                     std.heap.page_allocator.free(occurrences);
                     self.reviewSourcePublicationFailed(published, completed.file_index);
                     return;
@@ -8974,6 +9096,7 @@ pub const Presentation = struct {
             };
             const results = self.allocator.alloc(ReviewSearchResult, occurrences.len) catch |err| switch (err) {
                 error.OutOfMemory => {
+                    self.reportFailure(.review_search, .prepare, err, @src());
                     std.heap.page_allocator.free(occurrences);
                     std.heap.page_allocator.free(ranges);
                     self.reviewSourcePublicationFailed(published, completed.file_index);
@@ -9013,18 +9136,15 @@ pub const Presentation = struct {
                 if (geometry.list.height > 0 and index >= state.list_scroll + geometry.list.height)
                     state.list_scroll = index + 1 - geometry.list.height;
             };
+            if (state.source_scans) |scans| scans[completed.file_index] = .scanned;
             published.frame_revision += 1;
-        } else {
-            if (state.source_scanned) |scanned| scanned[completed.file_index] = false;
-            self.action_error = .buffer_search_scan_failed;
-            return;
-        }
+        } else self.reviewSourceScanFailed(published, completed.file_index);
         self.maybeQueueReviewSourceScan(published);
     }
 
     fn reviewSourcePublicationFailed(self: *Presentation, published: *Published, file_index: usize) void {
-        if (published.review_search.source_scanned) |scanned| scanned[file_index] = false;
-        self.action_error = .out_of_memory;
+        self.reviewSourceScanFailed(published, file_index);
+        self.maybeQueueReviewSourceScan(published);
     }
 
     fn discardQueuedReviewSearchScans(self: *Presentation) void {
@@ -9133,7 +9253,7 @@ pub const Presentation = struct {
         if (!state.open or completed.session_epoch != published.epoch or !state.pending or completed.request_id != state.request_id) return;
         const worker_batch = switch (completed.outcome) {
             .failed => {
-                self.rollbackReviewSearchQuery(state);
+                self.rollbackReviewSearchQuery(published);
                 self.action_error = .buffer_search_scan_failed;
                 published.frame_revision += 1;
                 return;
@@ -9154,7 +9274,7 @@ pub const Presentation = struct {
         const ranges = published.projectReviewRanges(batch, selected) catch |err| {
             self.reportFailure(.review_search, .prepare, err, @src());
             batch.deinit(self.allocator);
-            self.rollbackReviewSearchQuery(state);
+            self.rollbackReviewSearchQuery(published);
             self.action_error = .out_of_memory;
             published.frame_revision += 1;
             return;
@@ -9163,7 +9283,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 batch.deinit(self.allocator);
                 std.heap.page_allocator.free(ranges);
-                self.rollbackReviewSearchQuery(state);
+                self.rollbackReviewSearchQuery(published);
                 self.action_error = .out_of_memory;
                 published.frame_revision += 1;
                 return;
@@ -9180,7 +9300,7 @@ pub const Presentation = struct {
         state.previous_selection = null;
         state.pending = false;
         state.list_scroll = @min(state.list_scroll, (if (batch.occurrences.len > 0) batch.occurrences.len else published.session.diff.files.len) -| 1);
-        if (state.rollback_query) |*old| old.deinit(self.allocator);
+        if (state.rollback_query) |old| old.release();
         state.rollback_query = null;
         if (selected) |index| {
             if (!keep_preview) state.preview_scroll = switch (batch.occurrences[index].location) {
@@ -9195,14 +9315,17 @@ pub const Presentation = struct {
         }
         published.frame_revision += 1;
         self.action_error = null;
-        self.maybeQueueReviewSourceScan(published);
+        self.restartReviewSourceScans(published);
     }
 
-    fn rollbackReviewSearchQuery(self: *Presentation, state: *ReviewSearchState) void {
+    /// The rolled-back query resumes the source pass that the edit paused.
+    fn rollbackReviewSearchQuery(self: *Presentation, published: *Published) void {
+        defer self.maybeQueueReviewSourceScan(published);
+        const state = &published.review_search;
         state.pending = false;
         state.needs_scan = state.rollback_query == null;
         if (state.rollback_query) |previous| {
-            if (state.query) |*query| query.deinit(self.allocator);
+            if (state.query) |query| query.release();
             state.query = previous;
             state.rollback_query = null;
         }
@@ -9921,6 +10044,13 @@ pub const Presentation = struct {
             self.retryContentBuild(published, job);
             return;
         }
+        // The worker counted each recorded hold in its cache preview. A query
+        // or an Overlay change can change the decision without a Storage
+        // change.
+        for (job.enrichments.items) |enriched| if (enriched.hold != reviewSearchHolds(published, enriched.index)) {
+            self.retryContentBuild(published, job);
+            return;
+        };
         if (job.kind == .view) {
             const desired = published.pending_view orelse return;
             if (job.request_id != desired.request_id) return;
@@ -10049,7 +10179,7 @@ pub const Presentation = struct {
         }
         for (job.enrichments.items) |*enriched| if (!admissible(published, job, enriched)) return self.refuseEnrichments(published, job);
         for (job.enrichments.items) |*enriched| {
-            if (reviewSearchHolds(published, enriched.index)) {
+            if (enriched.hold) {
                 published.session.enrichment.hold(enriched.index);
                 published.review_search.held.?[enriched.index] = true;
             }
@@ -17285,8 +17415,7 @@ test "M21 authored Review Search streams a complete File partition after File En
 test "M21 authored failed source scan retries after reopening Review Search" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
     });
     defer presentation.deinit();
@@ -17312,30 +17441,15 @@ test "M21 authored failed source scan retries after reopening Review Search" {
         .outcome = .{ .completed = enrichment },
     } });
     try completeDisclosureBuild(&presentation);
-    command = presentation.takeCommand().?;
-    const scan_id = command.scan_review_source.command_id;
-    command.deinit();
-    try presentation.dispatch(.{ .review_source_scanned = .{
-        .allocator = testing.allocator,
-        .command_id = scan_id,
-        .session_epoch = 1,
-        .request_id = presentation.published.?.review_search.request_id,
-        .file_index = 0,
-        .outcome = .failed,
-    } });
+    for (0..2) |_| {
+        command = presentation.takeCommand().?;
+        var failed = executeReviewSourceScan(testing.allocator, &command.scan_review_source);
+        command.deinit();
+        failTestSourceScan(&failed);
+        try presentation.dispatch(.{ .review_source_scanned = failed });
+    }
     try testing.expect(presentation.takeCommand() == null);
-    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
-    try presentation.dispatch(.{ .action = .open_review_search });
-    command = presentation.takeCommand().?;
-    try testing.expect(command == .scan_review_source);
-    const failed_publication = executeReviewSourceScan(testing.allocator, &command.scan_review_source);
-    command.deinit();
-    const before = presentation.projection().revision.frame;
-    failing.fail_index = failing.alloc_index;
-    try presentation.dispatch(.{ .review_source_scanned = failed_publication });
-    try testing.expectEqual(before, presentation.projection().revision.frame);
-    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
-    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try presentation.dispatch(.{ .action = .open_review_search });
     command = presentation.takeCommand().?;
@@ -19381,28 +19495,6 @@ test "a stale Buffer Search retry reports a text error" {
     const published = presentation.published.?;
     published.buffer_search.input.?.query.?.text[0] = '\n';
     presentation.retryStaleBufferDisclosure(published);
-    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
-}
-
-test "a Review source scan reports a text error" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
-    });
-    defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .open_review_search });
-    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
-    const published = presentation.published.?;
-    for (published.session.enrichment.statuses) |*status| {
-        status.old = .absent;
-        status.new = .absent;
-    }
-    published.review_search.query.?.text[0] = '\n';
-    published.review_search.pending = false;
-    published.review_search.source_scan_active = false;
-    if (published.review_search.source_scanned) |scanned| @memset(scanned, false);
-    presentation.maybeQueueReviewSourceScan(published);
     try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
 }
 
@@ -30749,7 +30841,7 @@ test "one enrichment rebuild keeps the Review Search effects of each File in it"
 fn runReviewSearchTestWork(presentation: *Presentation, source_scans: usize) !void {
     var scanned: usize = 0;
     while (scanned < source_scans or
-        (presentation.commands.items.len > 0 and presentation.commands.items[0] == .build_buffer_disclosure))
+        (presentation.commands.items.len > 0 and presentation.commands.items[0] == .build_buffer_disclosure and !presentation.sourceScanIsNext()))
     {
         var command = presentation.takeCommand() orelse return;
         switch (command) {
@@ -30921,7 +31013,7 @@ test "M21 kernel Review Search source scans of a small Review evict while the sc
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
     var steps: usize = 0;
     var peak: usize = 0;
-    while (presentation.commands.items.len > 0) {
+    while (presentation.commands.items.len > 0 or presentation.queued_source_scan != null) {
         try runReviewSearchTestWork(&presentation, 1);
         steps += 1;
         var inactive: usize = 0;
@@ -34823,12 +34915,22 @@ fn publishCheckedReviewSources(presentation: *Presentation, hide_rows: bool, bet
 }
 
 fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize) !Presentation {
+    return openTestReviewSourceSearchWith(store, allocator, file_count, .{});
+}
+
+const TestReviewSourceOptions = struct {
+    diagnostic_state: bbr.diagnostic.State = .off,
+    inactive_file_cache_max_bytes: usize = std.meta.fieldInfo(Dependencies, .inactive_file_cache_max_bytes).defaultValue().?,
+};
+
+fn openTestReviewSourceSearchWith(store: *bbr.review.InMemoryStore, allocator: Allocator, file_count: usize, options: TestReviewSourceOptions) !Presentation {
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     // The emphasis splits one ReviewBody match into two ranges.
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "a new idea\n\nn**e**w again" });
-    var presentation = try Presentation.init(allocator, .{ .reviews = store.store() }, .{
+    var presentation = try Presentation.init(allocator, .{ .reviews = store.store(), .inactive_file_cache_max_bytes = options.inactive_file_cache_max_bytes }, .{
         .initial = .{ .key = key, .session = try testManyFileSession(testing.allocator, 1, file_count) },
         .geometry = .{ .cols = 100, .rows = 40 },
+        .diagnostic_state = options.diagnostic_state,
     });
     errdefer presentation.deinit();
     try presentation.dispatch(.{ .action = .open_review_search });
@@ -34836,6 +34938,622 @@ fn openTestReviewSourceSearch(store: *bbr.review.InMemoryStore, allocator: Alloc
     try completeBufferSearchScan(&presentation);
     try testing.expectEqual(@as(usize, 2), presentation.published.?.review_search.batch.?.occurrences.len);
     return presentation;
+}
+
+const TestSourceScanRun = struct {
+    /// The source scans of the failing File.
+    scans: usize = 0,
+    /// Whether a hold or the retry kept the failing File leased after each
+    /// failed source scan. Its length also ends an endless retry.
+    leased_after_failure: [4]bool = @splat(false),
+    review_search_records: usize = 0,
+};
+
+/// Runs every queued command. The first `failures` source scans of `file_index` fail.
+fn runTestSourceScans(presentation: *Presentation, file_index: usize, failures: usize) !TestSourceScanRun {
+    var run: TestSourceScanRun = .{};
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                var completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                if (completed.file_index != file_index) {
+                    try presentation.dispatch(.{ .review_source_scanned = completed });
+                    continue;
+                }
+                run.scans += 1;
+                if (run.scans > run.leased_after_failure.len) return error.EndlessRetry;
+                if (run.scans > failures) {
+                    try presentation.dispatch(.{ .review_source_scanned = completed });
+                    continue;
+                }
+                failTestSourceScan(&completed);
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+                run.leased_after_failure[run.scans - 1] = presentation.published.?.session.enrichment.files[file_index].leases > 0;
+            },
+            .report_diagnostic => |failure| {
+                if (failure.operation == .review_search) run.review_search_records += 1;
+                command.deinit();
+            },
+            else => return error.UnexpectedCommand,
+        }
+    }
+    return run;
+}
+
+fn failTestSourceScan(completed: *ReviewSourceScanned) void {
+    if (completed.outcome == .scanned) completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
+}
+
+fn testSourceOccurrences(presentation: *const Presentation, file_index: usize) usize {
+    var count: usize = 0;
+    for (presentation.published.?.review_search.batch.?.occurrences) |occurrence| {
+        if (occurrence.location == .source and occurrence.location.source.file_index == file_index) count += 1;
+    }
+    return count;
+}
+
+test "M21 kernel Review Search scans a File again after its source scan fails" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    const run = try runTestSourceScans(&presentation, 0, 1);
+    try testing.expectEqual(@as(usize, 2), run.scans);
+    // The worker boundary records a failed scan, so Presentation adds no record.
+    try testing.expectEqual(@as(usize, 0), run.review_search_records);
+    try testing.expect(run.leased_after_failure[0]);
+    try testing.expect(testSourceOccurrences(&presentation, 0) > 0);
+    try testing.expect(testSourceOccurrences(&presentation, 1) > 0);
+    try testing.expect(presentation.projection().action_error == null);
+}
+
+test "M21 kernel Review Search gives up on a File after its second failed source scan" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    const run = try runTestSourceScans(&presentation, 0, std.math.maxInt(usize));
+    try testing.expectEqual(@as(usize, 2), run.scans);
+    // The worker boundary records a failed scan, so Presentation adds no record.
+    try testing.expectEqual(@as(usize, 0), run.review_search_records);
+    try testing.expectEqualSlices(bool, &.{ true, false }, run.leased_after_failure[0..2]);
+    try testing.expectEqual(@as(usize, 0), testSourceOccurrences(&presentation, 0));
+    try testing.expectEqual(@as(usize, 0), testSourceOccurrences(&presentation, 1));
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+}
+
+test "M21 kernel Review Search stops its source scans after it gives up on a File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 3, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    var scans: usize = 0;
+    var records: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                scans += 1;
+                if (scans > 6) return error.EndlessRetry;
+                var failed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                failTestSourceScan(&failed);
+                try presentation.dispatch(.{ .review_source_scanned = failed });
+            },
+            .report_diagnostic => {
+                records += 1;
+                command.deinit();
+            },
+            else => return error.UnexpectedCommand,
+        }
+    }
+    // The worker boundary records each failed scan, so Presentation adds no record.
+    try testing.expectEqual(@as(usize, 2), scans);
+    try testing.expectEqual(@as(usize, 0), records);
+    try testing.expectEqualSlices(bool, &.{ false, false, false }, presentation.published.?.review_search.held.?);
+    for (presentation.published.?.session.enrichment.files) |file| try testing.expectEqual(@as(usize, 0), file.leases);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try presentation.dispatch(.{ .action = .open_review_search });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        defer command.deinit();
+        if (command == .scan_review_source) return;
+    }
+    return error.MissingSourceScan;
+}
+
+test "M21 kernel Review Search starts a source scan when no allocation succeeds" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    const enrichment = &presentation.published.?.session.enrichment;
+    while (!enrichment.isTerminal(0) or !enrichment.isTerminal(1)) {
+        var command = presentation.takeCommand() orelse return error.MissingEnrichment;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+            },
+            .report_diagnostic => command.deinit(),
+            else => return error.UnexpectedCommand,
+        }
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command == .build_buffer_disclosure) {
+            command.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+        } else command.deinit();
+    }
+    try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        defer command.deinit();
+        if (command == .scan_review_source) return;
+    }
+    return error.MissingSourceScan;
+}
+
+/// Runs queued work until the source scan of `file_index` waits in its slot
+/// behind an empty command queue.
+fn runTestUntilSourceScanWaits(presentation: *Presentation, file_index: usize) !void {
+    while (presentation.queued_source_scan == null or presentation.queued_source_scan.?.file_index != file_index or presentation.commands.items.len > 0) {
+        var command = presentation.takeCommand() orelse return error.MissingSourceScan;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+            },
+            .report_diagnostic => command.deinit(),
+            else => return error.UnexpectedCommand,
+        }
+    }
+}
+
+/// Runs queued work until a source scan starts and fails it.
+fn failNextTestSourceScan(presentation: *Presentation) !ReviewSourceScanned {
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                var failed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                failTestSourceScan(&failed);
+                return failed;
+            },
+            .report_diagnostic => command.deinit(),
+            else => return error.UnexpectedCommand,
+        }
+    }
+    return error.MissingSourceScan;
+}
+
+test "M21 kernel Review Search inserts its query scan into the reserved slot and holds the File of a discarded source scan" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 2, .{ .inactive_file_cache_max_bytes = 1 });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 1);
+    // The query edit reserves the only free slot of a full queue.
+    presentation.commands.clearAndFree(presentation.allocator);
+    try presentation.commands.ensureTotalCapacityPrecise(presentation.allocator, 1);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    var query_scans: usize = 0;
+    var cache_builds: usize = 0;
+    for (presentation.commands.items) |command| switch (command) {
+        .scan_buffer_search => query_scans += 1,
+        .build_buffer_disclosure => |job| cache_builds += @intFromBool(job.kind == .cache_update),
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), query_scans);
+    // The discarded scan holds its File again, so its release stages no cache build.
+    try testing.expectEqual(@as(usize, 0), cache_builds);
+    try testing.expect(presentation.published.?.review_search.held.?[1]);
+    try testing.expectEqualStrings("newe", presentation.published.?.review_search.query.?.query.text);
+}
+
+test "M21 kernel Review Search shows its scan failure when the cache build of the released File cannot stage" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    // File 11 is outside the focus of the first Files on screen.
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 12, .{ .inactive_file_cache_max_bytes = 1 });
+    defer presentation.deinit();
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try runTestUntilSourceScanWaits(&presentation, 11);
+    try presentation.dispatch(.{ .review_source_scanned = try failNextTestSourceScan(&presentation) });
+    const second = try failNextTestSourceScan(&presentation);
+    try testing.expectEqual(@as(usize, 11), second.file_index);
+    // A cache build cannot stage, because the full queue cannot grow.
+    try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .review_source_scanned = second });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+    const epoch = presentation.published.?.epoch;
+    try testing.expect(presentation.queuedBuildIndex(.cache_update, epoch) == null);
+    // No lease release follows the stopped pass. The focus check that the
+    // event loop runs after each event stages the cache build.
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expect(presentation.queuedBuildIndex(.cache_update, epoch) != null);
+}
+
+test "M21 kernel Review Search keeps the given-up Files of a query edit that rolls back" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 3);
+    defer presentation.deinit();
+    // File 2 stays without content, so its enrichment publishes after the rollback.
+    var late: ?EnrichFile = null;
+    var scans: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| if (file.file_index == 2) {
+                late = file;
+            } else try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                scans += 1;
+                var failed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                failTestSourceScan(&failed);
+                try presentation.dispatch(.{ .review_source_scanned = failed });
+            },
+            .report_diagnostic => command.deinit(),
+            else => return error.UnexpectedCommand,
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), scans);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
+    var command = presentation.takeCommand() orelse return error.MissingBufferSearchScan;
+    defer command.deinit();
+    var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+    if (completed.outcome == .scanned) completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
+    try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    try testing.expectEqualStrings("new", presentation.published.?.review_search.query.?.query.text);
+    try deliverTestEnrichment(&presentation, late orelse return error.MissingEnrichment);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        switch (queued) {
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |scan| {
+                std.debug.print("File {d} starts a source scan after the rollback\n", .{scan.file_index});
+                queued.deinit();
+                return error.GivenUpFileScannedAgain;
+            },
+            else => queued.deinit(),
+        }
+    }
+}
+
+test "M21 kernel Review Search resumes the retry of a query edit that rolls back" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .review_source_scanned = try failNextTestSourceScan(&presentation) });
+    // The edit discards the queued retry of File 0.
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
+    var command = presentation.takeCommand() orelse return error.MissingBufferSearchScan;
+    defer command.deinit();
+    var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+    if (completed.outcome == .scanned) completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
+    try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        switch (queued) {
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |scan| {
+                const file_index = scan.file_index;
+                queued.deinit();
+                try testing.expectEqual(@as(usize, 0), file_index);
+                try testing.expectEqual(SourceScan.retrying, presentation.published.?.review_search.source_scans.?[0]);
+                return;
+            },
+            else => queued.deinit(),
+        }
+    }
+    return error.MissingSourceScan;
+}
+
+test "M21 kernel Review Search starts a source scan without superseding a cache build in flight" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    while (!published.session.enrichment.isTerminal(0) or !published.session.enrichment.isTerminal(1)) {
+        var command = presentation.takeCommand() orelse return error.MissingEnrichment;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+            },
+            else => command.deinit(),
+        }
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command == .build_buffer_disclosure) {
+            command.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+        } else command.deinit();
+    }
+    // A pending update without a queued command stands for a cache build on the worker.
+    const in_flight = published.cache_update_generation;
+    published.pending_cache_update = in_flight;
+    published.pending_cache_focus = published.session.enrichment.focused;
+    defer published.pending_cache_update = null;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try testing.expect(presentation.queued_source_scan != null);
+    try testing.expectEqual(in_flight, published.cache_update_generation);
+}
+
+test "M21 kernel Review Search starts no source scan before its first query publishes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 2) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            else => command.deinit(),
+        }
+    }
+    try testing.expect(published.session.enrichment.isTerminal(0));
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    var command = presentation.takeCommand() orelse return error.MissingBufferSearchScan;
+    defer command.deinit();
+    var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+    if (completed.outcome == .scanned) completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
+    try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    try testing.expect(published.review_search.batch == null);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        defer queued.deinit();
+        if (queued == .scan_review_source) {
+            std.debug.print("File {d} starts a source scan before the first query publishes\n", .{queued.scan_review_source.file_index});
+            return error.UnpublishedSourceScan;
+        }
+    }
+}
+
+test "M21 kernel Review Search retries a reopened query scan that cannot queue at the next event" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    const inputs = [_]OwnedInput{ .{ .action = .open_review_search }, .ensure_focused_enrichment };
+    for (inputs) |input| {
+        // The query scan cannot queue, because the full queue cannot grow.
+        presentation.commands.clearAndFree(presentation.allocator);
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(input);
+        failing.fail_index = std.math.maxInt(usize);
+        const view = presentation.projection();
+        try testing.expectEqual(ActionError.out_of_memory, view.action_error.?);
+        try testing.expectEqualStrings("newe", view.review_search.?.query);
+        try testing.expect(view.review_search.?.pending);
+        try testing.expectEqual(@as(usize, 2), presentation.published.?.review_search.batch.?.occurrences.len);
+        try testing.expect(presentation.queued_source_scan == null);
+        var records: usize = 0;
+        while (presentation.takeCommand()) |next| {
+            var queued = next;
+            defer queued.deinit();
+            switch (queued) {
+                .report_diagnostic => records += 1,
+                .scan_buffer_search, .scan_review_source => return error.UnexpectedScan,
+                else => {},
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), records);
+    }
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+    try completeBufferSearchScan(&presentation);
+    const view = presentation.projection();
+    try testing.expectEqualStrings("newe", view.review_search.?.query);
+    try testing.expect(!view.review_search.?.pending);
+    try testing.expect(view.action_error == null);
+    try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
+}
+
+test "M21 kernel Review Search keeps another message of the same event when a reopened query retry succeeds" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0x2603, .text = "\x00" } });
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(@as(?ActionError, .buffer_search_invalid_query), presentation.projection().action_error);
+    try completeBufferSearchScan(&presentation);
+    const view = presentation.projection();
+    try testing.expectEqualStrings("newe", view.review_search.?.query);
+    try testing.expect(!view.review_search.?.pending);
+    try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
+}
+
+test "M21 kernel Review Search starts no source scan while a query edit is pending" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try openTestReviewSourceSearch(&store, testing.allocator, 2);
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    var in_flight = presentation.takeCommand() orelse return error.MissingSourceScan;
+    const completed = executeReviewSourceScan(testing.allocator, &in_flight.scan_review_source);
+    in_flight.deinit();
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .review_source_scanned = completed });
+    try testing.expect(presentation.projection().review_search.?.pending);
+    if (presentation.queued_source_scan) |scan| {
+        std.debug.print("File {d} starts a source scan into the results of the previous query\n", .{scan.file_index});
+        return error.StaleSourceScan;
+    }
+}
+
+test "M21 kernel Review Search starts its source scans after first query results without a match" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 2) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .enrich_file => |file| try deliverTestEnrichment(&presentation, file),
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            else => command.deinit(),
+        }
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'q', .text = "qqqq" } });
+    try completeBufferSearchScan(&presentation);
+    try testing.expectEqual(@as(usize, 0), presentation.published.?.review_search.batch.?.occurrences.len);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        defer queued.deinit();
+        if (queued == .scan_review_source) return;
+    }
+    return error.MissingSourceScan;
+}
+
+test "M21 kernel Review Search admits an enrichment with the hold that its build counted" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .inactive_file_cache_max_bytes = 1 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 2) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    var buffer: [2]EnrichFile = undefined;
+    const commands = takeQueuedTestEnrichments(&presentation, &buffer);
+    try testing.expectEqual(@as(usize, 2), commands.len);
+    try deliverTestEnrichment(&presentation, commands[1]);
+    // Without a query, the build counts no Review Search hold for File 1.
+    const job = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.enrichment, job.kind);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    job.build();
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        switch (command) {
+            .build_buffer_disclosure => |built| {
+                built.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = built });
+            },
+            .scan_buffer_search => |*scan| {
+                const completed = executeBufferSearchScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .buffer_search_scanned = completed });
+            },
+            .scan_review_source => |*scan| {
+                const completed = executeReviewSourceScan(testing.allocator, scan);
+                command.deinit();
+                try presentation.dispatch(.{ .review_source_scanned = completed });
+            },
+            else => return error.UnexpectedCommand,
+        }
+    }
+    const published = presentation.published.?;
+    try testing.expectEqual(SourceScan.scanned, published.review_search.source_scans.?[1]);
+    // The Frame shows the content of File 1 exactly when the Storage keeps it.
+    try testing.expectEqual(published.session.enrichment.file(1).new == .content, published.disclosure_inputs.blobs[1].new != null);
 }
 
 test "Review Search admits an enrichment rebuild after a selection move with the current active ranges" {
@@ -35043,11 +35761,8 @@ test "a Review Search source publication after a resize projects the new visual 
             const rows = published.visual_rows.len;
             const revision = published.visual_rows_revision;
             try target.dispatch(.{ .resize = .{ .cols = 40, .rows = 40 } });
-            // A publication makes a queued view build stale, so the next scan
-            // waits until the view build commits.
-            try testing.expect(target.commands.items[0] == .scan_review_source);
-            const scan = target.commands.orderedRemove(0);
-            defer target.commands.insertAssumeCapacity(0, scan);
+            // The view build runs before the queued source scan.
+            try testing.expect(target.queued_source_scan != null);
             try completeDisclosureBuild(target);
             try testing.expect(published.visual_rows_revision != revision);
             try testing.expect(published.visual_rows.len != rows);
@@ -35113,8 +35828,11 @@ test "an allocation failure in a Review Search source publication keeps the prev
                         try testing.expectEqual(results.ptr, state.results.?.ptr);
                         try testing.expectEqual(selected, state.selected);
                         try testing.expectEqual(revision, presentation.projection().revision.frame);
-                        try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
-                        try testing.expect(!state.source_scanned.?[file_index]);
+                        // The retry of the File is the next source scan.
+                        switch (state.source_scans.?[file_index]) {
+                            .retrying => {},
+                            .unscanned, .scanning, .awaiting_retry, .scanned, .given_up => return error.TestUnexpectedResult,
+                        }
                         failures += 1;
                     }
                     break true;
