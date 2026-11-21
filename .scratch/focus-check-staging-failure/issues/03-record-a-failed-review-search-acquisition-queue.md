@@ -1,7 +1,6 @@
 # Record a failed File Enrichment queue in the Review Search acquisition
 
-Status: claimed
-Claimed by: /Volumes/Work/t3-code/focus-check-staging-failure
+Status: resolved
 Blocked by: none
 
 Source: [ticket 01](01-keep-the-session-after-a-failed-focus-check-staging.md).
@@ -20,8 +19,36 @@ Queue the File Enrichment of maintenance work through one helper for the focus c
 
 ## Acceptance criteria
 
-- [ ] A test through the Presentation interface fails the acquisition queue after a `file_enrichment_launch_failed` completion. It expects one `report_diagnostic` record and the `file_enrichment_launch_failed` message. The test fails before the fix.
-- [ ] A test through the Presentation interface expects the `file_enrichment_launch_failed` message to stay after a successful acquisition queue. The test fails before the fix.
-- [ ] The rule is stated once in `CODING_STANDARDS.md` or `docs/rules/`.
-- [ ] Other sites of the class are fixed here or listed in a comment.
-- [ ] `zig build test` exits 0, `zig fmt --check src build.zig tests` passes, and `python3 tools/check_agent_docs.py` passes.
+- [x] A test through the Presentation interface fails the acquisition queue after a `file_enrichment_launch_failed` completion. It expects one `report_diagnostic` record and the `file_enrichment_launch_failed` message. The test fails before the fix.
+- [x] A test through the Presentation interface expects the `file_enrichment_launch_failed` message to stay after a successful acquisition queue. The test fails before the fix.
+- [x] The rule is stated once in `CODING_STANDARDS.md` or `docs/rules/`.
+- [x] Other sites of the class are fixed here or listed in a comment.
+- [x] `zig build test` exits 0, `zig fmt --check src build.zig tests` passes, and `python3 tools/check_agent_docs.py` passes.
+
+## Comments
+
+### 2026-11-21 other sites
+
+A search for `action_error = .out_of_memory` in `src/tui/presentation.zig` found 74 sites without a record next to them. Most are the outcome of an input that the user gave, so they are not maintenance work. This change fixes one more site, because the fix is the same few lines:
+
+- `retryReviewSearchQuery`. A failed retry kept the `out_of_memory` message of `replaceReviewSearchQuery`, so it replaced a message of an earlier input of the same event. The retry now restores a shown message after a failure too. The failure already had one record. The red test is "M21 kernel Review Search keeps another message of the same event when a reopened query retry fails". It failed with `expected .buffer_search_invalid_query, found .out_of_memory`.
+
+These sites stay open. Each needs a decision or a repro that costs more than a few lines:
+
+- `retryContentBuild`, `.cache_update`. A stale cache update that cannot stage again sets `pending_cache_update` to null, shows `out_of_memory` over any message, and writes no record. The focus check stages again, so it is maintenance work. A test that makes the cache update stale through a `resize` did not reach this path, because the completion took another branch and cleared `action_error`. A repro needs a stale cache update that reaches the retry.
+- The success of a cache update commit in `acceptBufferDisclosure` sets `action_error` to null. That completion is maintenance work too, so it can clear a message of an earlier input.
+- `queueFileEnrichment` shows `action_refused` when a path or a commit is too long. For maintenance work this replaces a shown message after each event, because the File stays pending. It is a refusal, not a failure, so this change keeps it.
+- `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and `dropEnrichments` show `out_of_memory` without a record. They drop the pending work of a user input, so no later check does it again. They are not maintenance work by the rule. Whether each failure needs a record is a separate question.
+- `openReviewSearchOccurrence` asks the acquisition to queue the File of a pending source. Before this change, that queue cleared an earlier message. Now the earlier message stays until the next input clears it. No test reads this case.
+
+## Completion
+
+2026-11-21, branch `focus-check-staging-failure`.
+
+- `pumpReviewSearchAcquisition` queues through `queueMaintenanceFileEnrichment` at both sites. A failure records once as `.file_enrichment`, `.prepare`, shows `out_of_memory` only when no message shows, and stops the pump. A success keeps the shown message.
+- `failMaintenance` writes the record and the message of a failure. `stageCacheBuild` and `queueMaintenanceFileEnrichment` call it, so the handler is in one place. `tools/check_diagnostics.py` accepts it, because each catch uses its capture and returns a literal or nothing after the record.
+- `retryReviewSearchQuery` keeps a shown message after a failed retry.
+- `CODING_STANDARDS.md` states the rule once in "Maintenance work keeps the shown message", and it lists the sites.
+- Red proof: "M21 kernel Review Search acquisition queue keeps the shown message" failed with `expected .file_enrichment_launch_failed, found null`. "M21 kernel Review Search acquisition queue failure records once and keeps the shown message" failed with `expected .file_enrichment_launch_failed, found .out_of_memory`. Both pass now.
+- Commits: `5be3dd40` (red tests), `f8e47310` (fix), `73e89eea` (red retry test), `344546c6` (retry fix), and the standard commit after them.
+- Checks: `zig build test` exit 0, `zig fmt --check src build.zig tests` exit 0, `python3 tools/check_diagnostics.py` exit 0, `python3 tools/check_agent_docs.py` exit 0.

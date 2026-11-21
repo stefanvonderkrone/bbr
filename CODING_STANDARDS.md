@@ -141,19 +141,27 @@ It also stages no cache build, because the lease of the scan keeps its File. The
 
 No check: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" fails only when a failed allocation from the Presentation allocator stops the start. An allocation from `std.heap.page_allocator` or from the Session allocator passes it, and so does an allocation whose failure the start ignores. A `catch` makes any allocation compile in a function that returns no error union. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
-### A focus check failure keeps the shown message
+### Maintenance work keeps the shown message
 
-A lease release or a focus check that cannot stage its cache build records the cause and shows `out_of_memory` only when no message shows.
-Both go through `stageCacheBuild`.
+Maintenance work is work that no input asked for and that a later check does again. A failed queue or staging of maintenance work has exactly one record, and it never overwrites or clears another message.
+A failure records its cause once and shows `out_of_memory` only when no message shows.
+A success clears only the `out_of_memory` message of an earlier failed attempt.
+
+These sites are maintenance work:
+
+- A cache staging after a lease release or in the focus check. Both go through `stageCacheBuild`.
+- The File Enrichment of the active File in the focus check, and the File Enrichments of the Review Search acquisition, `pumpReviewSearchAcquisition`. Both go through `queueMaintenanceFileEnrichment`.
+- The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
+
+`failMaintenance` writes the record and the message of a failure, so a new site calls it in its `catch`.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
-This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget.
+This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget, and it queues the File Enrichment of the active File again while the File is pending.
 While a cache update is pending, the focus check stages after that update commits.
-So the failure loses no work, also when no lease release follows, such as after a second failed source scan stops the pass.
-A failed staging in the focus check keeps the session, and the next focus check stages again.
-The focus check treats a File Enrichment of the active File that cannot queue the same way, because the File stays pending.
-The message of the event outcome stays, such as `buffer_search_scan_failed`.
+A File that the acquisition cannot queue stays pending and unacquired, so the next pump queues it again.
+So a failure loses no work and keeps the session.
+The message of the event outcome stays, such as `buffer_search_scan_failed` or `file_enrichment_launch_failed`.
 
-No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that stages a cache build and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
 ### Make Line row identities through LineOwner.of
 
