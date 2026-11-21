@@ -36,6 +36,15 @@ Give each failure one record through one helper beside `failMaintenance`. The fa
 
 The `.draft_save` and `.draft_mutation` retries in `retryContentBuild` show `out_of_memory` without a record in the same way. This ticket does not change them.
 
+### 2026-11-21 review
+
+The Standards review asked for the tests to show their message through an input, not through a write to `action_error`. They now dispatch `recover_submission` or an invalid Review Search key. The review also scoped the maintenance work message sentence in `CODING_STANDARDS.md` to maintenance work and moved the rule for a user action that hands its work to maintenance work into that section. `acceptBufferDisclosure` now chooses the success message in one `switch` on the build kind.
+
+Two judgement calls stay open:
+
+- `openReviewSearchOccurrence` also runs from a completion, in `retryContentBuild` for `.review_destination` and after an enrichment commit. If the File of the hit is evicted again at that point, the completion clears the shown message. No test reaches this case.
+- `dropEnrichments` replaces the shown message for any result that is not speculative. A File Enrichment of the focus check is maintenance work, so its dropped result can replace a message. This behavior is older than this ticket.
+
 ## Completion
 
 2026-11-21, branch `focus-check-staging-failure`.

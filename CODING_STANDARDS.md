@@ -144,9 +144,10 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 ### Maintenance work keeps the shown message
 
 [Maintenance work](src/tui/GLOSSARY.md) is work that no input asked for and that a later check does again. A failed queue or staging of maintenance work has exactly one record, and it never overwrites or clears another message.
-A failure records its cause once and shows `out_of_memory` only when no message shows.
+A failure of maintenance work records its cause once and shows `out_of_memory` only when no message shows.
 A File Enrichment or a query retry that succeeds clears only the `out_of_memory` message of an earlier failed attempt.
 A cache staging or a cache update commit writes no message.
+A user action that hands its work to maintenance work clears an older message before it does so. `openReviewSearchOccurrence` clears it before it pumps the Review Search acquisition for a hit in an evicted File.
 
 These sites are maintenance work:
 
@@ -171,7 +172,6 @@ No check: the tests cover only the current sites, and they dispatch `ensure_focu
 A completion that finds its build stale queues the work of a user input again. When the retry cannot queue, the work is dropped, and no later check does it again. So it is not maintenance work.
 The failure of a user input is the outcome of that input. So the retry records the cause once and shows `out_of_memory` over another message. `failDroppedInput` does both, and these retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, and `republishPostedParent`.
 `dropEnrichments` records each failure too, but it shows `out_of_memory` only when a dropped result is not speculative. A speculative result is not a user input.
-A user action that hands its work to maintenance work clears an older message before it does so. `openReviewSearchOccurrence` clears it before it pumps the Review Search acquisition for a hit in an evicted File.
 
 No check: the tests cover only the current retries. A new retry that shows `out_of_memory` without a record passes `tools/check_diagnostics.py`, because the check accepts a `catch` that names `error.OutOfMemory` in a switch prong and drops it. Related checked rule: [A failure has one record](docs/rules/diagnostics.md#a-failure-has-one-record).
 

@@ -10321,13 +10321,13 @@ pub const Presentation = struct {
             };
             self.refreshStaleRepairTree();
         }
-        if (job.kind != .enrichment and job.kind != .cache_update) {
-            self.action_error = null;
-        } else if (job.kind == .enrichment and !EnrichedFile.allSpeculative(job.enrichments.items)) {
+        switch (job.kind) {
+            .cache_update => {},
             // A File Enrichment runs beside other work, so it clears only an error of the enrichment path.
-            if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
+            .enrichment => if (!EnrichedFile.allSpeculative(job.enrichments.items)) if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
                 self.action_error = null;
-            };
+            },
+            else => self.action_error = null,
         }
         // After the success reset, so a failure stays visible.
         if (parent_reposted) self.republishPostedParent(published);
@@ -30623,7 +30623,8 @@ test "M21 kernel failed view retry records the dropped input once" {
     const before = presentation.projection().review.?.frame;
     presentation.commands.deinit(presentation.allocator);
     presentation.commands = .empty;
-    presentation.action_error = .buffer_search_scan_failed;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.action_refused, presentation.projection().action_error.?);
     failing.fail_index = failing.alloc_index;
     try presentation.dispatch(.{ .buffer_disclosure_built = worker });
     failing.fail_index = std.math.maxInt(usize);
@@ -30666,7 +30667,8 @@ fn expectFailedAcceptedDisclosureRetry(opening: bool) !void {
     const before = presentation.projection().review.?.frame;
     presentation.commands.deinit(presentation.allocator);
     presentation.commands = .empty;
-    presentation.action_error = .buffer_search_scan_failed;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.action_refused, presentation.projection().action_error.?);
     failing.fail_index = failing.alloc_index;
     try presentation.dispatch(.{ .buffer_disclosure_built = worker });
     failing.fail_index = std.math.maxInt(usize);
@@ -30697,7 +30699,8 @@ test "M21 kernel failed stale Buffer Search retry records the dropped input once
     const before = presentation.projection().review.?.frame;
     presentation.commands.deinit(presentation.allocator);
     presentation.commands = .empty;
-    presentation.action_error = .buffer_search_scan_failed;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.action_refused, presentation.projection().action_error.?);
     failing.fail_index = failing.alloc_index;
     try presentation.dispatch(.{ .buffer_disclosure_built = worker });
     failing.fail_index = std.math.maxInt(usize);
@@ -30766,6 +30769,8 @@ fn expectFailedEnrichmentQueue(failure: enum { queue, snapshot, merge }) !void {
     var buffer: [2]EnrichFile = undefined;
     const commands = takeQueuedTestEnrichments(&presentation, &buffer);
     try testing.expectEqual(@as(usize, 2), commands.len);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0x2603, .text = "\x00" } });
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
     var saved_arena: ?std.heap.ArenaAllocator = null;
     defer if (saved_arena) |*arena| arena.deinit();
     var saved_enrichments: std.ArrayList(EnrichedFile) = .empty;
@@ -30786,7 +30791,6 @@ fn expectFailedEnrichmentQueue(failure: enum { queue, snapshot, merge }) !void {
         presentation.commands = .empty;
         failing.fail_index = failing.alloc_index;
     }
-    presentation.action_error = .buffer_search_scan_failed;
     const dropped = commands[if (failure == .merge) @as(usize, 1) else 0];
     try deliverTestEnrichment(&presentation, dropped);
     failing.fail_index = std.math.maxInt(usize);
