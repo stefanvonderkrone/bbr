@@ -33136,6 +33136,339 @@ test "Review recovery Picker error survives the focus check that starts a File E
     try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
 }
 
+test "Review recovery Picker error survives a successful POST completion" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
+    var state = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    var post = state.takeCommand().?;
+    defer post.deinit();
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(.{ .post_draft_completed = .{
+        .command_id = post.post_draft.command_id,
+        .operation_id = post.post_draft.operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery Picker error survives a successful source check" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
+    var state = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+        .require_source_check = true,
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    const check = state.takeCommand().?.check_recovery;
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(recoveryCheckSucceeded(check.command_id, check.operation_id, null, "source"));
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery Picker error survives a successful duplicate check" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "recover" });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }});
+    var state = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .recover_submission });
+    const check = state.takeCommand().?.check_recovery;
+    try state.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "source"));
+    var duplicate = state.takeCommand().?;
+    defer duplicate.deinit();
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(.{ .duplicate_checked = .{
+        .command_id = duplicate.find_duplicate.command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .missing,
+    } });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery Picker error survives a completed Submission retry wait" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retry" });
+    var state = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    var post = state.takeCommand().?;
+    defer post.deinit();
+    try state.dispatch(.{ .post_draft_completed = .{
+        .command_id = post.post_draft.command_id,
+        .operation_id = post.post_draft.operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .rejected = error.RateLimited },
+    } });
+    const wait = state.takeCommand().?.wait_submission;
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(.{ .submission_wait_completed = wait });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery Picker error survives a successful Comment edit" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer state.deinit();
+    try cursorToCommentCard(&state, 99);
+    try state.dispatch(.{ .action = .edit_review_item });
+    try state.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" edited") } });
+    try state.dispatch(.{ .composer = .save });
+    var edit = state.takeCommand().?;
+    defer edit.deinit();
+    try state.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = state.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(.{ .comment_edit_completed = .{
+        .command_id = edit.update_comment.command_id,
+        .identity = edit.update_comment.identity,
+        .comment_id = 99,
+        .outcome = .updated,
+    } });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery Picker error survives a successful Comment delete" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer state.deinit();
+    try cursorToCommentCard(&state, 99);
+    try state.dispatch(.{ .action = .delete_review_item });
+    try state.dispatch(.{ .delete_confirmation = .confirm });
+    var deletion = state.takeCommand().?;
+    defer deletion.deinit();
+    try state.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = state.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(.{ .comment_delete_completed = .{
+        .command_id = deletion.delete_comment.command_id,
+        .identity = deletion.delete_comment.identity,
+        .comment_id = 99,
+        .outcome = .deleted,
+    } });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery Picker error survives a successful Reviewer Verdict change" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const session = try testSession(testing.allocator, 1, 'a');
+    session.authenticated_account_uuid = "{me}";
+    session.source.remote.author_uuid = "{author}";
+    session.source.remote.reviewer_verdicts = &.{};
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = session },
+    });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .set_verdict_approved });
+    const verdict = state.takeCommand().?.change_reviewer_verdict;
+    try state.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = state.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(.{ .reviewer_verdict_changed = .{
+        .command_id = verdict.command_id,
+        .identity = verdict.identity,
+        .target = .approved,
+        .outcome = .{ .completed = .success },
+    } });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery Picker error survives a prepared Reconciliation Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer state.deinit();
+    try cursorToCommentCard(&state, 99);
+    try state.dispatch(.{ .action = .delete_review_item });
+    try state.dispatch(.{ .delete_confirmation = .confirm });
+    var deletion = state.takeCommand().?;
+    defer deletion.deinit();
+    try state.dispatch(.{ .comment_delete_completed = .{
+        .command_id = deletion.delete_comment.command_id,
+        .identity = deletion.delete_comment.identity,
+        .comment_id = 99,
+        .outcome = .deleted,
+    } });
+    const load = state.takeCommand().?.load_session;
+    try testing.expectEqual(SessionLoadCause.reconciliation, load.cause);
+    try state.dispatch(.{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'b') },
+    } });
+    const prepare = state.takeCommand().?.prepare_session;
+    prepare.build();
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(.{ .session_prepared = prepare });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery Picker error survives a successful clipboard completion" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer state.deinit();
+    for (state.projection().review.?.frame.visual_rows, 0..) |row, index| if (row.yank_candidates.new != null) {
+        try moveToRow(&state, index);
+        break;
+    };
+    try state.dispatch(.{ .action = .yank });
+    var copy = state.takeCommand().?;
+    defer copy.deinit();
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(.{ .clipboard_completed = .{ .command_id = copy.copy_clipboard.command_id, .success = true } });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery Submission error survives a successful Picker load" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
+    var state = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    var post = state.takeCommand().?;
+    try state.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    const list = state.takeCommand().?.list_pull_requests;
+    try state.dispatch(try post.launchFailed(error.TestLaunchFailure));
+    try testing.expectEqual(ActionError.submission_launch_failed, state.projection().action_error.?);
+    try state.dispatch(.{ .pull_requests_loaded = .{
+        .command_id = list.command_id,
+        .work_id = list.work_id,
+        .outcome = .{ .loaded = try PullRequestSummaries.create(testing.allocator) },
+    } });
+    try testing.expectEqual(ActionError.submission_launch_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery a successful POST clears an error of its own path" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
+    var state = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    var post = state.takeCommand().?;
+    defer post.deinit();
+    state.action_error = .submission_launch_failed;
+    try state.dispatch(.{ .post_draft_completed = .{
+        .command_id = post.post_draft.command_id,
+        .operation_id = post.post_draft.operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+    try testing.expect(state.projection().action_error == null);
+}
+
+test "Review recovery a successful Comment delete clears an error of its own path" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer state.deinit();
+    try cursorToCommentCard(&state, 99);
+    try state.dispatch(.{ .action = .delete_review_item });
+    try state.dispatch(.{ .delete_confirmation = .confirm });
+    var deletion = state.takeCommand().?;
+    defer deletion.deinit();
+    try state.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = state.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    state.action_error = .comment_delete_failed;
+    try state.dispatch(.{ .comment_delete_completed = .{
+        .command_id = deletion.delete_comment.command_id,
+        .identity = deletion.delete_comment.identity,
+        .comment_id = 99,
+        .outcome = .deleted,
+    } });
+    try testing.expect(state.projection().action_error == null);
+}
+
 test "portable Picker input loads summaries and selects a replacement" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
