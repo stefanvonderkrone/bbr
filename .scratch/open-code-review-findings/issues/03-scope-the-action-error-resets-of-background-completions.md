@@ -37,9 +37,10 @@ The audit also found background completions that overwrite an unread error with 
 - With `clearError` changed to clear every error, `zig build test-review-recovery` reported `45/57 tests passed (12 failed)`.
 - The rule "Background work keeps an unrelated action error" in `docs/rules/tui-state.md` states the origin rule. The section "Other background completions keep an unrelated action error" left `CODING_STANDARDS.md`. A new section, "Choose the origin of an action error", keeps the part that no check sees: a completion must pass its own origin, not `.user`.
 
+- Review found that `retryReviewSearchQuery` now cleared every `.buffer` error, so it also cleared an unread build failure. `a26f6ce8` adds a test for this case. Before the fix, it failed with `expected buffer_build_failed, found null`. `e4d02628` adds the origin `.review_search` for the Review Search query, scan, and retry errors. After the fix, `zig build test-review-recovery` reported `59/59 tests passed`.
 Known gaps, out of scope: an older completion can clear a newer error of the same origin. A completion can also replace an unread error with a new error.
 
-Checks: `zig build test-review-recovery` gave `57/57 tests passed`. `zig build test` exited with 0 and gave `1718/1718 tests passed`. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, and `python3 tools/check_doc_symbols.py .` passed.
+Checks: `zig build test-review-recovery` gave `59/59 tests passed`. `zig build test` exited with 0 and gave `1719/1719 tests passed`. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, and `python3 tools/check_doc_symbols.py .` passed.
 
 ## Comments
 
