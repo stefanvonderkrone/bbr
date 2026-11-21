@@ -35596,6 +35596,38 @@ test "M21 kernel Review Search keeps another message of the same event when a re
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
 }
 
+test "M21 kernel Review Search keeps another message of the same event when a reopened query retry fails" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0x2603, .text = "\x00" } });
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(?ActionError, .buffer_search_invalid_query), presentation.projection().action_error);
+    const failure = (presentation.takeCommand() orelse return error.TestExpectedRecord).report_diagnostic;
+    try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try completeBufferSearchScan(&presentation);
+    try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
+}
+
 test "M21 kernel Review Search starts no source scan while a query edit is pending" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
