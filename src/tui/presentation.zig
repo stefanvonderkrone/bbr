@@ -33109,6 +33109,20 @@ test "Review recovery Picker error survives a completed cache update" {
     try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
 }
 
+test "Review recovery a completed cache update clears a failed build of its own path" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    state.action_error = .buffer_build_failed;
+    const published = state.published.?;
+    try state.queueCacheBuild(published, published.session.enrichment.focused);
+    try completeDisclosureBuild(&state);
+    try testing.expect(state.projection().action_error == null);
+}
+
 test "Review recovery Picker error survives the focus check that starts a File Enrichment" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
