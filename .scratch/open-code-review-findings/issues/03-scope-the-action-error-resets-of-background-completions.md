@@ -38,9 +38,16 @@ The audit also found background completions that overwrite an unread error with 
 - The rule "Background work keeps an unrelated action error" in `docs/rules/tui-state.md` states the origin rule. The section "Other background completions keep an unrelated action error" left `CODING_STANDARDS.md`. A new section, "Choose the origin of an action error", keeps the part that no check sees: a completion must pass its own origin, not `.user`.
 - Review found that `retryReviewSearchQuery` now cleared every `.buffer` error, so it also cleared an unread build failure. `a26f6ce8` adds a test for this case. Before the fix, it failed with `expected buffer_build_failed, found null`. `e4d02628` adds the origin `.review_search` for the Review Search query, scan, and retry errors. After the fix, `zig build test-review-recovery` reported `59/59 tests passed`.
 
-Known gaps, out of scope: an older completion can clear a newer error of the same origin. A completion can also replace an unread error with a new error.
+- `14f8ebdc` adds a failing test for a Buffer Search scan that clears an unread view build failure. Before the fix, `zig build test-review-recovery --summary all` reported `59/60 tests passed (1 failed)` with `expected .buffer_build_failed, found null`. The fix gives Buffer Search scans, scan retries, and the `.input`, `.accepted`, `.restore`, `.clear_input`, and `.open_input` disclosure builds the origin `.buffer_search`. View and Draft builds keep `.buffer`. User key handlers keep `.user`. A second test checks that a successful scan clears its own `buffer_search_no_matches` and `buffer_search_scan_failed` errors.
+- A read of every production `queueFileEnrichment` caller confirms that no speculative caller shows an action error. The three speculative calls in `ensureFocusedEnrichment` cover visible Files, overscan Files above, and overscan Files below. Each catches `OutOfMemory` and returns without `showError`. The other callers pass `false`: `pumpReviewSearchAcquisition`, the active File branch of `ensureFocusedEnrichment`, and `selectVersion`.
 
-Checks: `zig build test-review-recovery` gave `59/59 tests passed`. `zig build test` exited with 0 and gave `1719/1719 tests passed`. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, and `python3 tools/check_doc_symbols.py .` passed.
+Known gaps, out of scope:
+
+- An older completion can clear a newer error of the same origin.
+- A completion can replace an unread error with a new error.
+- User actions also reach helpers with a fixed path origin. `revealActiveFile` uses `.buffer`. `resumeDurableSubmission` reaches the `.submission` steps `resumePostDraftLaunch`, `resumeSubmissionWaitLaunch`, `queueRecoveryCheck`, `queueDuplicateCheck`, `persistDuplicateResolution`, `resumeSubmissionAdmission`, and `resumeSubmissionPersistence`. A user-triggered out-of-memory error in these helpers can be cleared by a later completion of the same path.
+
+Checks: `zig build test-review-recovery --summary all` gave `61/61 tests passed`. `zig build test --summary all` exited with 0 and gave `1721/1721 tests passed` on native macOS. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, and `python3 tools/check_doc_symbols.py .` passed.
 
 ## Comments
 

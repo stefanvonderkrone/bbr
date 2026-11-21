@@ -2874,7 +2874,8 @@ pub const DisclosureBuild = struct {
         fn errorOrigin(kind: Kind) ErrorOrigin {
             return switch (kind) {
                 .enrichment, .cache_update => .file_enrichment,
-                .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => .buffer,
+                .input, .accepted, .restore, .clear_input, .open_input => .buffer_search,
+                .general, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => .buffer,
             };
         }
 
@@ -4063,6 +4064,7 @@ const ErrorOrigin = enum {
     theme,
     file_enrichment,
     buffer,
+    buffer_search,
     review_search,
 };
 
@@ -9805,7 +9807,7 @@ pub const Presentation = struct {
         var batch = switch (completed.outcome) {
             .failed => {
                 input.pending = false;
-                self.showError(.buffer, .buffer_search_scan_failed);
+                self.showError(.buffer_search, .buffer_search_scan_failed);
                 published.frame_revision += 1;
                 return;
             },
@@ -9824,7 +9826,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 batch.deinit(self.allocator);
                 input.pending = false;
-                self.showError(.buffer, .out_of_memory);
+                self.showError(.buffer_search, .out_of_memory);
                 published.frame_revision += 1;
                 return;
             },
@@ -9832,7 +9834,7 @@ pub const Presentation = struct {
         const ranges = completed.ranges orelse {
             batch.deinit(self.allocator);
             input.pending = false;
-            self.showError(.buffer, .buffer_search_scan_failed);
+            self.showError(.buffer_search, .buffer_search_scan_failed);
             published.frame_revision += 1;
             return;
         };
@@ -9857,9 +9859,9 @@ pub const Presentation = struct {
         if (old_navigation_rows) |old| std.heap.page_allocator.free(old);
         input.navigation_rows = completed.navigation_rows;
         completed.navigation_rows = null;
-        if (active == null) self.showError(.buffer, .buffer_search_no_matches) else self.clearError(.buffer);
+        if (active == null) self.showError(.buffer_search, .buffer_search_no_matches) else self.clearError(.buffer_search);
         published.frame_revision += 1;
-        if ((published.buffer_search.input orelse return).accept_when_ready) self.acceptBufferSearch(.buffer);
+        if ((published.buffer_search.input orelse return).accept_when_ready) self.acceptBufferSearch(.buffer_search);
     }
 
     fn queueBufferDisclosure(self: *Presentation, published: *Published, batch: search.Batch, active: ?usize, request_id: u64, navigation_rows: ?[]SearchNavigationRow) !bool {
@@ -10838,17 +10840,17 @@ pub const Presentation = struct {
         const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch |err| switch (err) {
             error.OutOfMemory => {
                 input.pending = false;
-                self.showError(.buffer, .out_of_memory);
+                self.showError(.buffer_search, .out_of_memory);
                 return;
             },
             error.TooLong => {
                 input.pending = false;
-                self.showError(.buffer, .buffer_search_query_too_long);
+                self.showError(.buffer_search, .buffer_search_query_too_long);
                 return;
             },
             error.InvalidUtf8, error.LineEnding, error.Nul => {
                 input.pending = false;
-                self.showError(.buffer, .buffer_search_invalid_query);
+                self.showError(.buffer_search, .buffer_search_invalid_query);
                 return;
             },
         };
@@ -10867,7 +10869,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 command.deinit();
                 input.pending = false;
-                self.showError(.buffer, .out_of_memory);
+                self.showError(.buffer_search, .out_of_memory);
                 return;
             },
         };
@@ -19027,6 +19029,24 @@ test "Review recovery a failed view build survives a successful Buffer Search sc
     try testing.expectEqual(@as(usize, 1), view.buffer_search.?.total);
     try testing.expect(!view.buffer_search.?.pending);
     try testing.expectEqual(@as(?ActionError, .buffer_build_failed), view.action_error);
+}
+
+test "Review recovery a successful Buffer Search scan clears its own error" {
+    for ([_]ActionError{ .buffer_search_no_matches, .buffer_search_scan_failed }) |err| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+        presentation.showError(.buffer_search, err);
+        try testing.expectEqual(err, presentation.projection().action_error.?);
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+        try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+    }
 }
 
 test "M21 kernel Buffer Search query editing queues scan work" {
