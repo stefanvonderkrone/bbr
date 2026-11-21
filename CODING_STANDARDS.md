@@ -183,6 +183,7 @@ A completion that finds its build stale queues the work of a user input again. W
 The failure of a user input is the outcome of that input. So the retry records the cause once and shows `out_of_memory` over another message.
 `failDroppedInput` does both.
 These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and the `.draft_save` and `.draft_mutation` prongs of `retryContentBuild`.
+`selectVersion` also calls it when its view build or its File Enrichment cannot queue, because no later check does that input again.
 An enrichment failure can cancel the pending reading location from a refresh or Reconciliation.
 That cancellation drops part of the refresh or Reconciliation.
 No later check restores the canceled location.
