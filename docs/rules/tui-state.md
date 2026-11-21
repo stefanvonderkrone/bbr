@@ -66,6 +66,7 @@ A key, a mouse action, or an Overlay action passes `.user`, and its `clearError`
 A completion of background work passes the origin of its own path, and its `clearError` clears only an error of that origin.
 Thus a completion keeps an error that another path showed and that the user has not read yet.
 A Buffer build takes its origin from `DisclosureBuild.Kind.errorOrigin`.
+Review Search query scans, source scans, and scan retries use their own origin, separate from Buffer builds and Buffer Search.
 The File Enrichment path includes enrichment builds, cache updates, and the focus check that starts a File Enrichment.
 A speculative enrichment shows and clears no action error.
 The Projection still gives only the `ActionError`.

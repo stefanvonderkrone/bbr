@@ -4063,6 +4063,7 @@ const ErrorOrigin = enum {
     theme,
     file_enrichment,
     buffer,
+    review_search,
 };
 
 const ShownError = struct {
@@ -8661,7 +8662,7 @@ pub const Presentation = struct {
         self.clearError(.user);
         if (state.needs_scan) {
             const text = (state.query orelse unreachable).query.text;
-            self.replaceReviewSearchQuery(text, .buffer);
+            self.replaceReviewSearchQuery(text, .review_search);
             // The query must not show over the results of another query
             // without the pending mark, also when its scan cannot queue.
             state.pending = true;
@@ -8671,12 +8672,12 @@ pub const Presentation = struct {
 
     /// A reopened query whose scan could not queue stays pending with
     /// `needs_scan`. The retry runs after the inputs of an event, so a
-    /// success clears only the out-of-memory message of the failed scan.
+    /// success clears only an error from the Review Search scan path.
     fn retryReviewSearchQuery(self: *Presentation) void {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (!state.open or !state.pending or !state.needs_scan) return;
-        self.replaceReviewSearchQuery((state.query orelse unreachable).query.text, .buffer);
+        self.replaceReviewSearchQuery((state.query orelse unreachable).query.text, .review_search);
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
@@ -8918,7 +8919,7 @@ pub const Presentation = struct {
             if (next != null) {
                 self.queueFileEnrichment(published, next.?, false) catch |err| switch (err) {
                     error.OutOfMemory => {
-                        self.showError(.buffer, .out_of_memory);
+                        self.showError(.review_search, .out_of_memory);
                         published.review_search.opening_source = false;
                         break;
                     },
@@ -8939,7 +8940,7 @@ pub const Presentation = struct {
             if (next == null) break;
             self.queueFileEnrichment(published, next.?, false) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    self.showError(.buffer, .out_of_memory);
+                    self.showError(.review_search, .out_of_memory);
                     break;
                 },
             };
@@ -8989,7 +8990,7 @@ pub const Presentation = struct {
             if (scan.* != .scanned) scan.* = .given_up;
         };
         self.releaseReviewSearchHolds(published);
-        self.showError(.buffer, .buffer_search_scan_failed);
+        self.showError(.review_search, .buffer_search_scan_failed);
     }
 
     fn finishSearchLease(self: *Presentation, published: *Published, file_index: usize) void {
@@ -9251,7 +9252,7 @@ pub const Presentation = struct {
         const worker_batch = switch (completed.outcome) {
             .failed => {
                 self.rollbackReviewSearchQuery(published);
-                self.showError(.buffer, .buffer_search_scan_failed);
+                self.showError(.review_search, .buffer_search_scan_failed);
                 published.frame_revision += 1;
                 return;
             },
@@ -9272,7 +9273,7 @@ pub const Presentation = struct {
             self.reportFailure(.review_search, .prepare, err, @src());
             batch.deinit(self.allocator);
             self.rollbackReviewSearchQuery(published);
-            self.showError(.buffer, .out_of_memory);
+            self.showError(.review_search, .out_of_memory);
             published.frame_revision += 1;
             return;
         };
@@ -9281,7 +9282,7 @@ pub const Presentation = struct {
                 batch.deinit(self.allocator);
                 std.heap.page_allocator.free(ranges);
                 self.rollbackReviewSearchQuery(published);
-                self.showError(.buffer, .out_of_memory);
+                self.showError(.review_search, .out_of_memory);
                 published.frame_revision += 1;
                 return;
             },
@@ -9311,7 +9312,7 @@ pub const Presentation = struct {
             };
         }
         published.frame_revision += 1;
-        self.clearError(.buffer);
+        self.clearError(.review_search);
         self.restartReviewSourceScans(published);
     }
 
@@ -35752,7 +35753,7 @@ test "M21 kernel Review Search starts no source scan before its first query publ
     }
 }
 
-test "M21 kernel Review Search retries a reopened query scan that cannot queue at the next event" {
+test "Review recovery a Review Search query retry clears its failed scan error" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
