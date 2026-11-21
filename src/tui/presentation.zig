@@ -13043,19 +13043,15 @@ pub const Presentation = struct {
         if (requested == desired.selected_version) return;
         var candidate = desired;
         candidate.selected_version = requested;
-        self.queueViewBuild(published, candidate, if (published.pending_view) |view| view.isolated_file else published.isolated_file, if (published.pending_view) |view| view.geometry else published.geometry, .version) catch |err| switch (err) {
-            error.OutOfMemory => {
-                self.action_error = .out_of_memory;
-                return;
-            },
+        self.queueViewBuild(published, candidate, if (published.pending_view) |view| view.isolated_file else published.isolated_file, if (published.pending_view) |view| view.geometry else published.geometry, .version) catch |err| {
+            self.failDroppedInput(err, @src());
+            return;
         };
         const file_index = published.activeFile();
         if (candidate.scope == .whole and file_index != null and versionNeedsEnrichment(published, candidate.layout, requested, file_index.?)) {
-            self.queueFileEnrichment(published, file_index.?, false) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    self.cancelQueuedViewBuild(published);
-                    self.action_error = .out_of_memory;
-                },
+            self.queueFileEnrichment(published, file_index.?, false) catch |err| {
+                self.cancelQueuedViewBuild(published);
+                self.failDroppedInput(err, @src());
             };
         }
     }
