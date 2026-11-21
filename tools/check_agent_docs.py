@@ -33,6 +33,12 @@ PUBLIC_PULL_REQUESTS = {
         "an issue of the public Zig repository",
     ("docs/adr/0014-a-failure-is-recorded-once-and-error-reported-marks-it.md", "2647"):
         "an issue of the public Zig repository",
+    (".scratch/review-search-scan-retry", "35"):
+        "a pull request of the public bbr GitHub repository",
+    (".scratch/review-search-scan-retry", "36"):
+        "a pull request of the public bbr GitHub repository",
+    (".scratch/focus-check-staging-failure", "36"):
+        "a pull request of the public bbr GitHub repository",
 }
 AGENTS_MD_CAP = 5000
 COMPILE_CLAIM = re.compile(r"compile error|does not compile|do not compile|fails to compile")
