@@ -7185,7 +7185,7 @@ pub const Presentation = struct {
                             time_ns.? - click.time_ns.? <= 500 * 1_000_000) else false;
                 if (double_click) {
                     self.last_review_click = null;
-                    self.openReviewSearchOccurrence();
+                    self.openReviewSearchOccurrence(.input);
                 } else {
                     self.selectReviewSearch(index);
                     self.last_review_click = .{ .index = index, .time_ns = time_ns };
@@ -8314,7 +8314,7 @@ pub const Presentation = struct {
             switch (action) {
                 .next_review_search_occurrence => self.moveReviewSearch(1),
                 .previous_review_search_occurrence => self.moveReviewSearch(-1),
-                .open_search_occurrence => self.openReviewSearchOccurrence(),
+                .open_search_occurrence => self.openReviewSearchOccurrence(.input),
                 .half_page_down => self.scrollReviewSearch(1),
                 .half_page_up => self.scrollReviewSearch(-1),
                 else => {},
@@ -8488,7 +8488,7 @@ pub const Presentation = struct {
             .open_review_search => self.openReviewSearch(),
             .next_review_search_occurrence => self.moveReviewSearch(1),
             .previous_review_search_occurrence => self.moveReviewSearch(-1),
-            .open_search_occurrence => self.openReviewSearchOccurrence(),
+            .open_search_occurrence => self.openReviewSearchOccurrence(.input),
             .next_search_occurrence => self.traverseBufferSearch(.forward),
             .previous_search_occurrence => self.traverseBufferSearch(.backward),
             .clear_selection => {
@@ -9299,7 +9299,7 @@ pub const Presentation = struct {
         }
     }
 
-    fn openReviewSearchOccurrence(self: *Presentation) void {
+    fn openReviewSearchOccurrence(self: *Presentation, trigger: enum { input, completion }) void {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (!state.open or state.pending or state.destination_pending) return;
@@ -9325,7 +9325,7 @@ pub const Presentation = struct {
                 if (side == .pending) {
                     state.opening_source = true;
                     if (state.acquired) |acquired| acquired[source.file_index] = false;
-                    self.action_error = null;
+                    if (trigger == .input) self.action_error = null;
                     self.pumpReviewSearchAcquisition(published);
                 } else if (published.session.enrichment.status(source.file_index).old != .loading and published.session.enrichment.status(source.file_index).new != .loading) {
                     state.opening_source = false;
@@ -10346,7 +10346,7 @@ pub const Presentation = struct {
             {
                 self.version_restoration = null;
             };
-            if (reviewSearchOpeningFile(&published.review_search)) |index| if (job.enrichedFile(index) != null) self.openReviewSearchOccurrence();
+            if (reviewSearchOpeningFile(&published.review_search)) |index| if (job.enrichedFile(index) != null) self.openReviewSearchOccurrence(.completion);
             if (published.pending_review_location) |target| if (reviewLocationFile(published.session.diff.files, target)) |index| if (job.enrichedFile(index) != null) {
                 _ = restoreReviewLocation(self, published, target);
                 published.pending_review_location = null;
@@ -10358,7 +10358,7 @@ pub const Presentation = struct {
         switch (job.kind) {
             .review_destination => {
                 published.review_search.destination_pending = false;
-                self.openReviewSearchOccurrence();
+                self.openReviewSearchOccurrence(.completion);
             },
             .enrichment => self.retryEnrichmentBuild(published, job),
             .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch |err| {
@@ -31622,6 +31622,51 @@ test "M21 kernel opening a Review Search hit in an evicted File clears an older 
     try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
     try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
     try testing.expect(presentation.projection().review_search == null);
+}
+
+test "M21 kernel Review Search completion openings keep the selected File from eviction" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 16) },
+    });
+    defer presentation.deinit();
+    const storage = &presentation.published.?.session.enrichment;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+    var other: ?EnrichFile = null;
+    const file_index = for (0..64) |_| {
+        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+        const view = presentation.projection().review_search.?;
+        const location = view.results[view.selected.?].occurrence.location;
+        if (location != .source or storage.file(location.source.file_index).new != .pending) continue;
+        if (other) |command| {
+            if (location.source.file_index != command.file_index) break location.source.file_index;
+        } else {
+            try runReviewSearchTestWork(&presentation, 0);
+            other = presentation.takeCommand().?.enrich_file;
+        }
+    } else return error.TestUnexpectedResult;
+    try presentation.dispatch(.{ .action = .open_search_occurrence });
+    try testing.expect(storage.files[file_index].leases > 0);
+    try runReviewSearchTestWork(&presentation, 0);
+    const enrichment = presentation.takeCommand().?.enrich_file;
+    try testing.expectEqual(file_index, enrichment.file_index);
+    try deliverTestEnrichment(&presentation, enrichment);
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(storage.file(file_index).new == .content);
+    const destination = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.review_destination, destination.kind);
+    destination.build();
+    try failTestEnrichment(&presentation, other.?);
+    try presentation.dispatch(.{ .resize = .{ .cols = presentation.geometry.cols, .rows = presentation.geometry.rows + 1 } });
+    try presentation.dispatch(.{ .buffer_disclosure_built = destination });
+    try testing.expect(storage.file(file_index).new == .content);
+    try testing.expectEqual(@as(?ActionError, .file_enrichment_launch_failed), presentation.projection().action_error);
 }
 
 test "M21 kernel reopening Review Search holds no File that its query already scanned" {

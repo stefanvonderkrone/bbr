@@ -41,3 +41,20 @@ No live Bitbucket request or live TUI run is part of this work.
 Each failing test commit precedes its fix commit.
 The initial inspection found a second production `queueFileEnrichment(..., false)` caller in `selectVersion`.
 The inspection must account for that user input before it classifies every non-speculative result as maintenance work.
+
+### 2026-11-21 completion opening probe
+
+The new "M21 kernel Review Search completion openings keep the selected File from eviction" test reaches both completion callers.
+It selects an evicted File, opens it, accepts its enrichment, and makes the destination build stale with a height resize.
+The File has content at both completion openings.
+The test passes with the old unconditional clear too, so it is not red proof for the pending branch.
+
+`dispatch` calls `holdReviewSearchPreview` after every input.
+The Preview holds the selected File before either completion can run.
+`reviewSearchOpeningFile` requires the current selected occurrence to match the opening identity.
+Enrichment admission then stages that File's result and commits it before the completion opens the occurrence.
+The hold prevents that commit or another cache update from evicting the File.
+The destination retry also requires the same selected occurrence in `acceptViewBuild`.
+Thus the test cannot make that selected content pending through cache eviction at either completion.
+The signature still states the rule with `input` and `completion`.
+Both completion callers pass `completion`, and only `input` can clear before the acquisition pump.

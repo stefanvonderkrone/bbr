@@ -147,7 +147,9 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 A failure of maintenance work records its cause once and shows `out_of_memory` only when no message shows.
 A File Enrichment or a query retry that succeeds clears only the `out_of_memory` message of an earlier failed attempt.
 A cache staging or a cache update commit writes no message.
-A user action that hands its work to maintenance work clears an older message before it does so. `openReviewSearchOccurrence` clears it before it pumps the Review Search acquisition for a hit in an evicted File.
+A user action that hands its work to maintenance work clears an older message before it does so.
+`openReviewSearchOccurrence` clears it only on the user-input path before the acquisition pump for an evicted File.
+A completion keeps the shown message.
 
 These sites are maintenance work:
 
