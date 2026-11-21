@@ -45,6 +45,10 @@ Two judgement calls stay open:
 - `openReviewSearchOccurrence` also runs from a completion, in `retryContentBuild` for `.review_destination` and after an enrichment commit. If the File of the hit is evicted again at that point, the completion clears the shown message. No test reaches this case.
 - `dropEnrichments` replaces the shown message for any result that is not speculative. A File Enrichment of the focus check is maintenance work, so its dropped result can replace a message. This behavior is older than this ticket.
 
+### 2026-11-21 follow-up
+
+[Ticket 05](05-keep-maintenance-and-dropped-input-messages.md) owns the two open judgement calls and the Draft retry record gap.
+
 ## Completion
 
 2026-11-21, branch `focus-check-staging-failure`.
