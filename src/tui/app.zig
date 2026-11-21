@@ -1067,9 +1067,11 @@ fn presentationPrepareSessionWorker(loop: *Loop, work_id: u64, diagnostic: bbr.d
 
 fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, command_value: presentation.ScanReviewSource) void {
     var command = command_value;
-    defer command.deinit();
+    const scanned = presentation.executeReviewSourceScan(std.heap.page_allocator, &command);
+    // The result keeps a Session reference, so this release is never the last.
+    command.deinit();
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id, .diagnostic = diagnostic };
-    presentation_runtime.deliver(presentationSink(&sink_context), .{ .review_source_scanned = presentation.executeReviewSourceScan(std.heap.page_allocator, &command) });
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .review_source_scanned = scanned });
 }
 
 fn presentationWaitWorker(loop: *Loop, work_id: u64, diagnostic: bbr.diagnostics.Handle, io: std.Io, wait: presentation.WaitSubmission) void {
