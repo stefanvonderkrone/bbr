@@ -30877,6 +30877,45 @@ fn expectCompletionAllocationRecord(presentation: *Presentation) !void {
     try testing.expect(presentation.takeCommand() == null);
 }
 
+test "M21 kernel dropped Selected Version enrichment retries and restores the reading location" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .select_old_version });
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(cursorOwner(&presentation) == .file);
+    const waiting = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(@as(usize, 1), waiting.file_index);
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    failing.fail_index = failing.alloc_index;
+    try deliverTestEnrichment(&presentation, waiting);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try expectCompletionAllocationRecord(&presentation);
+    try testing.expect(cursorOwner(&presentation) == .file);
+
+    const retry = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(waiting.file_index, retry.file_index);
+    try deliverSizedTestEnrichment(&presentation, retry, "old b\n", "new b\n");
+    try completeDisclosureBuild(&presentation);
+
+    const review = presentation.projection().review.?;
+    try testing.expectEqual(SelectedVersion.old, review.selected_version);
+    const row = review.frame.visual_rows[review.navigation.cursor];
+    try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(row.buffer_index));
+    try testing.expectEqualStrings("old b", (frame_mod.selectedSource(row, .old) orelse return error.VersionLocationLost).text);
+}
+
 test "M21 kernel dropped enrichment that cancels a Refresh location shows its failure once" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
