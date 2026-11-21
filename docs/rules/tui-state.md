@@ -179,6 +179,29 @@ No other admission compares a selection.
 
 Enforcement: `DisclosureBuild` has no `review_selected` or `accepted_active` field, and `DisclosureBuild.create` takes no occurrence (compile error). The exhaustive switch in `Kind.opensOccurrence` makes each new Kind decide whether it opens an occurrence (compile error). The admission tests in `src/tui/presentation.zig`, run by `zig build test`, fail when an admission rejects or retries a build because the selection moved. The test "Buffer Search rejects and retries an enrichment rebuild after its accepted batch changes" keeps the batch check.
 
+## Review Search source scan failures
+
+A File gets two source scans at most for one Review Search query.
+After its first failed scan, the File keeps its Review Search hold, and the next source scan retries it.
+After its second failed scan, Review Search stops the source scans of the query and shows `buffer_search_scan_failed` once.
+Each File without a successful scan then stays unscanned and has no Review Search hold, so a lasting failure such as `OutOfMemory` costs two scans, not two scans for each File.
+The worker boundary records each failed scan once, and Presentation records each allocation failure of a publication once.
+The source scans of a query start only after its results publish, because a source result merges into the published results. `ReviewSearchState.currentQueryResultsPublished` decides the start and the merge of a source result. A query edit shows the results of `rollback_query` until its own results publish. When the Overlay closes first and its reopen cannot queue the query scan, the edited query stays in the input and the Overlay stays pending, so it never shows a query over the results of another query without the pending mark. The `ensure_focused_enrichment` input, which the App dispatches after each event while a Review shows, queues the query scan again. A lasting failure retries only at a later dispatch of that input, never in a loop. Each failed attempt records one failure. A successful retry clears only the out-of-memory message of the failed scan, because a message that an earlier input of the same event set must stay. A first query that rolls back after a failed scan has no results, so it starts no source scan.
+The results of a new query, or a reopened Overlay, start the source scans again.
+Until the results of a query edit publish, each File keeps its source scan state, so a query that rolls back keeps the attempts and the given-up Files of its pass, and the rollback resumes that pass.
+A source scan without a result, such as a queued scan that a query edit discards, returns its File to the state and the hold that it had before the scan.
+
+A source scan command always starts, because it needs no allocation.
+Its start drops the Review Search hold of its File without a cache build stage, because the lease of the command keeps the File. The completion of the scan releases that lease and stages.
+The command retains the published Session and reads its File there, because a published Session never changes its Diff.
+The scan result takes its own Session reference before the worker releases the command, so the Presentation thread releases the last reference of a replaced Session.
+It retains the query, which Presentation allocates once for each query change in `std.heap.page_allocator`, because a worker can release its last reference.
+It waits in its own slot, `Presentation.queued_source_scan`, because at most one source scan is queued or running.
+An enrichment build records whether Review Search holds each File, and its worker counts that hold when it previews the cache budget.
+Admission takes the recorded hold, and it retries the build when the current decision of `reviewSearchHolds` differs, because a query or Overlay change can change the decision without a Storage change.
+
+Enforcement: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" in `src/tui/presentation.zig` fails when a failed allocation from the Presentation allocator stops the start of a source scan, also through a `catch` that returns. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search stops its source scans after it gives up on a File", "M21 authored failed source scan retries after reopening Review Search", "M21 kernel Review Search keeps the given-up Files of a query edit that rolls back", and "M21 kernel Review Search resumes the retry of a query edit that rolls back" in the same file check the retry, the stop, and the rollback. The test "M21 kernel Review Search starts no source scan before its first query publishes" fails when a source scan starts before the first query results publish, "M21 kernel Review Search starts no source scan while a query edit is pending" fails when a source scan starts while the results of the previous query show, "M21 kernel Review Search retries a reopened query scan that cannot queue at the next event" fails when the reopened Overlay drops the edited query, shows it over the results of the previous query without the pending mark, or does not queue its scan at the next event, "M21 kernel Review Search keeps another message of the same event when a reopened query retry succeeds" fails when the successful retry clears a message that it did not set, and "M21 kernel Review Search starts its source scans after first query results without a match" fails when results without a match start no source scan. The test "M21 kernel Review Search starts a source scan without superseding a cache build in flight" fails when the start of a source scan stages a cache build while a cache update is pending. The test "M21 kernel Review Search admits an enrichment with the hold that its build counted" fails when admission takes a hold that the build did not count. `zig build test` runs them. An allocation from another allocator is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#a-source-scan-starts-without-an-allocation).
+
 ## Search occurrence index mapping
 
 A search occurrence index maps into a newer batch by one of two rules.
@@ -229,7 +252,7 @@ The streams are File Enrichment results and Review Search lease and hold release
 A new request joins the queued build and keeps its place.
 `takeCommand` gives the build a new snapshot through `refreshQueuedBuild`.
 One exception exists.
-A new Review Search source scan moves the queued cache update to the end of the queue while `Storage.cachePressure` is not `far_over_budget`.
+`takeCommand` gives the queued Review Search source scan before a cache update at the front of the queue while `Storage.cachePressure` is not `far_over_budget`.
 Far over the budget means that the inactive Files exceed the budget by more than the larger of the budget and the floor.
 The floor is `Storage.far_over_budget_floor` (4 MiB).
 After each File of the Review was admitted once, the floor is at most an eighth of the bytes of the Review.
@@ -264,7 +287,9 @@ Enforcement: the test "M21 kernel the Review Search Preview keeps its File conte
 ## Review Search scan hold
 
 A Review Search scan hold exists only while a source scan of its File is due.
-Queueing the source scan of a File releases its scan hold, and a scanned File never gets a scan hold again.
+A scan is due while the `SourceScan` of the File is `unscanned`, or `awaiting_retry` after a first failed scan.
+The start of the source scan of a File releases its scan hold, and the lease of the queued or running scan keeps the File.
+A `scanned` or `given_up` File gets no scan hold until the results of a new query, or a reopened Overlay, start the source scans again.
 `ReviewSearchState.needsScanHold` makes this decision for every site that adds a scan hold: admission through `reviewSearchHolds`, and opening or a query change through `holdReviewSearchFiles`.
 Otherwise a scanned File that the Preview acquires again, or that the Overlay holds again when it opens, keeps a hold that no scan releases, and the cache budget no longer covers it.
 

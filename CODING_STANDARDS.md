@@ -152,6 +152,25 @@ A `Nav` field whose type spans lines follows the Navigation across Frames rule t
 
 No check: a line check cannot tell a row number from another `usize`, and it reads a `Nav` field type only on one line. Related checked rule: [Navigation across Frames](docs/rules/tui-state.md#navigation-across-frames).
 
+### A source scan starts without an allocation
+
+The start of a Review Search source scan, `maybeQueueReviewSourceScan` and `ScanReviewSource.create`, allocates from no allocator.
+It also stages no cache build, because the lease of the scan keeps its File. The test "M21 kernel Review Search starts a source scan without superseding a cache build in flight" fails when the start stages a cache build while a cache update is pending, whatever its allocator.
+
+No check: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" fails only when a failed allocation from the Presentation allocator stops the start. An allocation from `std.heap.page_allocator` or from the Session allocator passes it, and so does an allocation whose failure the start ignores. A `catch` makes any allocation compile in a function that returns no error union. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+
+### A cache staging failure keeps the shown message
+
+A lease release that cannot stage its cache build records the cause and shows `out_of_memory` only when no message shows.
+The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
+This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget.
+While a cache update is pending, the focus check stages after that update commits.
+So the failure loses no work, also when no lease release follows, such as after a second failed source scan stops the pass.
+A failed staging in the focus check returns `OutOfMemory` from `dispatch` and ends the event loop.
+The message of the event outcome stays, such as `buffer_search_scan_failed`.
+
+No check: the test "M21 kernel Review Search shows its scan failure when the cache build of the released File cannot stage" covers only `stageReleasedSearchLeases`, and it dispatches `ensure_focused_enrichment` itself. A new site that stages a cache build and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+
 ### Make Line row identities through LineOwner.of
 
 No code writes a literal `.{ .hunk_line = line }` that bypasses `LineOwner.of`.
@@ -165,9 +184,9 @@ Only `Published.toggleFileRead` writes or deletes File Read Receipts.
 
 No check: the test covers Candidate Session preparation only, and a new caller of the `FileReadStore` write elsewhere fails no test. Related checked rule: [File Read Receipts in Candidate Session preparation](docs/rules/tui-state.md#file-read-receipts-in-candidate-session-preparation).
 
-### Only a Review Search source scan moves the queued cache update
+### Only a Review Search source scan passes the queued cache update
 
-A queued cache update keeps its place in the queue. Only a new Review Search source scan moves it to the end, and only while the cache is not far over the budget. Far over the budget is a byte limit that depends only on the budget and on the bytes of the Review, never on a File count. The bytes of the Review count only after each File was admitted once. Another request that moves it can starve the cache update and hold the cache over the budget.
+A queued cache update keeps its place in the queue. Only the queued Review Search source scan goes before it, and only while the cache is not far over the budget. Far over the budget is a byte limit that depends only on the budget and on the bytes of the Review, never on a File count. The bytes of the Review count only after each File was admitted once. Another request that passes it can starve the cache update and hold the cache over the budget.
 
 No check: a check would have to know every request that can reach the queue. Related checked rule: [Coalesced Buffer builds](docs/rules/tui-state.md#coalesced-buffer-builds).
 
