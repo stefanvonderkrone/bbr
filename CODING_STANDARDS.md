@@ -143,8 +143,10 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 
 ### Maintenance work keeps the shown message
 
-[Maintenance work](src/tui/GLOSSARY.md) is work that no input asked for and that a later check does again. A failed queue or staging of maintenance work has exactly one record, and it never overwrites or clears another message.
-A failure of maintenance work records its cause once and shows `out_of_memory` only when no message shows.
+[Maintenance work](src/tui/GLOSSARY.md) is work that no input asked for and that a later check does again.
+A failure of maintenance work records its cause once and shows its failure message only when no message shows.
+An allocation failure uses `out_of_memory`.
+A failed enrichment build uses `buffer_build_failed`.
 A File Enrichment or a query retry that succeeds clears only the `out_of_memory` message of an earlier failed attempt.
 A cache staging or a cache update commit writes no message.
 A user action that hands its work to maintenance work clears an older message before it does so.
@@ -157,16 +159,16 @@ These sites are maintenance work:
 - The retry of a stale cache update in `retryContentBuild`, and the commit of a cache update in `acceptBufferDisclosure`.
 - The File Enrichment of the active File in the focus check, and the File Enrichments of the Review Search acquisition, `pumpReviewSearchAcquisition`. Both go through `queueMaintenanceFileEnrichment`.
 - The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
-- Dropped non-speculative enrichment results in `dropEnrichments`, unless the drop cancels the pending reading location of a Refresh or Reconciliation.
-- A failed enrichment build in `acceptBufferDisclosure`, with the same pending reading location exception.
+- A failed enrichment build in `acceptBufferDisclosure` or non-speculative results dropped by `dropEnrichments`, when they cancel no pending reading location.
 
 `dropEnrichments` keeps its `.completion`, `.admission` record.
 A speculative-only drop records the failure without a message.
 A worker records a failed enrichment build before its completion.
-That completion adds no record and shows `buffer_build_failed` only when no message shows or it cancels a pending reading location.
+That completion adds no record.
 
-`failMaintenance` writes the record and the message of a failure, so a new site calls it in its `catch`.
-The query retry is the exception. `replaceReviewSearchQuery` also serves user input, so it records the failure, and `retryReviewSearchQuery` restores the shown message after it.
+`failMaintenance` writes the record and the message of a failed queue or staging, so a new such site calls it in its `catch`.
+The query retry is the exception.
+`replaceReviewSearchQuery` also serves user input, so it records the failure, and `retryReviewSearchQuery` restores the shown message after it.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
 This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget, and it queues the File Enrichment of the active File again while the File is pending.
 While a cache update is pending, the focus check stages after that update commits.
@@ -182,8 +184,10 @@ A completion that finds its build stale queues the work of a user input again. W
 The failure of a user input is the outcome of that input. So the retry records the cause once and shows `out_of_memory` over another message.
 `failDroppedInput` does both.
 These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and the `.draft_save` and `.draft_mutation` prongs of `retryContentBuild`.
-An enrichment drop that cancels a pending reading location from Refresh or Reconciliation drops part of that input.
-No later check restores the canceled location, so `dropEnrichments` calls `failDroppedInput` for that case too.
+An enrichment failure that cancels a pending reading location from Refresh or Reconciliation drops part of that input.
+No later check restores the canceled location.
+`dropEnrichments` calls `failDroppedInput` for that case too.
+The completion of a failed enrichment build shows `buffer_build_failed` for that case.
 
 No check: the tests cover only the current retries. A new retry that shows `out_of_memory` without a record passes `tools/check_diagnostics.py`, because the check accepts a `catch` that names `error.OutOfMemory` in a switch prong and drops it. Related checked rule: [A failure has one record](docs/rules/diagnostics.md#a-failure-has-one-record).
 
