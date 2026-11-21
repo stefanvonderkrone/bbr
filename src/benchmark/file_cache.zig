@@ -1869,7 +1869,8 @@ const SearchComplete = struct {
         const published = state.published orelse return false;
         const search = &published.review_search;
         if (!search.open or search.pending or search.query == null) return false;
-        for (search.source_scanned orelse return false) |scanned| if (!scanned) return false;
+        for (search.source_scans orelse return false) |scan| if (scan != .scanned) return false;
+        if (state.queued_source_scan != null) return false;
         for (state.commands.items) |command| if (command == .scan_review_source or command == .scan_buffer_search) return false;
         for (state.issued_commands.items) |issued| if (issued.target == .scan_review_source or issued.target == .scan_buffer_search) return false;
         return true;
