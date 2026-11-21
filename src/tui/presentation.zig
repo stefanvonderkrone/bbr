@@ -10369,14 +10369,14 @@ pub const Presentation = struct {
                 self.queueDraftBuild(published, job.new_draft.?) catch |err| switch (err) {
                     error.OutOfMemory => {
                         published.pending_draft_save = null;
-                        self.action_error = .out_of_memory;
+                        self.failDroppedInput(err, @src());
                     },
                 };
             },
             .draft_mutation => self.queueDraftMutation(published, job.mutation.?, job.mutation_id) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.pending_draft_mutation = null;
-                    self.action_error = .out_of_memory;
+                    self.failDroppedInput(err, @src());
                 },
             },
             .card_destination => self.queueCardDestination(published, job.destination_card.?, job.target.add, job.isolated_file, job.destination_attempt) catch |err| switch (err) {

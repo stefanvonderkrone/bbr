@@ -172,7 +172,9 @@ No check: the tests cover only the current sites, and they dispatch `ensure_focu
 ### A dropped user input shows its failure
 
 A completion that finds its build stale queues the work of a user input again. When the retry cannot queue, the work is dropped, and no later check does it again. So it is not maintenance work.
-The failure of a user input is the outcome of that input. So the retry records the cause once and shows `out_of_memory` over another message. `failDroppedInput` does both, and these retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, and `republishPostedParent`.
+The failure of a user input is the outcome of that input. So the retry records the cause once and shows `out_of_memory` over another message.
+`failDroppedInput` does both.
+These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and the `.draft_save` and `.draft_mutation` prongs of `retryContentBuild`.
 `dropEnrichments` records each failure too, but it shows `out_of_memory` only when a dropped result is not speculative. A speculative result is not a user input.
 
 No check: the tests cover only the current retries. A new retry that shows `out_of_memory` without a record passes `tools/check_diagnostics.py`, because the check accepts a `catch` that names `error.OutOfMemory` in a switch prong and drops it. Related checked rule: [A failure has one record](docs/rules/diagnostics.md#a-failure-has-one-record).
