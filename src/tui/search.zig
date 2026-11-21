@@ -230,6 +230,12 @@ pub const Query = struct {
         };
     }
 
+    pub fn clone(self: Query, allocator: std.mem.Allocator) !Query {
+        const text = try allocator.dupe(u8, self.text);
+        errdefer allocator.free(text);
+        return .{ .text = text, .scalars = try allocator.dupe(u21, self.scalars), .case_sensitive = self.case_sensitive };
+    }
+
     pub fn deinit(self: *Query, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
         allocator.free(self.scalars);
