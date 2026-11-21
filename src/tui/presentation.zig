@@ -31321,6 +31321,34 @@ test "M21 kernel a scanned File that the Review Search Preview acquires again is
     try testing.expect(storage.file(file_index).new != .content);
 }
 
+test "M21 kernel opening a Review Search hit in an evicted File clears an older message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 16) },
+    });
+    defer presentation.deinit();
+    const storage = &presentation.published.?.session.enrichment;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+    for (0..64) |_| {
+        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+        const view = presentation.projection().review_search.?;
+        const location = view.results[view.selected.?].occurrence.location;
+        if (location == .source and storage.file(location.source.file_index).new == .pending) break;
+    } else return error.TestUnexpectedResult;
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0x2603, .text = "\x00" } });
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .action = .open_search_occurrence });
+    try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+    try testing.expect(presentation.projection().review_search == null);
+}
+
 test "M21 kernel reopening Review Search holds no File that its query already scanned" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
