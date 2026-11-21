@@ -1,6 +1,6 @@
 # Keep a Picker error through a cache update
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -26,9 +26,20 @@ Triage verified this finding with a test. The test is in the brief below. The `o
 
 ## Acceptance criteria
 
-- [ ] A test decides whether a completed cache update clears `picker_load_failed`.
-- [ ] If the message is cleared, a background build no longer clears an unrelated action error, and the test passes.
-- [ ] `zig build test` passes.
+- [x] A test decides whether a completed cache update clears `picker_load_failed`.
+- [x] If the message is cleared, a background build no longer clears an unrelated action error, and the test passes.
+- [x] `zig build test` passes.
+
+## Completion
+
+- `44686508` adds two failing tests: "Review recovery Picker error survives a completed cache update" and "Review recovery Picker error survives the focus check that starts a File Enrichment". Before the fix, `zig build test-review-recovery` reported `42/44 tests passed (2 failed)`, each with `expected .picker_load_failed, found .action_refused`.
+- `91f55c56` fixes both sites. The success reset of a Buffer build is an exhaustive `switch` over `DisclosureBuild.Kind`. `.enrichment` and `.cache_update` call `clearFileEnrichmentError`, and every other kind clears the error. `queueFileEnrichment` also calls `clearFileEnrichmentError`. An audit found this second site, and the second test reproduces it.
+- The fix adds the rule "Background work keeps an unrelated action error" to `docs/rules/tui-state.md`, and a `CODING_STANDARDS.md` section for the other background completions. [Ticket 03](03-scope-the-action-error-resets-of-background-completions.md) tracks them.
+- When the delegate removed the `.input` prong, the build failed with `switch must handle all possibilities` and `unhandled enumeration value: 'input'`.
+
+- The test "Review recovery a completed cache update clears a failed build of its own path" checks that the scoped clear still clears `buffer_build_failed`. With `.cache_update => {}`, this test fails.
+
+Checks: `zig build test-review-recovery` gave `45/45 tests passed`. `zig build test` exited with 0. `zig fmt --check src build.zig tests` and `python3 tools/check_agent_docs.py` passed.
 
 ## Comments
 
@@ -79,11 +90,11 @@ The test queues the cache update through `queueCacheBuild`. In the app, `stageRe
 - `setByFileEnrichment(ActionError) bool`: the pattern to follow.
 
 **Acceptance criteria:**
-- [ ] The test above, or a test with the same steps, is in the Review recovery suite and passes.
-- [ ] The test "Review recovery Picker error survives an unrelated File Enrichment completion" still passes.
-- [ ] A completed cache update still clears an error that the cache update path sets. A test shows this.
-- [ ] `zig build test` passes.
-- [ ] `zig fmt --check src build.zig tests` passes.
+- [x] The test above, or a test with the same steps, is in the Review recovery suite and passes.
+- [x] The test "Review recovery Picker error survives an unrelated File Enrichment completion" still passes.
+- [x] A completed cache update still clears an error that the cache update path sets. A test shows this.
+- [x] `zig build test` passes.
+- [x] `zig fmt --check src build.zig tests` passes.
 
 **Out of scope:**
 - `.draft_save` and `.draft_mutation` builds. They can also finish after the user moves on, but triage did not verify a defect for them. File a new ticket if a test shows one.
