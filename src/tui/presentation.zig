@@ -8632,12 +8632,15 @@ pub const Presentation = struct {
     }
 
     /// A reopened query whose scan could not queue stays pending with
-    /// `needs_scan`.
+    /// `needs_scan`. The retry runs after the inputs of an event, so a
+    /// success clears only the out-of-memory message of the failed scan.
     fn retryReviewSearchQuery(self: *Presentation) void {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (!state.open or !state.pending or !state.needs_scan) return;
+        const shown = self.action_error;
         self.replaceReviewSearchQuery((state.query orelse unreachable).query.text);
+        if (!state.needs_scan and shown != .out_of_memory) self.action_error = shown;
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
