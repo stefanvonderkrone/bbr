@@ -12626,12 +12626,7 @@ pub const Presentation = struct {
         if (published.review_search.open) return;
         if (active) |file_index| {
             if (enrichment.needsEnrichment(file_index)) {
-                // The File stays pending, so the next focus check queues it
-                // again and the failure keeps the shown message.
-                self.queueFileEnrichment(published, file_index, false) catch |err| {
-                    self.reportFailure(.file_enrichment, .prepare, err, @src());
-                    if (self.action_error == null) self.action_error = .out_of_memory;
-                };
+                _ = self.queueMaintenanceFileEnrichment(published, file_index);
                 return;
             }
             if (!enrichment.isTerminal(file_index)) return;
@@ -12765,6 +12760,22 @@ pub const Presentation = struct {
         self.next_work_id = work_id;
         published.session.enrichment.markLoading(file_index);
         self.action_error = null;
+    }
+
+    /// Queues a File Enrichment that no input asked for. The File stays
+    /// pending after a failure, so a later check queues it again, and the
+    /// failure keeps the shown message. A success clears only the
+    /// out-of-memory message of an earlier failed queue. Returns false
+    /// after a failure.
+    fn queueMaintenanceFileEnrichment(self: *Presentation, published: *Published, file_index: usize) bool {
+        const shown = self.action_error;
+        self.queueFileEnrichment(published, file_index, false) catch |err| {
+            self.reportFailure(.file_enrichment, .prepare, err, @src());
+            if (self.action_error == null) self.action_error = .out_of_memory;
+            return false;
+        };
+        if (!published.session.enrichment.needsEnrichment(file_index) and shown != .out_of_memory) self.action_error = shown;
+        return true;
     }
 
     /// Reads of a replaced Session also count. They run until they finish.
