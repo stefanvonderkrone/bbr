@@ -6803,7 +6803,7 @@ pub const Presentation = struct {
                 // The App dispatches this after each event, so a failed
                 // retry waits for the next event.
                 self.retryReviewSearchQuery();
-                try self.ensureFocusedEnrichment();
+                self.ensureFocusedEnrichment();
             },
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
             .code_highlight_completed => |completed| self.acceptCodeHighlight(completed),
@@ -8970,10 +8970,14 @@ pub const Presentation = struct {
         if (self.shutdown_requested) return;
         const focused = if (published.pending_cache_update != null) published.pending_cache_focus else published.session.enrichment.focused;
         if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
+        self.stageCacheBuild(published, focused);
+    }
+
+    /// The focus check after each event stages again, so a failure keeps the
+    /// shown message.
+    fn stageCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) void {
         self.queueCacheBuild(published, focused) catch |err| {
             self.reportFailure(.buffer_build, .prepare, err, @src());
-            // The focus check after the event stages again, so this failure
-            // does not replace the shown outcome.
             if (self.action_error == null) self.action_error = .out_of_memory;
         };
     }
@@ -12599,7 +12603,7 @@ pub const Presentation = struct {
     /// as speculative work, up to `max_speculative_enrichments` at once: the
     /// visible Files from top to bottom, then the overscan Files above, then
     /// the overscan Files below.
-    fn ensureFocusedEnrichment(self: *Presentation) !void {
+    fn ensureFocusedEnrichment(self: *Presentation) void {
         if (self.shutdown_requested) return;
         const published = self.published orelse return;
         const files = @min(published.session.diff.files.len, published.session.enrichment.len());
@@ -12610,18 +12614,26 @@ pub const Presentation = struct {
         // the rest of this check.
         if (active) |file_index| self.promoteSpeculativeEnrichment(published.epoch, file_index);
         if (published.pending_cache_update != null) {
-            if (!std.meta.eql(published.pending_cache_focus, range.focused)) try self.queueCacheBuild(published, range.focused);
+            if (!std.meta.eql(published.pending_cache_focus, range.focused)) self.stageCacheBuild(published, range.focused);
             return;
         }
         if (published.session.enrichment.requiresCacheEnforcement(range.focused)) {
-            try self.queueCacheBuild(published, range.focused);
+            self.stageCacheBuild(published, range.focused);
             return;
         }
         const enrichment = &published.session.enrichment;
         enrichment.focusAdmitted(range.focused);
         if (published.review_search.open) return;
         if (active) |file_index| {
-            if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, false);
+            if (enrichment.needsEnrichment(file_index)) {
+                // The File stays pending, so the next focus check queues it
+                // again and the failure keeps the shown message.
+                self.queueFileEnrichment(published, file_index, false) catch |err| {
+                    self.reportFailure(.file_enrichment, .prepare, err, @src());
+                    if (self.action_error == null) self.action_error = .out_of_memory;
+                };
+                return;
+            }
             if (!enrichment.isTerminal(file_index)) return;
         }
         // Speculative work fails silently. A File that fails to queue stays
@@ -30393,7 +30405,7 @@ test "M21 kernel cache focus failure preserves content and focus before retry" {
     presentation.commands.deinit(presentation.allocator);
     presentation.commands = .empty;
     failing.fail_index = failing.alloc_index;
-    try testing.expectError(error.OutOfMemory, presentation.dispatch(.ensure_focused_enrichment));
+    try presentation.dispatch(.ensure_focused_enrichment);
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
     try testing.expectEqual(file_enrichment.FileRange.single(0), published.session.enrichment.focused);

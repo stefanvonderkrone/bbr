@@ -143,15 +143,17 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 
 ### A cache staging failure keeps the shown message
 
-A lease release that cannot stage its cache build records the cause and shows `out_of_memory` only when no message shows.
+A lease release or a focus check that cannot stage its cache build records the cause and shows `out_of_memory` only when no message shows.
+Both go through `stageCacheBuild`.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
 This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget.
 While a cache update is pending, the focus check stages after that update commits.
 So the failure loses no work, also when no lease release follows, such as after a second failed source scan stops the pass.
-A failed staging in the focus check returns `OutOfMemory` from `dispatch` and ends the event loop.
+A failed staging in the focus check keeps the session, and the next focus check stages again.
+The focus check treats a failed queue of the read of the active File the same way, because the File stays pending.
 The message of the event outcome stays, such as `buffer_search_scan_failed`.
 
-No check: the test "M21 kernel Review Search shows its scan failure when the cache build of the released File cannot stage" covers only `stageReleasedSearchLeases`, and it dispatches `ensure_focused_enrichment` itself. A new site that stages a cache build and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+No check: the test "M21 kernel Review Search shows its scan failure when the cache build of the released File cannot stage" covers `stageReleasedSearchLeases`, and it dispatches `ensure_focused_enrichment` itself. The tests "M21 kernel cache focus staging failure keeps the session and stages again" and "M21 kernel focus check keeps the session when the read of the active File cannot queue" cover the focus check. A new site that stages a cache build and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
 ### Make Line row identities through LineOwner.of
 
