@@ -10313,13 +10313,10 @@ pub const Presentation = struct {
             };
             self.refreshStaleRepairTree();
         }
-        if (job.kind != .enrichment) {
-            self.action_error = null;
-        } else if (!EnrichedFile.allSpeculative(job.enrichments.items)) {
-            // A File Enrichment runs beside other work, so it clears only an error of the enrichment path.
-            if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
-                self.action_error = null;
-            };
+        switch (job.kind) {
+            .enrichment => if (!EnrichedFile.allSpeculative(job.enrichments.items)) self.clearFileEnrichmentError(),
+            .cache_update => self.clearFileEnrichmentError(),
+            .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => self.action_error = null,
         }
         // After the success reset, so a failure stays visible.
         if (parent_reposted) self.republishPostedParent(published);
@@ -12752,7 +12749,13 @@ pub const Presentation = struct {
         }
         self.next_work_id = work_id;
         published.session.enrichment.markLoading(file_index);
-        self.action_error = null;
+        self.clearFileEnrichmentError();
+    }
+
+    fn clearFileEnrichmentError(self: *Presentation) void {
+        if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
+            self.action_error = null;
+        };
     }
 
     /// Reads of a replaced Session also count. They run until they finish.

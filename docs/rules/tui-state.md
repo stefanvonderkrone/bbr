@@ -57,6 +57,16 @@ Closing a clean result permits later batches, but it does not authorize unrelate
 
 Enforcement: the `Review recovery` tests in `src/tui/presentation.zig`, run by `zig build test-review-recovery` and `zig build test`. They check active, paused, and terminal input, retained ownership, repeated batches, and posted Comment navigation.
 
+## Background work keeps an unrelated action error
+
+A completion of background work clears only the action errors of its own path.
+The File Enrichment path includes enrichment builds, cache updates, and the focus check that starts a File Enrichment.
+This path clears only the errors that `setByFileEnrichment` names.
+A speculative enrichment build clears no action error.
+[The coding standard](../../CODING_STANDARDS.md#other-background-completions-keep-an-unrelated-action-error) covers other background completions.
+
+Enforcement: the exhaustive switch over `DisclosureBuild.Kind` in `acceptViewBuild` in `src/tui/presentation.zig` causes a compile error for a missing kind. Each new kind must decide which errors it clears. The `Review recovery` tests in the same file check unrelated action errors during enrichment builds, cache updates, and the focus check. `zig build test` runs them.
+
 ## Reading location across Refresh and Reconciliation
 
 Refresh and Reconciliation of the same Review restore the reading location through semantic identity.
