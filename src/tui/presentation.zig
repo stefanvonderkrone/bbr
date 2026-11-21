@@ -8880,13 +8880,10 @@ pub const Presentation = struct {
             else
                 null;
             if (next != null) {
-                self.queueFileEnrichment(published, next.?, false) catch |err| switch (err) {
-                    error.OutOfMemory => {
-                        self.action_error = .out_of_memory;
-                        published.review_search.opening_source = false;
-                        break;
-                    },
-                };
+                if (!self.queueMaintenanceFileEnrichment(published, next.?)) {
+                    published.review_search.opening_source = false;
+                    break;
+                }
                 if (published.session.enrichment.needsEnrichment(next.?)) break;
                 active += 1;
                 continue;
@@ -8901,12 +8898,7 @@ pub const Presentation = struct {
                 if (next == null or std.mem.order(u8, file.displayPath(), published.session.diff.files[next.?].displayPath()) == .lt) next = index;
             }
             if (next == null) break;
-            self.queueFileEnrichment(published, next.?, false) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    self.action_error = .out_of_memory;
-                    break;
-                },
-            };
+            if (!self.queueMaintenanceFileEnrichment(published, next.?)) break;
             // A refused path does not consume a slot; stop instead of looping.
             if (published.session.enrichment.needsEnrichment(next.?)) break;
             active += 1;
@@ -8973,13 +8965,16 @@ pub const Presentation = struct {
         self.stageCacheBuild(published, focused);
     }
 
-    /// The next focus check stages again, so a failure keeps the shown
-    /// message.
     fn stageCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) void {
-        self.queueCacheBuild(published, focused) catch |err| {
-            self.reportFailure(.buffer_build, .prepare, err, @src());
-            if (self.action_error == null) self.action_error = .out_of_memory;
-        };
+        self.queueCacheBuild(published, focused) catch |err| self.failMaintenance(.buffer_build, err, @src());
+    }
+
+    /// Work that no input asked for, such as a cache staging or a File
+    /// Enrichment of the focus check, runs again at a later check. So its
+    /// failure has one record and keeps the shown message.
+    fn failMaintenance(self: *Presentation, operation: bbr.diagnostic.Operation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
+        self.reportFailure(operation, .prepare, err, source);
+        if (self.action_error == null) self.action_error = .out_of_memory;
     }
 
     fn acceptReviewSourceScanned(self: *Presentation, completed_value: ReviewSourceScanned) void {
@@ -12763,15 +12758,13 @@ pub const Presentation = struct {
     }
 
     /// Queues a File Enrichment that no input asked for. The File stays
-    /// pending after a failure, so a later check queues it again, and the
-    /// failure keeps the shown message. A success clears only the
-    /// out-of-memory message of an earlier failed queue. Returns false
-    /// after a failure.
+    /// pending after a failure, so a later check queues it again. A
+    /// success clears only the out-of-memory message of an earlier failed
+    /// queue. Returns false after a failure.
     fn queueMaintenanceFileEnrichment(self: *Presentation, published: *Published, file_index: usize) bool {
         const shown = self.action_error;
         self.queueFileEnrichment(published, file_index, false) catch |err| {
-            self.reportFailure(.file_enrichment, .prepare, err, @src());
-            if (self.action_error == null) self.action_error = .out_of_memory;
+            self.failMaintenance(.file_enrichment, err, @src());
             return false;
         };
         if (!published.session.enrichment.needsEnrichment(file_index) and shown != .out_of_memory) self.action_error = shown;
