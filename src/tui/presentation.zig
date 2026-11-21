@@ -30482,6 +30482,36 @@ test "M21 kernel focus check keeps the session when the File Enrichment of the a
     }
 }
 
+test "M21 kernel focus check File Enrichment of the active File keeps the shown message" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        });
+        defer presentation.deinit();
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        if (message_shown) {
+            try presentation.dispatch(.{ .action = .recover_submission });
+        } else {
+            failing.fail_index = failing.alloc_index;
+            try presentation.dispatch(.ensure_focused_enrichment);
+            failing.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+            try testing.expect(presentation.takeCommand().? == .report_diagnostic);
+        }
+        try presentation.dispatch(.ensure_focused_enrichment);
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqual(@as(usize, 0), command.enrich_file.file_index);
+        const shown: ?ActionError = if (message_shown) .action_refused else null;
+        try testing.expectEqual(shown, presentation.projection().action_error);
+    }
+}
+
 test "M21 kernel cache focus supersedes queued and issued focus changes" {
     for ([_]bool{ false, true }) |issued| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);

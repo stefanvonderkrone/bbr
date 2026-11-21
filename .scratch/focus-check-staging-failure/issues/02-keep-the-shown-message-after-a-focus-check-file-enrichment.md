@@ -1,6 +1,7 @@
 # Keep the shown message after a File Enrichment queue in the focus check
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/focus-check-staging-failure
 Blocked by: none
 
 Source: [ticket 01](01-keep-the-session-after-a-failed-focus-check-staging.md), its Completion names this judgement call.
