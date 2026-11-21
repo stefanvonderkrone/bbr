@@ -19001,6 +19001,34 @@ test "M21 kernel Escape hides accepted Buffer Search status until traversal" {
     try testing.expect(presentation.projection().buffer_search != null);
 }
 
+test "Review recovery a failed view build survives a successful Buffer Search scan" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    const queued_scan = presentation.commands.orderedRemove(0);
+    const published = presentation.published.?;
+    try presentation.queueViewBuild(published, presentation.preferences, published.isolated_file, published.geometry, .restore);
+    try presentation.commands.append(presentation.allocator, queued_scan);
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    worker.failed = true;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?);
+
+    var scan = presentation.takeCommand().?;
+    defer scan.deinit();
+    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+    const view = presentation.projection();
+    try testing.expectEqual(@as(usize, 1), view.buffer_search.?.total);
+    try testing.expect(!view.buffer_search.?.pending);
+    try testing.expectEqual(@as(?ActionError, .buffer_build_failed), view.action_error);
+}
+
 test "M21 kernel Buffer Search query editing queues scan work" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
