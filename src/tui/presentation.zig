@@ -8973,8 +8973,8 @@ pub const Presentation = struct {
         self.stageCacheBuild(published, focused);
     }
 
-    /// The focus check after each event stages again, so a failure keeps the
-    /// shown message.
+    /// The next focus check stages again, so a failure keeps the shown
+    /// message.
     fn stageCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) void {
         self.queueCacheBuild(published, focused) catch |err| {
             self.reportFailure(.buffer_build, .prepare, err, @src());
@@ -30452,7 +30452,7 @@ test "M21 kernel cache focus staging failure keeps the session and stages again"
     }
 }
 
-test "M21 kernel focus check keeps the session when the read of the active File cannot queue" {
+test "M21 kernel focus check keeps the session when the File Enrichment of the active File cannot queue" {
     for ([_]bool{ false, true }) |message_shown| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
