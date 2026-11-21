@@ -4341,11 +4341,13 @@ const ReviewSearchState = struct {
     }
 };
 
-fn releaseEnrichments(published: *Published, enrichments: []const EnrichedFile) void {
+fn releaseEnrichments(published: *Published, enrichments: []const EnrichedFile) bool {
+    const restoring_location = published.pending_review_location != null;
     for (enrichments) |enriched| {
         published.cancelReviewLocationForFile(enriched.index);
         published.session.enrichment.resetLoading(enriched.index);
     }
+    return restoring_location and published.pending_review_location == null;
 }
 
 /// The Storage takes a result once, and a build takes one result for each File.
@@ -10074,7 +10076,7 @@ pub const Presentation = struct {
             if (job.kind == .draft_mutation) published.pending_draft_mutation = null;
             if (job.kind == .card_destination) return self.failCardDestination(published, .buffer_build_failed);
             if (job.kind != .enrichment or !EnrichedFile.allSpeculative(job.enrichments.items)) self.action_error = .buffer_build_failed;
-            releaseEnrichments(published, job.enrichments.items);
+            _ = releaseEnrichments(published, job.enrichments.items);
             return;
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -10552,9 +10554,12 @@ pub const Presentation = struct {
     }
 
     fn dropEnrichments(self: *Presentation, published: *Published, enrichments: []EnrichedFile, err: anyerror, comptime source: std.builtin.SourceLocation) void {
-        self.reportFailure(.completion, .admission, err, source);
-        if (!EnrichedFile.allSpeculative(enrichments)) self.action_error = .out_of_memory;
-        releaseEnrichments(published, enrichments);
+        if (releaseEnrichments(published, enrichments)) {
+            self.failDroppedInput(err, source);
+        } else {
+            self.reportFailure(.completion, .admission, err, source);
+            if (!EnrichedFile.allSpeculative(enrichments) and self.action_error == null) self.action_error = .out_of_memory;
+        }
         for (enrichments) |*enriched| enriched.result.deinit();
     }
 

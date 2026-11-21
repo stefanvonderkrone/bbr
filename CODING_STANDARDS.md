@@ -157,6 +157,10 @@ These sites are maintenance work:
 - The retry of a stale cache update in `retryContentBuild`, and the commit of a cache update in `acceptBufferDisclosure`.
 - The File Enrichment of the active File in the focus check, and the File Enrichments of the Review Search acquisition, `pumpReviewSearchAcquisition`. Both go through `queueMaintenanceFileEnrichment`.
 - The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
+- Dropped non-speculative enrichment results in `dropEnrichments`, unless the drop cancels the pending reading location of a Refresh or Reconciliation.
+
+`dropEnrichments` keeps its `.completion`, `.admission` record.
+A speculative-only drop records the failure without a message.
 
 `failMaintenance` writes the record and the message of a failure, so a new site calls it in its `catch`.
 The query retry is the exception. `replaceReviewSearchQuery` also serves user input, so it records the failure, and `retryReviewSearchQuery` restores the shown message after it.
@@ -175,7 +179,8 @@ A completion that finds its build stale queues the work of a user input again. W
 The failure of a user input is the outcome of that input. So the retry records the cause once and shows `out_of_memory` over another message.
 `failDroppedInput` does both.
 These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and the `.draft_save` and `.draft_mutation` prongs of `retryContentBuild`.
-`dropEnrichments` records each failure too, but it shows `out_of_memory` only when a dropped result is not speculative. A speculative result is not a user input.
+An enrichment drop that cancels a pending reading location from Refresh or Reconciliation drops part of that input.
+No later check restores the canceled location, so `dropEnrichments` calls `failDroppedInput` for that case too.
 
 No check: the tests cover only the current retries. A new retry that shows `out_of_memory` without a record passes `tools/check_diagnostics.py`, because the check accepts a `catch` that names `error.OutOfMemory` in a switch prong and drops it. Related checked rule: [A failure has one record](docs/rules/diagnostics.md#a-failure-has-one-record).
 
