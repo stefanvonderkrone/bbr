@@ -150,8 +150,7 @@ A failed enrichment build uses `buffer_build_failed`.
 A File Enrichment or a query retry that succeeds clears only the `out_of_memory` message of an earlier failed attempt.
 A cache staging or a cache update commit writes no message.
 A user action that hands its work to maintenance work clears an older message before it does so.
-`openReviewSearchOccurrence` clears it only on the user-input path before the acquisition pump for an evicted File.
-A completion that opens the occurrence keeps the shown message.
+`openReviewSearchOccurrence` clears it before the acquisition pump for an evicted File only for a user input, and a completion that opens the occurrence keeps the shown message. [Each OwnedInput kind has an event class](docs/rules/tui-state.md#each-ownedinput-kind-has-an-event-class) says how `dispatch` decides it.
 
 These sites are maintenance work:
 

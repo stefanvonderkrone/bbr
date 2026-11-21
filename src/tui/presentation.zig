@@ -1015,6 +1015,11 @@ pub const SessionLoaded = struct {
     outcome: SessionLoadOutcome,
 };
 
+/// Whether a person asked for the event. The failure of a user input is the
+/// outcome of that input, so it can replace the shown message. A completion
+/// is every other event, such as a worker result, a tick, or the focus check.
+const EventClass = enum { user_input, completion };
+
 pub const OwnedInput = union(enum) {
     diagnostics_changed: struct { command_id: ?CommandId = null, state: bbr.diagnostic.State },
     choose_pull_request: OwnedReviewIdentity,
@@ -6663,6 +6668,9 @@ pub const Presentation = struct {
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
     action_error: ?ActionError = null,
+    /// The class of the event that `dispatch` handles. Outside `dispatch`
+    /// no person asked for the work, so it is `.completion`.
+    event_class: EventClass = .completion,
     diagnostic_state: bbr.diagnostic.State = .off,
     diagnostic_pending: bool = false,
     fatal_error: ?FatalError = null,
@@ -6748,6 +6756,49 @@ pub const Presentation = struct {
     /// The sole mutation entry point. Candidate construction consumes a loaded
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
+        self.event_class = switch (input) {
+            .choose_pull_request,
+            .key,
+            .mouse,
+            .push_count_digit,
+            .resize_viewport,
+            .resize,
+            .action,
+            .composer,
+            .unknown_resolution,
+            .reanchor,
+            .delete_confirmation,
+            .dismiss_submission_result,
+            .request_shutdown,
+            => .user_input,
+            .diagnostics_changed,
+            .session_loaded,
+            .session_prepared,
+            .ensure_focused_enrichment,
+            .file_enrichment_completed,
+            .code_highlight_completed,
+            .post_draft_completed,
+            .post_draft_launch_failed,
+            .comment_edit_completed,
+            .comment_edit_launch_failed,
+            .comment_delete_completed,
+            .comment_delete_launch_failed,
+            .reviewer_verdict_changed,
+            .submission_wait_completed,
+            .submission_wait_launch_failed,
+            .recovery_checked,
+            .duplicate_checked,
+            .pull_requests_loaded,
+            .picker_tick,
+            .clipboard_completed,
+            .theme_persisted,
+            .external_edit_completed,
+            .buffer_search_scanned,
+            .buffer_disclosure_built,
+            .review_source_scanned,
+            => .completion,
+        };
+        defer self.event_class = .completion;
         defer self.holdReviewSearchPreview();
         defer if (self.published) |published| {
             if (published.diagnostic_failure) |failure| self.reportEvidence(failure);
@@ -7188,7 +7239,7 @@ pub const Presentation = struct {
                             time_ns.? - click.time_ns.? <= 500 * 1_000_000) else false;
                 if (double_click) {
                     self.last_review_click = null;
-                    self.openReviewSearchOccurrence(.input);
+                    self.openReviewSearchOccurrence();
                 } else {
                     self.selectReviewSearch(index);
                     self.last_review_click = .{ .index = index, .time_ns = time_ns };
@@ -8317,7 +8368,7 @@ pub const Presentation = struct {
             switch (action) {
                 .next_review_search_occurrence => self.moveReviewSearch(1),
                 .previous_review_search_occurrence => self.moveReviewSearch(-1),
-                .open_search_occurrence => self.openReviewSearchOccurrence(.input),
+                .open_search_occurrence => self.openReviewSearchOccurrence(),
                 .half_page_down => self.scrollReviewSearch(1),
                 .half_page_up => self.scrollReviewSearch(-1),
                 else => {},
@@ -8491,7 +8542,7 @@ pub const Presentation = struct {
             .open_review_search => self.openReviewSearch(),
             .next_review_search_occurrence => self.moveReviewSearch(1),
             .previous_review_search_occurrence => self.moveReviewSearch(-1),
-            .open_search_occurrence => self.openReviewSearchOccurrence(.input),
+            .open_search_occurrence => self.openReviewSearchOccurrence(),
             .next_search_occurrence => self.traverseBufferSearch(.forward),
             .previous_search_occurrence => self.traverseBufferSearch(.backward),
             .clear_selection => {
@@ -9302,7 +9353,7 @@ pub const Presentation = struct {
         }
     }
 
-    fn openReviewSearchOccurrence(self: *Presentation, trigger: enum { input, completion }) void {
+    fn openReviewSearchOccurrence(self: *Presentation) void {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (!state.open or state.pending or state.destination_pending) return;
@@ -9328,7 +9379,7 @@ pub const Presentation = struct {
                 if (side == .pending) {
                     state.opening_source = true;
                     if (state.acquired) |acquired| acquired[source.file_index] = false;
-                    if (trigger == .input) self.action_error = null;
+                    if (self.event_class == .user_input) self.action_error = null;
                     self.pumpReviewSearchAcquisition(published);
                 } else if (published.session.enrichment.status(source.file_index).old != .loading and published.session.enrichment.status(source.file_index).new != .loading) {
                     state.opening_source = false;
@@ -10351,7 +10402,7 @@ pub const Presentation = struct {
             {
                 self.version_restoration = null;
             };
-            if (reviewSearchOpeningFile(&published.review_search)) |index| if (job.enrichedFile(index) != null) self.openReviewSearchOccurrence(.completion);
+            if (reviewSearchOpeningFile(&published.review_search)) |index| if (job.enrichedFile(index) != null) self.openReviewSearchOccurrence();
             if (published.pending_review_location) |target| if (reviewLocationFile(published.session.diff.files, target)) |index| if (job.enrichedFile(index) != null) {
                 _ = restoreReviewLocation(self, published, target);
                 published.pending_review_location = null;
@@ -10363,7 +10414,7 @@ pub const Presentation = struct {
         switch (job.kind) {
             .review_destination => {
                 published.review_search.destination_pending = false;
-                self.openReviewSearchOccurrence(.completion);
+                self.openReviewSearchOccurrence();
             },
             .enrichment => self.retryEnrichmentBuild(published, job),
             .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch |err| {
