@@ -146,11 +146,12 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 [Maintenance work](src/tui/GLOSSARY.md) is work that no input asked for and that a later check does again. A failed queue or staging of maintenance work has exactly one record, and it never overwrites or clears another message.
 A failure records its cause once and shows `out_of_memory` only when no message shows.
 A File Enrichment or a query retry that succeeds clears only the `out_of_memory` message of an earlier failed attempt.
-A cache staging writes no message when it succeeds.
+A cache staging or a cache update commit writes no message.
 
 These sites are maintenance work:
 
 - A cache staging after a lease release or in the focus check. Both go through `stageCacheBuild`.
+- The retry of a stale cache update in `retryContentBuild`, and the commit of a cache update in `acceptBufferDisclosure`.
 - The File Enrichment of the active File in the focus check, and the File Enrichments of the Review Search acquisition, `pumpReviewSearchAcquisition`. Both go through `queueMaintenanceFileEnrichment`.
 - The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
 
@@ -164,6 +165,15 @@ So a failure loses no work and keeps the session.
 The message of the event outcome stays, such as `buffer_search_scan_failed` or `file_enrichment_launch_failed`.
 
 No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+
+### A dropped user input shows its failure
+
+A completion that finds its build stale queues the work of a user input again. When the retry cannot queue, the work is dropped, and no later check does it again. So it is not maintenance work.
+The failure of a user input is the outcome of that input. So the retry records the cause once and shows `out_of_memory` over another message. `failDroppedInput` does both, and these retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, and `republishPostedParent`.
+`dropEnrichments` records each failure too, but it shows `out_of_memory` only when a dropped result is not speculative. A speculative result is not a user input.
+A user action that hands its work to maintenance work clears an older message before it does so. `openReviewSearchOccurrence` clears it before it pumps the Review Search acquisition for a hit in an evicted File.
+
+No check: the tests cover only the current retries. A new retry that shows `out_of_memory` without a record passes `tools/check_diagnostics.py`, because the check accepts a `catch` that names `error.OutOfMemory` in a switch prong and drops it. Related checked rule: [A failure has one record](docs/rules/diagnostics.md#a-failure-has-one-record).
 
 ### Make Line row identities through LineOwner.of
 

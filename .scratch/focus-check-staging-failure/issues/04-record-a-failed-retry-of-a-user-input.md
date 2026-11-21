@@ -1,6 +1,6 @@
 # Record a failed retry of a user input once
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 Source: [ticket 03](03-record-a-failed-review-search-acquisition-queue.md), its comment lists these sites.
@@ -23,9 +23,26 @@ Give each failure one record through one helper beside `failMaintenance`. The fa
 
 ## Acceptance criteria
 
-- [ ] A test through the Presentation interface fails each retry site and expects exactly one `report_diagnostic` record and the `out_of_memory` message. Each test fails before the fix.
-- [ ] Each failure at the five sites has exactly one record.
-- [ ] The rule is stated once in `CODING_STANDARDS.md` or `docs/rules/`.
-- [ ] `zig build test` exits 0, `zig fmt --check src build.zig tests` passes, and `python3 tools/check_agent_docs.py` passes.
+- [x] A test through the Presentation interface fails each retry site and expects exactly one `report_diagnostic` record and the `out_of_memory` message. Each test fails before the fix.
+- [x] Each failure at the five sites has exactly one record.
+- [x] The rule is stated once in `CODING_STANDARDS.md` or `docs/rules/`.
+- [x] `zig build test` exits 0, `zig fmt --check src build.zig tests` passes, and `python3 tools/check_agent_docs.py` passes.
 
 ## Comments
+
+### 2026-11-21 sites with no injected failure
+
+`search.Query.init` in `retryStaleBufferDisclosure` and `DisclosureInputs.create` in `republishPostedParent` allocate from `std.heap.page_allocator`, so no test fails them. Their `OutOfMemory` prongs call `failDroppedInput` too.
+
+The `.draft_save` and `.draft_mutation` retries in `retryContentBuild` show `out_of_memory` without a record in the same way. This ticket does not change them.
+
+## Completion
+
+2026-11-21, branch `focus-check-staging-failure`.
+
+- `failDroppedInput` records the cause once as `.completion`, `.admission` and shows `out_of_memory`. `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, and `republishPostedParent` call it.
+- `dropEnrichments` records each failure itself, and the caller in `queueEnrichments` that recorded before it no longer does. A speculative result still keeps the shown message.
+- The message rule: the failure of a user input is the outcome of that input, so it replaces another message. `CODING_STANDARDS.md` states it once in "A dropped user input shows its failure".
+- Red proof: seven tests failed with `TestExpectedRecord`. They are the "M21 kernel failed ... records the dropped input once" tests for the view retry, the accepted disclosure retry, the Buffer Search opening retry, the stale Buffer Search retry, and the posted parent rebuild, and the "M21 kernel failed enrichment snapshot/merge records its dropped results once" tests. "M21 kernel failed enrichment queue records its dropped results once" passed before the fix, because that caller already recorded. All pass now.
+- Commits: `79909151` (red tests) and `468d0ef4` (fix).
+- Checks: `zig build test` exit 0, `zig fmt --check src build.zig tests` exit 0, `python3 tools/check_diagnostics.py` exit 0, `python3 tools/check_agent_docs.py` exit 0.

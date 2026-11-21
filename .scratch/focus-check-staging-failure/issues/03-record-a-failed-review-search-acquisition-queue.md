@@ -42,6 +42,14 @@ These sites stay open. Each needs a decision or a repro that costs more than a f
 - `openReviewSearch` pumps the acquisition and then sets `action_error` to null. A failed pump at the open now writes its record, but the open clears its `out_of_memory` message. This clear is older than this change.
 - `openReviewSearchOccurrence` asks the acquisition to queue the File of a pending source. Before this change, that queue cleared an earlier message. Now the earlier message stays until the next input clears it. No test reads this case.
 
+### 2026-11-21 follow-up of the open sites
+
+- `openReviewSearchOccurrence`. The operator decided that opening a hit is a user action, so it clears an older message. The action now clears the message before it pumps the acquisition for a hit in an evicted File. Red test: "M21 kernel opening a Review Search hit in an evicted File clears an older message" failed with `expected null, found .buffer_search_invalid_query`. Commits `0048eb56` and `fc7a0c37`.
+- `retryContentBuild`, `.cache_update`. A test reaches it: a File hold changes the cache revision after the worker built the update, so the completion retries it. The retry now fails through `failMaintenance`. Red test: "M21 kernel stale cache update retry failure records once and keeps the shown message" failed with `TestExpectedRecord`. Commits `ec6c30cc` and `49a9df59`.
+- The cache update commit in `acceptBufferDisclosure` no longer clears the shown message. Red test: "M21 kernel cache update commit keeps the shown message" failed with `expected .action_refused, found null`. Same commits.
+- The five retries of a user input record each failure once. [Ticket 04](04-record-a-failed-retry-of-a-user-input.md) has the evidence.
+- These sites stay open: `queueFileEnrichment` shows `action_refused` for maintenance work, and `openReviewSearch` clears the `out_of_memory` message of a failed pump at the open. The `.draft_save` and `.draft_mutation` retries in `retryContentBuild` show `out_of_memory` without a record, as the retries of ticket 04 did.
+
 ## Completion
 
 2026-11-21, branch `focus-check-staging-failure`.
