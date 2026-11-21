@@ -79,10 +79,11 @@ Totals: 8 real findings, 1 false positive, and 5 debatable or unverified finding
 
 The project rules find stale docs well. Neither rule set finds the state-machine defects of Presentation, which were 6 of 8 cases. Those defects come from a policy under a lasting failure, or from a snapshot that admission compares. A rule for each class would fit only this set of cases, so this ticket adds none.
 
-Three findings are still on `main`, and the verified ones need tickets:
+Two findings are still on `main`:
 
-- The stale test comment at `src/tui/presentation.zig:30870` is verified.
-- The `.cache_update` error reset at `src/tui/presentation.zig:10316` is unverified.
-- The `report` then `fail` path in `src/highlight/user_grammar.zig` is unverified.
+- The stale test comment at `src/tui/presentation.zig:30870` is verified. [Ticket 01](../../open-code-review-findings/issues/01-correct-the-cache-budget-test-comment.md) tracks it.
+- The `.cache_update` error reset at `src/tui/presentation.zig:10316` is unverified. [Ticket 02](../../open-code-review-findings/issues/02-keep-a-picker-error-through-a-cache-update.md) tracks it.
+
+The `user_grammar.zig` finding is false. `Diagnostic.report` drops a failed stderr write, and `diagnostic_handle.fail` still records the failure.
 
 ## Comments
