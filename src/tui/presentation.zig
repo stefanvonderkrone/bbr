@@ -30791,15 +30791,15 @@ test "M21 kernel failed posted parent rebuild records the dropped input once" {
     try expectDroppedInputRecord(&presentation);
 }
 
-test "M21 kernel failed enrichment queue records its dropped results once" {
+test "M21 kernel failed maintenance enrichment queue keeps the shown message and records once" {
     try expectFailedEnrichmentQueue(.queue);
 }
 
-test "M21 kernel failed enrichment snapshot records its dropped results once" {
+test "M21 kernel failed maintenance enrichment snapshot keeps the shown message and records once" {
     try expectFailedEnrichmentQueue(.snapshot);
 }
 
-test "M21 kernel failed enrichment merge records its dropped results once" {
+test "M21 kernel failed maintenance enrichment merge keeps the shown message and records once" {
     try expectFailedEnrichmentQueue(.merge);
 }
 
@@ -30851,11 +30851,16 @@ fn expectFailedEnrichmentQueue(failure: enum { queue, snapshot, merge }) !void {
         queued.destroy();
     }
     try testing.expect(presentation.published.?.session.enrichment.file(dropped.file_index).new == .pending);
-    try expectDroppedInputRecord(&presentation);
+    try testing.expectEqual(@as(?ActionError, .buffer_search_invalid_query), presentation.projection().action_error);
+    try expectCompletionAllocationRecord(&presentation);
 }
 
 fn expectDroppedInputRecord(presentation: *Presentation) !void {
     try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+    try expectCompletionAllocationRecord(presentation);
+}
+
+fn expectCompletionAllocationRecord(presentation: *Presentation) !void {
     const command = presentation.takeCommand() orelse return error.TestExpectedRecord;
     try testing.expect(command == .report_diagnostic);
     const failure = command.report_diagnostic;
@@ -30863,6 +30868,39 @@ fn expectDroppedInputRecord(presentation: *Presentation) !void {
     try testing.expectEqual(bbr.diagnostic.Phase.admission, failure.phase);
     try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
     try testing.expect(presentation.takeCommand() == null);
+}
+
+test "M21 kernel dropped enrichment that cancels a Refresh location shows its failure once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try presentation.dispatch(.{ .action = .next_file });
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    try refreshRecoverySession(&presentation, try testTwoFileSession(testing.allocator, 1));
+    try testing.expect(cursorOwner(&presentation) == .file);
+    const waiting = try takeTestEnrichment(&presentation);
+    try testing.expect(presentation.published.?.pending_review_location != null);
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+    failing.fail_index = failing.alloc_index;
+    try deliverTestEnrichment(&presentation, waiting);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.published.?.pending_review_location == null);
+    try testing.expect(presentation.published.?.session.enrichment.file(waiting.file_index).new == .pending);
+    try expectDroppedInputRecord(&presentation);
 }
 
 test "M21 kernel Review Search acquisition queue keeps the shown message" {
