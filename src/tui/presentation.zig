@@ -10321,9 +10321,9 @@ pub const Presentation = struct {
             };
             self.refreshStaleRepairTree();
         }
-        if (job.kind != .enrichment) {
+        if (job.kind != .enrichment and job.kind != .cache_update) {
             self.action_error = null;
-        } else if (!EnrichedFile.allSpeculative(job.enrichments.items)) {
+        } else if (job.kind == .enrichment and !EnrichedFile.allSpeculative(job.enrichments.items)) {
             // A File Enrichment runs beside other work, so it clears only an error of the enrichment path.
             if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
                 self.action_error = null;
@@ -10361,11 +10361,9 @@ pub const Presentation = struct {
                 self.openReviewSearchOccurrence();
             },
             .enrichment => self.retryEnrichmentBuild(published, job),
-            .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    published.pending_cache_update = null;
-                    self.action_error = .out_of_memory;
-                },
+            .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch |err| {
+                published.pending_cache_update = null;
+                self.failMaintenance(.buffer_build, err, @src());
             },
             .draft_save => {
                 self.queueDraftBuild(published, job.new_draft.?) catch |err| switch (err) {
@@ -30496,6 +30494,7 @@ test "M21 kernel stale cache update retry failure records once and keeps the sho
         try testing.expectEqual(bbr.diagnostic.Operation.buffer_build, failure.operation);
         try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
         try testing.expect(presentation.takeCommand() == null);
+        presentation.published.?.session.enrichment.finishLeaseDeferred(0);
         const epoch = presentation.published.?.epoch;
         try presentation.dispatch(.ensure_focused_enrichment);
         try testing.expect(presentation.queuedBuildIndex(.cache_update, epoch) != null);
