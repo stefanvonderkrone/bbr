@@ -51,7 +51,7 @@ SAFETY = """## Memory, illegal behavior, and errors
 - Report `.?` on a path where an earlier mode, such as local or demo mode, leaves the optional null.
 - `vaxis` cells borrow their text until `render`. Report text from a stack buffer or from memory freed before the render.
 - Follow `docs/rules/diagnostics.md`: one record per failure. Report `catch null`, `catch {}`, `_ = err;`, or an `else` prong over a whole error set when the code means to skip one expected error. `OutOfMemory`, `Canceled`, and the other errors must propagate.
-- A `catch` whose error set contains `error.Canceled` names `error.Canceled`. A cancelation is never a counted failure and starts no retry.
+- A `catch` whose error set contains `error.Canceled` names `error.Canceled`. A cancelation does not count toward a retry or give-up limit and starts no retry. A diagnostic record of the cause before `io.recancel()` is not such a count.
 - An `errdefer` that records a diagnostic must record the correct phase for every error that can pass it.
 - On each failure branch, restore the state that the success path changed before the call, such as a hidden Overlay, a pending destination, or a status message that the user must see."""
 
@@ -66,7 +66,8 @@ GUARDS = """## Do not report these
 - An exhaustive `switch` over a tagged union without an `else` prong. An `else` prong is a compile error there.
 - A parser bug, before you trace every index increment in the loop.
 - Behavior that an ADR records, such as silent speculative File Enrichment failures (ADR 0010).
-- Missing doc comments. bbr adds a comment only for a reason that the code cannot show."""
+- Missing doc comments. bbr adds a comment only for a reason that the code cannot show.
+- A missing test that an earlier commit adds. bbr often adds the failing test in the commit before the fix. Before you report a missing test, run `git log -5 --stat`. Drop the finding only when an earlier commit adds a test that reaches the changed code."""
 
 TUI = """## TUI state and paint
 
