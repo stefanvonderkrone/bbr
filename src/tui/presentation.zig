@@ -30919,6 +30919,66 @@ test "M21 kernel dropped Selected Version enrichment retries and restores the re
     try testing.expectEqualStrings("old b", (frame_mod.selectedSource(row, .old) orelse return error.VersionLocationLost).text);
 }
 
+test "M21 kernel failed Selected Version view build queue shows its failure once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .select_old_version });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.published.?.pending_view == null);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed Selected Version enrichment queue shows its failure once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var allocations: usize = 0;
+    for (0..2) |attempt| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 10 },
+        });
+        defer presentation.deinit();
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
+        try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
+        for (presentation.commands.items) |*queued| queued.deinit();
+        presentation.commands.clearRetainingCapacity();
+        try presentation.dispatch(.{ .action = .recover_submission });
+        const start = failing.alloc_index;
+        if (attempt == 1) failing.fail_index = start + allocations - 1;
+        try presentation.dispatch(.{ .action = .select_old_version });
+        failing.fail_index = std.math.maxInt(usize);
+        if (attempt == 0) {
+            allocations = failing.alloc_index - start;
+            try testing.expectEqual(@as(usize, 2), presentation.commands.items.len);
+            try testing.expect(presentation.commands.items[1] == .enrich_file);
+            for (presentation.commands.items) |*queued| queued.deinit();
+            presentation.commands.clearRetainingCapacity();
+            continue;
+        }
+        try testing.expect(failing.has_induced_failure);
+        try testing.expect(presentation.published.?.pending_view == null);
+        try expectDroppedInputRecord(&presentation);
+    }
+}
+
 test "M21 kernel dropped enrichment that cancels a Refresh location shows its failure once" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
