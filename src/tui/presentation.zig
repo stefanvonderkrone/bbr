@@ -35382,11 +35382,41 @@ test "M21 kernel Review Search retries a reopened query scan that cannot queue a
         try testing.expectEqual(@as(usize, 1), records);
     }
     try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
     try completeBufferSearchScan(&presentation);
     const view = presentation.projection();
     try testing.expectEqualStrings("newe", view.review_search.?.query);
     try testing.expect(!view.review_search.?.pending);
     try testing.expect(view.action_error == null);
+    try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
+}
+
+test "M21 kernel Review Search keeps another message of the same event when a reopened query retry succeeds" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0x2603, .text = "\x00" } });
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(@as(?ActionError, .buffer_search_invalid_query), presentation.projection().action_error);
+    try completeBufferSearchScan(&presentation);
+    const view = presentation.projection();
+    try testing.expectEqualStrings("newe", view.review_search.?.query);
+    try testing.expect(!view.review_search.?.pending);
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
 }
 
