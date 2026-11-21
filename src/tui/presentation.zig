@@ -30634,6 +30634,53 @@ test "M21 kernel failed view retry records the dropped input once" {
     try expectDroppedInputRecord(&presentation);
 }
 
+test "M21 kernel failed Draft save retry records the dropped input once" {
+    try expectFailedDraftRetry(false);
+}
+
+test "M21 kernel failed Draft mutation retry records the dropped input once" {
+    try expectFailedDraftRetry(true);
+}
+
+fn expectFailedDraftRetry(mutation: bool) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    if (mutation) try seedDeletableSubtree(store.store(), key);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+    if (mutation) {
+        try startTestDraftMutation(&presentation, .body);
+    } else {
+        try presentation.dispatch(.{ .action = .review_comment });
+        try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("keep this Draft") } });
+        try presentation.dispatch(.{ .composer = .save });
+    }
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(if (mutation) DisclosureBuild.Kind.draft_mutation else .draft_save, worker.kind);
+    worker.build();
+    presentation.published.?.tree.scroll += 1;
+    const before = presentation.projection().review.?.frame;
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.published.?.pending_draft_save == null);
+    try testing.expect(presentation.published.?.pending_draft_mutation == null);
+    try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try testing.expect(presentation.projection().composer != null);
+    try expectDroppedInputRecord(&presentation);
+}
+
 test "M21 kernel failed accepted disclosure retry records the dropped input once" {
     try expectFailedAcceptedDisclosureRetry(false);
 }
