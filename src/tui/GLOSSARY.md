@@ -205,6 +205,10 @@ _Avoid_: command, handler, event.
 The active input surface and semantic target from the current Presentation Frame: an Overlay when one captures input, otherwise the focused Pane and its cursor target. It determines Action resolution and ActionAvailability without becoming Review state.
 _Avoid_: mode (too broad), focus alone (omits the target), input state.
 
+**Event Origin**:
+Who sent an event that Presentation dispatch handles: the person (`user`) or the App (`app`). A key, a mouse event, an Action, and the other inputs of a person come from the person. Ticks, worker results, the focus check, and `resize` come from the App. Only the failure of an event from the person can replace the shown message.
+_Avoid_: event class, user input versus completion, trigger.
+
 **ActionAvailability**:
 Whether an Action is valid for the currently published Review. Unavailable Actions remain visible but greyed in the help Overlay; invoking one produces an explanatory status message, while Presentation alone decides availability. A mutation Action carries the precise refusal reason for the item under the cursor — an active or recovered SubmissionRun owns it, its publication outcome is unresolved, it is in flight, it is already represented by Bitbucket, or there is no ReviewCard there at all. A cascading Action answers for its whole consequence: one ineligible Reply below the item refuses the complete deletion rather than applying part of it.
 _Avoid_: mode check, hidden binding, silent no-op.

@@ -202,18 +202,18 @@ Admission takes the recorded hold, and it retries the build when the current dec
 
 Enforcement: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" in `src/tui/presentation.zig` fails when a failed allocation from the Presentation allocator stops the start of a source scan, also through a `catch` that returns. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search stops its source scans after it gives up on a File", "M21 authored failed source scan retries after reopening Review Search", "M21 kernel Review Search keeps the given-up Files of a query edit that rolls back", and "M21 kernel Review Search resumes the retry of a query edit that rolls back" in the same file check the retry, the stop, and the rollback. The test "M21 kernel Review Search starts no source scan before its first query publishes" fails when a source scan starts before the first query results publish, "M21 kernel Review Search starts no source scan while a query edit is pending" fails when a source scan starts while the results of the previous query show, "M21 kernel Review Search retries a reopened query scan that cannot queue at the next event" fails when the reopened Overlay drops the edited query, shows it over the results of the previous query without the pending mark, or does not queue its scan at the next event, "M21 kernel Review Search keeps another message of the same event when a reopened query retry succeeds" fails when the successful retry clears a message that it did not set, and "M21 kernel Review Search starts its source scans after first query results without a match" fails when results without a match start no source scan. The test "M21 kernel Review Search starts a source scan without superseding a cache build in flight" fails when the start of a source scan stages a cache build while a cache update is pending. The test "M21 kernel Review Search admits an enrichment with the hold that its build counted" fails when admission takes a hold that the build did not count. `zig build test` runs them. An allocation from another allocator is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#a-source-scan-starts-without-an-allocation).
 
-## Each OwnedInput kind has an event class
+## Each OwnedInput kind has an event origin
 
-`Presentation.dispatch` gives each event one `EventClass` before it handles the event.
-A key, a mouse event, an Action, and the other inputs of a person are `.user_input`.
-A worker result, a tick, and the focus check `ensure_focused_enrichment` are `.completion`.
-A `resize` is also `.completion`, because the App sends it after each event to sync the geometry.
-The class lives in `Presentation.event_class` until `dispatch` returns, and it is `.completion` outside `dispatch`.
-Code that must know whether a person asked for the event reads `event_class`. It takes no parameter for this choice, so no caller chooses the class.
+`Presentation.dispatch` gives each event one `EventOrigin` before it handles the event.
+A key, a mouse event, an Action, and the other inputs of a person are `.user`.
+A worker result, a tick, and the focus check `ensure_focused_enrichment` are `.app`.
+A `resize` is also `.app`, because the App sends it after each event to sync the geometry.
+The origin lives in `Presentation.event_origin` until `dispatch` returns, and it is `.app` outside `dispatch`.
+Code that must know whether a person sent the event reads `event_origin`. It takes no parameter for this choice, so no caller chooses the origin.
 A field set once for each event is the smallest form, because a parameter would go through every function between `dispatch` and the reader.
-`openReviewSearchOccurrence` clears the shown message before the acquisition pump for an evicted File only when the class is `.user_input`.
+`openReviewSearchOccurrence` clears the shown message before the acquisition pump for an evicted File only when the origin is `.user`.
 
-Enforcement: the exhaustive switch over `OwnedInput` at the start of `Presentation.dispatch` (compile error for a new `OwnedInput` kind without a class). The test "M21 kernel opening a Review Search hit in an evicted File clears an older message" in `src/tui/presentation.zig` fails when a user input keeps the older message. `zig build test` runs it. A wrong class for an existing kind is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message).
+Enforcement: the exhaustive switch over `OwnedInput` at the start of `Presentation.dispatch` (compile error for a new `OwnedInput` kind without an origin). The test "M21 kernel opening a Review Search hit in an evicted File clears an older message" in `src/tui/presentation.zig` fails when a user input keeps the older message. `zig build test` runs it. A wrong origin for an existing kind is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message).
 
 ## Search occurrence index mapping
 

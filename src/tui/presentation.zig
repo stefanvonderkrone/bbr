@@ -1015,11 +1015,11 @@ pub const SessionLoaded = struct {
     outcome: SessionLoadOutcome,
 };
 
-/// Whether a person asked for the event. The failure of a user input is the
-/// outcome of that input, so it can replace the shown message. A completion
-/// is every other event, such as a worker result, a tick, the focus check, or
-/// the geometry sync that the App sends after each event.
-const EventClass = enum { user_input, completion };
+/// Who sent the event: the person or the App. The failure of an event from the
+/// person is the outcome of that input, so it can replace the shown message.
+/// The App sends every other event, such as a worker result, a tick, the focus
+/// check, or the geometry sync after each event.
+const EventOrigin = enum { user, app };
 
 pub const OwnedInput = union(enum) {
     diagnostics_changed: struct { command_id: ?CommandId = null, state: bbr.diagnostic.State },
@@ -6671,7 +6671,7 @@ pub const Presentation = struct {
     action_error: ?ActionError = null,
     /// The class of the event that `dispatch` handles. Outside `dispatch`
     /// no person asked for the work, so it is `.completion`.
-    event_class: EventClass = .completion,
+    event_origin: EventOrigin = .app,
     diagnostic_state: bbr.diagnostic.State = .off,
     diagnostic_pending: bool = false,
     fatal_error: ?FatalError = null,
@@ -6757,7 +6757,7 @@ pub const Presentation = struct {
     /// The sole mutation entry point. Candidate construction consumes a loaded
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
-        self.event_class = switch (input) {
+        self.event_origin = switch (input) {
             .choose_pull_request,
             .key,
             .mouse,
@@ -6769,7 +6769,7 @@ pub const Presentation = struct {
             .delete_confirmation,
             .dismiss_submission_result,
             .request_shutdown,
-            => .user_input,
+            => .user,
             .resize_viewport,
             .resize,
             .diagnostics_changed,
@@ -6797,9 +6797,9 @@ pub const Presentation = struct {
             .buffer_search_scanned,
             .buffer_disclosure_built,
             .review_source_scanned,
-            => .completion,
+            => .app,
         };
-        defer self.event_class = .completion;
+        defer self.event_origin = .app;
         defer self.holdReviewSearchPreview();
         defer if (self.published) |published| {
             if (published.diagnostic_failure) |failure| self.reportEvidence(failure);
@@ -9380,7 +9380,7 @@ pub const Presentation = struct {
                 if (side == .pending) {
                     state.opening_source = true;
                     if (state.acquired) |acquired| acquired[source.file_index] = false;
-                    if (self.event_class == .user_input) self.action_error = null;
+                    if (self.event_origin == .user) self.action_error = null;
                     self.pumpReviewSearchAcquisition(published);
                 } else if (published.session.enrichment.status(source.file_index).old != .loading and published.session.enrichment.status(source.file_index).new != .loading) {
                     state.opening_source = false;
