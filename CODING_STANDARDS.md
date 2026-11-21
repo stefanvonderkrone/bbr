@@ -158,9 +158,12 @@ These sites are maintenance work:
 - The File Enrichment of the active File in the focus check, and the File Enrichments of the Review Search acquisition, `pumpReviewSearchAcquisition`. Both go through `queueMaintenanceFileEnrichment`.
 - The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
 - Dropped non-speculative enrichment results in `dropEnrichments`, unless the drop cancels the pending reading location of a Refresh or Reconciliation.
+- A failed enrichment build in `acceptBufferDisclosure`, with the same pending reading location exception.
 
 `dropEnrichments` keeps its `.completion`, `.admission` record.
 A speculative-only drop records the failure without a message.
+A worker records a failed enrichment build before its completion.
+That completion adds no record and shows `buffer_build_failed` only when no message shows or it cancels a pending reading location.
 
 `failMaintenance` writes the record and the message of a failure, so a new site calls it in its `catch`.
 The query retry is the exception. `replaceReviewSearchQuery` also serves user input, so it records the failure, and `retryReviewSearchQuery` restores the shown message after it.

@@ -10075,8 +10075,10 @@ pub const Presentation = struct {
             if (job.kind == .draft_save) published.pending_draft_save = null;
             if (job.kind == .draft_mutation) published.pending_draft_mutation = null;
             if (job.kind == .card_destination) return self.failCardDestination(published, .buffer_build_failed);
-            if (job.kind != .enrichment or !EnrichedFile.allSpeculative(job.enrichments.items)) self.action_error = .buffer_build_failed;
-            _ = releaseEnrichments(published, job.enrichments.items);
+            const dropped_location = releaseEnrichments(published, job.enrichments.items);
+            if (job.kind != .enrichment or dropped_location or
+                (!EnrichedFile.allSpeculative(job.enrichments.items) and self.action_error == null))
+                self.action_error = .buffer_build_failed;
             return;
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
