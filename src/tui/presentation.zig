@@ -8979,6 +8979,12 @@ pub const Presentation = struct {
         if (self.action_error == null) self.action_error = .out_of_memory;
     }
 
+    /// No later check retries this input, so its failure replaces the shown message.
+    fn failDroppedInput(self: *Presentation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
+        self.reportFailure(.completion, .admission, err, source);
+        self.action_error = .out_of_memory;
+    }
+
     fn acceptReviewSourceScanned(self: *Presentation, completed_value: ReviewSourceScanned) void {
         var completed = completed_value;
         defer completed.deinit();
@@ -10458,7 +10464,7 @@ pub const Presentation = struct {
         self.queueViewBuild(published, job.preferences, job.isolated_file, job.geometry, job.navigation_policy) catch |err| switch (err) {
             error.OutOfMemory => {
                 published.pending_view = null;
-                self.action_error = .out_of_memory;
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
@@ -10485,17 +10491,16 @@ pub const Presentation = struct {
                 .back => queued.enrichments.items.len,
             };
             queued.enrichments.insertSlice(queued.arena.allocator(), index, enrichments) catch |err| switch (err) {
-                error.OutOfMemory => return self.dropEnrichments(published, enrichments),
+                error.OutOfMemory => return self.dropEnrichments(published, enrichments, err, @src()),
             };
             for (queued.enrichments.items[index..][0..enrichments.len]) |*enriched| enriched.hold = reviewSearchHolds(published, enriched.index);
             return;
         }
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
-            self.reportFailure(.completion, .admission, err, @src());
-            return self.dropEnrichments(published, enrichments);
+            return self.dropEnrichments(published, enrichments, err, @src());
         };
         const job = self.createEnrichmentBuild(published, enrichments) catch |err| switch (err) {
-            error.OutOfMemory => return self.dropEnrichments(published, enrichments),
+            error.OutOfMemory => return self.dropEnrichments(published, enrichments, err, @src()),
         };
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
@@ -10548,7 +10553,8 @@ pub const Presentation = struct {
         self.commands.items[index] = .{ .build_buffer_disclosure = job };
     }
 
-    fn dropEnrichments(self: *Presentation, published: *Published, enrichments: []EnrichedFile) void {
+    fn dropEnrichments(self: *Presentation, published: *Published, enrichments: []EnrichedFile, err: anyerror, comptime source: std.builtin.SourceLocation) void {
+        self.reportFailure(.completion, .admission, err, source);
         if (!EnrichedFile.allSpeculative(enrichments)) self.action_error = .out_of_memory;
         releaseEnrichments(published, enrichments);
         for (enrichments) |*enriched| enriched.result.deinit();
@@ -10574,7 +10580,7 @@ pub const Presentation = struct {
         const inputs = DisclosureInputs.create(published) catch |err| switch (err) {
             error.OutOfMemory => {
                 published.disclosure_inputs_current = false;
-                self.action_error = .out_of_memory;
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
@@ -10588,7 +10594,7 @@ pub const Presentation = struct {
             self.queueViewBuild(published, self.preferences, published.isolated_file, self.geometry, .restore);
         result catch |err| switch (err) {
             error.OutOfMemory => {
-                self.action_error = .out_of_memory;
+                self.failDroppedInput(err, @src());
             },
         };
     }
@@ -10770,7 +10776,7 @@ pub const Presentation = struct {
             self.queueBufferSearchOpening(published, job.target.base) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.buffer_search.input.?.pending = false;
-                    self.action_error = .out_of_memory;
+                    self.failDroppedInput(err, @src());
                 },
             };
             return;
@@ -10788,7 +10794,7 @@ pub const Presentation = struct {
         const replacement = self.queueAcceptedDisclosure(published, job.target, destination, job.kind, job.result_error) catch |err| switch (err) {
             error.OutOfMemory => {
                 if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
-                self.action_error = .out_of_memory;
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
@@ -10810,7 +10816,7 @@ pub const Presentation = struct {
         const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch |err| switch (err) {
             error.OutOfMemory => {
                 input.pending = false;
-                self.action_error = .out_of_memory;
+                self.failDroppedInput(err, @src());
                 return;
             },
             error.TooLong => {
@@ -10839,7 +10845,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 command.deinit();
                 input.pending = false;
-                self.action_error = .out_of_memory;
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
