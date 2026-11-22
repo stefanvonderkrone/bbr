@@ -222,6 +222,10 @@ pub fn build(b: *std.Build) void {
     const benchmark_metrics = b.addSystemCommand(&.{"python3"});
     benchmark_metrics.addFileArg(b.path("tools/check_benchmark_metrics.py"));
     benchmark_metrics.addDirectoryArg(b.path("."));
+    const benchmark_builds = b.addSystemCommand(&.{"python3"});
+    benchmark_builds.addFileArg(b.path("tools/check_benchmark_builds.py"));
+    benchmark_builds.addDirectoryArg(b.path("."));
+    test_step.dependOn(&benchmark_builds.step);
     const doc_symbols = b.addSystemCommand(&.{"python3"});
     doc_symbols.addFileArg(b.path("tools/check_doc_symbols.py"));
     doc_symbols.addDirectoryArg(b.path("."));
