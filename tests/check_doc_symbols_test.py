@@ -21,6 +21,7 @@ class DocSymbolsTest(unittest.TestCase):
                 [sys.executable, str(CHECKER), str(root)],
                 capture_output=True,
                 text=True,
+                timeout=5,
             )
 
     def assert_rejected(self, result, name, location="AGENTS.md:1"):
