@@ -16506,12 +16506,15 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, 0).?).?);
         const initial_focused = Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused;
         storage.focusAdmitted(initial_focused);
-        var target = if (change == 0) initial_focused.end else initial_focused.first;
-        while (target < storage.len()) : (target += 1) {
-            published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, target).?).?);
-            if (change != 0 or !Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused.contains(initial_focused.first)) break;
+        var target = initial_focused.first;
+        if (change == 0) {
+            target = initial_focused.end;
+            while (target < storage.len()) : (target += 1) {
+                published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, target).?).?);
+                if (!Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused.contains(initial_focused.first)) break;
+            }
+            if (target >= storage.len()) return error.MissingCacheTarget;
         }
-        if (target >= storage.len()) return error.MissingCacheTarget;
         const focused = Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused;
         const victim = if (change == 0) initial_focused.first else focused.end;
         if (victim >= storage.len() or focused.contains(victim)) return error.MissingCacheVictim;
@@ -16537,7 +16540,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
             0 => try presentation.dispatch(.ensure_focused_enrichment),
             // A source scan completion releases its lease on the Review Search path.
             1 => presentation.withErrorOrigin(.review_search, Presentation.finishSearchLease, .{ presentation, published, victim }),
-            // Review Search owns the holds and any error from their release.
+            // giveUpReviewSourceScans releases the holds on the Review Search path.
             2 => presentation.withErrorOrigin(.review_search, Presentation.releaseReviewSearchHolds, .{ presentation, published }),
             else => unreachable,
         }

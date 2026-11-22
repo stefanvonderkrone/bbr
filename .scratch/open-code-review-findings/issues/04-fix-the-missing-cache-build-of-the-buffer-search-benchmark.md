@@ -123,7 +123,7 @@ These are stage timings from one full run with nine samples per stage.
 The run used Zig 0.16.0 on Darwin arm64 and the default ReleaseFast benchmark build.
 The benchmark uses a network-free Session and terminal cell metrics.
 Each timed worker built a Frame.
-The admission checks confirmed publication, eviction, and agreement with the synchronous control.
+The admission checks confirmed publication, eviction of the victim File, and agreement with the synchronous control.
 The focus case also rejected a stale build and rebuilt after a query edit.
 The machine had 18 logical CPUs and a load average of 9.44 before the experiments.
 No speedup or timing stability claim follows from this run.
