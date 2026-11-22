@@ -789,7 +789,7 @@ test "required failure awaits started Authenticated Account acquisition" {
         release_account.store(true, .release);
     }
 
-    try testing.expectError(error.NotFound, loadTestSession(schedule.io(), bb));
+    try expectTestSessionNotFound(schedule.io(), bb);
     try testing.expectEqual(@as(usize, 2), schedule.released);
     try testing.expectEqual(@as(usize, 2), fake.callCount());
 }
@@ -813,7 +813,7 @@ test "RawDiff failure prevents later Comments acquisition" {
         release_diff.store(true, .release);
     }
 
-    try testing.expectError(error.NotFound, loadTestSession(schedule.io(), bb));
+    try expectTestSessionNotFound(schedule.io(), bb);
     try testing.expectEqual(@as(usize, 3), schedule.released);
     try testing.expectEqual(@as(usize, 3), fake.callCount());
 }
@@ -837,7 +837,7 @@ test "Comments failure prevents later RawDiff acquisition" {
         release_comments.store(true, .release);
     }
 
-    try testing.expectError(error.NotFound, loadTestSession(schedule.io(), bb));
+    try expectTestSessionNotFound(schedule.io(), bb);
     try testing.expectEqual(@as(usize, 3), schedule.released);
     try testing.expectEqual(@as(usize, 3), fake.callCount());
 }
@@ -885,6 +885,15 @@ test "PullRequest completion gives Comments priority over RawDiff" {
 
 fn loadTestSession(io: Io, bb: Client) !*Session {
     return loadWith(io, std.heap.page_allocator, bb, "repo", 7);
+}
+
+fn expectTestSessionNotFound(io: Io, bb: Client) !void {
+    if (loadTestSession(io, bb)) |session| {
+        session.destroy();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expectEqual(error.NotFound, err);
+    }
 }
 
 const TestLoadSchedule = struct {
