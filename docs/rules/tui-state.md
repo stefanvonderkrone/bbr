@@ -61,18 +61,37 @@ Enforcement: the `Review recovery` tests in `src/tui/presentation.zig`, run by `
 
 Each shown action error records its origin, the path that showed it.
 `Presentation.action_error` holds a `ShownError`, which pairs the `ActionError` with an `ErrorOrigin`.
-Code writes it only through `showError` and `clearError`, and each call names an origin.
-A key, a mouse action, or an Overlay action passes `.user`, and its `clearError` clears any error.
-A completion of background work passes the origin of its own path, and its `clearError` clears only an error of that origin.
+Code writes it only through `showError` and `clearError`, and neither takes an origin.
+Both read `Presentation.event_origin`, the origin of the event that runs.
+`dispatch` sets the event origin from `OwnedInput.errorOrigin` and restores it when the event ends.
+A key, a mouse action, or an Overlay action has the origin `.user`, and its `clearError` clears any error.
+A completion of background work has the origin of its own path, and its `clearError` clears only an error of that origin.
 Thus a completion keeps an error that another path showed and that the user has not read yet.
-A Buffer build takes its origin from `DisclosureBuild.Kind.errorOrigin`.
-Buffer Search query scans, scan retries, and search disclosure builds use `.buffer_search`, separate from view and Draft builds.
-Review Search query scans, source scans, and scan retries use their own origin, separate from Buffer builds and Buffer Search.
+A helper that keys and completions both reach takes the origin of the event that reaches it.
+A Buffer build completion takes its origin from `DisclosureBuild.Kind.errorOrigin`.
+Draft save and Draft mutation builds have the origin `.draft`, separate from view builds.
+Buffer Search scans and search disclosure builds use `.buffer_search`.
+Review Search scans use `.review_search`.
+An input that shows and clears no action error has no origin.
+
+Some work runs inside an event but belongs to another path.
+It names its origin through `withErrorOrigin`, which restores the origin of the event after the work.
+These overrides exist:
+
+- The preview hold after each event acquires Files for the Review Search, so it runs as `.review_search`.
+- The Review Search query retry in the focus check and the reopened query scan run as `.review_search`, so their success clears only a Review Search error.
+- The pending replacement notice of the Submission Overlay runs as `.reconciliation`, so the end of the replacement clears it.
+- `init` discovers a recovered Submission as `.submission`.
+- The shutdown after an allocation failure in `takeCommand` resumes a paused Submission as `.submission`.
+
+Outside `dispatch` and `withErrorOrigin` the event origin is null.
+Then `showError` and `clearError` panic, because no event names the origin.
+A test that calls a method directly runs it through a test helper such as `showTestError`, which calls `withErrorOrigin`.
 The File Enrichment path includes enrichment builds, cache updates, and the focus check that starts a File Enrichment.
 A speculative enrichment shows and clears no action error.
 The Projection still gives only the `ActionError`.
 
-Enforcement: the exhaustive switch in `DisclosureBuild.Kind.errorOrigin` in `src/tui/presentation.zig` causes a compile error for a new build kind without an origin. `tools/check_action_errors.py` and `tests/check_action_errors_test.py` run under `zig build test`. The checker fails on a write of `action_error` in `src/tui/presentation.zig` outside `showError` and `clearError`, such as `self.action_error = null` in a completion. Both helpers take the origin as a required argument. The `Review recovery` tests in the same file check that each completion keeps an unrelated action error and that the Submission, a Comment delete, and a cache update still clear an error of their own origin. `zig build test` runs them.
+Enforcement: the exhaustive switches in `OwnedInput.errorOrigin` and `DisclosureBuild.Kind.errorOrigin` in `src/tui/presentation.zig` cause a compile error for a new input or a new build kind without an origin. `tools/check_action_errors.py` and `tests/check_action_errors_test.py` run under `zig build test`. The checker fails on a write of `action_error` outside `showError` and `clearError`, such as `self.action_error = null` in a completion. It also fails on a write of `event_origin` outside `dispatch` and `withErrorOrigin`, and it names `withErrorOrigin` as the fix. The `Review recovery` tests in the same file check that each completion keeps an unrelated action error, that the Submission, a Comment delete, and a cache update still clear an error of their own origin, that a view build keeps a Draft error and the error of a failed Draft jump, and that a user retry of a Submission or of a recovery clears an unrelated error. `zig build test` runs them.
 
 ## Reading location across Refresh and Reconciliation
 

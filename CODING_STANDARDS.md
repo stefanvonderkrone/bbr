@@ -70,10 +70,12 @@ No check: no check enforces it. `layouts.Scroll` is not optional in the existing
 
 ### Choose the origin of an action error
 
-A completion handler passes the `ErrorOrigin` of its own path to `showError` and `clearError`, not `.user`.
-A helper that both user handlers and completions call takes the origin as a parameter, as `openBufferSearchOccurrence` does.
+Add a `withErrorOrigin` override only for work that belongs to another path than its event, such as a pump that runs after the inputs of every event.
+Choose the origin of the path whose completion must clear the error, and name the reason in a comment at the override.
+A user handler does not override, because a user action must clear any error.
+When an error must stay through a completion of its own event path, give the path its own `ErrorOrigin` instead of an override, as Draft builds have `.draft`.
 
-No check: the type and the line check see that each write names an origin, but not that the origin is the path of the event. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
+No check: the type and the line check see that only the event and `withErrorOrigin` set the origin, but not that an override names the right path. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
 
 ### Reserve storage in every rebuild
 
