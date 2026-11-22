@@ -48,14 +48,40 @@ The audit also found background completions that overwrite an unread error with 
   - A test of the Submission retry key outside shutdown passed before the redesign, so it is not in the suite. `applyAction` clears every error before `startSubmission`.
 - `c54839a4` takes the origin from the dispatched event. `OwnedInput.errorOrigin` maps each input to an origin with an exhaustive switch. A key, a mouse action, and an Overlay action are `.user`. A resize is `.buffer`, because a status message can cause a resize. A Buffer build completion takes the origin of its job kind. Diagnostics, code highlight, clipboard, and External Edit completions have no origin. `dispatch` sets `Presentation.event_origin`, and `showError(err)` and `clearError()` read it. Outside `dispatch` and `withErrorOrigin` the origin is null, and both helpers panic. Draft save and Draft mutation builds have the new origin `.draft`. A codemod removed 362 origin arguments of `showError` and `clearError`, and the origin parameters and 17 call arguments of `landOnCard`, `replaceReviewSearchQuery`, `acceptBufferSearch`, `traverseBufferSearchBy`, and `openBufferSearchOccurrence`. Six overrides through `withErrorOrigin` remain: the preview hold after each event, the Review Search query retry, the reopened query scan, the pending replacement notice, the recovery discovery in `init`, and the shutdown after an allocation failure in `takeCommand`. The rule in `docs/rules/tui-state.md` names the reason of each. After the redesign, `zig build test-review-recovery --summary all` reported `65/65 tests passed`.
 - `26a3e937` extends `tools/check_action_errors.py`. The check fails on a write of `event_origin` outside `dispatch` and `withErrorOrigin`. With `self.event_origin = .review_search` in `retryReviewSearchQuery`, the check printed `src/tui/presentation.zig:8755: writes event_origin outside dispatch and withErrorOrigin.` and exited with 1.
+- `d78dd2bc` adds "Review recovery a refused speculative enrichment build shows no action error".
+  The test injects a duplicate File index after a speculative Buffer build.
+  Both results own their content independently.
+  The duplicate makes `admissible` return false without a stale cache revision.
+  The test checks that refusal keeps the published Buffer and shows no action error.
+  Before the fix, `zig build test-review-recovery --summary all` exited with 1.
+  It reported `65/66 tests passed (1 failed)` with `expected null, found .action_refused`.
+  This fault injection checks the refusal rule.
+  It does not prove that valid production work reaches refusal.
+- `0aa85c2f` makes `refuseEnrichments` show `action_refused` only when the build contains a result that is not speculative.
+  After the fix, `zig build test-review-recovery --summary all` exited with 0.
+  It reported `7/7 steps succeeded` and `66/66 tests passed`.
 
 Known gaps, out of scope:
 
 - An older completion can clear a newer error of the same origin.
 - A completion can replace an unread error with a new error.
 - A helper that a completion reaches shows its error with the origin of that completion, also when the helper belongs to another path. For example, the Review Search acquisition in a File Enrichment completion shows `.file_enrichment`.
+- `requestShutdown` reaches `resumeDurableSubmission` from a key with `.user` origin.
+  It also reaches that helper from `takeCommand` with `.submission` origin.
+  The File Enrichment out-of-memory path reaches it with `.file_enrichment` origin.
+  A resume error takes the origin of its caller.
+  An error with `.user` origin stays until the next key.
+  The design keeps this behavior on purpose.
+  The test "Review recovery a Submission retry key during shutdown clears an unrelated user error" needs the user origin there.
 
-Checks: `zig build test-review-recovery --summary all` gave `65/65 tests passed`. `zig build test --summary all` exited with 0 and gave `1725/1725 tests passed` on native macOS. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, and `python3 tools/check_doc_symbols.py .` passed.
+Checks:
+
+- `zig build test-review-recovery --summary all` exited with 0 and gave `66/66 tests passed`.
+- `zig build test --summary all` exited with 0 on native macOS.
+  It gave `63/63 steps succeeded` and `1726/1726 tests passed`.
+- `zig fmt --check src build.zig tests` passed.
+- `python3 tools/check_agent_docs.py` passed.
+- `python3 tools/check_doc_symbols.py .` passed.
 
 ## Comments
 

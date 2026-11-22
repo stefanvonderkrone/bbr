@@ -78,14 +78,17 @@ Some work runs inside an event but belongs to another path.
 It names its origin through `withErrorOrigin`, which restores the origin of the event after the work.
 These overrides exist:
 
-- The preview hold after each event acquires Files for the Review Search, so it runs as `.review_search`.
-- The Review Search query retry in the focus check and the reopened query scan run as `.review_search`, so their success clears only a Review Search error.
-- The pending replacement notice of the Submission Overlay runs as `.reconciliation`, so the end of the replacement clears it.
-- `init` discovers a recovered Submission as `.submission`.
-- The shutdown after an allocation failure in `takeCommand` resumes a paused Submission as `.submission`.
+- `dispatch` runs `holdReviewSearchPreview` after each event as `.review_search`, because the Preview hold acquires Files for Review Search.
+- The focus check runs `retryReviewSearchQuery` as `.review_search`, so a successful retry clears only a Review Search error.
+- `openReviewSearch` runs `replaceReviewSearchQuery` for a reopened query as `.review_search`, so its scan clears only a Review Search error.
+- `applySubmissionTreeKey` shows `replacement_pending` as `.reconciliation`, so the end of the replacement clears the notice.
+- `init` runs `discoverRecovery` as `.submission`, because recovery belongs to the Submission path.
+- After an allocation failure, `takeCommand` runs `requestShutdown` as `.submission`, because shutdown resumes a paused Submission.
 
 Outside `dispatch` and `withErrorOrigin` the event origin is null.
-Then `showError` and `clearError` panic, because no event names the origin.
+Then `showError` panics, because no event names the origin.
+`clearError` returns early when no error shows.
+Outside an event, `clearError` panics only while an error shows.
 A test that calls a method directly runs it through a test helper such as `showTestError`, which calls `withErrorOrigin`.
 The File Enrichment path includes enrichment builds, cache updates, and the focus check that starts a File Enrichment.
 A speculative enrichment shows and clears no action error.
