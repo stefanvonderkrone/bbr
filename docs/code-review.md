@@ -15,6 +15,7 @@ The review needs the `ocr` CLI, version 1.14.0, on `PATH`.
 Install the release binary for the host from the [v1.14.0 release](https://github.com/alibaba/open-code-review/releases/tag/v1.14.0), and check it against `sha256sum.txt`.
 Do not install the npm package, because it updates itself ([Open Code Review installation](https://github.com/alibaba/open-code-review/blob/v1.14.0/pages/src/content/docs/en/installation.md)).
 The troubleshooting section of the skill tells the agent to install the npm package. The prompt of the agent overrides that advice, and its shell permissions block `npm`.
+The prompt also overrides two steps of the skill. In commit mode the agent adds `--diff-merges=first-parent` to `git show`, as `ocr` does. The agent never writes a diff to a file, because the permissions deny `--output` and output redirection.
 
 ## Review rules
 
