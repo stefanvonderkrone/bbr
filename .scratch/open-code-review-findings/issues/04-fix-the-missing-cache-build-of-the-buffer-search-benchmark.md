@@ -1,6 +1,6 @@
 # Fix the missing cache build of the Buffer Search benchmark
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -24,9 +24,9 @@ A fix must keep these calls inside an event or inside `withErrorOrigin`.
 
 ## Acceptance criteria
 
-- [ ] `zig build bench-buffer-search` exits with 0.
-- [ ] The ticket records the commit that broke the benchmark and whether the cause was the code or the fixture.
-- [ ] `zig build test` passes.
+- [x] `zig build bench-buffer-search` exits with 0.
+- [x] The ticket records the commit that broke the benchmark and whether the cause was the code or the fixture.
+- [x] `zig build test` passes.
 
 ## Comments
 
@@ -59,11 +59,87 @@ The fixture still expects a build, because it checks `storage.requiresCacheEnfor
 - `Storage.requiresCacheEnforcement` and the Enrichment Range in `src/tui/file_enrichment.zig`. Do not change them to suit the benchmark.
 
 **Acceptance criteria:**
-- [ ] `zig build bench-buffer-search` exits with 0.
-- [ ] The benchmark output has timings for all three cases.
-- [ ] No production code changes.
-- [ ] `zig build test` and `zig fmt --check src build.zig tests` pass.
+- [x] `zig build bench-buffer-search` exits with 0.
+- [x] The benchmark output has timings for all three cases.
+- [x] No production code changes.
+- [x] `zig build test` and `zig fmt --check src build.zig tests` pass.
 
 **Out of scope:**
 - The compile of benchmarks in `zig build test` (ticket 06).
 - A change to the Enrichment Range or to cache enforcement.
+
+## Completion
+
+The benchmark fixture was stale after `c457811e3d25ef1b1c5e41fa1fe9a66491b69f8d`.
+Production code correctly protected File 0 above the focus on File 1.
+The fixture checked one File instead of the full Enrichment Range.
+
+Only `benchmarkCacheFrames` in `src/tui/presentation.zig` changed.
+The fixture now derives the focus target and victim from the production Enrichment Range.
+The focus case searches for a target whose range excludes the original victim.
+The release cases select a victim after the range and set the Storage focus before the timed release.
+Every pressure check uses the current Enrichment Range.
+Both release calls run with the Review Search error origin.
+The fixture keeps its stale-build, query, eviction, and synchronous-control checks.
+
+The range-only experiment failed with `MissingCacheVictim`.
+It showed target 1, range `[0, 3)`, and victim 0.
+A first boundary-based target also failed because navigation kept the victim in the viewport range.
+The search-based fixture passed with target 3, range `[1, 5)`, and victim 0.
+The release cases passed with range `[0, 2)` and victim 2.
+These experiments reject a fixed File 2 as a reliable correction for this fixture.
+
+Before, `zig build bench-buffer-search` exited with code 1:
+
+```text
+error: MissingCacheBuild
+bench-buffer-search
++- run exe bbr-buffer-search-bench failure
+error: process exited with error code 1
+```
+
+After, the same command exited with code 0 and printed all three cache cases:
+
+```text
+cache_fixture_files=1024 cache_fixture_drafts=1033 cache_fixture_body_bytes=4194385 cache_fixture_snapshot_bytes=4194304 cache_fixture_directories=1024 cache_fixture_disclosures=1024
+stage=cache_focus_dispatch median_ns=17959 p95_ns=19958
+stage=cache_focus_worker median_ns=425002125 p95_ns=451430042
+stage=cache_focus_admission median_ns=2454708 p95_ns=2841833
+stage=cache_focus_sync_control median_ns=1277684417 p95_ns=1380911167
+stage=source_lease_release_dispatch median_ns=10417 p95_ns=11750
+stage=source_lease_release_worker median_ns=413565542 p95_ns=438332375
+stage=source_lease_release_admission median_ns=1018250 p95_ns=2070958
+stage=source_lease_release_sync_control median_ns=791769792 p95_ns=905938750
+stage=review_holds_release_dispatch median_ns=36041 p95_ns=40125
+stage=review_holds_release_worker median_ns=409989333 p95_ns=422706000
+stage=review_holds_release_admission median_ns=9054958 p95_ns=10243708
+stage=review_holds_release_sync_control median_ns=786806792 p95_ns=832001791
+stage=cache_input_edit median_ns=7000 p95_ns=7875
+stage=cache_input_stale_admission median_ns=9219083 p95_ns=10261042
+stage=cache_input_retry_worker median_ns=422792083 p95_ns=511525834
+```
+
+These are stage timings from one full run with nine samples per stage.
+The run used Zig 0.16.0 on Darwin arm64 and the default ReleaseFast benchmark build.
+The benchmark uses a network-free Session and terminal cell metrics.
+Each timed worker built a Frame.
+The admission checks confirmed publication, eviction, and agreement with the synchronous control.
+The focus case also rejected a stale build and rebuilt after a query edit.
+The machine had 18 logical CPUs and a load average of 9.44 before the experiments.
+No speedup or timing stability claim follows from this run.
+No profile or end-to-end comparison established a performance limit.
+
+The following checks passed with exit code 0:
+
+- `zig build test`.
+- `zig fmt --check src build.zig tests`.
+- `python3 tools/check_agent_docs.py`.
+- `python3 tools/check_doc_symbols.py .`.
+- `python3 tools/check_action_errors.py .`.
+
+An independent review found no defects in the fixture change.
+The no-comments review found no comments to remove.
+The two new comments explain the required error-origin overrides.
+The deslop skill and advisor tool were not installed.
+The existing benchmark supplied the failing reproduction, so no separate failing-test commit was needed.
+Commit `40bf78c773ccbe90751f25c2415fc2e21646726a` contains the benchmark fix.
