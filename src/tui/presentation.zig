@@ -10313,13 +10313,10 @@ pub const Presentation = struct {
             };
             self.refreshStaleRepairTree();
         }
-        if (job.kind != .enrichment) {
-            self.action_error = null;
-        } else if (!EnrichedFile.allSpeculative(job.enrichments.items)) {
-            // A File Enrichment runs beside other work, so it clears only an error of the enrichment path.
-            if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
-                self.action_error = null;
-            };
+        switch (job.kind) {
+            .enrichment => if (!EnrichedFile.allSpeculative(job.enrichments.items)) self.clearFileEnrichmentError(),
+            .cache_update => self.clearFileEnrichmentError(),
+            .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => self.action_error = null,
         }
         // After the success reset, so a failure stays visible.
         if (parent_reposted) self.republishPostedParent(published);
@@ -12752,7 +12749,13 @@ pub const Presentation = struct {
         }
         self.next_work_id = work_id;
         published.session.enrichment.markLoading(file_index);
-        self.action_error = null;
+        self.clearFileEnrichmentError();
+    }
+
+    fn clearFileEnrichmentError(self: *Presentation) void {
+        if (self.action_error) |shown| if (setByFileEnrichment(shown)) {
+            self.action_error = null;
+        };
     }
 
     /// Reads of a replaced Session also count. They run until they finish.
@@ -33078,6 +33081,58 @@ test "Review recovery Picker error survives an unrelated File Enrichment complet
     } });
     try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error.?);
     try completeTestEnrichment(&state, enrich);
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+fn showTestPickerLoadFailure(state: *Presentation) !void {
+    try state.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    const list = state.takeCommand().?.list_pull_requests;
+    try state.dispatch(.{ .pull_requests_loaded = .{
+        .command_id = list.command_id,
+        .work_id = list.work_id,
+        .outcome = .{ .failed = bbr.diagnostic.Failure.capture(.picker_list, .execute, .{}, .{ .zig = error.ServerError }, @src()) },
+    } });
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error.?);
+}
+
+test "Review recovery Picker error survives a completed cache update" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    try showTestPickerLoadFailure(&state);
+    const published = state.published.?;
+    try state.queueCacheBuild(published, published.session.enrichment.focused);
+    try completeDisclosureBuild(&state);
+    try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
+}
+
+test "Review recovery a completed cache update clears a failed build of its own path" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    state.action_error = .buffer_build_failed;
+    const published = state.published.?;
+    try state.queueCacheBuild(published, published.session.enrichment.focused);
+    try completeDisclosureBuild(&state);
+    try testing.expect(state.projection().action_error == null);
+}
+
+test "Review recovery Picker error survives the focus check that starts a File Enrichment" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer state.deinit();
+    try showTestPickerLoadFailure(&state);
+    try state.dispatch(.ensure_focused_enrichment);
+    try testing.expect(state.takeCommand().? == .enrich_file);
     try testing.expectEqual(ActionError.picker_load_failed, state.projection().action_error orelse .action_refused);
 }
 

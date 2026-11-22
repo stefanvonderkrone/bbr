@@ -68,6 +68,14 @@ No check: no check enforces it. `layouts.Scroll` is not optional in the existing
 
 ## TUI state
 
+### Other background completions keep an unrelated action error
+
+A completion of background work clears only the action errors of its own path.
+The Submission, comment edit, comment delete, reviewer verdict, and clipboard completions still clear every action error. So do view builds and Draft builds.
+[Ticket 03](.scratch/open-code-review-findings/issues/03-scope-the-action-error-resets-of-background-completions.md) tracks these resets.
+
+No check: the recovery tests cover only the File Enrichment path, not these other completions. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
+
 ### Reserve storage in every rebuild
 
 Other rebuilds follow the Buffer rebuild storage rule too, such as the search candidates and the search projection ranges.

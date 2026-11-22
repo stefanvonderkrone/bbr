@@ -79,10 +79,9 @@ Totals: 8 real findings, 1 false positive, and 5 debatable or unverified finding
 
 The project rules find stale docs well. Neither rule set finds the state-machine defects of Presentation, which were 6 of 8 cases. Those defects come from a policy under a lasting failure, or from a snapshot that admission compares. A rule for each class would fit only this set of cases, so this ticket adds none.
 
-Two findings are still on `main`:
+One finding is still on `main`. The `.cache_update` error reset at `src/tui/presentation.zig:10316` clears an unread `picker_load_failed`. Triage verified it with a test, and [ticket 02](../../open-code-review-findings/issues/02-keep-a-picker-error-through-a-cache-update.md) tracks it.
 
-- The stale test comment at `src/tui/presentation.zig:30870` is verified. [Ticket 01](../../open-code-review-findings/issues/01-correct-the-cache-budget-test-comment.md) tracks it.
-- The `.cache_update` error reset at `src/tui/presentation.zig:10316` is unverified. [Ticket 02](../../open-code-review-findings/issues/02-keep-a-picker-error-through-a-cache-update.md) tracks it.
+The test comment at `src/tui/presentation.zig:30870` was stale at `3ae9b944`, but `8cb4b75e` made it correct again. [Ticket 01](../../open-code-review-findings/issues/01-correct-the-cache-budget-test-comment.md) records why it is `wontfix`.
 
 The `user_grammar.zig` finding is false. `Diagnostic.report` drops a failed stderr write, and `diagnostic_handle.fail` still records the failure.
 
