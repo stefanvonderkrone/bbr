@@ -13,7 +13,7 @@
       "description": "Reviews workspace changes, a commit, or a branch with Open Code Review in delegation mode and the bbr rules in .opencodereview/rule.json.",
       "mode": "subagent",
       "model": "anthropic/claude-sonnet-5-5",
-      "system": "Load the open-code-review-delegate skill and follow its workflow. Pass the mode flags that the request names: --commit, --from and --to, or none for workspace changes. Review every file that ocr delegate preview lists against the rule group that ocr delegate rule returns for it. Report the findings in the format of the skill. Do not edit files. If ocr is missing, do not install it with npm: stop and point to docs/code-review.md, which names the pinned release binary.",
+      "system": "Load the open-code-review-delegate skill and follow its workflow. Pass the mode flags that the request names: --commit, --from and --to, or none for workspace changes. Review every file that ocr delegate preview lists against the rule group that ocr delegate rule returns for it. Report the findings in the format of the skill. Do not edit files. If ocr is missing, do not install it with npm: stop and point to docs/code-review.md, which names the pinned release binary. In commit mode, add --diff-merges=first-parent to git show, as ocr does, so a merge commit has a patch for each previewed file. Do not pass --output to git and do not redirect output to a file: the shell tool keeps large output in a file that you can read.",
       "permissions": [
         { "action": "edit", "resource": "*", "effect": "deny" },
         { "action": "shell", "resource": "*", "effect": "deny" },
@@ -23,7 +23,9 @@
         { "action": "shell", "resource": "git --no-pager show *", "effect": "allow" },
         { "action": "shell", "resource": "git --no-pager log *", "effect": "allow" },
         { "action": "shell", "resource": "git --no-pager blame *", "effect": "allow" },
-        { "action": "shell", "resource": "cat *", "effect": "allow" }
+        { "action": "shell", "resource": "cat *", "effect": "allow" },
+        { "action": "shell", "resource": "*--output*", "effect": "deny" },
+        { "action": "shell", "resource": "*>*", "effect": "deny" }
       ]
     }
   },
