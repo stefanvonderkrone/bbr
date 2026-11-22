@@ -16089,7 +16089,7 @@ fn benchmarkHiddenSearchNavigation(presentation: *Presentation, io: std.Io) !voi
     }
     for (0..3) |stage| for (0..9) |sample| {
         try presentation.dispatch(.{ .action = .open_buffer_search });
-        try replaceTestBufferSearchQuery(&presentation, "needle");
+        try replaceTestBufferSearchQuery(presentation, "needle");
         var scan = presentation.takeCommand() orelse return error.MissingScan;
         defer scan.deinit();
         try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(std.heap.page_allocator, &scan.scan_buffer_search) });
@@ -16375,15 +16375,15 @@ fn benchmarkAuthoredSearchInput(presentation: *Presentation, io: std.Io, label: 
         var start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .action = .open_buffer_search });
         times[@intFromEnum(Stage.open)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        try replaceTestBufferSearchQuery(&presentation, "need");
+        try replaceTestBufferSearchQuery(presentation, "need");
         start = std.Io.Clock.awake.now(io);
-        try replaceTestBufferSearchQuery(&presentation, "needl");
+        try replaceTestBufferSearchQuery(presentation, "needl");
         times[@intFromEnum(Stage.edit_queued)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         var scan = presentation.takeCommand() orelse return error.MissingScan;
         defer scan.deinit();
         if (scan != .scan_buffer_search or !std.mem.eql(u8, scan.scan_buffer_search.query.text, "needl")) return error.WrongQueuedQuery;
         start = std.Io.Clock.awake.now(io);
-        try replaceTestBufferSearchQuery(&presentation, "needle");
+        try replaceTestBufferSearchQuery(presentation, "needle");
         times[@intFromEnum(Stage.edit_issued)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         const generation = published.buffer_search.input.?.request_id;
         const geometry: frame_mod.Geometry = .{ .cols = if (published.geometry.cols == 100) 80 else 100, .rows = 30 };
@@ -16510,7 +16510,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, target).?).?);
         if (change == 0) {
             try presentation.dispatch(.{ .action = .open_buffer_search });
-            try replaceTestBufferSearchQuery(&presentation, "needle");
+            try replaceTestBufferSearchQuery(presentation, "needle");
             try finishBenchmarkSearchWork(presentation);
         }
         if (change == 2) {
@@ -16535,7 +16535,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         if (job.failed) return error.CacheBuildFailed;
         if (change == 0) {
             start = std.Io.Clock.awake.now(io);
-            try replaceTestBufferSearchQuery(&presentation, "needl");
+            try replaceTestBufferSearchQuery(presentation, "needl");
             input_times[0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
             start = std.Io.Clock.awake.now(io);
             try presentation.dispatch(.{ .buffer_disclosure_built = job });
@@ -16655,7 +16655,7 @@ fn benchmarkReviewDestination(presentation: *Presentation, io: std.Io, query: []
             start = std.Io.Clock.awake.now(io);
             try presentation.dispatch(.{ .key = .{ .codepoint = query[0], .text = query } });
             opening_times[1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-            try replaceTestBufferSearchQuery(&presentation, "");
+            try replaceTestBufferSearchQuery(presentation, "");
             start = std.Io.Clock.awake.now(io);
             restore.build();
             opening_times[2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
