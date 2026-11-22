@@ -1,7 +1,6 @@
 # Compile every benchmark in zig build test
 
-Status: claimed
-Claimed by: /Volumes/Work/t3-code/benchmark-compile-check
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -25,10 +24,10 @@ Both are only on the branch `m28-full-review-file-cache-evaluation`, which is 60
 
 ## Acceptance criteria
 
-- [ ] `zig build test` compiles every benchmark executable on `main`.
-- [ ] A compile error in any benchmark root makes `zig build test` fail.
-- [ ] `docs/rules/build-and-checks.md` has a rule section with an Enforcement paragraph for this check.
-- [ ] `zig build test` passes.
+- [x] `zig build test` compiles every benchmark executable in this change for `main`.
+- [x] A compile error in a benchmark root makes `zig build test` fail.
+- [x] `docs/rules/build-and-checks.md` has a rule section with an Enforcement paragraph for this check.
+- [x] `zig build test` passes.
 
 ## Comments
 
@@ -100,13 +99,45 @@ fn addBenchmark(b: *std.Build, test_step: *std.Build.Step, name: []const u8, roo
 - `docs/rules/build-and-checks.md`: a new rule section, per `docs/agents/rule-areas.md`.
 
 **Acceptance criteria:**
-- [ ] `zig build test` compiles `bbr-bench`, `bbr-file-acquisition-bench`, and `bbr-buffer-search-bench`.
-- [ ] With a compile error put into `src/benchmark_buffer_search.zig`, `zig build test` fails. The ticket records the error text, and the error is then reverted.
-- [ ] No `b.addExecutable` call for a benchmark remains outside `addBenchmark`.
-- [ ] `docs/rules/build-and-checks.md` has a rule section with an Enforcement paragraph that names `addBenchmark` and the `test` step.
-- [ ] `zig build test`, `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, and `python3 tools/check_doc_symbols.py .` pass.
+- [x] `zig build test` compiles `bbr-bench`, `bbr-file-acquisition-bench`, and `bbr-buffer-search-bench`.
+- [x] With the past compile error restored in a benchmark function in `src/tui/presentation.zig`, `zig build test` fails. The ticket records the error text, and the error is then reverted.
+- [x] No `b.addExecutable` call for a benchmark remains outside `addBenchmark`.
+- [x] `docs/rules/build-and-checks.md` has a rule section with an Enforcement paragraph that names `addBenchmark` and the `test` step.
+- [x] `zig build test`, `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, and `python3 tools/check_doc_symbols.py .` pass.
 
 **Out of scope:**
 - The runtime failure of `bench-buffer-search` (ticket 04).
 - The file cache benchmark of the m28 branch.
 - Running benchmarks in CI.
+
+## Completion
+
+The benchmark build has one supported creation path, `addBenchmark`.
+The function adds each benchmark compile step to `test` without a run dependency.
+The checker rejects direct executable creation except the app and the CLI fixture.
+It also checks the helper body and the `test_step` argument at each call.
+Architecture owns the dependency.
+A source check rejects the bypass because Zig still exposes `addExecutable` to the build file.
+
+The regression proof above records both negative checks and their error text.
+The temporary mistakes no longer exist in the source.
+The CI workflow already runs `zig build test --summary all` on all four native targets.
+This change needs no separate CI command.
+
+Local checks on macOS with Zig 0.16.0:
+
+- `zig build test --summary all` exited 0. All 68 steps and all 1726 Zig tests passed.
+- The summary lists compile steps for all three benchmark executables.
+- `zig fmt --check src build.zig tests` exited 0.
+- `python3 tools/check_agent_docs.py` exited 0.
+- `python3 tools/check_doc_symbols.py .` exited 0.
+- `python3 tests/check_benchmark_builds_test.py` passed all six checker tests.
+
+The first review found two missing checks for changes to the helper and its callers.
+The checker and tests now cover both.
+A fresh review found no practical findings.
+The no-comments pass removed two module docstrings.
+The deslop skill was not installed, so that pass did not run.
+The source and prose received a manual diff review.
+Commits `15de1bbc`, `185a987d`, and `f3a0be77` hold the helper, checker, and regression proof.
+This completion and the checked rule are in the following documentation commit.

@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Require addBenchmark for executable creation outside the app and CLI fixture."""
-
 from pathlib import Path
 import re
 import sys

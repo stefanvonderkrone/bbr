@@ -1,5 +1,3 @@
-"""Check that a benchmark cannot skip compilation in the test step."""
-
 import importlib.util
 from pathlib import Path
 import subprocess

@@ -26,6 +26,16 @@ A benchmark measures cells with the vaxis measurement that the app uses, `termin
 
 Enforcement: `tools/check_benchmark_metrics.py`, run by `zig build test`. It fails on `.bytes` or `CellMetrics.bytes` in `src/benchmark/` and `src/benchmark_buffer_search.zig`, and names the replacement. A `.bytes =` field initializer is not a match.
 
+## Benchmark compilation in tests
+
+Every benchmark executable uses `addBenchmark` in `build.zig`.
+The function adds the compile step to the `test` step.
+The `test` step does not run benchmarks.
+Only the app `bbr` and the fixture `grammar-cli-integration` use a direct executable declaration outside `addBenchmark`.
+Those declarations each fit on one line.
+
+Enforcement: `tools/check_benchmark_builds.py`, run by `zig build test`, rejects other direct executable declarations outside `addBenchmark`. It checks the compile-only dependency in `addBenchmark` and requires each call to pass `test_step`. `tests/check_benchmark_builds_test.py` tests the check under `zig build test`.
+
 ## Test file suffixes
 
 The suffix of a file name in `tests/` decides where the file runs. No list needs an update. The suffixes are:
