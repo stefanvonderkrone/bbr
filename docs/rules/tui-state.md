@@ -65,7 +65,7 @@ This path clears only the errors that `setByFileEnrichment` names.
 A speculative enrichment build clears no action error.
 [The coding standard](../../CODING_STANDARDS.md#other-background-completions-keep-an-unrelated-action-error) covers other background completions.
 
-Enforcement: the exhaustive switch over `DisclosureBuild.Kind` in `acceptViewBuild` in `src/tui/presentation.zig` causes a compile error for a missing kind. Each new kind must decide which errors it clears. The `Review recovery` tests in the same file check unrelated action errors during enrichment builds, cache updates, and the focus check. `zig build test` runs them.
+Enforcement: the exhaustive switch over `DisclosureBuild.Kind` in `acceptViewBuild` in `src/tui/presentation.zig` causes a compile error for a missing kind. `acceptBufferDisclosure` calls `acceptViewBuild` only for a kind whose `buildsSearchCorpus` is true, so the prong decides the reset only for those kinds. The other kinds set the error in their own accept paths. The `Review recovery` tests in the same file check unrelated action errors during enrichment builds, cache updates, and the focus check. `zig build test` runs them.
 
 ## Reading location across Refresh and Reconciliation
 
