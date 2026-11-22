@@ -46,15 +46,19 @@ def violations(root):
     for relative, lines in zig_files(root, SOURCES, literals=False):
         for _, helpers, write, message in CHECKS:
             helper_depth = None
+            body_open = False
             depth = 0
             for number, line in enumerate(lines, 1):
                 if helper_depth is None and helpers.match(line):
                     helper_depth = depth
+                    body_open = False
                 elif helper_depth is None and write.search(line):
                     found.append((str(relative), number, f"{relative}:{number}: {message}"))
                 depth += line.count("{") - line.count("}")
-                if helper_depth is not None and depth <= helper_depth:
-                    helper_depth = None
+                if helper_depth is not None:
+                    body_open = body_open or depth > helper_depth
+                    if body_open and depth <= helper_depth:
+                        helper_depth = None
     return [message for _, _, message in sorted(found)]
 
 

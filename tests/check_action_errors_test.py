@@ -127,6 +127,21 @@ class ActionErrorsTest(unittest.TestCase):
         self.assertIn("src/tui/presentation.zig:5: writes event_origin outside dispatch and withErrorOrigin.", found[0])
         self.assertIn("withErrorOrigin(origin, work, args)", found[0])
 
+    def test_a_multiline_helper_signature_keeps_its_exemption(self):
+        found = self.check(
+            "    fn withErrorOrigin(\n"
+            "        self: *Presentation,\n"
+            "        origin: ErrorOrigin,\n"
+            "    ) void {\n"
+            "        self.event_origin = origin;\n"
+            "    }\n"
+            "    fn other(self: *Presentation) void {\n"
+            "        self.event_origin = null;\n"
+            "    }\n"
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("src/tui/presentation.zig:8: writes event_origin outside", found[0])
+
     def test_dispatch_and_the_override_helper_may_set_the_event_origin(self):
         self.assertEqual(self.check(ORIGIN_HELPERS), [])
 
