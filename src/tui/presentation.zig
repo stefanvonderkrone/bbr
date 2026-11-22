@@ -16487,7 +16487,6 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
     for (0..3) |change| for (0..9) |sample| {
         // Restore cache content and the complete Frame outside the timed stages.
         storage.configureCache(.{ .max_retained_bytes = 0 });
-        storage.focusAdmitted(.single(0));
         for (published.session.diff.files, 0..) |file, index| {
             if (storage.needsEnrichment(index)) {
                 var result = try file_enrichment.enrich(std.heap.page_allocator, client, plain.highlighter(), .{
@@ -16502,12 +16501,29 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
                 defer result.deinit();
                 try storage.admit(index, &result);
             }
-            if (index != 0) storage.hold(index);
         }
-        storage.configureCache(.{ .enabled = false });
         try published.rebuildBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
-        const target: usize = if (change == 0) 1 else 0;
-        published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, target).?).?);
+        published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, 0).?).?);
+        const initial_focused = Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused;
+        storage.focusAdmitted(initial_focused);
+        var target = initial_focused.first;
+        if (change == 0) {
+            target = initial_focused.end;
+            while (target < storage.len()) : (target += 1) {
+                published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, target).?).?);
+                if (!Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused.contains(initial_focused.first)) break;
+            }
+            if (target >= storage.len()) return error.MissingCacheTarget;
+        }
+        const focused = Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused;
+        const victim = if (change == 0) initial_focused.first else focused.end;
+        if (victim >= storage.len() or focused.contains(victim)) return error.MissingCacheVictim;
+        const unheld = if (change == 0) victim else target;
+        for (0..storage.len()) |index| {
+            if (index != unheld) storage.hold(index);
+        }
+        if (change != 0) storage.focusAdmitted(focused);
+        storage.configureCache(.{ .enabled = false });
         if (change == 0) {
             try presentation.dispatch(.{ .action = .open_buffer_search });
             try replaceTestBufferSearchQuery(presentation, "needle");
@@ -16516,18 +16532,20 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         if (change == 2) {
             if (published.review_search.held == null) published.review_search.held = try presentation.allocator.alloc(bool, storage.len());
             @memset(published.review_search.held.?, true);
-            published.review_search.held.?[0] = false;
+            published.review_search.held.?[unheld] = false;
         }
         const before = published.visual_rows.ptr;
         var start = std.Io.Clock.awake.now(io);
         switch (change) {
             0 => try presentation.dispatch(.ensure_focused_enrichment),
-            1 => presentation.finishSearchLease(published, 1),
-            2 => presentation.releaseReviewSearchHolds(published),
+            // A source scan completion releases its lease on the Review Search path.
+            1 => presentation.withErrorOrigin(.review_search, Presentation.finishSearchLease, .{ presentation, published, victim }),
+            // giveUpReviewSourceScans releases the holds on the Review Search path.
+            2 => presentation.withErrorOrigin(.review_search, Presentation.releaseReviewSearchHolds, .{ presentation, published }),
             else => unreachable,
         }
         times[change][0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(.single(target))) return error.CachePublishedBeforeWorker;
+        if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused)) return error.CachePublishedBeforeWorker;
         var job = (presentation.takeCommand() orelse return error.MissingCacheBuild).build_buffer_disclosure;
         start = std.Io.Clock.awake.now(io);
         job.build();
@@ -16540,7 +16558,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
             start = std.Io.Clock.awake.now(io);
             try presentation.dispatch(.{ .buffer_disclosure_built = job });
             input_times[1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-            if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(.single(target))) return error.StaleCachePublished;
+            if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused)) return error.StaleCachePublished;
             var scan = presentation.takeCommand() orelse return error.MissingScan;
             defer scan.deinit();
             if (scan != .scan_buffer_search) return error.UnexpectedCommand;
@@ -16554,8 +16572,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .buffer_disclosure_built = job });
         times[change][2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (published.worker_frame != job or storage.requiresCacheEnforcement(.single(target))) return error.CacheNotPublished;
-        const victim: usize = if (change == 0) 0 else 1;
+        if (published.worker_frame != job or storage.requiresCacheEnforcement(Presentation.enrichmentRange(published, published.activeFile(), storage.len()).focused)) return error.CacheNotPublished;
         if (storage.file(victim).new != .pending or published.disclosure_inputs.blobs[victim].new != null) return error.CacheVictimRetained;
         if (change == 0 and (!std.mem.eql(u8, published.buffer_search.input.?.query.?.text, "needl") or
             published.buffer_search.input.?.pending or published.buffer_search.input.?.batch.?.occurrences.len != 1024)) return error.CacheInputMismatch;
@@ -16570,8 +16587,8 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
             try finishBenchmarkSearchWork(presentation);
         }
         // The focus and single-lease cases retain the other inactive holds.
-        if (change != 2) for (1..storage.len()) |index| {
-            if (change == 1 and index == 1) continue;
+        if (change != 2) for (0..storage.len()) |index| {
+            if (index == unheld or (change == 1 and index == victim)) continue;
             storage.finishLeaseDeferred(index);
         };
     };
