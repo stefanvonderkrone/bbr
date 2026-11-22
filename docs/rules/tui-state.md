@@ -59,9 +59,8 @@ Enforcement: the `Review recovery` tests in `src/tui/presentation.zig`, run by `
 
 ## Background work keeps an unrelated action error
 
-A completion of background work clears only the action errors of its own path.
+A File Enrichment completion clears only the action errors that `setByFileEnrichment` names.
 The File Enrichment path includes enrichment builds, cache updates, and the focus check that starts a File Enrichment.
-This path clears only the errors that `setByFileEnrichment` names.
 A speculative enrichment build clears no action error.
 [The coding standard](../../CODING_STANDARDS.md#other-background-completions-keep-an-unrelated-action-error) covers other background completions.
 
