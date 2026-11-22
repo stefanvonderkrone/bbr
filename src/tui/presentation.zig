@@ -10661,7 +10661,7 @@ pub const Presentation = struct {
     /// rebuild did. The worker preview included them, so the other Files
     /// need a new rebuild.
     fn refuseEnrichments(self: *Presentation, published: *Published, job: *DisclosureBuild) void {
-        self.showError(.action_refused);
+        if (!EnrichedFile.allSpeculative(job.enrichments.items)) self.showError(.action_refused);
         var index = job.enrichments.items.len;
         while (index > 0) {
             index -= 1;
