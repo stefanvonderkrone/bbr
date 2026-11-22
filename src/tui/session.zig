@@ -776,52 +776,45 @@ test "required failure reporting follows logical acquisition order" {
 test "required failure awaits started Authenticated Account acquisition" {
     var release_pr: std.atomic.Value(bool) = .init(false);
     var release_account: std.atomic.Value(bool) = .init(false);
-    var done: std.atomic.Value(bool) = .init(false);
     var responses = testRemoteResponses(200);
     responses[0].released = &release_account;
     responses[3].released = &release_pr;
     responses[3].status = 404;
     var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
-    var future = try testing.io.concurrent(loadFailureAndSignal, .{ testing.io, bb, &done });
-    defer future.await(testing.io);
+    var schedule: TestLoadSchedule = .init(&.{ &release_pr, &release_account });
+    defer schedule.threaded.deinit();
     defer {
         release_pr.store(true, .release);
         release_account.store(true, .release);
     }
 
-    try spinUntil(&fake, .{ .call_count = 2 });
-    release_pr.store(true, .release);
-    try spinUntil(&fake, .{ .active_request_count_not = 2 });
-    try testing.expect(!done.load(.acquire));
-    release_account.store(true, .release);
-    future.await(testing.io);
-    try testing.expect(done.load(.acquire));
+    try expectTestSessionNotFound(schedule.io(), bb);
+    try testing.expectEqual(@as(usize, 2), schedule.released);
     try testing.expectEqual(@as(usize, 2), fake.callCount());
 }
 
 test "RawDiff failure prevents later Comments acquisition" {
     var release_pr: std.atomic.Value(bool) = .init(false);
+    var release_account: std.atomic.Value(bool) = .init(false);
     var release_diff: std.atomic.Value(bool) = .init(false);
     var responses = testRemoteResponses(200);
+    responses[0].released = &release_account;
     responses[1].status = 404;
     responses[1].released = &release_diff;
     responses[3].released = &release_pr;
     var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
-    var future = try testing.io.concurrent(loadTestSession, .{ testing.io, bb });
+    var schedule: TestLoadSchedule = .init(&.{ &release_account, &release_diff, &release_pr });
+    defer schedule.threaded.deinit();
     defer {
         release_pr.store(true, .release);
+        release_account.store(true, .release);
         release_diff.store(true, .release);
-        if (future.await(testing.io)) |candidate| candidate.destroy() else |_| {}
     }
 
-    try spinUntil(&fake, .{ .call_count = 3 });
-    release_diff.store(true, .release);
-    try spinUntil(&fake, .{ .active_request_count_not = 2 });
-    release_pr.store(true, .release);
-
-    try testing.expectError(error.NotFound, future.await(testing.io));
+    try expectTestSessionNotFound(schedule.io(), bb);
+    try testing.expectEqual(@as(usize, 3), schedule.released);
     try testing.expectEqual(@as(usize, 3), fake.callCount());
 }
 
@@ -836,22 +829,16 @@ test "Comments failure prevents later RawDiff acquisition" {
     responses[3].released = &release_pr;
     var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
-    var future = try testing.io.concurrent(loadTestSession, .{ testing.io, bb });
+    var schedule: TestLoadSchedule = .init(&.{ &release_pr, &release_comments, &release_account });
+    defer schedule.threaded.deinit();
     defer {
         release_pr.store(true, .release);
         release_account.store(true, .release);
         release_comments.store(true, .release);
-        if (future.await(testing.io)) |candidate| candidate.destroy() else |_| {}
     }
 
-    try spinUntil(&fake, .{ .call_count = 2 });
-    release_pr.store(true, .release);
-    try spinUntil(&fake, .{ .call_count = 3 });
-    release_comments.store(true, .release);
-    try spinUntil(&fake, .{ .active_request_count_not = 2 });
-    release_account.store(true, .release);
-
-    try testing.expectError(error.NotFound, future.await(testing.io));
+    try expectTestSessionNotFound(schedule.io(), bb);
+    try testing.expectEqual(@as(usize, 3), schedule.released);
     try testing.expectEqual(@as(usize, 3), fake.callCount());
 }
 
@@ -900,21 +887,69 @@ fn loadTestSession(io: Io, bb: Client) !*Session {
     return loadWith(io, std.heap.page_allocator, bb, "repo", 7);
 }
 
-fn loadFailureAndSignal(io: Io, bb: Client, done: *std.atomic.Value(bool)) void {
-    if (loadWith(io, std.heap.page_allocator, bb, "repo", 7)) |candidate| candidate.destroy() else |_| {}
-    done.store(true, .release);
+fn expectTestSessionNotFound(io: Io, bb: Client) !void {
+    if (loadTestSession(io, bb)) |session| {
+        session.destroy();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expectEqual(error.NotFound, err);
+    }
 }
+
+const TestLoadSchedule = struct {
+    threaded: Io.Threaded,
+    vtable: Io.VTable = undefined,
+    coordinator: std.Thread.Id = undefined,
+    releases: []const *std.atomic.Value(bool),
+    released: usize = 0,
+
+    fn init(releases: []const *std.atomic.Value(bool)) TestLoadSchedule {
+        return .{ .threaded = .init(std.heap.page_allocator, .{}), .releases = releases };
+    }
+
+    fn io(self: *TestLoadSchedule) Io {
+        const underlying = self.threaded.io();
+        self.vtable = underlying.vtable.*;
+        self.vtable.futexWait = wait;
+        self.vtable.groupCancel = cancel;
+        self.coordinator = std.Thread.getCurrentId();
+        return .{ .userdata = underlying.userdata, .vtable = &self.vtable };
+    }
+
+    fn cancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
+        const threaded: *Io.Threaded = @ptrCast(@alignCast(userdata.?));
+        const self: *TestLoadSchedule = @fieldParentPtr("threaded", threaded);
+        for (self.releases) |released| released.store(true, .release);
+        threaded.io().vtable.groupCancel(userdata, group, token);
+    }
+
+    fn wait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
+        const threaded: *Io.Threaded = @ptrCast(@alignCast(userdata.?));
+        const self: *TestLoadSchedule = @fieldParentPtr("threaded", threaded);
+        const underlying = threaded.io();
+        if (std.Thread.getCurrentId() != self.coordinator or expected != 0)
+            return underlying.vtable.futexWait(userdata, ptr, expected, timeout);
+
+        // Select awaits an empty completion queue through a fresh Condition.
+        // The next queue wait follows consumption of the previous completion.
+        std.debug.assert(timeout == .none);
+        if (self.released == self.releases.len) return error.Canceled;
+        self.releases[self.released].store(true, .release);
+        self.released += 1;
+        // A spurious wake must not release the next response before consumption.
+        while (@atomicLoad(u32, ptr, .acquire) == expected)
+            try underlying.vtable.futexWait(userdata, ptr, expected, timeout);
+    }
+};
 
 const TestWait = union(enum) {
     call_count: usize,
-    active_request_count_not: usize,
 };
 
 fn spinUntil(fake: *FakeHttpClient, wait: TestWait) !void {
     for (0..100_000_000) |_| {
         const ready = switch (wait) {
             .call_count => |count| fake.callCount() >= count,
-            .active_request_count_not => |count| fake.activeRequestCount() != count,
         };
         if (ready) return;
         std.atomic.spinLoopHint();
