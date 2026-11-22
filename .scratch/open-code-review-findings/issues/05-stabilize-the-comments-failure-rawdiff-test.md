@@ -1,7 +1,6 @@
 # Stabilize the Comments failure RawDiff test
 
-Status: claimed
-Claimed by: /Volumes/Work/t3-code/session-test-wait
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -30,9 +29,9 @@ It is not known whether this is a race in the test or a race in the Session load
 
 ## Acceptance criteria
 
-- [ ] The ticket records how often the test fails before the fix, and the cause.
-- [ ] The test passes in a loop of at least 1000 runs.
-- [ ] `zig build test` passes.
+- [x] The ticket records how often the test fails before the fix, and the cause.
+- [x] The test passes in a loop of at least 1000 runs.
+- [x] `zig build test` passes.
 
 ## Comments
 
@@ -70,11 +69,69 @@ The product behavior is correct. The test is wrong.
 - Do not change the Session coordinator to suit the test.
 
 **Acceptance criteria:**
-- [ ] With the 10 ms sleep before the Comments status check, the test passes 1000 of 1000 runs. The sleep is then removed.
-- [ ] With six `yes` processes as load, the test passes 1000 of 1000 runs.
-- [ ] If the coordinator starts RawDiff after it sets `required_failed`, the test fails. Check this once with a temporary break, then revert it.
-- [ ] `zig build test` and `zig fmt --check src build.zig tests` pass.
+- [x] With the 10 ms sleep before the Comments status check, the test passes 1000 of 1000 runs. The sleep is then removed.
+- [x] With six `yes` processes as load, the test passes 1000 of 1000 runs.
+- [x] If the coordinator starts RawDiff after it sets `required_failed`, the test fails. Check this once with a temporary break, then revert it.
+- [x] `zig build test` and `zig fmt --check src build.zig tests` pass.
 
 **Out of scope:**
 - A change to the order or cancellation of Session requests.
 - Other tests that use `spinUntil`.
+
+## Completion
+
+Commit `1445bbbf` fixes all three callers of the wrong wait in `src/tui/session.zig`.
+It deletes the `active_request_count_not` arm from `TestWait` and `spinUntil`.
+It also deletes the unused `loadFailureAndSignal` helper.
+The Session coordinator and `FakeHttpClient` do not change.
+
+The active request count falls before the caller checks the HTTP status.
+The old wait thus let another completion reach the coordinator before the required failure.
+All three tests had this race.
+
+The Session exposes no load state before `loadWith` returns.
+The failed branch also exposes no coordinator-consumption signal.
+A counter after `send` returns would still precede consumption.
+`TestLoadSchedule` instead controls response release through an isolated `std.Io.Threaded` instance.
+The helper changes only the test I/O vtable.
+Each coordinator wait on a fresh Condition releases the next response.
+The next completion-queue wait proves that the coordinator consumed the previous completion.
+The helper waits for an epoch change before it returns from a futex wait.
+Thus a spurious wake cannot release the next response.
+Cancellation releases all response gates before it joins the workers.
+
+The helper depends on Zig 0.16 queue behavior.
+`std/Io.zig` implements `Select.await` through `Queue.getOne`.
+Each blocked queue read uses a fresh Condition with epoch zero.
+Mutex contention waits use expected value two.
+The helper forwards those waits and all worker waits without a change.
+The tests keep their names because they still check the same request behavior.
+Exact request counts detect a request after the coordinator consumes a required failure.
+
+Native checks ran on macOS arm64 with Zig 0.16.0.
+The isolated executable selected the three tests with filters `required failure awaits started` and `failure prevents later`.
+A temporary build target installed that executable as `zig-out/bin/session-wait-tests`.
+Each loop started that executable in a fresh process with a 30-second timeout.
+
+- Before the fix, a 10 ms sleep after `self.http.send` returned a 404 caused each test to fail in 100 of 100 runs.
+- The Comments and RawDiff tests each reported `expected 3, found 4`.
+- The PullRequest failure test reported `expected 2, found 3`.
+- After the fix, each test passed 1000 of 1000 runs with that sleep.
+- After removal of the sleep, each test passed 1000 of 1000 runs with six `yes` processes as CPU load.
+- The loop stopped and joined all six load processes.
+- A temporary change started RawDiff in the Comments completion arm after it set `required_failed`.
+- The Comments test then failed with `expected 3, found 4`.
+- The temporary coordinator change and build target were removed.
+
+Checks on the committed code passed:
+
+- `zig build test --summary all` exited with code zero.
+- `zig fmt --check src build.zig tests` exited with code zero.
+- `python3 tools/check_agent_docs.py` exited with code zero.
+- `python3 tools/check_doc_symbols.py .` exited with code zero.
+
+An independent code review found no correctness issue.
+The no-comments pass kept three comments about queue and wake behavior.
+The installed skills did not include a deslop pass.
+The advisor tool was not available.
+Linux and macOS x86_64 runtime results remain unproven locally.
