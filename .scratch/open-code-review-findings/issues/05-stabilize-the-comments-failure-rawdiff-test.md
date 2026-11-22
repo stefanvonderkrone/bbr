@@ -1,6 +1,7 @@
 # Stabilize the Comments failure RawDiff test
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/session-test-wait
 Blocked by: none
 
 ## Problem
