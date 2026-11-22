@@ -141,7 +141,7 @@ pub const FakeHttpClient = struct {
         }
 
         if (canned.released) |released| {
-            const io = std.testing.io;
+            const io = std.Io.Threaded.global_single_threaded.io();
             const start = std.Io.Clock.awake.now(io);
             while (!released.load(.acquire)) {
                 if (start.untilNow(io, .awake).toSeconds() >= 10)
