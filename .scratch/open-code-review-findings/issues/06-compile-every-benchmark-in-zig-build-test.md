@@ -64,7 +64,8 @@ build.zig:140: executable bypasses benchmark compilation in the test step. Use a
 
 I restored the `addBenchmark` call after the check.
 The checker tests also reject a missing compile dependency and a dependency on a benchmark run.
-They reject an `addBenchmark` call that passes another step instead of `test_step`.
+The first checker also checked the `test_step` argument at each call.
+The review fix below removes that argument check.
 
 ## Agent Brief
 
@@ -115,7 +116,9 @@ fn addBenchmark(b: *std.Build, test_step: *std.Build.Step, name: []const u8, roo
 The benchmark build has one supported creation path, `addBenchmark`.
 The function adds each benchmark compile step to `test` without a run dependency.
 The checker rejects direct executable creation except the app and the CLI fixture.
-It also checks the helper body and the `test_step` argument at each call.
+It requires the helper to call `test_step.dependOn` and rejects `addRunArtifact` calls in the helper.
+The check reads only `build.zig`.
+It does not see an alias of `addExecutable` or reject run dependencies elsewhere.
 Architecture owns the dependency.
 A source check rejects the bypass because Zig still exposes `addExecutable` to the build file.
 
@@ -141,3 +144,19 @@ The deslop skill was not installed, so that pass did not run.
 The source and prose received a manual diff review.
 Commits `15de1bbc`, `185a987d`, and `f3a0be77` hold the helper, checker, and regression proof.
 This completion and the checked rule are in the following documentation commit.
+
+### Review fix
+
+The checker no longer matches exact declarations or checks the arguments of each `addBenchmark` call.
+It accepts multi-line declarations, type annotations, extra options, and a renamed helper variable.
+The tests cover those forms, direct benchmark declarations, and a helper that calls `addRunArtifact`.
+Each subprocess call has a ten-second timeout.
+
+I replaced the real Buffer Search benchmark declaration with a direct `addExecutable` call again.
+`python3 tools/check_benchmark_builds.py .` exited 1 and named `addBenchmark` as the fix.
+I restored the declaration before the green checks.
+The review found a valid nested module initializer before the executable name.
+The checker tracks brace depth to read the outer name.
+The test includes a nested import name and braces inside a string.
+`python3 tests/check_benchmark_builds_test.py` passes all eight tests.
+The checker reads 75 lines, down from 79.

@@ -28,13 +28,11 @@ Enforcement: `tools/check_benchmark_metrics.py`, run by `zig build test`. It fai
 
 ## Benchmark compilation in tests
 
-Every benchmark executable uses `addBenchmark` in `build.zig`.
-The function adds the compile step to the `test` step.
-The `test` step does not run benchmarks.
-Only the app `bbr` and the fixture `grammar-cli-integration` use a direct executable declaration outside `addBenchmark`.
-Those declarations each fit on one line.
+`addBenchmark` in `build.zig` adds only the compile step to `test`.
+The function calls `dependOn` on `test_step` and does not call `addRunArtifact`.
+Direct `addExecutable` calls use the literal name `"bbr"` or `"grammar-cli-integration"`, or the identifier `name` inside `addBenchmark`.
 
-Enforcement: `tools/check_benchmark_builds.py`, run by `zig build test`, rejects other direct executable declarations outside `addBenchmark`. It checks the compile-only dependency in `addBenchmark` and requires each call to pass `test_step`. `tests/check_benchmark_builds_test.py` tests the check under `zig build test`.
+Enforcement: `tools/check_benchmark_builds.py`, run by `zig build test`, rejects other names in direct `addExecutable` calls. It requires `addBenchmark` to call `dependOn` on `test_step` and rejects `addRunArtifact` calls in that function. The check reads only `build.zig`. It does not see an alias of `addExecutable` or reject run dependencies elsewhere. `tests/check_benchmark_builds_test.py` tests the check under `zig build test`.
 
 ## Test file suffixes
 

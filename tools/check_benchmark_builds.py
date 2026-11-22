@@ -6,56 +6,52 @@ import sys
 from source_lines import zig_files
 
 
-EXECUTABLE = re.compile(r"\b\w+\s*\.\s*addExecutable\s*\(")
-HELPER = re.compile(r"\bfn\s+addBenchmark\s*\([^{}]*\)\s*[^{}]*\{")
-HELPER_BODY = re.compile(
-    r"\s*const\s+exe\s*=\s*b\.addExecutable\(\.\{\s*\.name\s*=\s*name\s*,"
-    r"\s*\.root_module\s*=\s*root_module\s*\}\);\s*"
-    r"test_step\.dependOn\(&exe\.step\);\s*return\s+exe;\s*"
+EXECUTABLE = re.compile(
+    r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\\\\[^\n]*|(?P<call>\baddExecutable\s*\()'''
 )
-BENCHMARK = re.compile(r"\baddBenchmark\s*\(")
-TEST_ARGUMENT = re.compile(r"\s*b\s*,\s*test_step\s*,")
-APP_OR_FIXTURE = re.compile(
-    r'\s*const\s+\w+\s*=\s*b\.addExecutable\(\.\{\s*\.name\s*=\s*'
-    r'"(?:bbr|grammar-cli-integration)"\s*,\s*\.root_module\s*=\s*\w+\s*\}\);\s*'
+FIELD = re.compile(
+    r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\\\\[^\n]*|(?P<brace>[{}])|'''
+    r'''(?P<name>\.name\s*=\s*(?P<value>"(?:\\.|[^"\\])*"|\w+)(?=\s*[,}]))'''
 )
+HELPER = re.compile(r"^fn\s+addBenchmark\b.*?(?=^\}|\Z)", re.MULTILINE | re.DOTALL)
+COMPILE_DEPENDENCY = re.compile(r"\btest_step\s*\.\s*dependOn\s*\(")
+RUN = re.compile(r"\baddRunArtifact\s*\(")
 
 
-def closing(text, start, opening, closing_char):
-    depth = 1
-    for index in range(start + 1, len(text)):
-        if text[index] == opening:
-            depth += 1
-        elif text[index] == closing_char:
-            depth -= 1
+def executable_name(text, start):
+    if not re.compile(r"\s*\.\s*\{").match(text, start):
+        return None
+    depth = 0
+    for field in FIELD.finditer(text, start):
+        if field["brace"]:
+            depth += 1 if field["brace"] == "{" else -1
             if depth == 0:
-                return index
-    return len(text)
+                break
+        elif depth == 1 and field["name"]:
+            return field["value"]
+    return None
 
 
 def violations(root):
     _, lines = next(zig_files(root, ("build.zig",), literals=True))
     _, masked_lines = next(zig_files(root, ("build.zig",), literals=False))
+    text = "\n".join(lines)
     masked = "\n".join(masked_lines)
     helper = HELPER.search(masked)
-    helper_start = helper.end() - 1 if helper else -1
-    helper_end = closing(masked, helper_start, "{", "}") if helper else -1
-    if not helper or not HELPER_BODY.fullmatch(masked[helper_start + 1:helper_end]):
+    if not helper or not COMPILE_DEPENDENCY.search(helper[0]) or RUN.search(helper[0]):
         yield (
-            "build.zig: addBenchmark must create exe with addExecutable, "
-            "call test_step.dependOn(&exe.step), and return exe. Depend on compilation only, not a benchmark run."
+            "build.zig: addBenchmark must call test_step.dependOn and must not call addRunArtifact. "
+            "Depend on compilation only, not a benchmark run."
         )
-    for call in BENCHMARK.finditer(masked):
-        if helper and helper.start() <= call.start() <= helper_start:
+    helper = HELPER.search(text)
+    for call in EXECUTABLE.finditer(text):
+        if not call["call"]:
             continue
-        if not TEST_ARGUMENT.match(masked, call.end()):
-            number = masked.count("\n", 0, call.start()) + 1
-            yield f"build.zig:{number}: use addBenchmark(b, test_step, name, root_module) so test compiles the benchmark."
-    for call in EXECUTABLE.finditer(masked):
-        if helper_start < call.start() < helper_end:
-            continue
-        number = masked.count("\n", 0, call.start()) + 1
-        if APP_OR_FIXTURE.fullmatch(lines[number - 1]):
+        number = text.count("\n", 0, call.start()) + 1
+        name = executable_name(text, call.end())
+        if name in ('"bbr"', '"grammar-cli-integration"') or (
+            name == "name" and helper and helper.start() <= call.start() < helper.end()
+        ):
             continue
         yield (
             f"build.zig:{number}: executable bypasses benchmark compilation in the test step. "
