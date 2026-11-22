@@ -44,9 +44,13 @@ def markdown_lines(path):
 def violations(root):
     identifiers, containers = source_names(root)
     documents = [root / "AGENTS.md", root / "CODING_STANDARDS.md"]
-    documents.extend(sorted((root / "docs/rules").glob("*.md")))
+    rules = sorted((root / "docs/rules").glob("*.md"))
+    if not rules:
+        yield "docs/rules/*.md: no rule documents found. Restore docs/rules/, or update the document list in tools/check_doc_symbols.py."
+    documents.extend(rules)
     for path in documents:
         if not path.is_file():
+            yield f"{path.relative_to(root)}: the document is missing. Restore it, or update the document list in tools/check_doc_symbols.py."
             continue
         fence = None
         for number, line in markdown_lines(path):
