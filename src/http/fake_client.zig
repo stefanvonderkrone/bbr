@@ -140,8 +140,15 @@ pub const FakeHttpClient = struct {
             self.active_requests -= 1;
         }
 
-        if (canned.released) |released|
-            while (!released.load(.acquire)) std.atomic.spinLoopHint();
+        if (canned.released) |released| {
+            const io = std.testing.io;
+            const start = std.Io.Clock.awake.now(io);
+            while (!released.load(.acquire)) {
+                if (start.untilNow(io, .awake).toSeconds() >= 10)
+                    return error.TestResponseGateTimeout;
+                std.atomic.spinLoopHint();
+            }
+        }
         if (send_error) |e| {
             if (req.phase) |phase| if (send_phase) |reported| {
                 phase.* = reported;
