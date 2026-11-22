@@ -31354,6 +31354,35 @@ test "a failed enrichment rebuild releases each File and reports only demanded F
     }
 }
 
+test "Review recovery a refused speculative enrichment build shows no action error" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 4) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+    const batch = try takeTestEnrichments(&presentation, &buffer);
+    try testing.expect(batch.len >= 2);
+    try deliverTestEnrichment(&presentation, batch[0]);
+    try deliverTestEnrichment(&presentation, batch[1]);
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expect(EnrichedFile.allSpeculative(worker.enrichments.items));
+    worker.build();
+    try testing.expect(!worker.failed);
+    // Inject a duplicate File to exercise admission refusal.
+    worker.enrichments.items[1].index = worker.enrichments.items[0].index;
+    try testing.expect(!admissible(presentation.published.?, worker, &worker.enrichments.items[1]));
+    const before = presentation.projection().review.?.buffer.rows.ptr;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+
+    try testing.expectEqual(before, presentation.projection().review.?.buffer.rows.ptr);
+    try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+    for (batch[2..]) |command| try deliverTestEnrichment(&presentation, command);
+}
+
 test "a File focused while its result waits in an enrichment rebuild reports the failed rebuild" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
