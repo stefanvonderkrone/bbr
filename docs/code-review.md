@@ -7,7 +7,7 @@ bbr uses it in delegation mode: the coding agent reviews the change, so `ocr` ne
 
 Ask the `ocr-review` agent to review workspace changes, a commit, or a branch.
 The agent follows the `open-code-review-delegate` skill in `.agents/skills/`.
-The permissions of the agent in `opencode.jsonc` deny every action by default. They allow the read, glob, and grep tools, the skill, the output files of the shell tool, `ocr`, and the read-only `git --no-pager` commands of the skill. The read tool cannot open `.env` files.
+The permissions of the agent in `opencode.jsonc` deny every action by default. They allow the read, glob, and grep tools, the skill, the output files of the shell tool, `ocr`, and the read-only `git --no-pager` commands of the skill. The read tool cannot open `.env` files, but the grep tool can still match lines in them, because a grep rule matches the pattern, not the path.
 
 ## Install the CLI
 
