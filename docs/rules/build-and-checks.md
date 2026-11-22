@@ -41,9 +41,18 @@ Enforcement: `addTestScripts` in `build.zig` lists `tests/` when the build confi
 
 ## Checker source lines
 
-A line checker in `tools/` reads Zig source only through `zig_files` in `tools/source_lines.py`. `zig_files` reads each file and gives the checker the code lines of the file, without comments. A `//` inside a string literal stays. A checker that looks for a call, not for a name in a literal, passes `literals=False`. That option also empties each literal. A checker never reads a file or splits text itself, so raw text never reaches it. A checker that reads no Zig source, such as `check_agent_docs.py`, goes in `NO_ZIG_SOURCE` with its reason.
+A line checker in `tools/` reads Zig source only through `zig_files` in `tools/source_lines.py`. `zig_files` reads each file and gives the checker the code lines of the file, without comments. A `//` inside a string literal stays. A checker that looks for a call, not for a name in a literal, passes `literals=False`. That option also empties each literal. A checker never reads a Zig file or splits its text itself, so raw Zig text never reaches it. A checker that reads no Zig source, such as `check_agent_docs.py`, goes in `NO_ZIG_SOURCE` with its reason.
 
-Enforcement: `CheckersTest` in `tests/source_lines_test.py`, run by `zig build test`. It fails on each `tools/check_*.py` that calls `read_text(`, `read_bytes(`, `open(`, or `.splitlines()`, or that does not import `zig_files`.
+Enforcement: `CheckersTest` in `tests/source_lines_test.py`, run by `zig build test`. It fails on each `tools/check_*.py` that calls `read_text(`, `read_bytes(`, `open(`, or `.splitlines()`, or that does not import `zig_files`. `MARKDOWN_READERS` exempts only the Markdown reader function of `check_doc_symbols.py` from the raw-read check.
+
+## Code names in rule docs
+
+A backticked dotted code name in `AGENTS.md`, `CODING_STANDARDS.md`, or `docs/rules/*.md` names current Zig code.
+Each segment names an identifier in `src/`.
+When the second-to-last segment names a struct, union, or enum, its body contains the final segment.
+Use the full `std` prefix for standard library names.
+
+Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker skips fenced code blocks, file names, and names that start with `std`, `vaxis`, `zf`, or `c`. It skips the generic `error.X` placeholder. It drops a leading `bbr` or `tui` segment. Comments and string literals supply no identifiers. The checker does not see undotted names or names outside the listed docs. A name occurrence in a container body satisfies the check, even when that occurrence declares no member. The checker does not resolve imports or distinguish containers with the same name. A generic type is a function that returns a `struct`. The checker does not read it as a container. It checks the members of a generic type only as identifiers. The checker fails on a missing `AGENTS.md`, a missing `CODING_STANDARDS.md`, or an empty `docs/rules/`. It does not see a short `std` name whose segments all name identifiers in `src/`.
 
 ## Compile claims in Enforcement paragraphs
 

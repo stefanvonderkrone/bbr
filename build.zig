@@ -221,6 +221,9 @@ pub fn build(b: *std.Build) void {
     const benchmark_metrics = b.addSystemCommand(&.{"python3"});
     benchmark_metrics.addFileArg(b.path("tools/check_benchmark_metrics.py"));
     benchmark_metrics.addDirectoryArg(b.path("."));
+    const doc_symbols = b.addSystemCommand(&.{"python3"});
+    doc_symbols.addFileArg(b.path("tools/check_doc_symbols.py"));
+    doc_symbols.addDirectoryArg(b.path("."));
     const stdio_writers = b.addSystemCommand(&.{"python3"});
     stdio_writers.addFileArg(b.path("tools/check_stdio_writers.py"));
     stdio_writers.addDirectoryArg(b.path("."));
@@ -443,6 +446,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&stdio_writers.step);
     test_step.dependOn(&benchmark_metrics.step);
+    test_step.dependOn(&doc_symbols.step);
     test_step.dependOn(&b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true }).step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);

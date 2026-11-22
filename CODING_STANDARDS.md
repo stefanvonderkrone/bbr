@@ -46,7 +46,7 @@ A `catch` whose error set contains `error.Canceled` names `error.Canceled`. The 
 - It calls `io.recancel()`.
 - It stands under `io.swapCancelProtection(.blocked)` and is `unreachable`.
 
-`std.Io.sleep` and `Group.await` return `error{Canceled}`, so an `else` on those calls is unreachable. An `else` on a wider set that returns the cause also returns `error.Canceled`. `std/Io.zig` says that code which ignores `error.Canceled` is usually wrong, because the next cancelation point does not signal it again.
+`std.Io.sleep` and `std.Io.Group.await` return `error{Canceled}`, so an `else` on those calls is unreachable. An `else` on a wider set that returns the cause also returns `error.Canceled`. `std/Io.zig` says that code which ignores `error.Canceled` is usually wrong, because the next cancelation point does not signal it again.
 
 No check: a line check cannot see an error set, and a list of call names misses a `try` through another function. The compiler rejects a missing `error.Canceled` prong only when the `switch` has no `else`. Related checked rule: [A catch captures and records its cause](docs/rules/diagnostics.md#a-catch-captures-and-records-its-cause).
 
