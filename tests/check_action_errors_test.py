@@ -1,4 +1,4 @@
-"""Regression checks for the action error write validator."""
+"""Regression checks for the action error and event origin write validator."""
 
 import importlib.util
 from pathlib import Path
@@ -30,17 +30,18 @@ OLD_CLIPBOARD = """pub const Presentation = struct {
 HELPERS = """pub const Presentation = struct {
     action_error: ?ShownError = null,
 
-    fn showError(self: *Presentation, origin: ErrorOrigin, err: ActionError) void {
-        self.action_error = .{ .err = err, .origin = origin };
+    fn showError(self: *Presentation, err: ActionError) void {
+        self.action_error = .{ .err = err, .origin = self.errorOrigin() };
     }
 
-    fn clearError(self: *Presentation, origin: ErrorOrigin) void {
+    fn clearError(self: *Presentation) void {
         const shown = self.action_error orelse return;
+        const origin = self.errorOrigin();
         if (origin == .user or shown.origin == origin) self.action_error = null;
     }
 
     fn acceptPullRequests(self: *Presentation) void {
-        if (self.action_error == null) self.clearError(.picker);
+        if (self.action_error == null) self.clearError();
         // self.action_error = null;
         const text = "self.action_error = null";
         _ = text;
@@ -48,6 +49,41 @@ HELPERS = """pub const Presentation = struct {
 
     pub fn projection(self: *const Presentation) Projection {
         return .{ .action_error = if (self.action_error) |shown| shown.err else null };
+    }
+};
+"""
+
+
+# A retry inside a key event that sets the origin by hand and never restores it.
+HAND_ORIGIN = """pub const Presentation = struct {
+    event_origin: ?ErrorOrigin = null,
+
+    fn openReviewSearch(self: *Presentation) void {
+        self.event_origin = .review_search;
+        self.replaceReviewSearchQuery(text);
+    }
+};
+"""
+ORIGIN_HELPERS = """pub const Presentation = struct {
+    event_origin: ?ErrorOrigin = null,
+
+    pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
+        const outer_origin = self.event_origin;
+        self.event_origin = input.errorOrigin();
+        defer self.event_origin = outer_origin;
+        if (self.event_origin == .user) self.applyKey(input.key);
+    }
+
+    fn withErrorOrigin(self: *Presentation, origin: ErrorOrigin, comptime work: anytype, args: anytype) void {
+        const outer = self.event_origin;
+        self.event_origin = origin;
+        defer self.event_origin = outer;
+        @call(.auto, work, args);
+    }
+
+    fn openReviewSearch(self: *Presentation) void {
+        // self.event_origin = .review_search;
+        self.withErrorOrigin(.review_search, replaceReviewSearchQuery, .{ self, text });
     }
 };
 """
@@ -67,8 +103,8 @@ class ActionErrorsTest(unittest.TestCase):
     def test_the_old_clipboard_reset_is_rejected(self):
         found = self.check(OLD_CLIPBOARD)
         self.assertEqual(len(found), 1)
-        self.assertIn("src/tui/presentation.zig:8: writes action_error outside its helpers.", found[0])
-        self.assertIn("clearError(origin)", found[0])
+        self.assertIn("src/tui/presentation.zig:8: writes action_error outside showError and clearError.", found[0])
+        self.assertIn("clearError()", found[0])
 
     def test_writes_of_a_test_and_after_the_helpers_are_rejected(self):
         found = self.check(
@@ -80,10 +116,19 @@ class ActionErrorsTest(unittest.TestCase):
             + "    presentation.*.action_error = null;\n"
             + "}\n"
         )
-        self.assertEqual([message.split(":")[1] for message in found], ["25", "28"])
+        self.assertEqual([message.split(":")[1] for message in found], ["26", "29"])
 
     def test_the_helpers_reads_comments_literals_and_projection_fields_are_allowed(self):
         self.assertEqual(self.check(HELPERS), [])
+
+    def test_a_hand_set_event_origin_is_rejected(self):
+        found = self.check(HAND_ORIGIN)
+        self.assertEqual(len(found), 1)
+        self.assertIn("src/tui/presentation.zig:5: writes event_origin outside dispatch and withErrorOrigin.", found[0])
+        self.assertIn("withErrorOrigin(origin, work, args)", found[0])
+
+    def test_dispatch_and_the_override_helper_may_set_the_event_origin(self):
+        self.assertEqual(self.check(ORIGIN_HELPERS), [])
 
 
 if __name__ == "__main__":
