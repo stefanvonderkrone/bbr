@@ -33532,6 +33532,127 @@ test "Review recovery a successful Comment delete clears an error of its own pat
     try testing.expect(state.projection().action_error == null);
 }
 
+test "Review recovery a failed Draft save survives a successful view build" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "original", .state = .{ .failed = error.ServerError } });
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer state.deinit();
+    try cursorToDraftCard(&state, 1);
+    try state.dispatch(.{ .action = .edit_review_item });
+    try state.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" retried") } });
+    store.fail_next_edit = true;
+    try state.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&state);
+    try testing.expectEqual(ActionError.persistence_failed, state.projection().action_error.?);
+
+    try state.dispatch(.{ .resize = .{ .cols = state.geometry.cols + 10, .rows = state.geometry.rows } });
+    try completeNextDisclosureBuild(&state);
+    try testing.expectEqual(state.geometry.cols, state.published.?.geometry.cols);
+    try testing.expectEqual(@as(?ActionError, .persistence_failed), state.projection().action_error);
+}
+
+test "Review recovery a Submission retry key during shutdown clears an unrelated user error" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
+    var state = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    var post = state.takeCommand().?;
+    try state.dispatch(.request_shutdown);
+    try state.dispatch(try post.launchFailed(error.TestLaunchFailure));
+    try testing.expectEqual(ActionError.submission_launch_failed, state.projection().action_error.?);
+    try state.dispatch(.{ .action = .edit_review_item });
+    const user_error = state.projection().action_error.?;
+    try testing.expect(user_error != .submission_launch_failed);
+
+    try state.dispatch(.{ .action = .submit });
+    var retried = state.takeCommand().?;
+    defer retried.deinit();
+    try testing.expect(retried == .post_draft);
+    try testing.expectEqual(@as(?ActionError, null), state.projection().action_error);
+}
+
+test "Review recovery a recovery retry key clears an unrelated user error" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
+    var state = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+        .require_source_check = true,
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    const check = state.takeCommand().?.check_recovery;
+    try state.dispatch(recoveryCheckSucceeded(check.command_id, check.operation_id, null, "s" ** 65));
+    try testing.expectEqual(ActionError.recovery_check_failed, state.projection().action_error.?);
+    try state.dispatch(.{ .action = .edit_review_item });
+    const user_error = state.projection().action_error.?;
+    try testing.expect(user_error != .recovery_check_failed);
+
+    try state.dispatch(.{ .action = .recover_submission });
+    try testing.expect(state.takeCommand().? == .check_recovery);
+    try testing.expectEqual(@as(?ActionError, null), state.projection().action_error);
+}
+
+test "Review recovery a failed Draft jump survives a view build and clears on the next key" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "on b", .scope = .{ .@"inline" = .{ .path = "b.zig", .to = 1, .commit = "source" } } });
+    var state = try Presentation.init(failing.allocator(), .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer state.deinit();
+    try failSoleDraftSubmission(&state, key, try testTwoFileSession(testing.allocator, 1));
+    try state.dispatch(.{ .action = .isolate });
+    try completeNextDisclosureBuild(&state);
+    while (state.takeCommand()) |command| {
+        var discarded = command;
+        discarded.deinit();
+    }
+
+    // The card destination build cannot queue, because the empty queue cannot grow.
+    state.commands.clearAndFree(state.allocator);
+    failing.fail_index = failing.alloc_index;
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(ActionError.out_of_memory, state.projection().action_error.?);
+    try testing.expect(state.projection().submission_tree != null);
+
+    try state.dispatch(.{ .resize = .{ .cols = 110, .rows = 30 } });
+    try completeNextDisclosureBuild(&state);
+    try testing.expectEqual(@as(u16, 110), state.published.?.geometry.cols);
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), state.projection().action_error);
+    // Escape only hides the Overlay. The next motion key clears the error.
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(state.projection().submission_tree == null);
+    try state.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expectEqual(@as(?ActionError, null), state.projection().action_error);
+}
+
 test "portable Picker input loads summaries and selects a replacement" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
