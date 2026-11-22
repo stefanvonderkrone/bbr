@@ -21,7 +21,7 @@
         { "action": "glob", "resource": "*", "effect": "allow" },
         { "action": "grep", "resource": "*", "effect": "allow" },
         { "action": "skill", "resource": "open-code-review-delegate", "effect": "allow" },
-        { "action": "external_directory", "resource": "~/.local/share/opencode/shell/*", "effect": "allow" },
+        { "action": "external_directory", "resource": "*/opencode/shell/*", "effect": "allow" },
         { "action": "shell", "resource": "ocr --version", "effect": "allow" },
         { "action": "shell", "resource": "ocr delegate *", "effect": "allow" },
         { "action": "shell", "resource": "git --no-pager diff *", "effect": "allow" },
