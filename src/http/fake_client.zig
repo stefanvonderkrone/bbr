@@ -1,5 +1,6 @@
-//! In-memory `HttpClient` for tests: returns a canned status + body and records
-//! the last request so tests can assert URL / method. No network.
+//! In-memory `HttpClient` for tests and benchmarks: returns a canned status + body
+//! and records the last request so tests can assert URL / method. No network.
+//! Benchmark executables compile this file, so it must not use `std.testing`.
 //!
 //! Captured request data is copied into a fixed buffer, so it stays valid after
 //! the caller frees the request's slices.
@@ -23,7 +24,9 @@ pub const Canned = struct {
     /// The transport phase that `send_error` reports, as `StdHttpClient` does.
     send_phase: ?Phase = null,
     /// A request waits until this flag becomes true. Tests use it to choose
-    /// completion order without coupling responses to start order.
+    /// completion order without coupling responses to start order. After 10 s
+    /// the request fails with `error.TestResponseGateTimeout`, so a test fails
+    /// instead of hanging.
     released: ?*std.atomic.Value(bool) = null,
 };
 

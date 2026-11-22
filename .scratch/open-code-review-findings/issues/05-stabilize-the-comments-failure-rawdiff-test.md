@@ -165,3 +165,13 @@ The no-comments pass kept three comments about queue and wake behavior.
 The installed skills did not include a deslop pass.
 The advisor tool was not available.
 Linux and macOS x86_64 runtime results remain unproven locally.
+
+## Merged head
+
+PR 47 combined this change with tickets 04 and 06 by merge commits.
+The merge broke the `bbr-buffer-search-bench` compile, because the benchmarks also use `FakeHttpClient` and the response gate read `std.testing.io`.
+The benchmark compile step of ticket 06 caught the break.
+Commit `139aaa59` reads the gate clock from `std.Io.Threaded.global_single_threaded` instead.
+The header of `src/http/fake_client.zig` now says that the file must not use `std.testing`.
+On the merged head, `zig build test` passed 1726 of 1726 tests and `zig build bench-buffer-search` exited with 0.
+The run counts above come from the branch head before the merge.
