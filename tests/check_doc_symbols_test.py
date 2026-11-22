@@ -9,11 +9,15 @@ CHECKER = Path(__file__).resolve().parents[1] / "tools/check_doc_symbols.py"
 
 
 class DocSymbolsTest(unittest.TestCase):
-    def check(self, document, source, *, path="AGENTS.md"):
+    def check(self, document, source, *, path="AGENTS.md", missing=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "src").mkdir()
             (root / "src/fixture.zig").write_text(source, encoding="utf-8")
+            for required in ("AGENTS.md", "CODING_STANDARDS.md", "docs/rules/fixture.md"):
+                if required not in missing:
+                    (root / required).parent.mkdir(parents=True, exist_ok=True)
+                    (root / required).write_text("", encoding="utf-8")
             doc = root / path
             doc.parent.mkdir(parents=True, exist_ok=True)
             doc.write_text(document, encoding="utf-8")
@@ -103,6 +107,17 @@ class DocSymbolsTest(unittest.TestCase):
     def test_missing_name_in_coding_standards_fails(self):
         result = self.check("Use `Missing.member`.\n", "", path="CODING_STANDARDS.md")
         self.assert_rejected(result, "Missing.member", "CODING_STANDARDS.md:1")
+
+
+    def test_missing_document_fails(self):
+        result = self.check("", "", path="docs/rules/fixture.md", missing=("CODING_STANDARDS.md",))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("CODING_STANDARDS.md: the document is missing.", result.stderr)
+
+    def test_empty_rule_directory_fails(self):
+        result = self.check("", "", missing=("docs/rules/fixture.md",))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("docs/rules/*.md: no rule documents found.", result.stderr)
 
 
 if __name__ == "__main__":
