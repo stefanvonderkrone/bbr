@@ -83,7 +83,9 @@ The product behavior is correct. The test is wrong.
 Commit `1445bbbf` fixes all three callers of the wrong wait in `src/tui/session.zig`.
 It deletes the `active_request_count_not` arm from `TestWait` and `spinUntil`.
 It also deletes the unused `loadFailureAndSignal` helper.
-The Session coordinator and `FakeHttpClient` do not change.
+The Session coordinator does not change.
+The review follow-up bounds each fake response gate at ten seconds.
+A gate that stays closed returns `error.TestResponseGateTimeout`.
 
 The active request count falls before the caller checks the HTTP status.
 The old wait thus let another completion reach the coordinator before the required failure.
@@ -94,17 +96,26 @@ The failed branch also exposes no coordinator-consumption signal.
 A counter after `send` returns would still precede consumption.
 `TestLoadSchedule` instead controls response release through an isolated `std.Io.Threaded` instance.
 The helper changes only the test I/O vtable.
-Each coordinator wait on a fresh Condition releases the next response.
-The next completion-queue wait proves that the coordinator consumed the previous completion.
+The helper checks the thread ID and the expected futex value.
+A wait on the coordinator thread with expected value zero releases the next response.
+The helper does not check the identity of the Condition or the queue.
+In Zig 0.16.0, the next matching wait follows consumption of the previous completion.
 The helper waits for an epoch change before it returns from a futex wait.
 Thus a spurious wake cannot release the next response.
 Cancellation releases all response gates before it joins the workers.
 
-The helper depends on Zig 0.16 queue behavior.
-`std/Io.zig` implements `Select.await` through `Queue.getOne`.
-Each blocked queue read uses a fresh Condition with epoch zero.
-Mutex contention waits use expected value two.
-The helper forwards those waits and all worker waits without a change.
+The helper depends on Zig 0.16.0 queue behavior.
+The following paths are relative to the `lib_dir` from `zig env`.
+`std/Io.zig:1470-1471` implements `Select.await` through `Queue.getOne`.
+`std/Io.zig:2292-2295` reads one element through `Queue.get`.
+`std/Io.zig:2122-2136` gives a blocked queue read a fresh Condition.
+`std/Io.zig:1663-1666` initializes its epoch to zero.
+`std/Io.zig:1592-1596` gives the mutex contention state value two.
+`std/Io.zig:1612-1616` waits on that value.
+The helper forwards waits with another expected value and all worker waits without a change.
+A Zig upgrade can add another matching wait on the coordinator thread.
+That wait can release a response too early.
+The ten-second gate bound turns a missed wait into a test failure instead of an indefinite wait.
 The tests keep their names because they still check the same request behavior.
 Exact request counts detect a request after the coordinator consumes a required failure.
 
@@ -122,6 +133,25 @@ Each loop started that executable in a fresh process with a 30-second timeout.
 - A temporary change started RawDiff in the Comments completion arm after it set `required_failed`.
 - The Comments test then failed with `expected 3, found 4`.
 - The temporary coordinator change and build target were removed.
+
+To rerun the delay check, add this temporary statement in `Client.send` in `src/bitbucket/client.zig`.
+Put it after `self.http.send` returns and before `classify(response.status)`.
+It delays each required 404 response after the fake client drops its active request count.
+
+```zig
+if (response.status == 404)
+    try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+```
+
+Temporarily add a build target for `exe.root_module` with these test filters:
+
+- `required failure awaits started`
+- `failure prevents later`
+
+Install that test executable.
+Run it in 300 fresh processes with a 30-second timeout for each process.
+Each process must pass all three Session tests.
+Remove the delay and the temporary build target after the check.
 
 Checks on the committed code passed:
 
