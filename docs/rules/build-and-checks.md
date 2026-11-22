@@ -52,7 +52,7 @@ Each segment names an identifier in `src/`.
 When the second-to-last segment names a struct, union, or enum, its body contains the final segment.
 Use the full `std` prefix for standard library names.
 
-Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker skips fenced code blocks, file names, and names that start with `std`, `vaxis`, `zf`, or `c`. It skips the generic `error.X` placeholder. It drops a leading `bbr` or `tui` segment. Comments and string literals supply no identifiers. The checker does not see undotted names or names outside the listed docs. A name occurrence in a container body satisfies the check, even when that occurrence declares no member. The checker does not resolve imports or distinguish containers with the same name.
+Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker skips fenced code blocks, file names, and names that start with `std`, `vaxis`, `zf`, or `c`. It skips the generic `error.X` placeholder. It drops a leading `bbr` or `tui` segment. Comments and string literals supply no identifiers. The checker does not see undotted names or names outside the listed docs. A name occurrence in a container body satisfies the check, even when that occurrence declares no member. The checker does not resolve imports or distinguish containers with the same name. A generic type, a function that returns a `struct`, is not a container for the check, so its members are checked only as identifiers.
 
 ## Compile claims in Enforcement paragraphs
 
