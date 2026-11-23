@@ -6,16 +6,16 @@ A PullRequest is always `--pull-request-id`, a Comment `--comment-id`, and a Tas
 
 ## Recipes
 
-Replace `REPO`, `42`, and `7` with real values. A write recipe still needs the approval of the mutation guard in SKILL.md.
+Replace `REPO`, `42`, and `7` with real values. Replace `UUID` with the `uuid` of `bbr api whoami --json`, which includes its braces. A write recipe still needs the approval of the mutation guard in SKILL.md.
 
 ```sh
 # Find the PullRequest of the current Branch
 bbr api list-pull-requests --repository REPO --source-branch "$(git branch --show-current)" --state OPEN --json
 # Read every Comment on a PullRequest
 bbr api list-comments --repository REPO --pull-request-id 42 --json
-# Read only the Comments of other accounts, such as review findings (UUID from whoami)
-bbr api list-comments --repository REPO --pull-request-id 42 --query 'user.uuid != "{uuid}"' --json
-# Bitbucket cannot filter resolution or parent. Read the `resolved` field of the JSON instead.
+# Read only the Comments of other accounts, such as review findings
+bbr api list-comments --repository REPO --pull-request-id 42 --query 'user.uuid != "UUID"' --json
+# Bitbucket cannot filter resolution or parent. Read the `resolved` and `parent_id` fields of the JSON instead.
 # Wrap each inline.path term in parentheses, such as 'deleted = false AND (inline.path != null)'.
 # Reply to Comment 7 (write)
 bbr api create-comment --repository REPO --pull-request-id 42 --parent-id 7 --body-file reply.md
