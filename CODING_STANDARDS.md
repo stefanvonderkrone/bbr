@@ -46,7 +46,7 @@ A `catch` whose error set contains `error.Canceled` names `error.Canceled`. The 
 - It calls `io.recancel()`.
 - It stands under `io.swapCancelProtection(.blocked)` and is `unreachable`.
 
-`std.Io.sleep` and `Group.await` return `error{Canceled}`, so an `else` on those calls is unreachable. An `else` on a wider set that returns the cause also returns `error.Canceled`. `std/Io.zig` says that code which ignores `error.Canceled` is usually wrong, because the next cancelation point does not signal it again.
+`std.Io.sleep` and `std.Io.Group.await` return `error{Canceled}`, so an `else` on those calls is unreachable. An `else` on a wider set that returns the cause also returns `error.Canceled`. `std/Io.zig` says that code which ignores `error.Canceled` is usually wrong, because the next cancelation point does not signal it again.
 
 No check: a line check cannot see an error set, and a list of call names misses a `try` through another function. The compiler rejects a missing `error.Canceled` prong only when the `switch` has no `else`. Related checked rule: [A catch captures and records its cause](docs/rules/diagnostics.md#a-catch-captures-and-records-its-cause).
 
@@ -73,6 +73,16 @@ Presentation maps a Scroll Drag pointer to an offset only through `view.dragOffs
 No check: a test checks the drag result of each scroll bar, but a second path with the same result in the tested cases passes. Related checked rule: [Scroll bar arithmetic](docs/rules/tui-paint.md#scroll-bar-arithmetic).
 
 ## TUI state
+
+### Choose the origin of an action error
+
+Add a `withErrorOrigin` override only for work that belongs to another path than its event, such as a pump that runs after the inputs of every event.
+Choose the origin of the path whose completion must clear the error.
+A user handler overrides only for an error that a later completion of another path must clear.
+Name the reason in a comment at each override.
+When an error must stay through a completion of its own event path, give the path its own `ErrorOrigin` instead of an override, as Draft builds have `.draft`.
+
+No check: the type and the line check see that only the event and `withErrorOrigin` set the origin, but not that an override names the right path. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
 
 ### Reserve storage in every rebuild
 

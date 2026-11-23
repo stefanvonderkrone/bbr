@@ -1,7 +1,9 @@
 """Regression checks for the comment-free source lines that every line checker reads."""
 
+import ast
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
@@ -57,12 +59,21 @@ class ZigCodeWithoutLiteralsTest(unittest.TestCase):
 NO_ZIG_SOURCE = {
     "check_agent_docs.py": "reads the Markdown agent documents. It reads Zig source only through zig_files",
 }
+MARKDOWN_READERS = {
+    "check_doc_symbols.py": "markdown_lines",
+}
 RAW_READS = ("read_text(", "read_bytes(", "open(", ".splitlines()")
 
 
 def checker_problems(path):
     """Each way the checker at `path` reads source text itself instead of through source_lines.zig_files."""
     text = path.read_text(encoding="utf-8")
+    if path.name in MARKDOWN_READERS:
+        reader = MARKDOWN_READERS[path.name]
+        for node in ast.parse(text).body:
+            if isinstance(node, ast.FunctionDef) and node.name == reader:
+                text = text.replace(ast.get_source_segment(text, node), "")
+                break
     fix = (
         f"tools/{path.name}: read Zig source only with source_lines.zig_files, which drops comments outside literals. "
         f"A checker that reads no Zig source goes in NO_ZIG_SOURCE in tests/source_lines_test.py with its reason."
@@ -74,6 +85,30 @@ def checker_problems(path):
 
 
 class CheckersTest(unittest.TestCase):
+    def test_markdown_exception_does_not_hide_other_raw_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "check_doc_symbols.py"
+            document_reader = (
+                "from source_lines import zig_files\n"
+                "def markdown_lines(path):\n"
+                "    with path.open() as document:\n"
+                "        yield from document\n"
+            )
+            path.write_text(document_reader, encoding="utf-8")
+            self.assertEqual(checker_problems(path), [])
+            path.write_text(
+                document_reader + "def source_names(path):\n    return path.read_text()\n",
+                encoding="utf-8",
+            )
+            problems = checker_problems(path)
+            self.assertEqual(len(problems), 1)
+            self.assertIn("It calls read_text(", problems[0])
+
+    def test_markdown_reader_exceptions_name_existing_functions(self):
+        for name, reader in MARKDOWN_READERS.items():
+            tree = ast.parse((TOOLS / name).read_text(encoding="utf-8"))
+            self.assertTrue(any(isinstance(node, ast.FunctionDef) and node.name == reader for node in tree.body))
+
     def test_every_zig_checker_reads_lines_through_source_lines(self):
         for name in NO_ZIG_SOURCE:
             self.assertTrue((TOOLS / name).is_file(), f"NO_ZIG_SOURCE names tools/{name}, which does not exist.")
