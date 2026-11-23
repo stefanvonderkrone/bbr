@@ -1,6 +1,6 @@
 # Check stderr writes on TUI paths
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: none
 
 ## Problem
@@ -20,8 +20,12 @@ A plain line check is not enough. `src/main.zig` has about 100 valid `std.debug.
 
 ## Acceptance criteria
 
-- [ ] The check fails on the old `Diagnostic.report` of M27 (before `5eb344e4`).
-- [ ] The check passes on the current tree, or each remaining site is fixed or named with its reason.
+- [ ] `Diagnostic.report` is gone from `src/highlight/query_predicates.zig`. `src/highlight/tree_sitter_highlighter.zig` and `src/highlight/user_grammar.zig` no longer call it. The failure is the one record of `Handle.fail`.
+- [ ] A CLI path that showed the query message, such as `bbr grammar`, still shows it through `bbr.cli_failure.fail`.
+- [ ] `Failure.report` moves out of `src/tui/config.zig` to the CLI code in `src/main.zig`, its only caller.
+- [ ] The check covers the production code of `src/tui/` and `src/highlight/`. It fails on `std.debug.print`, `lockStderr`, and `stderr()`.
+- [ ] The check fails on the `Diagnostic.report` of `main` before this ticket.
+- [ ] The check passes on the tree after this ticket. Each exempt site is named with its reason.
 - [ ] `tests/` holds the regression tests of the check, and `zig build test` runs the check.
 - [ ] The rule is a section in the matching doc under `docs/rules/`.
 
@@ -30,3 +34,11 @@ A plain line check is not enough. `src/main.zig` has about 100 valid `std.debug.
 ### 2026-11-18 filed
 
 The operator asked for this ticket after the M27 stderr fix.
+
+### 2026-11-23 triage
+
+- The write is still on `main`. `Diagnostic.report` in `src/highlight/query_predicates.zig` writes through `std.debug.lockStderr`. `src/highlight/tree_sitter_highlighter.zig` line 56 and `src/highlight/user_grammar.zig` line 300 call it. The fix `5eb344e4` is only on the unmerged branch `m27-zig-builtin-grammar`.
+- The operator decided: this ticket fixes the write on `main`. The check has no allowlist for it. The m27 merge then resolves a small conflict.
+- Checked modules: `src/tui/` and `src/highlight/`. `src/highlight/user_grammar.zig` is in the list. It writes a CLI message only through `bbr.cli_failure.fail`.
+- `Failure.report` in `src/tui/config.zig` is called only by `reportConfigFailure` in `src/main.zig`, on a CLI path. Move it to the CLI code instead of an exemption.
+- The `pub fn benchmark*` functions in `src/tui/presentation.zig` print their results with `std.debug.print`. Only benchmark binaries call them. The check exempts them by name. This leaves a gap: a production function with a `benchmark` prefix passes the check. Write the gap into the rule section.

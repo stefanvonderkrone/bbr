@@ -1,7 +1,7 @@
 # Move the unchecked conventions to review standards
 
-Status: needs-triage
-Blocked by: 01
+Status: ready-for-agent
+Blocked by: none
 
 ## Problem
 
@@ -26,9 +26,13 @@ The implementing agent carries the most context. The reviewer receives a diff an
 
 ## Acceptance criteria
 
-- [ ] Each "Convention (no check)" rule, full or partial, is either a new check or a rule in `CODING_STANDARDS.md`.
-- [ ] The import rule for `presentation.zig` is a check that `zig build test` runs, or the ticket records why it is not.
-- [ ] The `code-review` skill finds `CODING_STANDARDS.md` without changes, or its pointer is updated.
+- [x] Each "Convention (no check)" rule, full or partial, is either a new check or a rule in `CODING_STANDARDS.md`.
+- [x] The `code-review` skill finds `CODING_STANDARDS.md` without changes, or its pointer is updated.
+- [ ] `src/tui/presentation.zig` imports no vaxis and no `theme.zig` directly, and a check that `zig build test` runs rejects such an import.
+- [ ] A check rejects the literal `.{ .hunk_line = ` in production code outside `LineOwner.of` in `src/tui/frame.zig`.
+- [ ] A check rejects `@constCast(session.` and `@constCast(published.session.` outside `test` blocks.
+- [ ] A test compares the keys that each fixed-key handler reads with its section in `help.fixed_sections` in `src/tui/help.zig`.
+- [ ] Each new check has its regression tests in `tests/`. Each rule moves from `CODING_STANDARDS.md` to its area doc in `docs/rules/` with its enforcement.
 - [ ] `python3 tools/check_agent_docs.py` and `zig build test` pass.
 
 ## Completion of the move
@@ -45,3 +49,13 @@ Candidates for a check, not done:
 - A `@constCast` of a Session field after publication. A line check can reject `@constCast` on Session fields outside test blocks.
 - The `.bytes` default of `BuildOptions.cell_metrics`. Follow-up ticket 03 removes the default.
 - The fixed help sections. A test can compare the keys that each fixed-key handler reads with its section in `help.fixed_sections`.
+
+## Comments
+
+### 2026-11-23 triage
+
+- Ticket 01 is resolved, so this ticket has no blocker.
+- The move is done. The remaining work is the four checks in the acceptance criteria.
+- The `.bytes` default of `BuildOptions.cell_metrics` is out of scope. [Follow-up ticket 03](../../enrichment-rebuild-follow-up/issues/03-require-the-cell-metrics-of-every-buffer-build.md) owns it.
+- On 2026-11-23 `main` has no direct import of vaxis or `theme.zig` in `presentation.zig`. The only `.{ .hunk_line = ` is in `LineOwner.of`. Each `@constCast(session.` is in a `test` block. The `@constCast` calls at `presentation.zig` lines 2138, 4959, and 11175 and `review_body.zig` line 259 are not Session fields, and the check must not reject them. Each check passes on the current tree.
+- A line check reads source through `zig_files` in `tools/source_lines.py`.
