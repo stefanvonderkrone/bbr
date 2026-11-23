@@ -1103,6 +1103,11 @@ test "scope rejections name only missing token scopes on stderr" {
     const prefix = "bbr api create-branch: Bitbucket rejected request (Forbidden): ";
     const envelope = "{\"type\":\"error\",\"error\":{\"message\":\"" ++ message ++ "\",\"detail\":";
     const scope_prefix = "a" ** 127;
+    const edge_scopes = scope_prefix ++ "1\",\"" ++ scope_prefix ++ "2\",\"" ++ scope_prefix ++ "3\",\"" ++
+        scope_prefix ++ "4\",\"" ++ scope_prefix ++ "5\",\"" ++ scope_prefix ++ "6\",\"" ++ scope_prefix ++ "7\",\"";
+    const edge_list = scope_prefix ++ "1, " ++ scope_prefix ++ "2, " ++ scope_prefix ++ "3, " ++
+        scope_prefix ++ "4, " ++ scope_prefix ++ "5, " ++ scope_prefix ++ "6, " ++ scope_prefix ++ "7, ";
+    comptime std.debug.assert((edge_list ++ "b" ** 114).len == 1024);
     for ([_]struct { body: []const u8, expected: []const u8 }{
         .{
             .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\",\"read:user:bitbucket\",\"" ++ scope ++ "\",\"read:user:bitbucket\"],\"granted\":[]}}}",
@@ -1136,6 +1141,8 @@ test "scope rejections name only missing token scopes on stderr" {
                 scope_prefix ++ "7\",\"" ++ scope_prefix ++ "8\",\"" ++ scope_prefix ++ "9\"],\"granted\":[]}}}",
             .expected = prefix ++ message ++ "\n",
         },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ edge_scopes ++ "b" ** 114 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ " Missing token scopes: " ++ edge_list ++ "b" ** 114 ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ edge_scopes ++ "b" ** 115 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
         .{ .body = envelope ++ "{\"required\":[\"read:user:bitbucket\",\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ " Missing token scopes: read:user:bitbucket, " ++ scope ++ "\n" },
         .{ .body = "{\"error\":{\"detail\":{\"required\":[\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ "Missing token scopes: " ++ scope ++ "\n" },
     }) |case| {
