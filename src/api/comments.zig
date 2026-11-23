@@ -14,6 +14,10 @@ pub const list_help =
     \\List comments (GET .../comments, follows pages). PR head is fetched
     \\automatically for outdated detection unless --no-head or explicit commits.
     \\--no-follow returns one page. --limit caps the number of comments fetched.
+    \\--query takes a Bitbucket filter on id, user.uuid, created_on, deleted, and
+    \\inline.path, such as 'user.uuid != "{uuid}"'. Bitbucket rejects resolution
+    \\and parent. Put inline.path first in an AND, because Bitbucket reads
+    \\"AND inline" as "AND in".
     \\Flags can appear in any order.
     \\
 ++ pages.pagelenHelp(bbr.bitbucket.max_pagelen.comments);
