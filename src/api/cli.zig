@@ -495,20 +495,23 @@ test "skills/bbr/VERBS.md lists every bbr api verb once" {
     try std.testing.expect(!failed);
 }
 
-test "every command in the bbr skill uses only the flags of its verb" {
+test "every command in the bbr skill parses through its CLI handler" {
     var failed = false;
     for (verbs) |verb| {
-        var tokens: DocTokens = .{ .text = verb.example, .pos = "bbr api ".len + verb.name.len };
-        while (nextForeignFlag(verb, &tokens)) |name| {
-            std.debug.print("bbr api {s}: the example of its row of `verbs` in src/api/cli.zig passes --{s}, which the row does not list\n", .{ verb.name, name });
-            failed = true;
-        }
+        const source = @embedFile("cli.zig");
+        const start = std.mem.indexOf(u8, source, verb.name) orelse return error.TestUnexpectedResult;
+        const command: DocCommand = .{
+            .path = "src/api/cli.zig",
+            .line = std.mem.count(u8, source[0..start], "\n") + 1,
+            .text = verb.example["bbr api ".len..],
+        };
+        if (!try command.check()) failed = true;
     }
     for ([_]struct { path: []const u8, doc: []const u8 }{
         .{ .path = "skills/bbr/SKILL.md", .doc = @embedFile("bbr_skill_md") },
         .{ .path = "skills/bbr/VERBS.md", .doc = @embedFile("bbr_verbs_md") },
     }) |file| {
-        if (!bbrApiCommandsUseRowFlags(file.path, file.doc)) failed = true;
+        if (!try bbrApiCommandsParse(file.path, file.doc)) failed = true;
         var lines = std.mem.splitScalar(u8, file.doc, '\n');
         var line_number: usize = 0;
         while (lines.next()) |line| {
@@ -516,54 +519,71 @@ test "every command in the bbr skill uses only the flags of its verb" {
             var spans = std.mem.splitScalar(u8, line, '`');
             var code = false;
             while (spans.next()) |span| : (code = !code) {
-                if (code and !codeSpanUsesRowFlags(file.path, line_number, span)) failed = true;
+                if (code and !try codeSpanParses(file.path, line_number, span)) failed = true;
             }
         }
     }
     try std.testing.expect(!failed);
 }
 
-/// Checks every `bbr api` command in `text`, in prose, a code span, or a
-/// fence. Agents copy each shape, so no Markdown parse decides what counts.
-/// A verb with an uppercase letter, such as `VERB`, is a placeholder.
-fn bbrApiCommandsUseRowFlags(path: []const u8, text: []const u8) bool {
+test "copied commands remove shell quote delimiters before option parsing" {
+    for ([_][]const u8{
+        "list-comments --repository='sample' --pull-request-id=\"42\" --no-head",
+        "update-pull-request --repository sample --pull-request-id '42' \\\n --draft \"false\"",
+    }) |text| {
+        const command: DocCommand = .{ .path = "quoted command", .line = 1, .text = text };
+        try std.testing.expect(try command.check());
+    }
+}
+
+test "the copied reply recipe accepts a body file without sending HTTP" {
+    const command: DocCommand = .{
+        .path = "skills/bbr/VERBS.md",
+        .line = 21,
+        .text = "create-comment --repository REPO --pull-request-id 42 --parent-id 7 --body-file reply.md",
+    };
+    try std.testing.expect(try command.check());
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var output: TestOutput = .{};
+    var fake: bbr.http.FakeHttpClient = .{};
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    try std.testing.expectError(error.FileNotFound, comments.runCreate(
+        output.init(&env, &arena),
+        bb,
+        &.{ "--repository", "REPO", "--pull-request-id", "42", "--parent-id", "7", "--body-file", "reply.md" },
+        false,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+}
+
+fn bbrApiCommandsParse(path: []const u8, text: []const u8) !bool {
     var ok = true;
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, text, pos, "bbr api")) |start| {
         pos = start + "bbr api".len;
-        const line_number = std.mem.count(u8, text[0..start], "\n") + 1;
-        var tokens: DocTokens = .{ .text = text, .pos = pos };
-        var token = tokens.next();
-        // As in `parseGlobal`, any flag can come before the verb, and a flag
-        // that takes a value in the space form also takes the next word.
-        const verb = while (token) |t| : (token = tokens.next()) {
-            if (!std.mem.startsWith(u8, t, "--")) break t;
-            if (takesValue(flagName(t)) and std.mem.indexOfScalar(u8, t, '=') == null) _ = tokens.next();
-        } else continue;
-        const placeholder = for (verb) |c| {
-            if (!(std.ascii.isLower(c) or c == '-')) break true;
-        } else false;
-        if (placeholder) continue;
-        if (findVerb(verb)) |row| {
-            // Rescan from `bbr api`, so the flags before the verb count too.
-            var command: DocTokens = .{ .text = text, .pos = pos };
-            if (!flagsOfRow(path, line_number, row, &command)) ok = false;
-        } else if (std.mem.indexOfScalar(u8, verb, '-') != null or hasFlag(&tokens)) {
-            std.debug.print("{s}:{d}: `bbr api {s}` names no row of `verbs` in src/api/cli.zig; `bbr api --help` lists the verbs\n", .{ path, line_number, verb });
-            ok = false;
-        }
+        const command: DocCommand = .{
+            .path = path,
+            .line = std.mem.count(u8, text[0..start], "\n") + 1,
+            .text = text[pos..],
+        };
+        if (!try command.check()) ok = false;
     }
     return ok;
 }
 
-/// Checks an inline code span without `bbr api`. A span that starts with a
-/// verb passes only the flags of its row. Any other `--` word is a flag of
-/// some row.
-fn codeSpanUsesRowFlags(path: []const u8, line_number: usize, span: []const u8) bool {
+fn codeSpanParses(path: []const u8, line_number: usize, span: []const u8) !bool {
     if (std.mem.indexOf(u8, span, "bbr api") != null) return true;
     var tokens: DocTokens = .{ .text = span };
     const first = tokens.next() orelse return true;
-    if (findVerb(first)) |row| return flagsOfRow(path, line_number, row, &tokens);
+    var args = tokens;
+    if ((findVerb(first) != null and args.next() != null) or (docVerbName(first) and hasDocFlag(tokens))) {
+        const command: DocCommand = .{ .path = path, .line = line_number, .text = span };
+        return command.check();
+    }
     tokens = .{ .text = span };
     var ok = true;
     while (tokens.next()) |t| {
@@ -576,28 +596,79 @@ fn codeSpanUsesRowFlags(path: []const u8, line_number: usize, span: []const u8) 
     return ok;
 }
 
-fn flagsOfRow(path: []const u8, line_number: usize, row: Verb, tokens: *DocTokens) bool {
-    var ok = true;
-    while (nextForeignFlag(row, tokens)) |name| {
-        std.debug.print("{s}:{d}: a `{s}` command passes --{s}, which is not in its row of `verbs` in src/api/cli.zig; `bbr api {s} --help` lists its flags\n", .{ path, line_number, row.name, name, row.name });
-        ok = false;
-    }
-    return ok;
+fn docVerbName(word: []const u8) bool {
+    if (word.len == 0) return false;
+    for (word) |c| if (!(std.ascii.isLower(c) or c == '-')) return false;
+    return word[0] != '-';
 }
 
-fn nextForeignFlag(row: Verb, tokens: *DocTokens) ?[]const u8 {
-    while (tokens.next()) |t| {
-        if (!std.mem.startsWith(u8, t, "--")) continue;
-        const name = flagName(t);
-        if (!contains(&global_flags, name) and !contains(row.value_flags, name) and !contains(row.switch_flags, name)) return name;
-    }
-    return null;
-}
-
-fn hasFlag(tokens: *DocTokens) bool {
-    while (tokens.next()) |t| if (std.mem.startsWith(u8, t, "--")) return true;
+fn hasDocFlag(start: DocTokens) bool {
+    var tokens = start;
+    while (tokens.next()) |word| if (std.mem.startsWith(u8, word, "--")) return true;
     return false;
 }
+
+const DocCommand = struct {
+    path: []const u8,
+    line: usize,
+    text: []const u8,
+
+    fn check(self: DocCommand) !bool {
+        const a = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var words: std.ArrayList([]const u8) = .empty;
+        var tokens: DocTokens = .{ .text = self.text };
+        while (tokens.next()) |raw| {
+            var word: std.ArrayList(u8) = .empty;
+            var quote: ?u8 = null;
+            for (raw) |c| {
+                if (quote) |q| {
+                    if (c == q) {
+                        quote = null;
+                        continue;
+                    }
+                } else if (c == '\'' or c == '"') {
+                    quote = c;
+                    continue;
+                }
+                try word.append(scratch, c);
+            }
+            try words.append(scratch, word.items);
+        }
+        const command: DocCommand = .{ .path = self.path, .line = self.line, .text = self.text[0..tokens.pos] };
+        const parsed = parseGlobal(scratch, words.items) catch |err| {
+            return command.reject(if (diagnosticVerb(words.items)) |row| row.name else "VERB", err);
+        };
+        const name = parsed.verb orelse {
+            if (parsed.rest.len != 0 and !parsed.help_only) return command.reject("VERB", error.UnknownFlag);
+            return true;
+        };
+        if (!docVerbName(name)) return true;
+        const row = findVerb(name) orelse {
+            if (std.mem.indexOfScalar(u8, name, '-') == null and !hasDocFlag(.{ .text = self.text })) return true;
+            return command.reject(name, error.UnknownVerb);
+        };
+        if (parsed.help_only) return true;
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var output: TestOutput = .{};
+        var fake: bbr.http.FakeHttpClient = .{ .status = 403, .max_calls = 1 };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = parsed.workspace orelse "demo" });
+        row.handler(output.init(&env, &arena), bb, parsed.rest, parsed.json) catch |err| {
+            if (isOptionError(err)) return command.reject(name, err);
+        };
+        return true;
+    }
+
+    fn reject(self: DocCommand, name: []const u8, err: anyerror) bool {
+        std.debug.print("{s}:{d}: `bbr api{s}{s}` fails CLI parsing ({s}); see `bbr api {s} --help`\n", .{
+            self.path, self.line, if (std.mem.startsWith(u8, self.text, " ")) @as([]const u8, "") else " ", self.text, @errorName(err), name,
+        });
+        return false;
+    }
+};
 
 fn flagName(token: []const u8) []const u8 {
     const name = token["--".len..];

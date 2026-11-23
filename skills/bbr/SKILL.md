@@ -31,7 +31,7 @@ Groups: Workspaces, Repositories, Branches, PullRequests, Files, Comments, Tasks
 
 ## 3. Confirm flags
 
-Copy the [VERBS.md](./VERBS.md) recipe or example of your verb when it shows every flag that you need. A test checks that each of these commands passes only flags of its verb. Run `bbr api VERB --help` only for a flag that no recipe or example of your verb shows, or after an `UnknownFlag` error. Help needs no login. Done when each flag in your command appears in a recipe or example of the same verb, or in `bbr api VERB --help`.
+Copy the [VERBS.md](./VERBS.md) recipe or example of your verb when it shows every flag that you need. A test checks each command through the CLI parser and verb handler, including flag values and required flags. Run `bbr api VERB --help` only for a flag that no recipe or example of your verb shows, or after an `UnknownFlag` error. Help needs no login. Done when each flag in your command appears in a recipe or example of the same verb, or in `bbr api VERB --help`.
 
 Rules: `bbr api [--profile NAME] [--workspace SLUG] [--json] VERB [options]`. Globals go before or after the verb. All flags are long kebab-case names, such as `--pull-request-id`. No short flags.
 
