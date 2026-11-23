@@ -1614,7 +1614,7 @@ test "diagnostics pending store fallback records preparation failure but not abs
     try testing.expect(std.mem.indexOf(u8, text, @errorName(cause)) != null);
 }
 
-test "diagnostics check-verdict refusals have one record and reach exitFailure as Reported" {
+test "diagnostics failed check-verdict changes have one record and reach exitFailure as Reported" {
     const testing = std.testing;
     const pr =
         "{\"id\":42,\"title\":\"Review\",\"state\":\"OPEN\",\"author\":{\"display_name\":\"Ada\",\"uuid\":\"{author}\"}," ++
