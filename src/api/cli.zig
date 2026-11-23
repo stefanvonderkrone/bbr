@@ -495,6 +495,104 @@ test "skills/bbr/VERBS.md lists every bbr api verb once" {
     try std.testing.expect(!failed);
 }
 
+test "every command in the bbr skill uses only the flags of its verb" {
+    var failed = false;
+    for ([_]struct { path: []const u8, doc: []const u8 }{
+        .{ .path = "skills/bbr/SKILL.md", .doc = @embedFile("bbr_skill_md") },
+        .{ .path = "skills/bbr/VERBS.md", .doc = @embedFile("bbr_verbs_md") },
+    }) |file| {
+        var in_fence = false;
+        var lines = std.mem.splitScalar(u8, file.doc, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "```")) {
+                in_fence = !in_fence;
+                continue;
+            }
+            if (in_fence) {
+                if (!docCommandUsesRowFlags(file.path, line)) failed = true;
+                continue;
+            }
+            var spans = std.mem.splitScalar(u8, line, '`');
+            var code = false;
+            while (spans.next()) |span| : (code = !code) {
+                if (code and !docCommandUsesRowFlags(file.path, span)) failed = true;
+            }
+        }
+    }
+    try std.testing.expect(!failed);
+}
+
+/// Checks one code span or fenced line. A span that starts with `bbr api`
+/// must name a verb; a span that starts with a verb name is also checked.
+/// Other spans, and placeholders such as `VERB`, are not commands.
+fn docCommandUsesRowFlags(path: []const u8, span: []const u8) bool {
+    var tokens: DocTokens = .{ .text = span };
+    var first = tokens.next() orelse return true;
+    const after_bbr_api = std.mem.eql(u8, first, "bbr");
+    if (after_bbr_api) {
+        const second = tokens.next() orelse return true;
+        if (!std.mem.eql(u8, second, "api")) return true;
+        first = tokens.next() orelse return true;
+    }
+    var token: ?[]const u8 = first;
+    const verb = while (token) |t| : (token = tokens.next()) {
+        if (!std.mem.startsWith(u8, t, "--")) break t;
+        const name = flagName(t);
+        if (std.mem.eql(u8, name, "profile") or std.mem.eql(u8, name, "workspace")) {
+            if (std.mem.indexOfScalar(u8, t, '=') == null) _ = tokens.next();
+        }
+    } else return true;
+    for (verb) |c| if (!(std.ascii.isLower(c) or c == '-')) return true;
+    const row = findVerb(verb) orelse {
+        if (!after_bbr_api) return true;
+        std.debug.print("{s}: `{s}` names `{s}`, which is not a row of `verbs` in src/api/cli.zig\n", .{ path, span, verb });
+        return false;
+    };
+    var ok = true;
+    while (tokens.next()) |t| {
+        if (!std.mem.startsWith(u8, t, "--")) continue;
+        const name = flagName(t);
+        if (contains(&global_flags, name) or contains(row.value_flags, name) or contains(row.switch_flags, name)) continue;
+        std.debug.print("{s}: `{s}` passes --{s}, which is not a flag of bbr api {s}\n", .{ path, span, name, verb });
+        ok = false;
+    }
+    return ok;
+}
+
+fn flagName(token: []const u8) []const u8 {
+    const name = token["--".len..];
+    return name[0 .. std.mem.indexOfScalar(u8, name, '=') orelse name.len];
+}
+
+/// Shell words of a doc command. Quoted text stays inside its word, and the
+/// words end at a pipe, a list operator, a redirection, or a comment.
+const DocTokens = struct {
+    text: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *DocTokens) ?[]const u8 {
+        while (self.pos < self.text.len and self.text[self.pos] == ' ') self.pos += 1;
+        if (self.pos == self.text.len) return null;
+        switch (self.text[self.pos]) {
+            '|', ';', '&', '>', '#' => return null,
+            else => {},
+        }
+        const start = self.pos;
+        var quote: ?u8 = null;
+        while (self.pos < self.text.len) : (self.pos += 1) {
+            const c = self.text[self.pos];
+            if (quote) |q| {
+                if (c == q) quote = null;
+            } else if (c == '\'' or c == '"') {
+                quote = c;
+            } else if (c == ' ') break;
+        }
+        const word = self.text[start..self.pos];
+        if (std.mem.indexOf(u8, word, ">&") != null) return null;
+        return word;
+    }
+};
+
 fn bulletVerb(line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, "- `")) return null;
     const rest = line["- `".len..];
