@@ -933,6 +933,8 @@ const TestLoadSchedule = struct {
         // Select awaits an empty completion queue through a fresh Condition.
         // The next queue wait follows consumption of the previous completion.
         std.debug.assert(timeout == .none);
+        // A completion put between the unlock and this wait is not consumed yet.
+        if (@atomicLoad(u32, ptr, .acquire) != expected) return;
         if (self.released == self.releases.len) return error.Canceled;
         self.releases[self.released].store(true, .release);
         self.released += 1;
