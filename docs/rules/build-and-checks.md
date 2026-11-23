@@ -26,6 +26,14 @@ A benchmark measures cells with the vaxis measurement that the app uses, `termin
 
 Enforcement: `tools/check_benchmark_metrics.py`, run by `zig build test`. It fails on `.bytes` or `CellMetrics.bytes` in `src/benchmark/` and `src/benchmark_buffer_search.zig`, and names the replacement. A `.bytes =` field initializer is not a match.
 
+## Benchmark compilation in tests
+
+`addBenchmark` in `build.zig` adds only the compile step to `test`.
+The function calls `dependOn` on `test_step` and does not call `addRunArtifact`.
+Direct `addExecutable` calls use the literal name `"bbr"` or `"grammar-cli-integration"`, or the identifier `name` inside `addBenchmark`.
+
+Enforcement: `tools/check_benchmark_builds.py`, run by `zig build test`, rejects other names in direct `addExecutable` calls. It requires `addBenchmark` to call `dependOn` on `test_step` and rejects `addRunArtifact` calls in that function. The check reads only `build.zig`. It does not see an alias of `addExecutable` or reject run dependencies elsewhere. `tests/check_benchmark_builds_test.py` tests the check under `zig build test`.
+
 ## Test file suffixes
 
 The suffix of a file name in `tests/` decides where the file runs. No list needs an update. The suffixes are:
@@ -41,9 +49,18 @@ Enforcement: `addTestScripts` in `build.zig` lists `tests/` when the build confi
 
 ## Checker source lines
 
-A line checker in `tools/` reads Zig source only through `zig_files` in `tools/source_lines.py`. `zig_files` reads each file and gives the checker the code lines of the file, without comments. A `//` inside a string literal stays. A checker that looks for a call, not for a name in a literal, passes `literals=False`. That option also empties each literal. A checker never reads a file or splits text itself, so raw text never reaches it. A checker that reads no Zig source, such as `check_agent_docs.py`, goes in `NO_ZIG_SOURCE` with its reason. A checker that also reads a file that is not Zig source, such as `check_live_run_denial.py` with `opencode.jsonc`, goes in `NON_ZIG_READS` with its reason. That checker still imports `zig_files`, but the test does not look for its raw reads.
+A line checker in `tools/` reads Zig source only through `zig_files` in `tools/source_lines.py`. `zig_files` reads each file and gives the checker the code lines of the file, without comments. A `//` inside a string literal stays. A checker that looks for a call, not for a name in a literal, passes `literals=False`. That option also empties each literal. A checker never reads a Zig file or splits its text itself, so raw Zig text never reaches it. A checker that reads no Zig source, such as `check_agent_docs.py`, goes in `NO_ZIG_SOURCE` with its reason. A checker that also reads a file that is not Zig source, such as `check_live_run_denial.py` with `opencode.jsonc`, goes in `NON_ZIG_READS` with its reason. That checker still imports `zig_files`, but the test does not look for its raw reads.
 
-Enforcement: `CheckersTest` in `tests/source_lines_test.py`, run by `zig build test`. It fails on each `tools/check_*.py` that calls `read_text(`, `read_bytes(`, `open(`, or `.splitlines()`, or that does not import `zig_files`.
+Enforcement: `CheckersTest` in `tests/source_lines_test.py`, run by `zig build test`. It fails on each `tools/check_*.py` that calls `read_text(`, `read_bytes(`, `open(`, or `.splitlines()`, or that does not import `zig_files`. `MARKDOWN_READERS` exempts only the Markdown reader function of `check_doc_symbols.py` from the raw-read check.
+
+## Code names in rule docs
+
+A backticked dotted code name in `AGENTS.md`, `CODING_STANDARDS.md`, or `docs/rules/*.md` names current Zig code.
+Each segment names an identifier in `src/`.
+When the second-to-last segment names a struct, union, or enum, its body contains the final segment.
+Use the full `std` prefix for standard library names.
+
+Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker skips fenced code blocks, file names, and names that start with `std`, `vaxis`, `zf`, or `c`. It skips the generic `error.X` placeholder. It drops a leading `bbr` or `tui` segment. Comments and string literals supply no identifiers. The checker does not see undotted names or names outside the listed docs. A name occurrence in a container body satisfies the check, even when that occurrence declares no member. The checker does not resolve imports or distinguish containers with the same name. A generic type is a function that returns a `struct`. The checker does not read it as a container. It checks the members of a generic type only as identifiers. The checker fails on a missing `AGENTS.md`, a missing `CODING_STANDARDS.md`, or an empty `docs/rules/`. It does not see a short `std` name whose segments all name identifiers in `src/`.
 
 ## Compile claims in Enforcement paragraphs
 
@@ -64,4 +81,4 @@ Enforcement: `build.zig` clears the environment of each `test-cli` run and sets 
 
 An agent never starts bbr with the real environment of the operator. It never runs `bbr`, `zig build run`, `zig-out/bin/bbr`, `zig run src/main.zig`, or a `zig build` step that reads the Credential, not even with `--help`. Those steps are `check`, `check-blobs`, `check-acquisition`, `check-mutation`, `check-verdict`, `check-external-edit`, and `bench-file-acquisition`. An agent never reads the Credential and never sends it to Bitbucket. A check that needs the live environment goes into its ticket as `ready-for-human`. `zig build test`, `zig build test-*`, `zig build bench`, and `zig fmt` stay allowed, because they are hermetic.
 
-Enforcement: the `bash` deny rules in `opencode.jsonc` block the commands at run time. `tools/check_live_run_denial.py`, run by the CI step "Check the live bbr run denial", fails when a listed command is not denied, when an allowed command is denied, or when a rule decides no listed command. It also fails when a `build.zig` step is not denied, unless its name starts with `test` or it is in `HERMETIC_STEPS`. Its list covers a path to a `bbr` binary, a `VAR=value` prefix, a `timeout` prefix, `sh -c` or `bash -c` text that names `bbr`, and `zig build` options before `run`. The checker assumes that OpenCode matches each parsed command with last-match-wins wildcards.
+Enforcement: the `shell` deny rules in `opencode.jsonc` block the commands at run time. `tools/check_live_run_denial.py`, run by the CI step "Check the live bbr run denial", fails when a listed command is not denied, when an allowed command is denied, or when a rule decides no listed command. It also fails when a `build.zig` step is not denied, unless its name starts with `test` or it is in `HERMETIC_STEPS`. Its list covers a path to a `bbr` binary, a `VAR=value` prefix, a `timeout` prefix, `sh -c` or `bash -c` text that names `bbr`, and `zig build` options before `run`. The checker assumes that OpenCode V2 matches each parsed command with last-match-wins wildcards, and that a rule that ends in ` *` also matches the command without arguments.

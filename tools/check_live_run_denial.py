@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Check that opencode.jsonc denies agent commands that start bbr with the real environment."""
 
-from fnmatch import fnmatchcase
 import json
 from pathlib import Path
 import re
@@ -75,17 +74,28 @@ def build_steps(root):
     return [step for line in lines for step in re.findall(r'b\.step\("([^"]+)"', line)]
 
 
-def bash_rules(root):
+def shell_rules(root):
+    """The top-level `shell` rules of opencode.jsonc as (resource, effect) pairs, in order."""
     text = (root / "opencode.jsonc").read_text()
     text = re.sub(r"^\s*//.*$", "", text, flags=re.MULTILINE)
-    return json.loads(text).get("permission", {}).get("bash", {})
+    rules = json.loads(text).get("permissions", [])
+    return [(rule["resource"], rule["effect"]) for rule in rules if rule["action"] == "shell"]
+
+
+def matches(pattern, command):
+    """OpenCode V2 matching: `*` matches any text, `?` one character, and a trailing ` *` also matches no arguments."""
+    regex = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern)
+    if pattern.endswith(" *"):
+        regex = regex[: -len(re.escape(" ") + ".*")] + "(?: .*)?"
+    return re.fullmatch(regex, command, flags=re.DOTALL) is not None
 
 
 def decision(rules, command):
+    """The effect of the last matching rule. No match leaves the command allowed."""
     result = "allow"
-    for pattern, action in rules.items():
-        if fnmatchcase(command, pattern):
-            result = action
+    for pattern, effect in rules:
+        if matches(pattern, command):
+            result = effect
     return result
 
 
@@ -96,7 +106,7 @@ def failures(rules):
 
 
 def check(root):
-    rules = bash_rules(root)
+    rules = shell_rules(root)
     errors = failures(rules)
     for step in build_steps(root):
         hermetic = step in HERMETIC_STEPS or step == "test" or step.startswith("test-")
@@ -110,8 +120,8 @@ def check(root):
     if errors:
         return errors
     # A rule that no listed command needs can be deleted with no failing check.
-    for pattern in rules:
-        rest = {p: a for p, a in rules.items() if p != pattern}
+    for index, (pattern, _) in enumerate(rules):
+        rest = rules[:index] + rules[index + 1 :]
         if not failures(rest):
             errors.append(
                 f"opencode.jsonc rule {pattern!r} decides no command in DENIED or ALLOWED. "

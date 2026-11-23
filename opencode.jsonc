@@ -1,36 +1,48 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "permission": {
-    "external_directory": {
-      "/opt/homebrew/Cellar/zig/**": "allow"
-    },
-    "read": {
-      "/opt/homebrew/Cellar/zig/**": "allow"
-    },
-    "bash": {
-      "bbr": "deny",
-      "bbr *": "deny",
-      "*/bbr": "deny",
-      "*/bbr *": "deny",
-      "*=* bbr": "deny",
-      "*=* bbr *": "deny",
-      "timeout * bbr": "deny",
-      "timeout * bbr *": "deny",
-      "*sh -c *bbr*": "deny",
-      "*bbr-file-acquisition-bench*": "deny",
-      "*zig build run": "deny",
-      "*zig build run *": "deny",
-      "*zig build * run": "deny",
-      "*zig build * run *": "deny",
-      "*zig build *check*": "deny",
-      "*zig build *bench-file-acquisition*": "deny",
-      "*zig run *": "deny",
-      "python3 tests/*_test.py zig-out/bin/bbr": "allow"
+  "permissions": [
+    { "action": "external_directory", "resource": "/opt/homebrew/Cellar/zig/*", "effect": "allow" },
+    { "action": "read", "resource": "/opt/homebrew/Cellar/zig/*", "effect": "allow" },
+    { "action": "atlassian_*", "resource": "*", "effect": "deny" },
+    { "action": "chrome_devtools_*", "resource": "*", "effect": "deny" },
+    { "action": "confluence_*", "resource": "*", "effect": "deny" },
+    { "action": "shell", "resource": "bbr *", "effect": "deny" },
+    { "action": "shell", "resource": "*/bbr *", "effect": "deny" },
+    { "action": "shell", "resource": "*=* bbr *", "effect": "deny" },
+    { "action": "shell", "resource": "timeout * bbr *", "effect": "deny" },
+    { "action": "shell", "resource": "*sh -c *bbr*", "effect": "deny" },
+    { "action": "shell", "resource": "*bbr-file-acquisition-bench*", "effect": "deny" },
+    { "action": "shell", "resource": "*zig build run *", "effect": "deny" },
+    { "action": "shell", "resource": "*zig build * run *", "effect": "deny" },
+    { "action": "shell", "resource": "*zig build *check*", "effect": "deny" },
+    { "action": "shell", "resource": "*zig build *bench-file-acquisition*", "effect": "deny" },
+    { "action": "shell", "resource": "*zig run *", "effect": "deny" },
+    { "action": "shell", "resource": "python3 tests/*_test.py zig-out/bin/bbr", "effect": "allow" }
+  ],
+  "agents": {
+    "ocr-review": {
+      "description": "Reviews workspace changes, a commit, or a branch with Open Code Review in delegation mode and the bbr rules in .opencodereview/rule.json.",
+      "mode": "subagent",
+      "model": "anthropic/claude-sonnet-5-5",
+      "system": "Load the open-code-review-delegate skill and follow its workflow. Pass the mode flags that the request names: --commit, --from and --to, or none for workspace changes. Review every file that ocr delegate preview lists against the rule group that ocr delegate rule returns for it. Report the findings in the format of the skill. Do not edit files. If ocr is missing, do not install it with npm: stop and point to docs/code-review.md, which names the pinned release binary. In commit mode, add --diff-merges=first-parent to git show, as ocr does, so a merge commit has a patch for each previewed file. Do not pass --output to git and do not redirect output to a file: the shell tool keeps large output in a file that you can read. Read an untracked file with the read tool, not cat. Run each shell command alone, without cd, pipes, or ;.",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*.env", "effect": "deny" },
+        { "action": "read", "resource": "*.env.*", "effect": "deny" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "skill", "resource": "open-code-review-delegate", "effect": "allow" },
+        { "action": "external_directory", "resource": "*/opencode/shell/*", "effect": "allow" },
+        { "action": "shell", "resource": "ocr --version", "effect": "allow" },
+        { "action": "shell", "resource": "ocr delegate *", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff *", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager show *", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager log *", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager blame *", "effect": "allow" },
+        { "action": "shell", "resource": "*--output*", "effect": "deny" },
+        { "action": "shell", "resource": "*>*", "effect": "deny" }
+      ]
     }
-  },
-  "mcp": {
-    "atlassian": { "enabled": false },
-    "chrome-devtools": { "enabled": false },
-    "confluence": { "enabled": false }
   }
 }
