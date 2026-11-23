@@ -12,7 +12,7 @@ CONTAINER = re.compile(
     r"(?:(?:extern|packed)\s+)?(?:struct|union|enum)\b[^{]*\{"
 )
 FILE_EXTENSIONS = {
-    "zig", "md", "py", "json", "toml", "zon", "txt", "sh",
+    "zig", "md", "py", "json", "jsonc", "toml", "zon", "txt", "sh",
     "html", "yml", "yaml", "c", "h", "cc", "scm",
 }
 EXTERNAL_MODULES = {"std", "vaxis", "zf", "c"}
