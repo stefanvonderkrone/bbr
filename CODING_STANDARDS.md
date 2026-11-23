@@ -46,7 +46,7 @@ A `catch` whose error set contains `error.Canceled` names `error.Canceled`. The 
 - It calls `io.recancel()`.
 - It stands under `io.swapCancelProtection(.blocked)` and is `unreachable`.
 
-`std.Io.sleep` and `Group.await` return `error{Canceled}`, so an `else` on those calls is unreachable. An `else` on a wider set that returns the cause also returns `error.Canceled`. `std/Io.zig` says that code which ignores `error.Canceled` is usually wrong, because the next cancelation point does not signal it again.
+`std.Io.sleep` and `std.Io.Group.await` return `error{Canceled}`, so an `else` on those calls is unreachable. An `else` on a wider set that returns the cause also returns `error.Canceled`. `std/Io.zig` says that code which ignores `error.Canceled` is usually wrong, because the next cancelation point does not signal it again.
 
 No check: a line check cannot see an error set, and a list of call names misses a `try` through another function. The compiler rejects a missing `error.Canceled` prong only when the `switch` has no `else`. Related checked rule: [A catch captures and records its cause](docs/rules/diagnostics.md#a-catch-captures-and-records-its-cause).
 
@@ -67,6 +67,16 @@ A layout tree always declares its scroll bars, and only the scroll numbers vary.
 No check: no check enforces it. `layouts.Scroll` is not optional in the existing trees, but a new tree can still leave out a scroll bar. Related checked rule: [Slot placement](docs/rules/tui-paint.md#slot-placement).
 
 ## TUI state
+
+### Choose the origin of an action error
+
+Add a `withErrorOrigin` override only for work that belongs to another path than its event, such as a pump that runs after the inputs of every event.
+Choose the origin of the path whose completion must clear the error.
+A user handler overrides only for an error that a later completion of another path must clear.
+Name the reason in a comment at each override.
+When an error must stay through a completion of its own event path, give the path its own `ErrorOrigin` instead of an override, as Draft builds have `.draft`.
+
+No check: the type and the line check see that only the event and `withErrorOrigin` set the origin, but not that an override names the right path. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
 
 ### Reserve storage in every rebuild
 
@@ -147,17 +157,14 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 A failure of maintenance work records its cause once and shows its failure message only when no message shows.
 An allocation failure uses `out_of_memory`.
 A failed enrichment build uses `buffer_build_failed`.
-A File Enrichment or a query retry that succeeds clears only the `out_of_memory` message of an earlier failed attempt.
-A cache staging or a cache update commit writes no message.
-A user action that hands its work to maintenance work clears an older message before it does so.
-`openReviewSearchOccurrence` clears it before the acquisition pump for an evicted File only for an event from the person.
-An event from the App that opens the occurrence keeps the shown message.
-[Each OwnedInput kind has an event origin](docs/rules/tui-state.md#each-ownedinput-kind-has-an-event-origin) says how `dispatch` decides the origin.
+A success clears only an error of its own origin, by [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
+A cache staging writes no message.
+A user action that hands its work to maintenance work calls `clearError` before it does so, as `openReviewSearchOccurrence` does before the acquisition pump for an evicted File.
 
 These sites are maintenance work:
 
 - A cache staging after a lease release or in the focus check. Both go through `stageCacheBuild`.
-- The retry of a stale cache update in `retryContentBuild`, and the commit of a cache update in `acceptBufferDisclosure`.
+- The retry of a stale cache update in `retryContentBuild`.
 - The File Enrichment of the active File in the focus check, and the File Enrichments of the Review Search acquisition, `pumpReviewSearchAcquisition`. Both go through `queueMaintenanceFileEnrichment`.
 - The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
 - A failed enrichment build in `acceptBufferDisclosure` that cancels no pending reading location, `pending_review_location`.
@@ -168,7 +175,8 @@ A speculative-only drop records the failure without a message.
 
 `failMaintenance` writes the record and the message of a failed queue or staging, so a new such site calls it in its `catch`.
 The query retry is the exception.
-`replaceReviewSearchQuery` also serves user input, so it records the failure, and `retryReviewSearchQuery` restores the shown message after it.
+`replaceReviewSearchQuery` also serves user input, so it records the failure and shows `out_of_memory`.
+After a failed retry, `retryReviewSearchQuery` shows the earlier error again with its own origin through `withErrorOrigin`.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
 This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget, and it queues the File Enrichment of the active File again while the File is pending.
 While a cache update is pending, the focus check stages after that update commits.
@@ -176,11 +184,7 @@ A File that the acquisition cannot queue stays pending and unacquired, so the ne
 So a failure loses no work and keeps the session.
 The message of the event outcome stays, such as `buffer_search_scan_failed` or `file_enrichment_launch_failed`.
 
-No check: a wrong origin for an existing kind in the `dispatch` switch compiles. Only the `.user` test of the occurrence opening checks an origin.
-No event from the App reaches the clear in `openReviewSearchOccurrence`, so no test can show that an event from the App keeps the message there.
-Both callers for events from the App open the selected occurrence only while it matches the opened one.
-The Review Search Preview holds the File of that occurrence, so the File keeps its content.
-The tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and calls `showError` without the check of a shown message passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
 ### A dropped user input shows its failure
 

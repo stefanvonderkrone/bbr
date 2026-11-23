@@ -27,6 +27,13 @@ Apply the rule of `retryReviewSearchQuery` to the File Enrichment of the active 
 
 The success of `queueFileEnrichment` sets `action_error` to null, also when a message of the same event shows. The focus check now queues the File Enrichment of the active File through `queueMaintenanceFileEnrichment`. That helper saves the shown message before the queue. After a queue that marks the File loading, it restores the message unless the message is `out_of_memory`, as `retryReviewSearchQuery` does. A refused queue, such as a path over the length limit, still shows `action_refused`. [Ticket 03](03-record-a-failed-review-search-acquisition-queue.md) lists it.
 
+### 2026-11-23 merge of main
+
+On main the focus check has the origin `.file_enrichment`, and its successful queue clears only an error of that origin.
+So the merge removes the saved message from `queueMaintenanceFileEnrichment`.
+Both cases of the test still pass: the user message stays, and a success clears the `out_of_memory` message of the failed focus check queue.
+"Review recovery Picker error survives the focus check that starts a File Enrichment" on main checks the first case too.
+
 ## Completion
 
 2026-11-21, branch `focus-check-staging-failure`.

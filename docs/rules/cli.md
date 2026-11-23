@@ -10,7 +10,7 @@ Enforcement: `tools/check_xdg_reads.py`, run by `zig build test`. The check skip
 
 ## Streaming stdout and stderr writers
 
-A stdout or stderr writer uses `writerStreaming`. `File.writer` writes at absolute offsets from 0. Thus it overwrites earlier text in a redirected file, and later writers overwrite its text. Code uses `stdout()` and `stderr()` only as `.writerStreaming(`, or as `.handle` on one side of `==` or `!=`. This way, no alias and no File built from the handle can hide a positional writer.
+A stdout or stderr writer uses `writerStreaming`. `std.Io.File.writer` writes at absolute offsets from 0. Thus it overwrites earlier text in a redirected file, and later writers overwrite its text. Code uses `stdout()` and `stderr()` only as `.writerStreaming(`, or as `.handle` on one side of `==` or `!=`. This way, no alias and no File built from the handle can hide a positional writer.
 
 Enforcement: `tools/check_stdio_writers.py`, run by `zig build test`. `zig fmt --check`, also run by `zig build test`, removes the spaces that could split the call chain. `tests/redirected_output_cli_test.py`, run by `zig build test-cli`, checks the bbr text in a file that holds earlier output.
 

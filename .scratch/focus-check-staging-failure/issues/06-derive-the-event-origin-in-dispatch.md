@@ -60,6 +60,25 @@ The origin names who sent the event: the person or the App.
 Ticks, worker results, the focus check, and `resize` come from the App.
 The rename changes no behavior.
 
+### 2026-11-23 merge of main
+
+PR #46 on main adds `ErrorOrigin` and the field `event_origin: ?ErrorOrigin`.
+`dispatch` sets it from `OwnedInput.errorOrigin`, an exhaustive switch over `OwnedInput`.
+`showError` and `clearError` read it and take no origin.
+`clearError` clears any error for `.user`, and only an error of its own origin otherwise.
+`tools/check_action_errors.py` rejects a write of `action_error` outside both helpers, and a write of `event_origin` outside `dispatch` and `withErrorOrigin`.
+
+So `EventOrigin` repeats `event_origin == .user`, and the merge removes it.
+`openReviewSearchOccurrence` calls `clearError` before the acquisition pump for an evicted File.
+For a user event this clears any message, as before.
+For a completion it clears only an error of the completion's own origin, by the rule of main.
+No completion reaches this clear, as the 2026-11-21 reviews say, so no test changes.
+No caller chooses the origin: `clearError` takes no origin, the exhaustive switch gives each event its origin, and the line check limits who writes `event_origin`.
+
+The pump now queues each File as `.review_search` through `withErrorOrigin`, because it acquires Files for Review Search.
+Without the override, "M21 kernel Review Search acquisition queue keeps the shown message" fails, because the queue clears the `file_enrichment_launch_failed` of its own event.
+Without the `clearError` call, "M21 kernel opening a Review Search hit in an evicted File clears an older message" fails.
+
 ## Answer
 
 `selectVersion` calls `failDroppedInput` in both `catch` handlers.

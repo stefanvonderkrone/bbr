@@ -57,6 +57,46 @@ Closing a clean result permits later batches, but it does not authorize unrelate
 
 Enforcement: the `Review recovery` tests in `src/tui/presentation.zig`, run by `zig build test-review-recovery` and `zig build test`. They check active, paused, and terminal input, retained ownership, repeated batches, and posted Comment navigation.
 
+## Background work keeps an unrelated action error
+
+Each shown action error records its origin, the path that showed it.
+`Presentation.action_error` holds a `ShownError`, which pairs the `ActionError` with an `ErrorOrigin`.
+Code writes it only through `showError` and `clearError`, and neither takes an origin.
+Both read `Presentation.event_origin`, the origin of the event that runs.
+`dispatch` sets the event origin from `OwnedInput.errorOrigin` and restores it when the event ends.
+A key, a mouse action, or an Overlay action has the origin `.user`, and its `clearError` clears any error.
+A completion of background work has the origin of its own path, and its `clearError` clears only an error of that origin.
+Thus a completion keeps an error that another path showed and that the user has not read yet.
+A helper that keys and completions both reach takes the origin of the event that reaches it.
+A Buffer build completion takes its origin from `DisclosureBuild.Kind.errorOrigin`.
+Draft save and Draft mutation builds have the origin `.draft`, separate from view builds.
+Buffer Search scans and search disclosure builds use `.buffer_search`.
+Review Search scans use `.review_search`.
+An input that shows and clears no action error has no origin.
+
+Some work runs inside an event but belongs to another path.
+It names its origin through `withErrorOrigin`, which restores the origin of the event after the work.
+These overrides exist:
+
+- `dispatch` runs `holdReviewSearchPreview` after each event as `.review_search`, because the Preview hold acquires Files for Review Search.
+- The focus check runs `retryReviewSearchQuery` as `.review_search`, so a successful retry clears only a Review Search error. After a failed retry it shows the earlier error again with that error's origin, because [maintenance work keeps the shown message](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message).
+- `pumpReviewSearchAcquisition` queues each File as `.review_search`, because it acquires Files for Review Search. So a success keeps an error of the event that pumps, such as `file_enrichment_launch_failed` of the File that failed before.
+- `openReviewSearch` runs `replaceReviewSearchQuery` for a reopened query as `.review_search`, so its scan clears only a Review Search error.
+- `applySubmissionTreeKey` shows `replacement_pending` as `.reconciliation`, so the end of the replacement clears the notice.
+- `init` runs `discoverRecovery` as `.submission`, because recovery belongs to the Submission path.
+- After an allocation failure, `takeCommand` runs `requestShutdown` as `.submission`, because shutdown resumes a paused Submission.
+
+Outside `dispatch` and `withErrorOrigin` the event origin is null.
+Then `showError` panics, because no event names the origin.
+`clearError` returns early when no error shows.
+Outside an event, `clearError` panics only while an error shows.
+A test that calls a method directly runs it through a test helper such as `showTestError`, which calls `withErrorOrigin`.
+The File Enrichment path includes enrichment builds, cache updates, and the focus check that starts a File Enrichment.
+A speculative enrichment shows and clears no action error.
+The Projection still gives only the `ActionError`.
+
+Enforcement: the exhaustive switches in `OwnedInput.errorOrigin` and `DisclosureBuild.Kind.errorOrigin` in `src/tui/presentation.zig` cause a compile error for a new input or a new build kind without an origin. `tools/check_action_errors.py` and `tests/check_action_errors_test.py` run under `zig build test`. The checker fails on a write of `action_error` outside `showError` and `clearError`, such as `self.action_error = null` in a completion. It also fails on a write of `event_origin` outside `dispatch` and `withErrorOrigin`, and it names `withErrorOrigin` as the fix. The checker does not see a write through a pointer, such as `slot.* = null` after `const slot = &self.action_error`. The same limit holds for `event_origin`. The `Review recovery` tests in the same file check that each completion keeps an unrelated action error, that the Submission, a Comment delete, and a cache update still clear an error of their own origin, that a view build keeps a Draft error and the error of a failed Draft jump, and that a user retry of a Submission or of a recovery clears an unrelated error. The test "M21 kernel Review Search acquisition queue keeps the shown message" fails when the acquisition clears the error of the event that pumps, and "M21 kernel opening a Review Search hit in an evicted File clears an older message" fails when the user opening keeps it. `zig build test` runs them.
+
 ## Reading location across Refresh and Reconciliation
 
 Refresh and Reconciliation of the same Review restore the reading location through semantic identity.
@@ -201,19 +241,6 @@ An enrichment build records whether Review Search holds each File, and its worke
 Admission takes the recorded hold, and it retries the build when the current decision of `reviewSearchHolds` differs, because a query or Overlay change can change the decision without a Storage change.
 
 Enforcement: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" in `src/tui/presentation.zig` fails when a failed allocation from the Presentation allocator stops the start of a source scan, also through a `catch` that returns. The tests "M21 kernel Review Search scans a File again after its source scan fails", "M21 kernel Review Search gives up on a File after its second failed source scan", "M21 kernel Review Search stops its source scans after it gives up on a File", "M21 authored failed source scan retries after reopening Review Search", "M21 kernel Review Search keeps the given-up Files of a query edit that rolls back", and "M21 kernel Review Search resumes the retry of a query edit that rolls back" in the same file check the retry, the stop, and the rollback. The test "M21 kernel Review Search starts no source scan before its first query publishes" fails when a source scan starts before the first query results publish, "M21 kernel Review Search starts no source scan while a query edit is pending" fails when a source scan starts while the results of the previous query show, "M21 kernel Review Search retries a reopened query scan that cannot queue at the next event" fails when the reopened Overlay drops the edited query, shows it over the results of the previous query without the pending mark, or does not queue its scan at the next event, "M21 kernel Review Search keeps another message of the same event when a reopened query retry succeeds" fails when the successful retry clears a message that it did not set, and "M21 kernel Review Search starts its source scans after first query results without a match" fails when results without a match start no source scan. The test "M21 kernel Review Search starts a source scan without superseding a cache build in flight" fails when the start of a source scan stages a cache build while a cache update is pending. The test "M21 kernel Review Search admits an enrichment with the hold that its build counted" fails when admission takes a hold that the build did not count. `zig build test` runs them. An allocation from another allocator is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#a-source-scan-starts-without-an-allocation).
-
-## Each OwnedInput kind has an event origin
-
-`Presentation.dispatch` gives each event one `EventOrigin` before it handles the event.
-A key, a mouse event, an Action, and the other inputs of a person are `.user`.
-A worker result, a tick, and the focus check `ensure_focused_enrichment` are `.app`.
-A `resize` is also `.app`, because the App sends it after each event to sync the geometry.
-The origin lives in `Presentation.event_origin` until `dispatch` returns, and it is `.app` outside `dispatch`.
-Code that must know whether a person sent the event reads `event_origin`. It takes no parameter for this choice, so no caller chooses the origin.
-A field set once for each event is the smallest form, because a parameter would go through every function between `dispatch` and the reader.
-`openReviewSearchOccurrence` clears the shown message before the acquisition pump for an evicted File only when the origin is `.user`.
-
-Enforcement: the exhaustive switch over `OwnedInput` at the start of `Presentation.dispatch` (compile error for a new `OwnedInput` kind without an origin). The test "M21 kernel opening a Review Search hit in an evicted File clears an older message" in `src/tui/presentation.zig` fails when a user input keeps the older message. `zig build test` runs it. A wrong origin for an existing kind is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message).
 
 ## Search occurrence index mapping
 
