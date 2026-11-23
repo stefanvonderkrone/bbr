@@ -40,7 +40,7 @@ Close a PullRequest without merging its changes. Decline changes the PullRequest
 _Avoid_: Changes Requested, No Verdict, delete PullRequest.
 
 **PullRequest Author**:
-The Bitbucket account that opened the PullRequest. This account cannot set a Reviewer Verdict on its own PullRequest.
+The Bitbucket account that opened the PullRequest. bbr refuses to set a Reviewer Verdict for the PullRequest Author.
 _Avoid_: reviewer, owner (the Workspace owns the Repository).
 
 **Default Reviewer**:
@@ -80,7 +80,7 @@ The Bitbucket account proven by the current Credential, identified for mutation 
 _Avoid_: reviewer identity (a reviewer may read without proven mutation ownership), display name, credential owner.
 
 **Reviewer Verdict**:
-The Authenticated Account's current review decision for a PullRequest: Approved, Changes Requested, or No Verdict. Setting No Verdict removes the account's current Approved or Changes Requested state. A PullRequest Author cannot set a Reviewer Verdict on that PullRequest.
+The Authenticated Account's current review decision for a PullRequest: Approved, Changes Requested, or No Verdict. Setting No Verdict removes the account's current Approved or Changes Requested state. bbr refuses to set a Reviewer Verdict for the PullRequest Author.
 _Avoid_: approval state (omits Changes Requested), participant state (Bitbucket wire vocabulary), review status (too broad).
 
 **Task**:

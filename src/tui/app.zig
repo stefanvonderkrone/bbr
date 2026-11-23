@@ -575,7 +575,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .pull_request_not_open => "Reviewer Verdict requires an open PullRequest",
         .reviewer_verdict_unknown => "Reviewer Verdict data is unavailable; reload to retry",
         .pull_request_author_unknown => "PullRequest Author identity is unavailable; reload to retry",
-        .pull_request_author => "the PullRequest Author cannot set a Reviewer Verdict",
+        .pull_request_author => "bbr refuses to set a Reviewer Verdict for the PullRequest Author",
         .reviewer_verdict_unchanged => "the PullRequest already has this Reviewer Verdict",
         .reviewer_verdict_failed => "Bitbucket refused the Reviewer Verdict change",
         .reviewer_verdict_source_changed => "Reviewer Verdict unchanged; SourceCommit changed",
