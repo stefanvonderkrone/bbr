@@ -686,7 +686,10 @@ pub const Client = struct {
             return .{ .api_error = asApiError(err) orelse return err };
         defer deinitPullRequest(allocator, before);
         if (!std.mem.eql(u8, before.source_commit, expected_source_commit)) return .stale_source_commit;
-        if (before.author_uuid.len != 0 and std.mem.eql(u8, before.author_uuid, authenticated_account_uuid)) return noted(self.diagnostic, error.PullRequestAuthorCannotSetReviewerVerdict, .validate, null);
+        if (before.author_uuid.len != 0 and std.mem.eql(u8, before.author_uuid, authenticated_account_uuid)) {
+            self.diagnostic.note(.{ .err = error.PullRequestAuthorCannotSetReviewerVerdict, .phase = .validate });
+            return .pull_request_author;
+        }
 
         const current = before.reviewerVerdict(authenticated_account_uuid);
         if (current == target) return .success;
@@ -6619,7 +6622,8 @@ test "review fixes malformed Comment scope frees partial decoding" {
 test "review followups Reviewer Verdict rejects the PullRequest Author before mutation" {
     for ([_]types.ReviewerVerdict{ .approved, .changes_requested, .no_verdict }) |target| {
         var fake: FakeHttpClient = .{ .body = verdict_none };
-        try testing.expectError(error.PullRequestAuthorCannotSetReviewerVerdict, Client.init(fake.httpClient(), testCredential()).changeReviewerVerdict(testing.allocator, "repo", 42, "abc123", "{ada}", target));
+        const result = try Client.init(fake.httpClient(), testCredential()).changeReviewerVerdict(testing.allocator, "repo", 42, "abc123", "{ada}", target);
+        try testing.expectEqual(types.ReviewerVerdictChangeResult.pull_request_author, result);
         try testing.expectEqual(@as(usize, 1), fake.call_count);
         try testing.expectEqual(httpc.Method.GET, fake.methodAt(0).?);
     }

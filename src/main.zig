@@ -715,7 +715,7 @@ fn checkVerdict(io: std.Io, gpa: std.mem.Allocator, bb: bbr.bitbucket.Client, re
     defer gpa.free(account_uuid);
     const initial_pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
     defer bbr.bitbucket.deinitPullRequest(gpa, initial_pull_request);
-    if (std.mem.eql(u8, account_uuid, initial_pull_request.author_uuid)) return error.PullRequestAuthorCannotSetReviewerVerdict;
+    if (std.mem.eql(u8, account_uuid, initial_pull_request.author_uuid)) return verdictChangeFailed(io, diagnostic, .pull_request_author, error.ReviewerVerdictChangeFailed, @src());
 
     const initial = initial_pull_request.reviewerVerdict(account_uuid);
     const target: bbr.bitbucket.ReviewerVerdict = if (initial == .approved) .changes_requested else .approved;
@@ -752,6 +752,7 @@ fn restoreReviewerVerdict(
 /// The cause that a failed change result names, else `failure`.
 fn verdictChangeCause(result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror) anyerror {
     return switch (result) {
+        .pull_request_author => error.PullRequestAuthorCannotSetReviewerVerdict,
         .api_error => |err| err,
         .unresolved => |err| err orelse failure,
         .success, .reconciled_success, .stale_source_commit => failure,
@@ -761,7 +762,7 @@ fn verdictChangeCause(result: bbr.bitbucket.ReviewerVerdictChangeResult, failure
 /// Shows a failed change with the cause that its result names, and records that cause once.
 fn verdictChangeFailed(io: std.Io, diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
     const cause = verdictChangeCause(result, failure);
-    return bbr.cli_failure.fail(io, diagnostic.forContext(.verdict, .{}), .execute, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) } });
+    return bbr.cli_failure.fail(io, diagnostic.forContext(.verdict, .{}), if (result == .pull_request_author) .validate else .execute, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) } });
 }
 
 fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) bool {

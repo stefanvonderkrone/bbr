@@ -11667,6 +11667,10 @@ pub const Presentation = struct {
                 self.durable_reviewer_verdict = null;
                 self.showError(.reviewer_verdict_source_changed);
             },
+            .pull_request_author => {
+                self.durable_reviewer_verdict = null;
+                self.showError(.pull_request_author);
+            },
             .api_error => {
                 self.durable_reviewer_verdict = null;
                 self.showError(.reviewer_verdict_failed);
@@ -20263,6 +20267,7 @@ test "Reviewer Verdict rejects stale completions and keeps every terminal result
         action_error: ActionError,
     }{
         .{ .result = .stale_source_commit, .action_error = .reviewer_verdict_source_changed },
+        .{ .result = .pull_request_author, .action_error = .pull_request_author },
         .{ .result = .{ .api_error = error.Forbidden }, .action_error = .reviewer_verdict_failed },
         .{ .result = .{ .unresolved = null }, .action_error = .reviewer_verdict_unresolved },
     };
