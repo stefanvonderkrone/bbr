@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run bbr");
     run_step.dependOn(&run_cmd.step);
 
+    const test_step = b.step("test", "Run tests");
     const bench_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
     const bench_core_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -248,6 +249,13 @@ pub fn build(b: *std.Build) void {
     const benchmark_metrics = b.addSystemCommand(&.{"python3"});
     benchmark_metrics.addFileArg(b.path("tools/check_benchmark_metrics.py"));
     benchmark_metrics.addDirectoryArg(b.path("."));
+    const benchmark_builds = b.addSystemCommand(&.{"python3"});
+    benchmark_builds.addFileArg(b.path("tools/check_benchmark_builds.py"));
+    benchmark_builds.addDirectoryArg(b.path("."));
+    test_step.dependOn(&benchmark_builds.step);
+    const doc_symbols = b.addSystemCommand(&.{"python3"});
+    doc_symbols.addFileArg(b.path("tools/check_doc_symbols.py"));
+    doc_symbols.addDirectoryArg(b.path("."));
     const stdio_writers = b.addSystemCommand(&.{"python3"});
     stdio_writers.addFileArg(b.path("tools/check_stdio_writers.py"));
     stdio_writers.addDirectoryArg(b.path("."));
@@ -280,6 +288,10 @@ pub fn build(b: *std.Build) void {
     navigation_fields.addFileArg(b.path("tools/check_navigation_fields.py"));
     navigation_fields.addDirectoryArg(b.path("."));
     test_step.dependOn(&navigation_fields.step);
+    const action_errors = b.addSystemCommand(&.{"python3"});
+    action_errors.addFileArg(b.path("tools/check_action_errors.py"));
+    action_errors.addDirectoryArg(b.path("."));
+    test_step.dependOn(&action_errors.step);
     const task_spawns = b.addSystemCommand(&.{"python3"});
     task_spawns.addFileArg(b.path("tools/check_task_spawns.py"));
     task_spawns.addDirectoryArg(b.path("."));
@@ -477,6 +489,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&stdio_writers.step);
     test_step.dependOn(&benchmark_metrics.step);
+    test_step.dependOn(&doc_symbols.step);
     test_step.dependOn(&b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true }).step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
@@ -484,6 +497,12 @@ pub fn build(b: *std.Build) void {
 }
 
 /// `zig build test` compiles every benchmark, so CI catches a benchmark that no test reaches.
+fn addBenchmark(b: *std.Build, test_step: *std.Build.Step, name: []const u8, root_module: *std.Build.Module) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{ .name = name, .root_module = root_module });
+    test_step.dependOn(&exe.step);
+    return exe;
+}
+
 fn addBenchmark(b: *std.Build, test_step: *std.Build.Step, name: []const u8, root_module: *std.Build.Module) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{ .name = name, .root_module = root_module });
     test_step.dependOn(&exe.step);
