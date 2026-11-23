@@ -1057,6 +1057,12 @@ test "Bitbucket rejection messages survive response cleanup and stay on stderr" 
             .expected = "bbr api list-comments: Bitbucket rejected request (Forbidden): Repository access denied\n",
         },
         .{
+            .status = 403,
+            .body = "{\"error\":{\"message\":\"Missing privileges\",\"detail\":{\"required\":[\"read:pullrequest:bitbucket\"],\"granted\":[]}}}",
+            .err = error.Forbidden,
+            .expected = "bbr api list-comments: Bitbucket rejected request (Forbidden): Missing privileges Missing token scopes: read:pullrequest:bitbucket\n",
+        },
+        .{
             .body = "{\"error\":{\"message\":\"Unsupported\\nfilter\\u001b\"}}",
             .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): Unsupported filter \n",
         },
@@ -1083,6 +1089,55 @@ test "Bitbucket rejection messages survive response cleanup and stay on stderr" 
         try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
         try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+    }
+}
+
+test "scope rejections name only missing token scopes on stderr" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const message = "Your credentials lack one or more required privilege scopes.";
+    const scope = "write:repository:bitbucket";
+    const prefix = "bbr api create-branch: Bitbucket rejected request (Forbidden): ";
+    const envelope = "{\"type\":\"error\",\"error\":{\"message\":\"" ++ message ++ "\",\"detail\":";
+    for ([_]struct { body: []const u8, expected: []const u8 }{
+        .{
+            .body = envelope ++ "{\"required\":[\"write:repository:bitbucket\",\"read:repository:bitbucket\"],\"granted\":[\"read:wiki:bitbucket\",\"read:repository:bitbucket\",\"write:pullrequest:bitbucket\"]}}}",
+            .expected = prefix ++ message ++ " Missing token scopes: " ++ scope ++ "\n",
+        },
+        .{ .body = envelope ++ "\"other detail\"}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "null}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":42,\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":null}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[42],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":[42]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":[\"" ++ scope ++ "\"]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"test-token\"],\"granted\":[]}}}", .expected = prefix ++ message ++ " Missing token scopes: [redacted]\n" },
+        .{ .body = envelope ++ "{\"required\":[\"write\\nsecret\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ "a" ** 1025 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[" ++ "\"scope\"," ** 64 ++ "\"scope\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":[" ++ "\"scope\"," ** 256 ++ "\"scope\"]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[" ++ ("\"" ++ "a" ** 128 ++ "\",") ** 8 ++ "\"" ++ "a" ** 128 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"read:user:bitbucket\",\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ " Missing token scopes: read:user:bitbucket, " ++ scope ++ "\n" },
+        .{ .body = "{\"error\":{\"detail\":{\"required\":[\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ "Missing token scopes: " ++ scope ++ "\n" },
+    }) |case| {
+        for ([_]bool{ false, true }) |json| {
+            var output: TestOutput = .{};
+            var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+            defer detail.deinit();
+            var fake: bbr.http.FakeHttpClient = .{ .status = 403, .body = case.body };
+            var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" });
+            bb.error_detail = &detail;
+            const init = output.init(&env, &arena);
+            try std.testing.expectError(error.Forbidden, branches.runCreate(init, bb, &.{ "--repository=sample", "--name=probe", "--target=main" }, json));
+            try std.testing.expectEqual(error.Reported, reportFailure(init, findVerb("create-branch"), error.Forbidden, &detail, .{}));
+            try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
+            try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+            try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+        }
     }
 }
 

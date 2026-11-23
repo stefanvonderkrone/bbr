@@ -106,11 +106,22 @@ pub const Client = struct {
             defer self.mutex.unlock(self.io);
             self.deinit();
             self.reason = reason;
-            const Envelope = struct { @"error": ?struct { message: ?[]const u8 = null } = null };
+            const Envelope = struct { @"error": ?struct { message: ?[]const u8 = null, detail: std.json.Value = .null } = null };
             const parsed = std.json.parseFromSlice(Envelope, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return;
             defer parsed.deinit();
             const api_error = parsed.value.@"error" orelse return;
-            const message = api_error.message orelse return;
+            var scope_buffer: [1024]u8 = undefined;
+            const missing = missingTokenScopes(api_error.detail, &scope_buffer);
+            const original: []const u8 = api_error.message orelse "";
+            const expanded = if (missing.len == 0) null else std.fmt.allocPrint(
+                self.allocator,
+                "{s}{s}Missing token scopes: {s}",
+                .{ original, if (original.len == 0) "" else " ", missing },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return,
+            };
+            defer if (expanded) |text| self.allocator.free(text);
+            const message: []const u8 = if (expanded) |text| text else api_error.message orelse return;
             if (message.len == 0) return;
             var redacted: std.ArrayList(u8) = .empty;
             defer redacted.deinit(self.allocator);
@@ -1710,6 +1721,49 @@ pub const Client = struct {
         };
     }
 };
+
+fn tokenScope(value: std.json.Value) ?[]const u8 {
+    const text = switch (value) {
+        .string => |text| text,
+        else => return null,
+    };
+    if (text.len == 0 or text.len > 128) return null;
+    for (text) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != ':' and byte != '_' and byte != '-') return null;
+    return text;
+}
+
+fn missingTokenScopes(detail: std.json.Value, buffer: []u8) []const u8 {
+    const object = switch (detail) {
+        .object => |object| object,
+        else => return "",
+    };
+    const required = switch (object.get("required") orelse return "") {
+        .array => |array| array.items,
+        else => return "",
+    };
+    const granted = switch (object.get("granted") orelse return "") {
+        .array => |array| array.items,
+        else => return "",
+    };
+    if (required.len > 64 or granted.len > 256) return "";
+    for (required) |value| _ = tokenScope(value) orelse return "";
+    for (granted) |value| _ = tokenScope(value) orelse return "";
+    var length: usize = 0;
+    for (required) |value| {
+        const scope = value.string;
+        const found = for (granted) |entry| {
+            if (std.mem.eql(u8, scope, entry.string)) break true;
+        } else false;
+        if (found) continue;
+        const separator = if (length == 0) "" else ", ";
+        if (separator.len + scope.len > buffer.len - length) return "";
+        @memcpy(buffer[length..][0..separator.len], separator);
+        length += separator.len;
+        @memcpy(buffer[length..][0..scope.len], scope);
+        length += scope.len;
+    }
+    return buffer[0..length];
+}
 
 /// Paging for list endpoints. `follow` follows `next` links (default true:
 /// return all items). With `follow=false` a single page is returned.
