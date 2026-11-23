@@ -1906,7 +1906,25 @@ test "status labels project every Reviewer Verdict" {
 test "qualified Reviewer Verdict results retain their outcome" {
     try std.testing.expectEqualStrings("changed", reviewerVerdictOutcomeLabel(.{ .completed = .success }));
     try std.testing.expectEqualStrings("refused because SourceCommit changed", reviewerVerdictOutcomeLabel(.{ .completed = .stale_source_commit }));
+    try std.testing.expectEqualStrings("refused for the PullRequest Author", reviewerVerdictOutcomeLabel(.{ .completed = .pull_request_author }));
     try std.testing.expectEqualStrings("outcome unresolved", reviewerVerdictOutcomeLabel(.{ .completed = .{ .unresolved = null } }));
+}
+
+test "Reviewer Verdict status names the PullRequest Author refusal" {
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    var state = try presentation.Presentation.init(std.testing.allocator, .{ .reviews = store.store() }, .{});
+    defer state.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 42);
+    var projection = state.projection();
+    projection.reviewer_verdict_result = .{ .key = key, .target = .approved, .outcome = .{ .completed = .pull_request_author } };
+    try std.testing.expectEqualStrings(
+        "bbr refuses to set a Reviewer Verdict for the PullRequest Author",
+        presentationStatus(std.testing.allocator, projection, key).?,
+    );
+    const other_status = presentationStatus(std.testing.allocator, projection, null).?;
+    defer std.testing.allocator.free(other_status);
+    try std.testing.expectEqualStrings("repo#42: Reviewer Verdict refused for the PullRequest Author", other_status);
 }
 
 const TestStatus = struct {
