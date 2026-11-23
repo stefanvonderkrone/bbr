@@ -20,10 +20,9 @@
       "computedHash": "43a71462e5ad089e652133fe6f8c3c3835688a143e0ad973d6c5b803d1dbafe7"
     },
     "code-review": {
-      "source": "mattpocock/skills",
-      "sourceType": "github",
-      "skillPath": "skills/engineering/code-review/SKILL.md",
-      "computedHash": "57cfd4ceb011f05e58a1a4f4cad3b2e03419d371f8990f4bcb32ff0d435a039f"
+      "source": ".agents/skills/code-review",
+      "sourceType": "local",
+      "computedHash": "1cea6f9772dff039b7e351b5aedcfcf64f2eb39eb9fe558b1e1e7484ffb60ef3"
     },
     "codebase-design": {
       "source": "mattpocock/skills",
@@ -74,16 +73,14 @@
       "computedHash": "8ebcf017c0a59681f3c2f1ebf90e32f481954a068181a75151c44aa2c55de4b4"
     },
     "implement": {
-      "source": "mattpocock/skills",
-      "sourceType": "github",
-      "skillPath": "skills/engineering/implement/SKILL.md",
-      "computedHash": "b6371a0a6723bad551f3adc721e3729a6a97acfc3670dc2bdea198bbe78408c0"
+      "source": ".agents/skills/implement",
+      "sourceType": "local",
+      "computedHash": "6fbd09c1c54050da2ae445935f7e77f9995079d7221c79dedb6879b028d28631"
     },
     "implement-spec": {
-      "source": "mattpocock/skills",
-      "sourceType": "github",
-      "skillPath": "skills/engineering/implement-spec/SKILL.md",
-      "computedHash": "f0db7dafd236fff9dc40da566cb72bbad6802674f64617b06959b00a436c7d5b"
+      "source": ".agents/skills/implement-spec",
+      "sourceType": "local",
+      "computedHash": "f68506ba1af12ee07209c7e1a4a65b8eea00191cef8f6a7fdde49b446a19793f"
     },
     "improve-codebase-architecture": {
       "source": "mattpocock/skills",
@@ -102,6 +99,12 @@
       "sourceType": "github",
       "skillPath": "skills/misc/migrate-to-shoehorn/SKILL.md",
       "computedHash": "6397731ced114f3657aa88b55ed13d1344a56d77ca449c568e3200c21740fa99"
+    },
+    "open-code-review-delegate": {
+      "source": "alibaba/open-code-review",
+      "sourceType": "github",
+      "skillPath": "skills/open-code-review-delegate/SKILL.md",
+      "computedHash": "b59a81c5275d316c67c1faa5fa021e068d77db1be9fba6963f4d276d7d26af96"
     },
     "pr": {
       "source": "mattpocock/skills",
