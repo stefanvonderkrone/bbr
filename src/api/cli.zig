@@ -534,19 +534,20 @@ fn bbrApiCommandsUseRowFlags(path: []const u8, text: []const u8) bool {
         const line_number = std.mem.count(u8, text[0..start], "\n") + 1;
         var tokens: DocTokens = .{ .text = text, .pos = pos };
         var token = tokens.next();
+        // As in `parseGlobal`, any flag can come before the verb, and a flag
+        // that takes a value in the space form also takes the next word.
         const verb = while (token) |t| : (token = tokens.next()) {
             if (!std.mem.startsWith(u8, t, "--")) break t;
-            const name = flagName(t);
-            if (std.mem.eql(u8, name, "profile") or std.mem.eql(u8, name, "workspace")) {
-                if (std.mem.indexOfScalar(u8, t, '=') == null) _ = tokens.next();
-            }
+            if (takesValue(flagName(t)) and std.mem.indexOfScalar(u8, t, '=') == null) _ = tokens.next();
         } else continue;
         const placeholder = for (verb) |c| {
             if (!(std.ascii.isLower(c) or c == '-')) break true;
         } else false;
         if (placeholder) continue;
         if (findVerb(verb)) |row| {
-            if (!flagsOfRow(path, line_number, row, &tokens)) ok = false;
+            // Rescan from `bbr api`, so the flags before the verb count too.
+            var command: DocTokens = .{ .text = text, .pos = pos };
+            if (!flagsOfRow(path, line_number, row, &command)) ok = false;
         } else if (std.mem.indexOfScalar(u8, verb, '-') != null or hasFlag(&tokens)) {
             std.debug.print("{s}:{d}: `bbr api {s}` names no row of `verbs` in src/api/cli.zig; `bbr api --help` lists the verbs\n", .{ path, line_number, verb });
             ok = false;
