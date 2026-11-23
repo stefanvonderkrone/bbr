@@ -33,7 +33,7 @@ Groups: Workspaces, Repositories, Branches, PullRequests, Files, Comments, Tasks
 
 Use the [VERBS.md](./VERBS.md) recipe or example when it shows every flag that you need. A test keeps these flags equal to the verbs. Run `bbr api VERB --help` only for a flag that no recipe or example shows, or after an `UnknownFlag` error. Help needs no login. Done when every flag in your command appears in a VERBS.md recipe, a VERBS.md example, or the help output.
 
-Rules: `bbr api [--profile NAME] [--workspace SLUG] [--json] VERB [options]`. Globals go before or after the verb. All flags use long `--kebab-case`. No short flags.
+Rules: `bbr api [--profile NAME] [--workspace SLUG] [--json] VERB [options]`. Globals go before or after the verb. All flags are long kebab-case names, such as `--pull-request-id`. No short flags.
 
 ## 4. Run with output rule
 

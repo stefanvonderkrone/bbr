@@ -2,7 +2,7 @@
 
 Each recipe and example passes only flags that its verb takes. Run `bbr api VERB --help` for a flag that none of them shows.
 
-A PullRequest is always `--pull-request-id`, a Comment `--comment-id`, and a Task `--task-id`. No verb takes `--id`.
+A PullRequest is always `--pull-request-id`, a Comment `--comment-id`, and a Task `--task-id`. No verb takes --id.
 
 ## Recipes
 

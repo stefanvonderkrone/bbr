@@ -497,66 +497,105 @@ test "skills/bbr/VERBS.md lists every bbr api verb once" {
 
 test "every command in the bbr skill uses only the flags of its verb" {
     var failed = false;
+    for (verbs) |verb| {
+        var tokens: DocTokens = .{ .text = verb.example, .pos = "bbr api ".len + verb.name.len };
+        while (nextForeignFlag(verb, &tokens)) |name| {
+            std.debug.print("bbr api {s}: the example of its row of `verbs` in src/api/cli.zig passes --{s}, which the row does not list\n", .{ verb.name, name });
+            failed = true;
+        }
+    }
     for ([_]struct { path: []const u8, doc: []const u8 }{
         .{ .path = "skills/bbr/SKILL.md", .doc = @embedFile("bbr_skill_md") },
         .{ .path = "skills/bbr/VERBS.md", .doc = @embedFile("bbr_verbs_md") },
     }) |file| {
-        var in_fence = false;
+        if (!bbrApiCommandsUseRowFlags(file.path, file.doc)) failed = true;
         var lines = std.mem.splitScalar(u8, file.doc, '\n');
+        var line_number: usize = 0;
         while (lines.next()) |line| {
-            if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "```")) {
-                in_fence = !in_fence;
-                continue;
-            }
-            if (in_fence) {
-                if (!docCommandUsesRowFlags(file.path, line)) failed = true;
-                continue;
-            }
+            line_number += 1;
             var spans = std.mem.splitScalar(u8, line, '`');
             var code = false;
             while (spans.next()) |span| : (code = !code) {
-                if (code and !docCommandUsesRowFlags(file.path, span)) failed = true;
+                if (code and !codeSpanUsesRowFlags(file.path, line_number, span)) failed = true;
             }
         }
     }
     try std.testing.expect(!failed);
 }
 
-/// Checks one code span or fenced line. A span that starts with `bbr api`
-/// must name a verb; a span that starts with a verb name is also checked.
-/// Other spans, and placeholders such as `VERB`, are not commands.
-fn docCommandUsesRowFlags(path: []const u8, span: []const u8) bool {
-    var tokens: DocTokens = .{ .text = span };
-    var first = tokens.next() orelse return true;
-    const after_bbr_api = std.mem.eql(u8, first, "bbr");
-    if (after_bbr_api) {
-        const second = tokens.next() orelse return true;
-        if (!std.mem.eql(u8, second, "api")) return true;
-        first = tokens.next() orelse return true;
-    }
-    var token: ?[]const u8 = first;
-    const verb = while (token) |t| : (token = tokens.next()) {
-        if (!std.mem.startsWith(u8, t, "--")) break t;
-        const name = flagName(t);
-        if (std.mem.eql(u8, name, "profile") or std.mem.eql(u8, name, "workspace")) {
-            if (std.mem.indexOfScalar(u8, t, '=') == null) _ = tokens.next();
+/// Checks every `bbr api` command in `text`, in prose, a code span, or a
+/// fence. Agents copy each shape, so no Markdown parse decides what counts.
+/// A verb with an uppercase letter, such as `VERB`, is a placeholder.
+fn bbrApiCommandsUseRowFlags(path: []const u8, text: []const u8) bool {
+    var ok = true;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, "bbr api")) |start| {
+        pos = start + "bbr api".len;
+        const line_number = std.mem.count(u8, text[0..start], "\n") + 1;
+        var tokens: DocTokens = .{ .text = text, .pos = pos };
+        var token = tokens.next();
+        const verb = while (token) |t| : (token = tokens.next()) {
+            if (!std.mem.startsWith(u8, t, "--")) break t;
+            const name = flagName(t);
+            if (std.mem.eql(u8, name, "profile") or std.mem.eql(u8, name, "workspace")) {
+                if (std.mem.indexOfScalar(u8, t, '=') == null) _ = tokens.next();
+            }
+        } else continue;
+        const placeholder = for (verb) |c| {
+            if (!(std.ascii.isLower(c) or c == '-')) break true;
+        } else false;
+        if (placeholder) continue;
+        if (findVerb(verb)) |row| {
+            if (!flagsOfRow(path, line_number, row, &tokens)) ok = false;
+        } else if (std.mem.indexOfScalar(u8, verb, '-') != null or hasFlag(&tokens)) {
+            std.debug.print("{s}:{d}: `bbr api {s}` names no row of `verbs` in src/api/cli.zig; `bbr api --help` lists the verbs\n", .{ path, line_number, verb });
+            ok = false;
         }
-    } else return true;
-    for (verb) |c| if (!(std.ascii.isLower(c) or c == '-')) return true;
-    const row = findVerb(verb) orelse {
-        if (!after_bbr_api) return true;
-        std.debug.print("{s}: `{s}` names `{s}`, which is not a row of `verbs` in src/api/cli.zig\n", .{ path, span, verb });
-        return false;
-    };
+    }
+    return ok;
+}
+
+/// Checks an inline code span without `bbr api`. A span that starts with a
+/// verb passes only the flags of its row. Any other `--` word is a flag of
+/// some row.
+fn codeSpanUsesRowFlags(path: []const u8, line_number: usize, span: []const u8) bool {
+    if (std.mem.indexOf(u8, span, "bbr api") != null) return true;
+    var tokens: DocTokens = .{ .text = span };
+    const first = tokens.next() orelse return true;
+    if (findVerb(first)) |row| return flagsOfRow(path, line_number, row, &tokens);
+    tokens = .{ .text = span };
     var ok = true;
     while (tokens.next()) |t| {
         if (!std.mem.startsWith(u8, t, "--")) continue;
         const name = flagName(t);
-        if (contains(&global_flags, name) or contains(row.value_flags, name) or contains(row.switch_flags, name)) continue;
-        std.debug.print("{s}: `{s}` passes --{s}, which is not a flag of bbr api {s}\n", .{ path, span, name, verb });
+        if (contains(&global_flags, name) or takesValue(name) or contains(flag_sets.switches, name)) continue;
+        std.debug.print("{s}:{d}: `{s}` names --{s}, which no row of `verbs` in src/api/cli.zig lists\n", .{ path, line_number, span, name });
         ok = false;
     }
     return ok;
+}
+
+fn flagsOfRow(path: []const u8, line_number: usize, row: Verb, tokens: *DocTokens) bool {
+    var ok = true;
+    while (nextForeignFlag(row, tokens)) |name| {
+        std.debug.print("{s}:{d}: a `{s}` command passes --{s}, which is not in its row of `verbs` in src/api/cli.zig; `bbr api {s} --help` lists its flags\n", .{ path, line_number, row.name, name, row.name });
+        ok = false;
+    }
+    return ok;
+}
+
+fn nextForeignFlag(row: Verb, tokens: *DocTokens) ?[]const u8 {
+    while (tokens.next()) |t| {
+        if (!std.mem.startsWith(u8, t, "--")) continue;
+        const name = flagName(t);
+        if (!contains(&global_flags, name) and !contains(row.value_flags, name) and !contains(row.switch_flags, name)) return name;
+    }
+    return null;
+}
+
+fn hasFlag(tokens: *DocTokens) bool {
+    while (tokens.next()) |t| if (std.mem.startsWith(u8, t, "--")) return true;
+    return false;
 }
 
 fn flagName(token: []const u8) []const u8 {
@@ -564,28 +603,37 @@ fn flagName(token: []const u8) []const u8 {
     return name[0 .. std.mem.indexOfScalar(u8, name, '=') orelse name.len];
 }
 
-/// Shell words of a doc command. Quoted text stays inside its word, and the
-/// words end at a pipe, a list operator, a redirection, or a comment.
+/// Shell words of one doc command. Quoted text stays inside its word, and a
+/// backslash before a line break joins the lines. The words end at a line
+/// break, a backtick, a pipe, a list operator, a redirection, a closing
+/// parenthesis, or a comment.
 const DocTokens = struct {
     text: []const u8,
     pos: usize = 0,
 
     fn next(self: *DocTokens) ?[]const u8 {
-        while (self.pos < self.text.len and self.text[self.pos] == ' ') self.pos += 1;
+        while (self.pos < self.text.len) : (self.pos += 1) {
+            if (std.mem.startsWith(u8, self.text[self.pos..], "\\\n")) {
+                self.pos += 1;
+            } else if (self.text[self.pos] != ' ' and self.text[self.pos] != '\t') break;
+        }
         if (self.pos == self.text.len) return null;
         switch (self.text[self.pos]) {
-            '|', ';', '&', '>', '#' => return null,
+            '\n', '`', '|', ';', '&', '<', '>', ')', '#' => return null,
             else => {},
         }
         const start = self.pos;
         var quote: ?u8 = null;
         while (self.pos < self.text.len) : (self.pos += 1) {
             const c = self.text[self.pos];
+            if (c == '\n') break;
             if (quote) |q| {
                 if (c == q) quote = null;
-            } else if (c == '\'' or c == '"') {
-                quote = c;
-            } else if (c == ' ') break;
+            } else switch (c) {
+                '\'', '"' => quote = c,
+                ' ', '\t', '`', ')', ';', '|' => break,
+                else => {},
+            }
         }
         const word = self.text[start..self.pos];
         if (std.mem.indexOf(u8, word, ">&") != null) return null;
