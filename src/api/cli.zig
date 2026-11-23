@@ -1104,6 +1104,14 @@ test "scope rejections name only missing token scopes on stderr" {
     const envelope = "{\"type\":\"error\",\"error\":{\"message\":\"" ++ message ++ "\",\"detail\":";
     for ([_]struct { body: []const u8, expected: []const u8 }{
         .{
+            .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\",\"read:user:bitbucket\",\"" ++ scope ++ "\",\"read:user:bitbucket\"],\"granted\":[]}}}",
+            .expected = prefix ++ message ++ " Missing token scopes: " ++ scope ++ ", read:user:bitbucket\n",
+        },
+        .{
+            .body = envelope ++ "{\"required\":[\"read:user:bitbucket\",\"" ++ scope ++ "\",\"read:user:bitbucket\",\"" ++ scope ++ "\"],\"granted\":[\"read:user:bitbucket\"]}}}",
+            .expected = prefix ++ message ++ " Missing token scopes: " ++ scope ++ "\n",
+        },
+        .{
             .body = envelope ++ "{\"required\":[\"write:repository:bitbucket\",\"read:repository:bitbucket\"],\"granted\":[\"read:wiki:bitbucket\",\"read:repository:bitbucket\",\"write:pullrequest:bitbucket\"]}}}",
             .expected = prefix ++ message ++ " Missing token scopes: " ++ scope ++ "\n",
         },
@@ -1120,7 +1128,7 @@ test "scope rejections name only missing token scopes on stderr" {
         .{ .body = envelope ++ "{\"required\":[\"" ++ "a" ** 1025 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
         .{ .body = envelope ++ "{\"required\":[" ++ "\"scope\"," ** 64 ++ "\"scope\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
         .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":[" ++ "\"scope\"," ** 256 ++ "\"scope\"]}}}", .expected = prefix ++ message ++ "\n" },
-        .{ .body = envelope ++ "{\"required\":[" ++ ("\"" ++ "a" ** 128 ++ "\",") ** 8 ++ "\"" ++ "a" ** 128 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ "a" ** 1024 ++ "\",\"b\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
         .{ .body = envelope ++ "{\"required\":[\"read:user:bitbucket\",\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ " Missing token scopes: read:user:bitbucket, " ++ scope ++ "\n" },
         .{ .body = "{\"error\":{\"detail\":{\"required\":[\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ "Missing token scopes: " ++ scope ++ "\n" },
     }) |case| {

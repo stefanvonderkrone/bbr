@@ -1752,8 +1752,12 @@ fn missingTokenScopes(detail: std.json.Value, buffer: []u8) []const u8 {
     for (required) |value| _ = tokenScope(value) orelse return "";
     for (granted) |value| _ = tokenScope(value) orelse return "";
     var length: usize = 0;
-    for (required) |value| {
+    for (required, 0..) |value, index| {
         const scope = value.string;
+        const duplicate = for (required[0..index]) |entry| {
+            if (std.mem.eql(u8, scope, entry.string)) break true;
+        } else false;
+        if (duplicate) continue;
         const found = for (granted) |entry| {
             if (std.mem.eql(u8, scope, entry.string)) break true;
         } else false;
