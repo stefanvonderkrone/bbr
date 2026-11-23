@@ -31,7 +31,7 @@ Groups: Workspaces, Repositories, Branches, PullRequests, Files, Comments, Tasks
 
 ## 3. Confirm flags
 
-Use the [VERBS.md](./VERBS.md) recipe or example when it shows every flag that you need. A test keeps these flags equal to the verbs. Run `bbr api VERB --help` only for a flag that no recipe or example shows, or after an `UnknownFlag` error. Help needs no login. Done when every flag in your command appears in a VERBS.md recipe, a VERBS.md example, or the help output.
+Copy the [VERBS.md](./VERBS.md) recipe or example of your verb when it shows every flag that you need. A test checks that each of these commands passes only flags of its verb. Run `bbr api VERB --help` only for a flag that no recipe or example of your verb shows, or after an `UnknownFlag` error. Help needs no login. Done when each flag in your command appears in a recipe or example of the same verb, or in `bbr api VERB --help`.
 
 Rules: `bbr api [--profile NAME] [--workspace SLUG] [--json] VERB [options]`. Globals go before or after the verb. All flags are long kebab-case names, such as `--pull-request-id`. No short flags.
 
@@ -47,7 +47,7 @@ Reads run free. Writes need approval unless the user ordered the write. The writ
 
 ## Resolve an account ID or UUID
 
-Run `bbr api get-user --help`, then `bbr api get-user --user-id ID --json`.
+Run `bbr api get-user --user-id ID --json`.
 Use the exact ID supplied by the user. For a Bitbucket mention `@{ID}`, pass the ID without the mention wrapper.
 The response has `uuid`, `account_id`, `display_name`, and `nickname`. This read does not require Workspace membership.
 A public profile does not prove Repository access. Keep an unresolved mention literal if the lookup fails.
@@ -58,13 +58,12 @@ Files supplied through `--description-file` must not exceed 1 MiB.
 
 When the user names a reviewer or another account, resolve that name in the selected Workspace:
 
-1. Run `bbr api search-workspace-members --help`.
-2. Run `bbr api search-workspace-members --name 'Ada Lovelace' --json` with the user's name as the value.
+1. Run `bbr api search-workspace-members --name 'Ada Lovelace' --json` with the user's name as the value.
    For several names in the same Workspace, use one command with repeated `--name` flags:
    `bbr api search-workspace-members --name 'Ada Lovelace' --name 'Grace Hopper' --json`.
    The command fetches the member list once for all names.
    If the request fails, report the error and stop this lookup.
-3. Read the JSON array, which contains one group per supplied name in input order, including duplicate names.
+2. Read the JSON array, which contains one group per supplied name in input order, including duplicate names.
    Each group contains `name` and `matches`. Each match contains `uuid`, `display_name`, and `nickname` directly.
    Use the complete matches without `--limit` to check for ambiguity.
    Apply these selection rules independently to each group:
@@ -76,9 +75,9 @@ When the user names a reviewer or another account, resolve that name in the sele
    - For multiple results, ask the user to choose, even when one result matches exactly.
      Show each candidate's display name, nickname, and UUID.
    - For one result with larger differences or only a partial name match, ask the user to confirm that member.
-4. If a group contains no matches, ask for a more complete name, nickname, or another Workspace.
+3. If a group contains no matches, ask for a more complete name, nickname, or another Workspace.
    Search another Workspace only after the user selects it.
-5. Pass the selected UUID to the command's existing `--reviewer` or `--uuid` option.
+4. Pass the selected UUID to the command's existing `--reviewer` or `--uuid` option.
    Reviewer Verdict writes still use the Authenticated Account.
 
 Done when a single result with only minor name differences or the user's selection supplies the UUID for the next command.
