@@ -16,8 +16,8 @@ pub const list_help =
     \\--no-follow returns one page. --limit caps the number of comments fetched.
     \\--query takes a Bitbucket filter on id, user.uuid, created_on, deleted, and
     \\inline.path, such as 'user.uuid != "{uuid}"'. Bitbucket rejects resolution
-    \\and parent. Put inline.path first in an AND, because Bitbucket reads
-    \\"AND inline" as "AND in".
+    \\and parent. Wrap each inline.path term in parentheses, because after AND
+    \\or OR Bitbucket reads "inline" as the in operator.
     \\Flags can appear in any order.
     \\
 ++ pages.pagelenHelp(bbr.bitbucket.max_pagelen.comments);
