@@ -4,7 +4,7 @@
 
 - Issues and PRDs are local Markdown under `.scratch/`. External PRs are not a triage surface. Read [the issue tracker guide](docs/agents/issue-tracker.md) before you create, claim, or close a ticket.
 - Ticket states are `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. Read [the triage labels](docs/agents/triage-labels.md) before you change a state.
-- Read [the project tool defaults](docs/agents/tools.md) before a task that needs a disabled MCP server.
+- Read [the project tool defaults](docs/agents/tools.md) before a task that needs a denied MCP server.
 
 ## Domain
 

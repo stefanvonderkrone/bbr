@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run bbr");
     run_step.dependOn(&run_cmd.step);
 
+    const test_step = b.step("test", "Run tests");
     const bench_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
     const bench_core_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -96,7 +97,7 @@ pub fn build(b: *std.Build) void {
     addTreeSitter(b, bench_highlight_mod);
     addRe2(b, bench_highlight_mod, target, macos_sdk);
     bench_mod.addImport("benchmark_highlight", bench_highlight_mod);
-    const bench_exe = b.addExecutable(.{ .name = "bbr-bench", .root_module = bench_mod });
+    const bench_exe = addBenchmark(b, test_step, "bbr-bench", bench_mod);
     const install_bench = b.addInstallArtifact(bench_exe, .{});
     b.getInstallStep().dependOn(&install_bench.step);
     const run_bench = b.addRunArtifact(bench_exe);
@@ -120,7 +121,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "file_enrichment", .module = file_enrichment_bench_mod },
         },
     });
-    const file_acquisition_bench = b.addExecutable(.{ .name = "bbr-file-acquisition-bench", .root_module = file_acquisition_bench_mod });
+    const file_acquisition_bench = addBenchmark(b, test_step, "bbr-file-acquisition-bench", file_acquisition_bench_mod);
     const run_file_acquisition_bench = b.addRunArtifact(file_acquisition_bench);
     if (b.args) |args| run_file_acquisition_bench.addArgs(args);
     const file_acquisition_bench_step = b.step("bench-file-acquisition", "Run the opt-in File Enrichment concurrency benchmark");
@@ -136,7 +137,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vaxis", .module = vaxis.module("vaxis") },
         },
     });
-    const buffer_search_bench = b.addExecutable(.{ .name = "bbr-buffer-search-bench", .root_module = buffer_search_bench_mod });
+    const buffer_search_bench = addBenchmark(b, test_step, "bbr-buffer-search-bench", buffer_search_bench_mod);
     const buffer_search_bench_step = b.step("bench-buffer-search", "Run the deterministic large Buffer Search benchmark");
     const run_buffer_search_bench = b.addRunArtifact(buffer_search_bench);
     if (b.args) |args| run_buffer_search_bench.addArgs(args);
@@ -221,10 +222,16 @@ pub fn build(b: *std.Build) void {
     const benchmark_metrics = b.addSystemCommand(&.{"python3"});
     benchmark_metrics.addFileArg(b.path("tools/check_benchmark_metrics.py"));
     benchmark_metrics.addDirectoryArg(b.path("."));
+    const benchmark_builds = b.addSystemCommand(&.{"python3"});
+    benchmark_builds.addFileArg(b.path("tools/check_benchmark_builds.py"));
+    benchmark_builds.addDirectoryArg(b.path("."));
+    test_step.dependOn(&benchmark_builds.step);
+    const doc_symbols = b.addSystemCommand(&.{"python3"});
+    doc_symbols.addFileArg(b.path("tools/check_doc_symbols.py"));
+    doc_symbols.addDirectoryArg(b.path("."));
     const stdio_writers = b.addSystemCommand(&.{"python3"});
     stdio_writers.addFileArg(b.path("tools/check_stdio_writers.py"));
     stdio_writers.addDirectoryArg(b.path("."));
-    const test_step = b.step("test", "Run tests");
     // The core module is C-free. A macOS build links libc implicitly, so a libc call in
     // core compiles there and fails only in the Linux CI jobs. Every host also compiles
     // the core tests for Linux, so that mistake fails in a local `zig build test`.
@@ -254,6 +261,10 @@ pub fn build(b: *std.Build) void {
     navigation_fields.addFileArg(b.path("tools/check_navigation_fields.py"));
     navigation_fields.addDirectoryArg(b.path("."));
     test_step.dependOn(&navigation_fields.step);
+    const action_errors = b.addSystemCommand(&.{"python3"});
+    action_errors.addFileArg(b.path("tools/check_action_errors.py"));
+    action_errors.addDirectoryArg(b.path("."));
+    test_step.dependOn(&action_errors.step);
     const task_spawns = b.addSystemCommand(&.{"python3"});
     task_spawns.addFileArg(b.path("tools/check_task_spawns.py"));
     task_spawns.addDirectoryArg(b.path("."));
@@ -450,9 +461,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&stdio_writers.step);
     test_step.dependOn(&benchmark_metrics.step);
+    test_step.dependOn(&doc_symbols.step);
     test_step.dependOn(&b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true }).step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
+}
+
+fn addBenchmark(b: *std.Build, test_step: *std.Build.Step, name: []const u8, root_module: *std.Build.Module) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{ .name = name, .root_module = root_module });
+    test_step.dependOn(&exe.step);
+    return exe;
 }
 
 const TestScript = enum { python, shell, cli, ci };
