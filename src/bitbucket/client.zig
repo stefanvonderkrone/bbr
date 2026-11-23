@@ -241,7 +241,7 @@ pub const Client = struct {
         defer suffix.deinit(allocator);
         try suffix.appendSlice(allocator, "/commit/");
         try percentEncodeInto(allocator, &suffix, commit);
-        try suffix.appendSlice(allocator, "/pullrequests");
+        try suffix.appendSlice(allocator, "/pullrequests?fields=" ++ comptime partialFields(PrListPage));
         const url = try self.repositoryEndpoint(allocator, repo_slug, suffix.items);
         defer allocator.free(url);
         return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url, largestPage(opts, max_pagelen.commit_pull_requests), null, true);
@@ -3336,6 +3336,37 @@ test "API lifecycle PullRequest mutations return optional detail fields without 
     try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .source_repository = "fork/sample" }));
     try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .title = "Change", .source_repository = "fork/sample" }));
     try testing.expectEqual(@as(usize, 3), fake.call_count);
+}
+
+test "API lifecycle commit lookup requests summary fields instead of the short default response" {
+    const a = testing.allocator;
+    const fields = "values.id,values.title,values.state,values.author.display_name,values.source.branch.name,values.destination.branch.name,values.destination.repository.full_name,values.draft,next,page,pagelen,size";
+    const endpoint = base_url ++ "/repositories/check24/myrepo/commit/abc123/pullrequests";
+    const next = endpoint ++ "?fields=" ++ fields ++ "&pagelen=1&page=2";
+    const short = "{\"repo_indexed\":true,\"type\":\"paginated_pullrequests\",\"page\":1,\"pagelen\":1,\"values\":[{\"draft\":false,\"id\":2389,\"links\":{\"self\":{\"href\":\"" ++ base_url ++ "/repositories/check24/myrepo/pullrequests/2389\"}},\"queued\":false,\"title\":\"Change\",\"type\":\"pullrequest\"}]}";
+    const summary = "{\"id\":2389,\"title\":\"Change\",\"state\":\"MERGED\",\"author\":{\"display_name\":\"Ada\"},\"source\":{\"branch\":{\"name\":\"feature\"}},\"destination\":{\"branch\":{\"name\":\"main\"},\"repository\":{\"full_name\":\"check24/myrepo\"}},\"draft\":false}";
+    const responses = [_]httpc_fixture.Canned{
+        .{ .request_key = "?fields=" ++ fields ++ "&pagelen=1&page=2", .body = "{\"page\":2,\"pagelen\":1,\"values\":[" ++ summary ++ "]}" },
+        .{ .request_key = "?fields=" ++ fields, .body = "{\"page\":1,\"pagelen\":1,\"values\":[" ++ summary ++ "],\"next\":\"" ++ next ++ "\"}" },
+    };
+    var fake: FakeHttpClient = .{ .body = short, .responses = &responses, .max_calls = 2 };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const result = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{ .pagelen = 1 });
+    defer deinitSummaries(a, result);
+    try testing.expectEqual(@as(usize, 2), result.len);
+    try testing.expectEqual(@as(usize, 2), fake.call_count);
+    try testing.expectEqualStrings(endpoint ++ "?fields=" ++ fields ++ "&pagelen=1", fake.urlAt(0).?);
+    try testing.expectEqualStrings(next, fake.urlAt(1).?);
+    for (result) |pr| {
+        try testing.expectEqual(@as(u64, 2389), pr.id);
+        try testing.expectEqualStrings("Change", pr.title);
+        try testing.expectEqualStrings("MERGED", pr.state);
+        try testing.expectEqualStrings("Ada", pr.author_display_name);
+        try testing.expectEqualStrings("feature", pr.source_branch);
+        try testing.expectEqualStrings("main", pr.destination_branch);
+        try testing.expectEqualStrings("check24/myrepo", pr.destination_repository);
+        try testing.expect(!pr.draft);
+    }
 }
 
 test "API lifecycle commit lookup has no state filter and reports pending pages" {
@@ -6434,7 +6465,7 @@ test "a list without a requested pagelen requests the largest page of its endpoi
     a.free(try bb.listWorkspaceMembers(a, .{}));
     try testing.expectEqualStrings(base_url ++ "/workspaces/check24/members?pagelen=100", fake.lastUrl().?);
     a.free(try bb.listCommitPullRequests(a, "repo", "abc", .{}));
-    try testing.expectEqualStrings(base_url ++ "/repositories/check24/repo/commit/abc/pullrequests?pagelen=100", fake.lastUrl().?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/repo/commit/abc/pullrequests?fields=" ++ comptime partialFields(PrListPage) ++ "&pagelen=100", fake.lastUrl().?);
 }
 
 test "review fixes typed pagers free in-flight URL and previous items on errors" {
