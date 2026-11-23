@@ -98,6 +98,10 @@ A counter after `send` returns would still precede consumption.
 The helper changes only the test I/O vtable.
 The helper checks the thread ID and the expected futex value.
 A wait on the coordinator thread with expected value zero releases the next response.
+The helper releases the response only when the watched value still equals the expected value.
+`Condition.waitInner` unlocks its mutex before it calls `futexWait`, so a completion can arrive in that gap.
+In that case the helper returns without a release, and the coordinator consumes the completion first.
+This check is defensive. It came from a CodeRabbit review of the Zig 0.16.0 source, and no run showed the gap.
 The helper does not check the identity of the Condition or the queue.
 In Zig 0.16.0, the next matching wait follows consumption of the previous completion.
 The helper waits for an epoch change before it returns from a futex wait.
@@ -175,3 +179,9 @@ Commit `139aaa59` reads the gate clock from `std.Io.Threaded.global_single_threa
 The header of `src/http/fake_client.zig` now says that the file must not use `std.testing`.
 On the merged head, `zig build test` passed 1726 of 1726 tests and `zig build bench-buffer-search` exited with 0.
 The run counts above come from the branch head before the merge.
+
+## Stale-wait check
+
+Commit `1832d922` added the stale-wait check above.
+On that head, `zig build test` and `zig fmt --check src build.zig tests` passed.
+The delay and load loops above ran on earlier heads. Nobody reran them on `1832d922`.
