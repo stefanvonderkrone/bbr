@@ -16,7 +16,7 @@ bbr api list-comments --repository REPO --pull-request-id 42 --json
 # Read only the Comments of other accounts, such as review findings
 bbr api list-comments --repository REPO --pull-request-id 42 --query 'user.uuid != "UUID"' --json
 # Bitbucket cannot filter resolution or parent. Read the `resolved` and `parent_id` fields of the JSON instead.
-# Wrap each inline.path term in parentheses, such as 'deleted = false AND (inline.path != null)'.
+# Wrap each inline.path term in parentheses, such as 'user.uuid != "UUID" AND (inline.path != null)'.
 # Reply to Comment 7 (write)
 bbr api create-comment --repository REPO --pull-request-id 42 --parent-id 7 --body-file reply.md
 # Replace the PullRequest description (write)

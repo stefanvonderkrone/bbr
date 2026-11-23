@@ -15,7 +15,8 @@ pub const list_help =
     \\automatically for outdated detection unless --no-head or explicit commits.
     \\--no-follow returns one page. --limit caps the number of comments fetched.
     \\--query takes a Bitbucket filter on id, user.uuid, created_on, deleted, and
-    \\inline.path, such as 'user.uuid != "{uuid}"'. Bitbucket rejects resolution
+    \\inline.path, such as 'user.uuid != "UUID"', with the uuid of whoami and its
+    \\braces. Bitbucket rejects resolution
     \\and parent. Wrap each inline.path term in parentheses, because after AND
     \\or OR Bitbucket reads "inline" as the in operator.
     \\Flags can appear in any order.
