@@ -88,19 +88,19 @@ Use `list-workspace-members --json` to read the member directory without a name 
 
 ## Branch and PullRequest workflow
 
-Use `create-branch --name NAME --target REV` with a commit hash or an existing branch name as the target. Branch names exclude the `refs/heads/` prefix.
+Use `create-branch --repository REPO --name NAME --target REV` with a commit hash or an existing branch name as the target. Branch names exclude the `refs/heads/` prefix.
 
 `create-pull-request` requires a title and a source branch. It creates a Ready PullRequest by default. Add `--draft true` for a Draft PullRequest. An omitted destination branch uses the Repository's main branch.
 
 For a fork source, use `--source-repository WORKSPACE/SLUG` with `--source-branch NAME`. The selected Workspace and `--repository` identify the destination Repository.
 
-Use `update-pull-request --draft false` to make a Draft PullRequest ready. Use `--draft true` to make it a draft. The command changes only supplied fields. An empty description clears the description.
+Use `update-pull-request --repository REPO --pull-request-id 42 --draft false` to make a Draft PullRequest ready. Use `--draft true` to make it a draft. The command changes only supplied fields. An empty description clears the description.
 
 Repeated `--reviewer UUID` options replace the complete reviewer list. `--clear-reviewers` sends an empty list. Do not combine `--reviewer` with `--clear-reviewers`. Without a reviewer flag, `create-pull-request` sends no reviewers and `update-pull-request` keeps them.
 
 The Bitbucket web UI adds the Default Reviewers of the Repository to a new PullRequest. The API adds none. When the user wants these reviewers, add `--default-reviewers`. The command then sends the Default Reviewers and the `--reviewer` values. Add `--effective` to use the Effective Default Reviewers, which also include the Default Reviewers of the Project. The command leaves out the PullRequest Author. It prints a warning on stderr when a `--reviewer` value names the Author. On update, `--default-reviewers` replaces the reviewer list. Do not combine `--default-reviewers` with `--clear-reviewers`. Run `list-default-reviewers --repository SLUG` to show the Default Reviewers before a write.
 
-Approval uses `set-verdict --verdict approved` with the expected SourceCommit. `decline-pull-request` closes the PullRequest without merging. Decline is not a Reviewer Verdict.
+Approval uses `set-verdict --repository REPO --pull-request-id 42 --verdict approved --expected-source-commit abc123` with the expected SourceCommit. `decline-pull-request` closes the PullRequest without merging. Decline is not a Reviewer Verdict.
 
 ## PullRequests by author or reviewer
 
@@ -108,7 +108,7 @@ Approval uses `set-verdict --verdict approved` with the expected SourceCommit. `
 
 ## Commit lookup
 
-`list-commit-pull-requests --commit HASH` lists PullRequests where Bitbucket reviewed the commit, including closed PullRequests. It follows pages by default. Use `--page`, `--pagelen`, `--no-follow`, and `--limit` to control the results.
+`list-commit-pull-requests --repository REPO --commit HASH` lists PullRequests where Bitbucket reviewed the commit, including closed PullRequests. It follows pages by default. Use `--page`, `--pagelen`, `--no-follow`, and `--limit` to control the results.
 
 The Pull Request Commit Links app must exist. Bitbucket installs it when someone selects `Go to pull request` on a commit's details page. Pending indexing fails with `PullRequestLinksIndexing`. Report the hint instead of treating that failure as an empty list. The command does not poll automatically. `NotFound` can also mean that links lack an index.
 
