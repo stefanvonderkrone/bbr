@@ -126,9 +126,9 @@ Enforcement: `diagnostics.concurrent` and `diagnostics.selectConcurrent` in `src
 
 In `src/bitbucket/client.zig`, each production error return goes through `noted(diagnostic, error.X, phase, cause)`. This applies inside a result such as `.api_error` too. It also applies to an error outside `ApiError`, such as `OutOfMemory` or `BlobSizeMismatch`. Only a testing error such as `error.TestUnexpectedResult` in a test helper needs no note.
 
-An input check notes `.prepare`. A response with the wrong structure notes `.validate`. An item decoder that can reject an item takes the `diagnostics.Handle` of the page first. Without a fresh note, a boundary record of the error takes the evidence of an earlier failure with the same name.
+An input check notes `.prepare`. A response with the wrong structure notes `.validate`. A bbr policy refusal on well-formed response data, such as the PullRequest Author verdict refusal, also notes `.validate`. An item decoder that can reject an item takes the `diagnostics.Handle` of the page first. Without a fresh note, a boundary record of the error takes the evidence of an earlier failure with the same name.
 
-Enforcement: `tools/check_diagnostics.py` checks every `error.X` except `error.Test*` in each complete return expression. It ignores error patterns in switch prongs. The `diagnostics` tests in `src/bitbucket/client.zig` check the phase, the page, and the replacement of stale evidence. `zig build test` runs them.
+Enforcement: `tools/check_diagnostics.py` checks every `error.X` except `error.Test*` in each complete return expression. It ignores error patterns in switch prongs. The `diagnostics` tests in `src/bitbucket/client.zig` check the phase, the page, and the replacement of stale evidence. The `diagnostics check-verdict refusals` test in `src/main.zig` checks `.validate` for the PullRequest Author refusal. `zig build test` runs them.
 
 ## An error comparison uses a switch
 
