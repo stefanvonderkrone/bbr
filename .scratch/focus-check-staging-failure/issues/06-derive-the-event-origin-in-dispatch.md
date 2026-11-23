@@ -73,7 +73,11 @@ So `EventOrigin` repeats `event_origin == .user`, and the merge removes it.
 For a user event this clears any message, as before.
 For a completion it clears only an error of the completion's own origin, by the rule of main.
 No completion reaches this clear, as the 2026-11-21 reviews say, so no test changes.
-No caller chooses the origin: `clearError` takes no origin, the exhaustive switch gives each event its origin, and the line check limits who writes `event_origin`.
+`clearError` takes no origin, and the exhaustive switch gives each event its origin.
+Three new `withErrorOrigin` calls pass an origin: the two queues in `pumpReviewSearchAcquisition` pass `.review_search`, and `retryReviewSearchQuery` passes the origin of the error that it shows again.
+The line check limits the writes of `event_origin` to `dispatch` and `withErrorOrigin`, but it does not check the origin that a caller passes.
+Only the override list in `docs/rules/tui-state.md` and the tests below control these origins.
+This comment replaces the earlier answer and the criterion "clears the message only for an event from the person".
 
 The pump now queues each File as `.review_search` through `withErrorOrigin`, because it acquires Files for Review Search.
 Without the override, "M21 kernel Review Search acquisition queue keeps the shown message" fails, because the queue clears the `file_enrichment_launch_failed` of its own event.

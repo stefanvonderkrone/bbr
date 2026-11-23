@@ -79,7 +79,7 @@ It names its origin through `withErrorOrigin`, which restores the origin of the 
 These overrides exist:
 
 - `dispatch` runs `holdReviewSearchPreview` after each event as `.review_search`, because the Preview hold acquires Files for Review Search.
-- The focus check runs `retryReviewSearchQuery` as `.review_search`, so a successful retry clears only a Review Search error. After a failed retry it shows the earlier error again with that error's origin, because [maintenance work keeps the shown message](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message).
+- The focus check runs `retryReviewSearchQuery` as `.review_search`, so a successful retry clears only a Review Search error. [Maintenance work keeps the shown message](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message) says how a failed retry keeps the earlier error.
 - `pumpReviewSearchAcquisition` queues each File as `.review_search`, because it acquires Files for Review Search. So a success keeps an error of the event that pumps, such as `file_enrichment_launch_failed` of the File that failed before.
 - `openReviewSearch` runs `replaceReviewSearchQuery` for a reopened query as `.review_search`, so its scan clears only a Review Search error.
 - `applySubmissionTreeKey` shows `replacement_pending` as `.reconciliation`, so the end of the replacement clears the notice.

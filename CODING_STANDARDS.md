@@ -158,7 +158,7 @@ A failure of maintenance work records its cause once and shows its failure messa
 An allocation failure uses `out_of_memory`.
 A failed enrichment build uses `buffer_build_failed`.
 A success clears only an error of its own origin, by [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
-A cache staging writes no message.
+A successful cache staging writes no message.
 A user action that hands its work to maintenance work calls `clearError` before it does so, as `openReviewSearchOccurrence` does before the acquisition pump for an evicted File.
 
 These sites are maintenance work:
