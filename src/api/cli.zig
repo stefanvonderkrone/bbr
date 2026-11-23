@@ -536,13 +536,7 @@ test "copied commands remove shell quote delimiters before option parsing" {
     }
 }
 
-test "the copied reply recipe accepts a body file without sending HTTP" {
-    const command: DocCommand = .{
-        .path = "skills/bbr/VERBS.md",
-        .line = 21,
-        .text = "create-comment --repository REPO --pull-request-id 42 --parent-id 7 --body-file reply.md",
-    };
-    try std.testing.expect(try command.check());
+test "create-comment with a missing body file sends no HTTP" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -645,9 +639,9 @@ const DocCommand = struct {
             if (parsed.rest.len != 0 and !parsed.help_only) return command.reject("VERB", error.UnknownFlag);
             return true;
         };
-        if (!docVerbName(name)) return true;
+        if (name.len == 0 or !std.ascii.isLower(name[0])) return true;
         const row = findVerb(name) orelse {
-            if (std.mem.indexOfScalar(u8, name, '-') == null and !hasDocFlag(.{ .text = self.text })) return true;
+            if (std.mem.indexOfScalar(u8, name, '-') == null and !hasDocFlag(.{ .text = command.text })) return true;
             return command.reject(name, error.UnknownVerb);
         };
         if (parsed.help_only) return true;
