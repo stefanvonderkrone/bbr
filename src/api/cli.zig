@@ -243,6 +243,7 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*cons
         try writer.print(": bad options ({s})\n", .{@errorName(err)});
         try writeHelp(writer, if (verb) |v| v.name else null);
     } else switch (err) {
+        error.PullRequestAuthorCannotSetReviewerVerdict => try writer.writeAll(": You are the Author of this PullRequest. bbr does not set a Reviewer Verdict on it.\n"),
         error.MissingUsername, error.MissingToken, error.MissingWorkspace => try writer.print(
             ": MissingCredential ({s})\nRun `bbr auth login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n",
             .{@errorName(err)},
@@ -1093,7 +1094,7 @@ test "failed verdict changes produce no stdout success result" {
     ;
     const cases = [_]struct { account: []const u8, expected_commit: []const u8, err: anyerror }{
         .{ .account = "{\"uuid\":\"{account}\"}", .expected_commit = "old", .err = error.ReviewerVerdictChangeFailed },
-        .{ .account = "{\"uuid\":\"{author}\"}", .expected_commit = "abc123", .err = error.Forbidden },
+        .{ .account = "{\"uuid\":\"{author}\"}", .expected_commit = "abc123", .err = error.PullRequestAuthorCannotSetReviewerVerdict },
     };
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
@@ -1108,8 +1109,16 @@ test "failed verdict changes produce no stdout success result" {
             const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" });
             const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
             try std.testing.expectError(case.err, pullrequests.runSetVerdict(output.init(&env, &arena), bb, args, json));
+            if (std.mem.eql(u8, case.account, "{\"uuid\":\"{author}\"}")) {
+                var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+                defer detail.deinit();
+                try std.testing.expectEqual(error.Reported, reportFailure(output.init(&env, &arena), findVerb("set-verdict"), case.err, &detail, .{}));
+                try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), "You are the Author of this PullRequest. bbr does not set a Reviewer Verdict on it.") != null);
+            }
             try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
             try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+            try std.testing.expectEqual(bbr.http.client.Method.GET, fake.methodAt(0).?);
+            try std.testing.expectEqual(bbr.http.client.Method.GET, fake.methodAt(1).?);
         }
     }
 }
