@@ -2,7 +2,6 @@ const std = @import("std");
 const version_identity = @import("build/version.zig");
 
 pub fn build(b: *std.Build) void {
-    const test_step = b.step("test", "Run tests");
     var target = b.standardTargetOptions(.{});
     if (target.query.os_tag == null and
         target.query.os_version_min == null and
@@ -497,12 +496,6 @@ pub fn build(b: *std.Build) void {
 }
 
 /// `zig build test` compiles every benchmark, so CI catches a benchmark that no test reaches.
-fn addBenchmark(b: *std.Build, test_step: *std.Build.Step, name: []const u8, root_module: *std.Build.Module) *std.Build.Step.Compile {
-    const exe = b.addExecutable(.{ .name = name, .root_module = root_module });
-    test_step.dependOn(&exe.step);
-    return exe;
-}
-
 fn addBenchmark(b: *std.Build, test_step: *std.Build.Step, name: []const u8, root_module: *std.Build.Module) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{ .name = name, .root_module = root_module });
     test_step.dependOn(&exe.step);

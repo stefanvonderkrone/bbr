@@ -77,12 +77,6 @@ A CLI check under `zig build test-cli` gets no Credentials, Profile, or XDG home
 
 Enforcement: `build.zig` clears the environment of each `test-cli` run and sets `BBR_TEST_CLI=1`. `cli_env` exits without that marker, so a direct `python3 tests/...` run fails.
 
-## Benchmark executables
-
-`zig build test` compiles every benchmark executable: `bbr-bench`, `bbr-file-acquisition-bench`, `bbr-buffer-search-bench`, and `bbr-file-cache-bench`. A benchmark executable comes from `addBenchmark` in `build.zig`, which adds its compile step to `zig build test`.
-
-Enforcement: `addBenchmark` in `build.zig` adds the build of each benchmark executable that it creates to `zig build test`, so a broken benchmark root fails `zig build test`. A benchmark executable from a direct `b.addExecutable` call is a convention, in [CODING_STANDARDS.md](../../CODING_STANDARDS.md#a-benchmark-executable-comes-from-addbenchmark).
-
 ## File cache benchmark output
 
 The File cache benchmark prints only metadata and numbers, never source text, File paths, query text, Comment text, or URLs. The Credential token never reaches its stdout, its stderr, or a run file.

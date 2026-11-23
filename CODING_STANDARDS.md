@@ -58,12 +58,6 @@ A benchmark Buffer build sets `cell_metrics` to `tui.terminal_cell_metrics`. A b
 
 No check: `tools/check_benchmark_metrics.py` looks for the `.bytes` name, so it cannot see a default that a build gets by omission, or a second copy of the adapter. Related checked rule: [Benchmark cell metrics](docs/rules/build-and-checks.md#benchmark-cell-metrics).
 
-### A benchmark executable comes from addBenchmark
-
-A new benchmark executable comes from `addBenchmark` in `build.zig`, never from a direct `b.addExecutable` call. Otherwise `zig build test` does not compile it, and a compile error in its root reaches only the person who runs it.
-
-No check: a check would have to tell a benchmark executable from the other executables of `build.zig`. Related checked rule: [Benchmark executables](docs/rules/build-and-checks.md#benchmark-executables).
-
 ### The File cache benchmark gaps that no test sees
 
 The Enrichment Range term of each Session load in the request estimate has no test, because the File Jump terms cover the load fetches in both fixtures.
