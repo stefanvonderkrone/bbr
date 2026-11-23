@@ -1229,6 +1229,12 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
     const account: bbr.http.Canned = .{ .body = "{\"uuid\":\"{account}\"}" };
     const cases = [_]struct { responses: []const bbr.http.Canned, expected_commit: []const u8 = "abc123", message: []const u8, phase: []const u8 = "", cause: []const u8 }{
         .{
+            .responses = &.{ .{ .body = "{\"uuid\":\"{author}\"}" }, .{ .body = pr } },
+            .message = "bbr api set-verdict: You are the Author of this PullRequest. bbr does not set a Reviewer Verdict on it.\n",
+            .phase = "phase=validate",
+            .cause = "error=PullRequestAuthorCannotSetReviewerVerdict",
+        },
+        .{
             .responses = &.{ account, .{ .body = pr }, .{ .send_error = error.ConnectionResetByPeer }, .{ .body = pr } },
             .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: ConnectionResetByPeer\n",
             .cause = "error=ConnectionResetByPeer",
