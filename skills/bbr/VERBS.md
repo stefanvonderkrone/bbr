@@ -1,6 +1,23 @@
 # bbr api verbs
 
-Run `bbr api VERB --help` for flags. No flag tables here.
+Each recipe and example passes only flags that its verb takes. Run `bbr api VERB --help` for a flag that none of them shows.
+
+A PullRequest is always `--pull-request-id`, a Comment `--comment-id`, and a Task `--task-id`. No verb takes `--id`.
+
+## Recipes
+
+Replace `REPO`, `42`, and `7` with real values. A write recipe still needs the approval of the mutation guard in SKILL.md.
+
+```sh
+# Find the PullRequest of the current Branch
+bbr api list-pull-requests --repository REPO --source-branch "$(git branch --show-current)" --state OPEN --json
+# Read every Comment on a PullRequest
+bbr api list-comments --repository REPO --pull-request-id 42 --json
+# Reply to Comment 7 (write)
+bbr api create-comment --repository REPO --pull-request-id 42 --parent-id 7 --body-file reply.md
+# Replace the PullRequest description (write)
+bbr api update-pull-request --repository REPO --pull-request-id 42 --description-file body.md
+```
 
 ## Workspaces
 
@@ -43,7 +60,7 @@ Run `bbr api VERB --help` for flags. No flag tables here.
 
 - `list-comments` — list Comments on a PullRequest. Example: `bbr api list-comments --repository sample --pull-request-id 42 --no-head --limit 10`
 - `get-comment` — get one Comment. Example: `bbr api get-comment --repository sample --pull-request-id 42 --comment-id 7`
-- `create-comment` — create a Comment or reply (live). Example: `bbr api create-comment --repository sample --pull-request-id 42 --body 'Please add a test.'`
+- `create-comment` — create a Comment or reply (live). Example: `bbr api create-comment --repository sample --pull-request-id 42 --body 'Please add a test.'`. Reply: `bbr api create-comment --repository sample --pull-request-id 42 --parent-id 7 --body 'Done.'`
 - `update-comment` — edit a Comment body (live). Example: `bbr api update-comment --repository sample --pull-request-id 42 --comment-id 7 --body 'Please test this case.'`
 - `delete-comment` — delete a Comment (live). Example: `bbr api delete-comment --repository sample --pull-request-id 42 --comment-id 7`
 - `resolve-comment` — resolve a thread without editing prose (live). Example: `bbr api resolve-comment --repository sample --pull-request-id 42 --comment-id 7`
