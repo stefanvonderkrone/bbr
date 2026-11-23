@@ -1102,6 +1102,7 @@ test "scope rejections name only missing token scopes on stderr" {
     const scope = "write:repository:bitbucket";
     const prefix = "bbr api create-branch: Bitbucket rejected request (Forbidden): ";
     const envelope = "{\"type\":\"error\",\"error\":{\"message\":\"" ++ message ++ "\",\"detail\":";
+    const scope_prefix = "a" ** 127;
     for ([_]struct { body: []const u8, expected: []const u8 }{
         .{
             .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\",\"read:user:bitbucket\",\"" ++ scope ++ "\",\"read:user:bitbucket\"],\"granted\":[]}}}",
@@ -1128,7 +1129,13 @@ test "scope rejections name only missing token scopes on stderr" {
         .{ .body = envelope ++ "{\"required\":[\"" ++ "a" ** 1025 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
         .{ .body = envelope ++ "{\"required\":[" ++ "\"scope\"," ** 64 ++ "\"scope\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
         .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":[" ++ "\"scope\"," ** 256 ++ "\"scope\"]}}}", .expected = prefix ++ message ++ "\n" },
-        .{ .body = envelope ++ "{\"required\":[\"" ++ "a" ** 1024 ++ "\",\"b\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{
+            .body = envelope ++ "{\"required\":[\"" ++
+                scope_prefix ++ "1\",\"" ++ scope_prefix ++ "2\",\"" ++ scope_prefix ++ "3\",\"" ++
+                scope_prefix ++ "4\",\"" ++ scope_prefix ++ "5\",\"" ++ scope_prefix ++ "6\",\"" ++
+                scope_prefix ++ "7\",\"" ++ scope_prefix ++ "8\",\"" ++ scope_prefix ++ "9\"],\"granted\":[]}}}",
+            .expected = prefix ++ message ++ "\n",
+        },
         .{ .body = envelope ++ "{\"required\":[\"read:user:bitbucket\",\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ " Missing token scopes: read:user:bitbucket, " ++ scope ++ "\n" },
         .{ .body = "{\"error\":{\"detail\":{\"required\":[\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ "Missing token scopes: " ++ scope ++ "\n" },
     }) |case| {
