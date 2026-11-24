@@ -34,7 +34,7 @@ HELPERS = """pub const Presentation = struct {
         self.showErrorFor(err, null);
     }
 
-    fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedReviewIdentity) void {
+    fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedRemoteReviewIdentity) void {
         self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key };
     }
 
@@ -53,6 +53,17 @@ HELPERS = """pub const Presentation = struct {
 
     pub fn projection(self: *const Presentation) Projection {
         return .{ .action_error = if (self.action_error) |shown| shown.err else null };
+    }
+};
+"""
+
+
+# showError before the PullRequest key, when it wrote the field itself.
+OLD_SHOW_ERROR = """pub const Presentation = struct {
+    action_error: ?ShownError = null,
+
+    fn showError(self: *Presentation, err: ActionError) void {
+        self.action_error = .{ .err = err, .origin = self.errorOrigin() };
     }
 };
 """
@@ -121,6 +132,11 @@ class ActionErrorsTest(unittest.TestCase):
             + "}\n"
         )
         self.assertEqual([message.split(":")[1] for message in found], ["30", "33"])
+
+    def test_show_error_may_not_write_the_field_itself(self):
+        found = self.check(OLD_SHOW_ERROR)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("src/tui/presentation.zig:5: writes action_error outside showErrorFor and clearError.", found[0])
 
     def test_the_helpers_reads_comments_literals_and_projection_fields_are_allowed(self):
         self.assertEqual(self.check(HELPERS), [])
