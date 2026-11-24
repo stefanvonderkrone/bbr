@@ -61,6 +61,7 @@ Enforcement: the `Review recovery` tests in `src/tui/presentation.zig`, run by `
 
 Each shown action error records its origin, the path that showed it.
 `Presentation.action_error` holds a `ShownError`, which pairs the `ActionError` with an `ErrorOrigin` and an optional PullRequest key.
+The key is an `OwnedRemoteReviewIdentity`, because only a Remote Review has a `repo#id` name.
 Code writes it only through `showErrorFor` and `clearError`, and neither takes an origin.
 `showError` calls `showErrorFor` without a key.
 A Reviewer Verdict completion shows its error with `showErrorFor` and the key of its PullRequest.

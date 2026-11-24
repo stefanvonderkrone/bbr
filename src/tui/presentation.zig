@@ -3790,7 +3790,7 @@ pub const Projection = struct {
     replacement_error: ?ReplacementError,
     action_error: ?ActionError,
     /// The PullRequest of `action_error` when it belongs to one PullRequest.
-    action_error_key: ?OwnedReviewIdentity,
+    action_error_key: ?OwnedRemoteReviewIdentity,
     buffer_search: ?BufferSearchProjection,
     review_search: ?ReviewSearchProjection,
     clipboard_status: ?ClipboardStatus,
@@ -4117,7 +4117,7 @@ const ErrorOrigin = enum {
 const ShownError = struct {
     err: ActionError,
     origin: ErrorOrigin,
-    key: ?OwnedReviewIdentity,
+    key: ?OwnedRemoteReviewIdentity,
 };
 
 pub const ActionError = enum {
@@ -7033,8 +7033,9 @@ pub const Presentation = struct {
     }
 
     /// Shows `err` as an error of the PullRequest `key`, so the status can
-    /// name that PullRequest while another one is visible.
-    fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedReviewIdentity) void {
+    /// name it as `repo#id` while another review is visible. Only a Remote
+    /// Review has that name.
+    fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedRemoteReviewIdentity) void {
         self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key };
     }
 
@@ -11644,12 +11645,12 @@ pub const Presentation = struct {
             .completed => |result| result,
             .launch_failed => {
                 self.durable_reviewer_verdict = null;
-                self.showErrorFor(.reviewer_verdict_launch_failed, durable.key);
+                self.showErrorFor(.reviewer_verdict_launch_failed, .init(durable.key));
                 return;
             },
             .adapter_failed => {
                 self.durable_reviewer_verdict = null;
-                self.showErrorFor(.reviewer_verdict_failed, durable.key);
+                self.showErrorFor(.reviewer_verdict_failed, .init(durable.key));
                 return;
             },
         };
@@ -11675,19 +11676,19 @@ pub const Presentation = struct {
             },
             .stale_source_commit => {
                 self.durable_reviewer_verdict = null;
-                self.showErrorFor(.reviewer_verdict_source_changed, durable.key);
+                self.showErrorFor(.reviewer_verdict_source_changed, .init(durable.key));
             },
             .pull_request_author => {
                 self.durable_reviewer_verdict = null;
-                self.showErrorFor(.pull_request_author, durable.key);
+                self.showErrorFor(.pull_request_author, .init(durable.key));
             },
             .api_error => {
                 self.durable_reviewer_verdict = null;
-                self.showErrorFor(.reviewer_verdict_failed, durable.key);
+                self.showErrorFor(.reviewer_verdict_failed, .init(durable.key));
             },
             .unresolved => {
                 self.durable_reviewer_verdict = null;
-                self.showErrorFor(.reviewer_verdict_unresolved, durable.key);
+                self.showErrorFor(.reviewer_verdict_unresolved, .init(durable.key));
             },
         }
     }
@@ -20313,7 +20314,7 @@ test "Reviewer Verdict rejects stale completions and keeps every terminal result
             .outcome = .{ .completed = case.result },
         } });
         try testing.expectEqual(case.action_error, presentation.projection().action_error.?);
-        try testing.expect(OwnedReviewIdentity.eql(key, presentation.projection().action_error_key.?));
+        try testing.expect(OwnedReviewIdentity.eql(key, presentation.projection().action_error_key.?.value));
         const result = presentation.projection().reviewer_verdict_result.?;
         try testing.expect(OwnedReviewIdentity.eql(key, result.key));
         try testing.expectEqual(command.target, result.target);
@@ -20394,7 +20395,7 @@ test "Reviewer Verdict error after a Session switch names its PullRequest" {
         const projection = presentation.projection();
         try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
         try testing.expect(projection.action_error != null);
-        try testing.expect(OwnedReviewIdentity.eql(first_key, projection.action_error_key.?));
+        try testing.expect(OwnedReviewIdentity.eql(first_key, projection.action_error_key.?.value));
     }
 }
 

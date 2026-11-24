@@ -551,8 +551,8 @@ fn actionErrorStatus(
     text: []const u8,
 ) []const u8 {
     const key = projection.action_error_key orelse return text;
-    if (visible_key) |visible| if (presentation.OwnedReviewIdentity.eql(key, visible)) return text;
-    return std.fmt.allocPrint(frame, "{s}#{d}: {s}", .{ key.repository(), key.pull_request_id, text }) catch |err| switch (err) {
+    if (visible_key) |visible| if (presentation.OwnedReviewIdentity.eql(key.value, visible)) return text;
+    return std.fmt.allocPrint(frame, "{s}#{d}: {s}", .{ key.repository(), key.pullRequestId(), text }) catch |err| switch (err) {
         error.OutOfMemory => text,
     };
 }
@@ -1952,7 +1952,7 @@ test "an action error of another PullRequest names that PullRequest" {
     const other = try presentation.OwnedReviewIdentity.init("workspace", "repo", 7);
     var projection = state.projection();
     projection.action_error = .pull_request_author;
-    projection.action_error_key = key;
+    projection.action_error_key = .{ .value = key };
 
     try std.testing.expectEqualStrings(
         "repo#42: bbr refuses to set a Reviewer Verdict for the PullRequest Author",
