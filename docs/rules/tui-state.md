@@ -69,6 +69,7 @@ Their work shows each error of their own PullRequest with `showErrorFor` and the
 An `out_of_memory` error has no key, because it belongs to the process and not to one PullRequest.
 When that PullRequest is not the visible review, or no review is visible, the status names it as `repo#id: ` before the error text.
 The re-anchor banner shows no action error of another PullRequest, because its text names no PullRequest.
+While Buffer Search is open, the status shows the Buffer Search line with only Buffer Search errors, so it does not show an action error of another PullRequest.
 `showErrorFor` and `clearError` read `Presentation.event_origin`, the origin of the event that runs.
 `dispatch` sets the event origin from `OwnedInput.errorOrigin` and restores it when the event ends.
 A key, a mouse action, or an Overlay action has the origin `.user`, and its `clearError` clears any error.
