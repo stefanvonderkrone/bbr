@@ -8363,7 +8363,7 @@ pub const Presentation = struct {
         const temp_id = durable.current_temp_id orelse return;
         self.dependencies.reviews.abandonSubmission(durable.operation_id, durable.key.storeKey()) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         durable.review.setState(temp_id, .outcome_unknown);
@@ -33766,9 +33766,13 @@ test "Review recovery a Comment edit or delete failure after a Session switch na
     }
 }
 
+fn failAbandonSubmission(_: *anyopaque, _: bbr.review.OperationId, _: bbr.review.RemoteReviewIdentity) anyerror!void {
+    return error.TestAbandonFailure;
+}
+
 test "Review recovery a Submission failure after a Session switch names its PullRequest" {
-    const Case = enum { post_launch_failed, wait_launch_failed, recovery_check_failed, source_changed, duplicate_check_failed };
-    for ([_]Case{ .post_launch_failed, .wait_launch_failed, .recovery_check_failed, .source_changed, .duplicate_check_failed }) |case| {
+    const Case = enum { post_launch_failed, wait_launch_failed, recovery_check_failed, source_changed, duplicate_check_failed, abandon_failed };
+    for ([_]Case{ .post_launch_failed, .wait_launch_failed, .recovery_check_failed, .source_changed, .duplicate_check_failed, .abandon_failed }) |case| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
@@ -33776,10 +33780,14 @@ test "Review recovery a Submission failure after a Session switch names its Pull
         const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
         const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
         try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
-        const recovered = case == .duplicate_check_failed;
+        const recovered = case == .duplicate_check_failed or case == .abandon_failed;
         const operation_id = if (recovered) try store.store().beginSubmission(first_key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }}) else 0;
+        var vtable = store.store().vtable.*;
+        vtable.abandon_submission = failAbandonSubmission;
+        var reviews = store.store();
+        reviews.vtable = &vtable;
         var state = try Presentation.init(testing.allocator, .{
-            .reviews = store.store(),
+            .reviews = reviews,
             .submission_locks = locks.locks(),
             .require_source_check = case == .recovery_check_failed or case == .source_changed,
         }, .{ .initial = .{ .key = first_key, .session = try testSession(testing.allocator, 1, 'a') } });
@@ -33804,6 +33812,10 @@ test "Review recovery a Submission failure after a Session switch names its Pull
             try state.dispatch(rejected);
             command = state.takeCommand().?;
         }
+        if (case == .abandon_failed) {
+            try state.dispatch(try command.launchFailed(error.TestLaunchFailure));
+            try state.dispatch(.{ .key = .{ .codepoint = 'A', .text = "A" } });
+        }
         try state.dispatch(.{ .choose_pull_request = second_key });
         const load = state.takeCommand().?.load_session;
         try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
@@ -33814,6 +33826,7 @@ test "Review recovery a Submission failure after a Session switch names its Pull
         switch (case) {
             .post_launch_failed, .wait_launch_failed, .recovery_check_failed, .duplicate_check_failed => try state.dispatch(try command.launchFailed(error.TestLaunchFailure)),
             .source_changed => try state.dispatch(recoveryCheckSucceeded(command.check_recovery.command_id, command.check_recovery.operation_id, null, "different-head")),
+            .abandon_failed => {},
         }
 
         const projection = state.projection();
@@ -33823,6 +33836,7 @@ test "Review recovery a Submission failure after a Session switch names its Pull
             .recovery_check_failed => .recovery_check_failed,
             .source_changed => .recovery_source_changed,
             .duplicate_check_failed => .duplicate_check_failed,
+            .abandon_failed => .persistence_failed,
         }), projection.action_error);
         const shown_key = projection.action_error_key orelse return error.TestExpectedPullRequestKey;
         try testing.expect(OwnedReviewIdentity.eql(first_key, shown_key.value));
