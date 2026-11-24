@@ -12165,7 +12165,8 @@ pub const Presentation = struct {
     }
 
     fn refreshStaleRepairTree(self: *Presentation) void {
-        const gate = self.stale_repair orelse return;
+        // The tree slices the gate's text, so it must point into `self`, not a copy.
+        const gate = if (self.stale_repair) |*gate| gate else return;
         const tree = self.submission_tree orelse return;
         if (!OwnedReviewIdentity.eql(tree.key, gate.key)) return;
         tree.stale_repair = .{
