@@ -3789,6 +3789,8 @@ pub const Projection = struct {
     replacing: bool,
     replacement_error: ?ReplacementError,
     action_error: ?ActionError,
+    /// The PullRequest of `action_error` when it belongs to one PullRequest.
+    action_error_key: ?OwnedReviewIdentity,
     buffer_search: ?BufferSearchProjection,
     review_search: ?ReviewSearchProjection,
     clipboard_status: ?ClipboardStatus,
@@ -4115,6 +4117,7 @@ const ErrorOrigin = enum {
 const ShownError = struct {
     err: ActionError,
     origin: ErrorOrigin,
+    key: ?OwnedReviewIdentity,
 };
 
 pub const ActionError = enum {
@@ -7026,7 +7029,13 @@ pub const Presentation = struct {
 
     /// Shows `err` with the origin of the work that runs.
     fn showError(self: *Presentation, err: ActionError) void {
-        self.action_error = .{ .err = err, .origin = self.errorOrigin() };
+        self.showErrorFor(err, null);
+    }
+
+    /// Shows `err` as an error of the PullRequest `key`, so the status can
+    /// name that PullRequest while another one is visible.
+    fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedReviewIdentity) void {
+        self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key };
     }
 
     /// A user action clears any error. Other work clears only an error of its
@@ -7139,6 +7148,7 @@ pub const Presentation = struct {
             .replacing = self.replacement != null,
             .replacement_error = self.replacement_error,
             .action_error = if (self.action_error) |shown| shown.err else null,
+            .action_error_key = if (self.action_error) |shown| shown.key else null,
             .buffer_search = if (self.published) |published| if (published.active_search == .buffer) published.buffer_search.projection() else null else null,
             .review_search = if (self.published) |published| blk: {
                 var search_view = published.review_search.projection(self.geometry) orelse break :blk null;
@@ -11634,12 +11644,12 @@ pub const Presentation = struct {
             .completed => |result| result,
             .launch_failed => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_launch_failed);
+                self.showErrorFor(.reviewer_verdict_launch_failed, durable.key);
                 return;
             },
             .adapter_failed => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_failed);
+                self.showErrorFor(.reviewer_verdict_failed, durable.key);
                 return;
             },
         };
@@ -11665,19 +11675,19 @@ pub const Presentation = struct {
             },
             .stale_source_commit => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_source_changed);
+                self.showErrorFor(.reviewer_verdict_source_changed, durable.key);
             },
             .pull_request_author => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.pull_request_author);
+                self.showErrorFor(.pull_request_author, durable.key);
             },
             .api_error => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_failed);
+                self.showErrorFor(.reviewer_verdict_failed, durable.key);
             },
             .unresolved => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_unresolved);
+                self.showErrorFor(.reviewer_verdict_unresolved, durable.key);
             },
         }
     }
@@ -20303,6 +20313,7 @@ test "Reviewer Verdict rejects stale completions and keeps every terminal result
             .outcome = .{ .completed = case.result },
         } });
         try testing.expectEqual(case.action_error, presentation.projection().action_error.?);
+        try testing.expect(OwnedReviewIdentity.eql(key, presentation.projection().action_error_key.?));
         const result = presentation.projection().reviewer_verdict_result.?;
         try testing.expect(OwnedReviewIdentity.eql(key, result.key));
         try testing.expectEqual(command.target, result.target);
@@ -20346,6 +20357,45 @@ test "Reviewer Verdict survives a Session switch without projecting into the new
     try testing.expect(OwnedReviewIdentity.eql(first_key, presentation.projection().reviewer_verdict_result.?.key));
     try testing.expect(presentation.takeCommand() == null);
     try testing.expect(!presentation.remoteWriteBusy());
+}
+
+test "Reviewer Verdict error after a Session switch names its PullRequest" {
+    for ([_]bbr.bitbucket.ReviewerVerdictChangeResult{ .pull_request_author, .stale_source_commit }) |completed| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        const first = try testSession(testing.allocator, 1, 'a');
+        first.authenticated_account_uuid = "{me}";
+        first.source.remote.author_uuid = "{author}";
+        first.source.remote.reviewer_verdicts = &.{};
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = first_key, .session = first },
+            .viewport_rows = 8,
+        });
+        defer presentation.deinit();
+
+        try presentation.dispatch(.{ .action = .set_verdict_approved });
+        const verdict = presentation.takeCommand().?.change_reviewer_verdict;
+        const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+        try presentation.dispatch(.{ .choose_pull_request = second_key });
+        const load = presentation.takeCommand().?.load_session;
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+        } });
+        try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+            .command_id = verdict.command_id,
+            .identity = verdict.identity,
+            .target = verdict.target,
+            .outcome = .{ .completed = completed },
+        } });
+
+        const projection = presentation.projection();
+        try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
+        try testing.expect(projection.action_error != null);
+        try testing.expect(OwnedReviewIdentity.eql(first_key, projection.action_error_key.?));
+    }
 }
 
 test "Reviewer Verdict replacement failure preserves the Session and qualified result" {

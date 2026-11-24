@@ -31,7 +31,11 @@ HELPERS = """pub const Presentation = struct {
     action_error: ?ShownError = null,
 
     fn showError(self: *Presentation, err: ActionError) void {
-        self.action_error = .{ .err = err, .origin = self.errorOrigin() };
+        self.showErrorFor(err, null);
+    }
+
+    fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedReviewIdentity) void {
+        self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key };
     }
 
     fn clearError(self: *Presentation) void {
@@ -103,7 +107,7 @@ class ActionErrorsTest(unittest.TestCase):
     def test_the_old_clipboard_reset_is_rejected(self):
         found = self.check(OLD_CLIPBOARD)
         self.assertEqual(len(found), 1)
-        self.assertIn("src/tui/presentation.zig:8: writes action_error outside showError and clearError.", found[0])
+        self.assertIn("src/tui/presentation.zig:8: writes action_error outside showErrorFor and clearError.", found[0])
         self.assertIn("clearError()", found[0])
 
     def test_writes_of_a_test_and_after_the_helpers_are_rejected(self):
@@ -116,7 +120,7 @@ class ActionErrorsTest(unittest.TestCase):
             + "    presentation.*.action_error = null;\n"
             + "}\n"
         )
-        self.assertEqual([message.split(":")[1] for message in found], ["26", "29"])
+        self.assertEqual([message.split(":")[1] for message in found], ["30", "33"])
 
     def test_the_helpers_reads_comments_literals_and_projection_fields_are_allowed(self):
         self.assertEqual(self.check(HELPERS), [])

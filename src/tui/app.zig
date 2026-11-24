@@ -360,14 +360,14 @@ fn presentationStatus(
     // The armed re-anchor banner outlives one refusal: it keeps naming the
     // Draft and whatever the source cursor currently proposes.
     if (projection.reanchor) |reanchor| return reanchorStatus(frame, projection, reanchor);
-    if (projection.review_search != null and projection.action_error != null) return switch (projection.action_error.?) {
+    if (projection.review_search != null and projection.action_error != null) return actionErrorStatus(frame, projection, visible_key, switch (projection.action_error.?) {
         .buffer_search_query_too_long => "Review Search Query limit is 256 characters",
         .buffer_search_invalid_query => "Review Search Query is invalid",
         .buffer_search_scan_failed => "Review Search failed",
         else => actionErrorText(projection.action_error.?),
-    };
+    });
     if (projection.buffer_search) |search_projection| return bufferSearchStatus(frame, projection, search_projection);
-    if (projection.action_error) |err| return actionErrorText(err);
+    if (projection.action_error) |err| return actionErrorStatus(frame, projection, visible_key, actionErrorText(err));
     if (projection.diagnostic_pending) return "changing diagnostic logging";
     if (projection.clipboard_status) |status| return switch (status) {
         .copied => "copied text",
@@ -540,6 +540,20 @@ fn reviewerVerdictOutcomeLabel(outcome: presentation.ReviewerVerdictCommandOutco
         },
         .launch_failed => "could not start",
         .adapter_failed => "failed",
+    };
+}
+
+/// Names the PullRequest of the shown action error when another one is visible.
+fn actionErrorStatus(
+    frame: std.mem.Allocator,
+    projection: presentation.Projection,
+    visible_key: ?presentation.OwnedReviewIdentity,
+    text: []const u8,
+) []const u8 {
+    const key = projection.action_error_key orelse return text;
+    if (visible_key) |visible| if (presentation.OwnedReviewIdentity.eql(key, visible)) return text;
+    return std.fmt.allocPrint(frame, "{s}#{d}: {s}", .{ key.repository(), key.pull_request_id, text }) catch |err| switch (err) {
+        error.OutOfMemory => text,
     };
 }
 
@@ -1925,6 +1939,39 @@ test "Reviewer Verdict status names the PullRequest Author refusal" {
     const other_status = presentationStatus(std.testing.allocator, projection, null).?;
     defer std.testing.allocator.free(other_status);
     try std.testing.expectEqualStrings("repo#42: Reviewer Verdict refused for the PullRequest Author", other_status);
+}
+
+test "an action error of another PullRequest names that PullRequest" {
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    var state = try presentation.Presentation.init(std.testing.allocator, .{ .reviews = store.store() }, .{});
+    defer state.deinit();
+    var frame = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer frame.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 42);
+    const other = try presentation.OwnedReviewIdentity.init("workspace", "repo", 7);
+    var projection = state.projection();
+    projection.action_error = .pull_request_author;
+    projection.action_error_key = key;
+
+    try std.testing.expectEqualStrings(
+        "repo#42: bbr refuses to set a Reviewer Verdict for the PullRequest Author",
+        presentationStatus(frame.allocator(), projection, other).?,
+    );
+    try std.testing.expectEqualStrings(
+        "bbr refuses to set a Reviewer Verdict for the PullRequest Author",
+        presentationStatus(frame.allocator(), projection, key).?,
+    );
+
+    projection.action_error = .reviewer_verdict_source_changed;
+    try std.testing.expectEqualStrings(
+        "repo#42: Reviewer Verdict unchanged; SourceCommit changed",
+        presentationStatus(frame.allocator(), projection, null).?,
+    );
+
+    projection.action_error = .out_of_memory;
+    projection.action_error_key = null;
+    try std.testing.expectEqualStrings(actionErrorText(.out_of_memory), presentationStatus(frame.allocator(), projection, other).?);
 }
 
 const TestStatus = struct {

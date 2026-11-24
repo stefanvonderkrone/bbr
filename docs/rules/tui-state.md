@@ -60,8 +60,11 @@ Enforcement: the `Review recovery` tests in `src/tui/presentation.zig`, run by `
 ## Background work keeps an unrelated action error
 
 Each shown action error records its origin, the path that showed it.
-`Presentation.action_error` holds a `ShownError`, which pairs the `ActionError` with an `ErrorOrigin`.
-Code writes it only through `showError` and `clearError`, and neither takes an origin.
+`Presentation.action_error` holds a `ShownError`, which pairs the `ActionError` with an `ErrorOrigin` and an optional PullRequest key.
+Code writes it only through `showErrorFor` and `clearError`, and neither takes an origin.
+`showError` calls `showErrorFor` without a key.
+A Reviewer Verdict completion shows its error with `showErrorFor` and the key of its PullRequest.
+When that PullRequest is not the visible review, the status names it as `repo#id: ` before the error text.
 Both read `Presentation.event_origin`, the origin of the event that runs.
 `dispatch` sets the event origin from `OwnedInput.errorOrigin` and restores it when the event ends.
 A key, a mouse action, or an Overlay action has the origin `.user`, and its `clearError` clears any error.
@@ -86,15 +89,15 @@ These overrides exist:
 - After an allocation failure, `takeCommand` runs `requestShutdown` as `.submission`, because shutdown resumes a paused Submission.
 
 Outside `dispatch` and `withErrorOrigin` the event origin is null.
-Then `showError` panics, because no event names the origin.
+Then `showErrorFor` panics, because no event names the origin.
 `clearError` returns early when no error shows.
 Outside an event, `clearError` panics only while an error shows.
 A test that calls a method directly runs it through a test helper such as `showTestError`, which calls `withErrorOrigin`.
 The File Enrichment path includes enrichment builds, cache updates, and the focus check that starts a File Enrichment.
 A speculative enrichment shows and clears no action error.
-The Projection still gives only the `ActionError`.
+The Projection gives the `ActionError` as `action_error` and the PullRequest key as `action_error_key`.
 
-Enforcement: the exhaustive switches in `OwnedInput.errorOrigin` and `DisclosureBuild.Kind.errorOrigin` in `src/tui/presentation.zig` cause a compile error for a new input or a new build kind without an origin. `tools/check_action_errors.py` and `tests/check_action_errors_test.py` run under `zig build test`. The checker fails on a write of `action_error` outside `showError` and `clearError`, such as `self.action_error = null` in a completion. It also fails on a write of `event_origin` outside `dispatch` and `withErrorOrigin`, and it names `withErrorOrigin` as the fix. The checker does not see a write through a pointer, such as `slot.* = null` after `const slot = &self.action_error`. The same limit holds for `event_origin`. The `Review recovery` tests in the same file check that each completion keeps an unrelated action error, that the Submission, a Comment delete, and a cache update still clear an error of their own origin, that a view build keeps a Draft error and the error of a failed Draft jump, and that a user retry of a Submission or of a recovery clears an unrelated error. `zig build test` runs them.
+Enforcement: the exhaustive switches in `OwnedInput.errorOrigin` and `DisclosureBuild.Kind.errorOrigin` in `src/tui/presentation.zig` cause a compile error for a new input or a new build kind without an origin. `tools/check_action_errors.py` and `tests/check_action_errors_test.py` run under `zig build test`. The checker fails on a write of `action_error` outside `showErrorFor` and `clearError`, such as `self.action_error = null` in a completion. It also fails on a write of `event_origin` outside `dispatch` and `withErrorOrigin`, and it names `withErrorOrigin` as the fix. The checker does not see a write through a pointer, such as `slot.* = null` after `const slot = &self.action_error`. The same limit holds for `event_origin`. The `Review recovery` tests in the same file check that each completion keeps an unrelated action error, that the Submission, a Comment delete, and a cache update still clear an error of their own origin, that a view build keeps a Draft error and the error of a failed Draft jump, and that a user retry of a Submission or of a recovery clears an unrelated error. `zig build test` runs them. The test "Reviewer Verdict error after a Session switch names its PullRequest" in `src/tui/presentation.zig` checks the key of a Reviewer Verdict error after the user opens another PullRequest. The test "an action error of another PullRequest names that PullRequest" in `src/tui/app.zig` checks the `repo#id: ` status text, and that an error without a key keeps the plain text.
 
 ## Reading location across Refresh and Reconciliation
 
