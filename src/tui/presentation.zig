@@ -20361,7 +20361,16 @@ test "Reviewer Verdict survives a Session switch without projecting into the new
 }
 
 test "Reviewer Verdict error after a Session switch names its PullRequest" {
-    for ([_]bbr.bitbucket.ReviewerVerdictChangeResult{ .pull_request_author, .stale_source_commit }) |completed| {
+    const cases = [_]struct {
+        outcome: ReviewerVerdictCommandOutcome,
+        action_error: ActionError,
+    }{
+        .{ .outcome = .{ .completed = .pull_request_author }, .action_error = .pull_request_author },
+        .{ .outcome = .{ .completed = .stale_source_commit }, .action_error = .reviewer_verdict_source_changed },
+        .{ .outcome = .launch_failed, .action_error = .reviewer_verdict_launch_failed },
+        .{ .outcome = .adapter_failed, .action_error = .reviewer_verdict_failed },
+    };
+    for (cases) |case| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
@@ -20389,13 +20398,14 @@ test "Reviewer Verdict error after a Session switch names its PullRequest" {
             .command_id = verdict.command_id,
             .identity = verdict.identity,
             .target = verdict.target,
-            .outcome = .{ .completed = completed },
+            .outcome = case.outcome,
         } });
 
         const projection = presentation.projection();
         try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
-        try testing.expect(projection.action_error != null);
-        try testing.expect(OwnedReviewIdentity.eql(first_key, projection.action_error_key.?.value));
+        try testing.expectEqual(@as(?ActionError, case.action_error), projection.action_error);
+        const shown_key = projection.action_error_key orelse return error.TestExpectedPullRequestKey;
+        try testing.expect(OwnedReviewIdentity.eql(first_key, shown_key.value));
     }
 }
 
