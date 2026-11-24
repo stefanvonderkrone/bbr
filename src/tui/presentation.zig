@@ -6331,7 +6331,6 @@ const SubmissionTree = struct {
     omitted_drafts: []const bbr.review.TempId = &.{},
     selected: usize = 0,
     completion: ?bbr.review.SubmissionCompletion = null,
-    stale_repair: ?StaleRepairProjection = null,
     /// A jump to a Draft hides a terminal tree. Submit shows it again.
     hidden: bool = false,
 
@@ -6641,7 +6640,6 @@ const SubmissionTree = struct {
             .failed = failed,
             .skipped = skipped,
             .outcome_unknown = outcome_unknown,
-            .stale_repair = self.stale_repair,
         };
     }
 };
@@ -7111,7 +7109,13 @@ pub const Presentation = struct {
             .submission_result = self.submission_result,
             .submission_tree = if (self.submission_tree) |tree| blk: {
                 if (tree.hidden or self.submissionRepairInteractionActive()) break :blk null;
-                break :blk tree.projection();
+                var view = tree.projection();
+                if (self.staleRepairGate(tree.key)) |gate| view.stale_repair = .{
+                    .loaded_source_commit = gate.loaded_source_commit.slice(),
+                    .observed_source_commit = gate.observed_source_commit.slice(),
+                    .reloaded = gate.reloaded,
+                };
+                break :blk view;
             } else null,
             .comment_edit_result = self.comment_edit_result,
             .comment_delete_result = self.comment_delete_result,
@@ -8199,7 +8203,7 @@ pub const Presentation = struct {
             if (key.matches('A', .{})) self.abandonRecoveredSubmission();
             return;
         }
-        if (tree.stale_repair != null and key.matches('R', .{})) {
+        if (self.staleRepairGate(tree.key) != null and key.matches('R', .{})) {
             const published = self.published orelse return;
             if (OwnedReviewIdentity.eql(published.key, tree.key)) self.queueRefresh(tree.key);
             return;
@@ -8349,7 +8353,7 @@ pub const Presentation = struct {
         };
         tree.hidden = true;
         self.submission_result = null;
-        if (self.durable_submission != null or tree.completion == null or tree.completion.? != .clean or tree.stale_repair != null) return;
+        if (self.durable_submission != null or tree.completion == null or tree.completion.? != .clean or self.staleRepairGate(tree.key) != null) return;
         const published = self.published orelse return;
         if (!OwnedReviewIdentity.eql(published.key, tree.key)) return;
         if (tree.hasUnpostedOmittedDrafts(&published.review)) return;
@@ -11369,7 +11373,7 @@ pub const Presentation = struct {
             self.showError(.remote_write_busy);
             return;
         }
-        if (self.stale_repair) |gate| if (OwnedReviewIdentity.eql(gate.key, published.key)) {
+        if (self.staleRepairGate(published.key)) |gate| {
             const root = selected_root orelse {
                 self.showError(.recovery_source_changed);
                 return;
@@ -11378,7 +11382,7 @@ pub const Presentation = struct {
                 self.showError(.recovery_source_changed);
                 return;
             }
-        };
+        }
         if (self.durable_submission) |durable| {
             if (selected_root != null) {
                 self.showError(.submission_already_active);
@@ -12164,16 +12168,14 @@ pub const Presentation = struct {
             tree.sync(durable);
     }
 
+    fn staleRepairGate(self: *const Presentation, key: OwnedReviewIdentity) ?*const StaleRepairGate {
+        const gate = if (self.stale_repair) |*gate| gate else return null;
+        return if (OwnedReviewIdentity.eql(gate.key, key)) gate else null;
+    }
+
     fn refreshStaleRepairTree(self: *Presentation) void {
-        // The tree slices the gate's text, so it must point into `self`, not a copy.
-        const gate = if (self.stale_repair) |*gate| gate else return;
         const tree = self.submission_tree orelse return;
-        if (!OwnedReviewIdentity.eql(tree.key, gate.key)) return;
-        tree.stale_repair = .{
-            .loaded_source_commit = gate.loaded_source_commit.slice(),
-            .observed_source_commit = gate.observed_source_commit.slice(),
-            .reloaded = gate.reloaded,
-        };
+        const gate = self.staleRepairGate(tree.key) orelse return;
         const published = self.published orelse return;
         if (!OwnedReviewIdentity.eql(published.key, gate.key)) return;
         for (tree.items.items) |*item| {
@@ -32482,6 +32484,83 @@ test "changed-source Duplicate guard records an existing Comment without posting
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectEqual(@as(usize, 0), (try store.store().load(arena.allocator(), key.storeKey())).len);
+}
+
+test "Review recovery a clean changed-source Duplicate guard ends the stale repair of its tree" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "already posted" });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", &.{.{ .temp_id = 1, .parent = null }});
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 7, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .recover_submission });
+    const check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "new-head"));
+    try testing.expectEqualStrings("new-head", presentation.projection().submission_tree.?.stale_repair.?.observed_source_commit);
+    var duplicate = presentation.takeCommand().?;
+    duplicate.deinit();
+    try presentation.dispatch(.{ .duplicate_checked = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .found = 900 },
+    } });
+
+    const tree = presentation.projection().submission_tree.?;
+    try testing.expectEqual(bbr.review.SubmissionCompletion.clean, tree.completion.?);
+    try testing.expect(tree.stale_repair == null);
+    while (presentation.takeCommand()) |command_value| {
+        var command = command_value;
+        command.deinit();
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'R', .text = "R" } });
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.dismiss_submission_result);
+    try testing.expect(presentation.submission_tree == null);
+}
+
+test "Review recovery a stale repair gate of another PullRequest never shows in a Submission tree" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const stale_key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(stale_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "stale" });
+    const operation_id = try store.store().beginSubmission(stale_key.storeKey(), "old-head", &.{.{ .temp_id = 1, .parent = null }});
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "fresh" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .recover_submission });
+    const check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "new-head"));
+    var duplicate = presentation.takeCommand().?;
+    duplicate.deinit();
+    try presentation.dispatch(.{ .duplicate_checked = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .missing,
+    } });
+    try testing.expect(presentation.projection().submission_tree.?.stale_repair != null);
+
+    try presentation.dispatch(.{ .action = .submit });
+    const tree = presentation.projection().submission_tree.?;
+    try testing.expect(OwnedReviewIdentity.eql(key, tree.key));
+    try testing.expect(tree.stale_repair == null);
 }
 
 test "reviewer can mark a selected unresolved Draft as unpublished" {
