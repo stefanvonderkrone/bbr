@@ -7110,10 +7110,15 @@ pub const Presentation = struct {
             .submission_tree = if (self.submission_tree) |tree| blk: {
                 if (tree.hidden or self.submissionRepairInteractionActive()) break :blk null;
                 var view = tree.projection();
-                if (self.staleRepairGate(tree.key)) |gate| view.stale_repair = .{
-                    .loaded_source_commit = gate.loaded_source_commit.slice(),
-                    .observed_source_commit = gate.observed_source_commit.slice(),
-                    .reloaded = gate.reloaded,
+                const retry_running = if (self.durable_submission) |durable|
+                    !durable.recovered and OwnedReviewIdentity.eql(durable.key, tree.key)
+                else
+                    false;
+                const gate = if (retry_running) null else self.staleRepairGate(tree.key);
+                if (gate) |stale| view.stale_repair = .{
+                    .loaded_source_commit = stale.loaded_source_commit.slice(),
+                    .observed_source_commit = stale.observed_source_commit.slice(),
+                    .reloaded = stale.reloaded,
                 };
                 break :blk view;
             } else null,
@@ -33228,6 +33233,58 @@ test "stale repair reload evaluates each root scope independently and checks the
     try testing.expectEqualStrings("new-head", changed_again.loaded_source_commit);
     try testing.expectEqualStrings("third-head", changed_again.observed_source_commit);
     try testing.expect(presentation.takeCommand() == null);
+}
+
+test "Review recovery a retry hides the stale repair banner until its source check finds a changed source" {
+    for ([_][]const u8{ "third-head", "new-head" }) |checked_source| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+        defer locks.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "review", .scope = .review });
+        var presentation = try Presentation.init(testing.allocator, .{
+            .reviews = store.store(),
+            .submission_locks = locks.locks(),
+            .require_source_check = true,
+        }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+        defer presentation.deinit();
+
+        try presentation.dispatch(.{ .action = .submit });
+        const first_check = presentation.takeCommand().?.check_recovery;
+        try presentation.dispatch(recoveryCheckSucceeded(first_check.command_id, first_check.operation_id, null, "new-head"));
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'R', .text = "R" } });
+        const reload = presentation.takeCommand().?.load_session;
+        const refreshed = try testSession(testing.allocator, 1, 'a');
+        refreshed.header.source_commit = "new-head";
+        refreshed.source.remote.source_commit = "new-head";
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+            .command_id = reload.command_id,
+            .intent = reload.intent,
+            .outcome = .{ .loaded = refreshed },
+        } });
+        try testing.expect(presentation.projection().submission_tree.?.stale_repair.?.reloaded);
+
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+        const retry_check = presentation.takeCommand().?.check_recovery;
+        const retrying = presentation.projection().submission_tree.?;
+        try testing.expect(retrying.completion == null);
+        try testing.expect(retrying.stale_repair == null);
+
+        try presentation.dispatch(recoveryCheckSucceeded(retry_check.command_id, retry_check.operation_id, null, checked_source));
+        const checked = presentation.projection().submission_tree.?;
+        if (std.mem.eql(u8, checked_source, "new-head")) {
+            try testing.expect(checked.stale_repair == null);
+            try testing.expect(presentation.stale_repair == null);
+        } else {
+            try testing.expectEqualStrings("new-head", checked.stale_repair.?.loaded_source_commit);
+            try testing.expectEqualStrings("third-head", checked.stale_repair.?.observed_source_commit);
+        }
+        while (presentation.takeCommand()) |command_value| {
+            var command = command_value;
+            command.deinit();
+        }
+    }
 }
 
 test "abandoning recovered ambiguity posts nothing and releases only settled Drafts" {
