@@ -65,7 +65,7 @@ The key is an `OwnedRemoteReviewIdentity`, because only a Remote Review has a `r
 Code writes it only through `showErrorFor` and `clearError`, and neither takes an origin.
 `showError` calls `showErrorFor` without a key.
 A Reviewer Verdict completion shows its error with `showErrorFor` and the key of its PullRequest.
-When that PullRequest is not the visible review, the status names it as `repo#id: ` before the error text.
+When that PullRequest is not the visible review, or no review is visible, the status names it as `repo#id: ` before the error text.
 Both read `Presentation.event_origin`, the origin of the event that runs.
 `dispatch` sets the event origin from `OwnedInput.errorOrigin` and restores it when the event ends.
 A key, a mouse action, or an Overlay action has the origin `.user`, and its `clearError` clears any error.
