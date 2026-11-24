@@ -7629,7 +7629,7 @@ pub const Presentation = struct {
             return;
         };
         self.commands.appendAssumeCapacity(.{ .find_duplicate = command });
-        if (source_changed) self.showError(.recovery_source_changed) else self.clearError();
+        if (source_changed) self.showErrorFor(.recovery_source_changed, .init(durable.key)) else self.clearError();
     }
 
     fn requestShutdown(self: *Presentation) void {
@@ -11514,7 +11514,7 @@ pub const Presentation = struct {
         if (durable.operation_id != failed.operation_id or !durableIdentityMatches(durable.key, failed.identity) or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_post) return;
         durable.phase = .post_retry_paused;
         self.syncSubmissionTree(durable);
-        self.showError(.submission_launch_failed);
+        self.showErrorFor(.submission_launch_failed, .init(durable.key));
     }
 
     fn acceptCommentEdit(self: *Presentation, completed: CommentEditCompleted) void {
@@ -11528,9 +11528,9 @@ pub const Presentation = struct {
             }
             self.restoreCommentEditComposer(durable);
             self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+            self.showErrorFor(.comment_edit_failed, .init(durable.key));
             self.durable_comment_edit = null;
             durable.destroy();
-            self.showError(.comment_edit_failed);
             return;
         }
         durable.outcome = completed.outcome;
@@ -11555,9 +11555,9 @@ pub const Presentation = struct {
         if (!durableIdentityMatches(durable.key, failed.identity) or durable.comment_id != failed.comment_id) return;
         self.restoreCommentEditComposer(durable);
         self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+        self.showErrorFor(.comment_edit_launch_failed, .init(durable.key));
         self.durable_comment_edit = null;
         durable.destroy();
-        self.showError(.comment_edit_launch_failed);
     }
 
     fn acceptCommentDelete(self: *Presentation, completed: CommentDeleteCompleted) void {
@@ -11571,9 +11571,9 @@ pub const Presentation = struct {
             }
             self.restoreCommentDeleteConfirmation(durable);
             self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+            self.showErrorFor(.comment_delete_failed, .init(durable.key));
             self.durable_comment_delete = null;
             durable.destroy();
-            self.showError(.comment_delete_failed);
             return;
         }
         durable.outcome = completed.outcome;
@@ -11598,9 +11598,9 @@ pub const Presentation = struct {
         if (!durableIdentityMatches(durable.key, failed.identity) or durable.comment_id != failed.comment_id) return;
         self.restoreCommentDeleteConfirmation(durable);
         self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+        self.showErrorFor(.comment_delete_launch_failed, .init(durable.key));
         self.durable_comment_delete = null;
         durable.destroy();
-        self.showError(.comment_delete_launch_failed);
     }
 
     fn startReviewerVerdictChange(self: *Presentation, published: *Published, target: bbr.bitbucket.ReviewerVerdict) void {
@@ -11740,12 +11740,12 @@ pub const Presentation = struct {
             },
             error.DraftNotFound => {
                 self.reportFailure(.submission, .prepare, err, @src());
-                self.showError(.persistence_failed);
+                self.showErrorFor(.persistence_failed, .init(durable.key));
                 return;
             },
             error.InvalidSubmissionState => {
                 self.reportFailure(.submission, .prepare, err, @src());
-                self.showError(.submission_launch_failed);
+                self.showErrorFor(.submission_launch_failed, .init(durable.key));
                 return;
             },
         };
@@ -11758,7 +11758,7 @@ pub const Presentation = struct {
             self.reportFailure(.mutation, .write, err, @src());
             self.publishDurableCheckpoint(durable);
             self.syncSubmissionTree(durable);
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         self.publishSubmissionProgress(durable, progress);
@@ -11796,7 +11796,7 @@ pub const Presentation = struct {
             self.reportFailure(.mutation, .write, err, @src());
             self.publishDurableCheckpoint(durable);
             self.syncSubmissionTree(durable);
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         self.publishSubmissionProgress(durable, progress);
@@ -11837,7 +11837,7 @@ pub const Presentation = struct {
         const current_source = switch (checked.outcome) {
             .failed => {
                 durable.phase = .recovery_check_paused;
-                self.showError(.recovery_check_failed);
+                self.showErrorFor(.recovery_check_failed, .init(durable.key));
                 return;
             },
             .current_source => |source| source,
@@ -11890,7 +11890,7 @@ pub const Presentation = struct {
                 }
                 const draft = durable.review.getConst(post.temp_id) orelse {
                     durable.phase = .recovery_check_paused;
-                    self.showError(.recovery_check_failed);
+                    self.showErrorFor(.recovery_check_failed, .init(durable.key));
                     return;
                 };
                 const command = PostDraft.create(self.allocator, durable.key, draft.*, post) catch |err| switch (err) {
@@ -11908,7 +11908,7 @@ pub const Presentation = struct {
             .check => self.queueDuplicateCheck(durable),
             else => {
                 durable.phase = .recovery_check_paused;
-                self.showError(.recovery_check_failed);
+                self.showErrorFor(.recovery_check_failed, .init(durable.key));
             },
         }
     }
@@ -11916,14 +11916,14 @@ pub const Presentation = struct {
     fn abortChangedSubmission(self: *Presentation, durable: *DurableSubmission) void {
         const observed = durable.observed_source_commit orelse {
             durable.phase = .recovery_check_paused;
-            self.showError(.recovery_check_failed);
+            self.showErrorFor(.recovery_check_failed, .init(durable.key));
             return;
         };
         const completion: bbr.review.SubmissionCompletion = .{ .aborted = .draft };
         self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
             durable.phase = .recovery_check_paused;
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         if (durable.current_temp_id) |temp_id| durable.review.setState(temp_id, .draft);
@@ -11940,7 +11940,7 @@ pub const Presentation = struct {
         durable.destroy();
         self.submission_result = result;
         self.refreshStaleRepairTree();
-        self.showError(.recovery_source_changed);
+        self.showErrorFor(.recovery_source_changed, .init(result.key));
     }
 
     fn acceptDuplicateCheck(self: *Presentation, checked: DuplicateChecked) void {
@@ -11964,7 +11964,7 @@ pub const Presentation = struct {
         }
         if (checked.outcome == .failed or checked.outcome == .rejected) {
             durable.phase = .duplicate_check_paused;
-            self.showError(.duplicate_check_failed);
+            self.showErrorFor(.duplicate_check_failed, .init(durable.key));
             return;
         }
         durable.pending_duplicate = .{ .outcome = checked.outcome };
@@ -12009,7 +12009,7 @@ pub const Presentation = struct {
                 durable.phase = .wait_retry_paused;
                 self.dependencies.reviews.checkpointSubmissionRetry(durable.operation_id, durable.key.storeKey(), wait.temp_id, wait.checkpoint) catch |err| {
                     self.reportFailure(.submission, .write, err, @src());
-                    self.showError(.persistence_failed);
+                    self.showErrorFor(.persistence_failed, .init(durable.key));
                     return;
                 };
                 durable.pending_wait_retry = null;
@@ -12033,7 +12033,7 @@ pub const Presentation = struct {
                 durable.phase = .persistence_paused;
                 const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch |err| {
                     self.reportFailure(.submission, .write, err, @src());
-                    self.showError(.persistence_failed);
+                    self.showErrorFor(.persistence_failed, .init(durable.key));
                     return;
                 };
                 self.publishSubmissionProgress(durable, progress);
@@ -12055,7 +12055,7 @@ pub const Presentation = struct {
             self.dependencies.reviews.checkpointSubmission(durable.operation_id, durable.key.storeKey(), temp_id, outcome, null) catch |err| {
                 self.reportFailure(.submission, .write, err, @src());
                 durable.phase = .duplicate_persistence_paused;
-                self.showError(.persistence_failed);
+                self.showErrorFor(.persistence_failed, .init(durable.key));
                 return;
             };
             durable.recordCheckpoint(temp_id, outcome, null);
@@ -12070,7 +12070,7 @@ pub const Presentation = struct {
         self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
             durable.phase = .duplicate_persistence_paused;
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         const result = durable.persistedResultProjection(completion);
@@ -12114,7 +12114,7 @@ pub const Presentation = struct {
         durable.pending_wait_retry = failed;
         durable.phase = .wait_retry_paused;
         self.syncSubmissionTree(durable);
-        self.showError(.submission_launch_failed);
+        self.showErrorFor(.submission_launch_failed, .init(durable.key));
     }
 
     fn resumeSubmissionWaitLaunch(self: *Presentation, durable: *DurableSubmission) void {
@@ -12133,7 +12133,7 @@ pub const Presentation = struct {
             checkpoint,
         ) catch |err| {
             self.reportFailure(.persistence, .write, err, @src());
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         durable.pending_wait_retry = null;
@@ -12148,10 +12148,10 @@ pub const Presentation = struct {
             self.reportFailure(.submission, .execute, err, @src());
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
-            self.showError(switch (err) {
-                error.OutOfMemory => .out_of_memory,
-                else => .persistence_failed,
-            });
+            switch (err) {
+                error.OutOfMemory => self.showError(.out_of_memory),
+                else => self.showErrorFor(.persistence_failed, .init(durable.key)),
+            }
             return;
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
@@ -33687,6 +33687,104 @@ test "Review recovery a successful POST clears an error of its own path" {
         .outcome = .{ .posted = 900 },
     } });
     try testing.expect(state.projection().action_error == null);
+}
+
+test "Review recovery a Comment edit or delete failure after a Session switch names its PullRequest" {
+    const Case = enum { edit_failed, edit_launch_failed, delete_failed, delete_launch_failed };
+    for ([_]Case{ .edit_failed, .edit_launch_failed, .delete_failed, .delete_launch_failed }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = first_key, .session = try testCommentSession(testing.allocator, 1) },
+            .viewport_rows = 12,
+        });
+        defer state.deinit();
+        try cursorToCommentCard(&state, 99);
+        switch (case) {
+            .edit_failed, .edit_launch_failed => {
+                try state.dispatch(.{ .action = .edit_review_item });
+                try state.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" edited") } });
+                try state.dispatch(.{ .composer = .save });
+            },
+            .delete_failed, .delete_launch_failed => {
+                try state.dispatch(.{ .action = .delete_review_item });
+                try state.dispatch(.{ .delete_confirmation = .confirm });
+            },
+        }
+        var command = state.takeCommand().?;
+        try state.dispatch(.{ .choose_pull_request = second_key });
+        const load = state.takeCommand().?.load_session;
+        try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+        } });
+        switch (case) {
+            .edit_failed => {
+                defer command.deinit();
+                try state.dispatch(.{ .comment_edit_completed = .{
+                    .command_id = command.update_comment.command_id,
+                    .identity = command.update_comment.identity,
+                    .comment_id = 99,
+                    .outcome = .{ .definitive_failure = error.Forbidden },
+                } });
+            },
+            .delete_failed => {
+                defer command.deinit();
+                try state.dispatch(.{ .comment_delete_completed = .{
+                    .command_id = command.delete_comment.command_id,
+                    .identity = command.delete_comment.identity,
+                    .comment_id = 99,
+                    .outcome = .{ .definitive_failure = error.Forbidden },
+                } });
+            },
+            .edit_launch_failed, .delete_launch_failed => try state.dispatch(try command.launchFailed(error.TestLaunchFailure)),
+        }
+
+        const projection = state.projection();
+        try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
+        try testing.expectEqual(@as(?ActionError, switch (case) {
+            .edit_failed => .comment_edit_failed,
+            .edit_launch_failed => .comment_edit_launch_failed,
+            .delete_failed => .comment_delete_failed,
+            .delete_launch_failed => .comment_delete_launch_failed,
+        }), projection.action_error);
+        const shown_key = projection.action_error_key orelse return error.TestExpectedPullRequestKey;
+        try testing.expect(OwnedReviewIdentity.eql(first_key, shown_key.value));
+    }
+}
+
+test "Review recovery a Submission failure after a Session switch names its PullRequest" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+    try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
+    var state = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = first_key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .submit });
+    var post = state.takeCommand().?;
+    try state.dispatch(.{ .choose_pull_request = second_key });
+    const load = state.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try state.dispatch(try post.launchFailed(error.TestLaunchFailure));
+
+    const projection = state.projection();
+    try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
+    try testing.expectEqual(@as(?ActionError, .submission_launch_failed), projection.action_error);
+    const shown_key = projection.action_error_key orelse return error.TestExpectedPullRequestKey;
+    try testing.expect(OwnedReviewIdentity.eql(first_key, shown_key.value));
 }
 
 test "Review recovery a successful Comment delete clears an error of its own path" {
