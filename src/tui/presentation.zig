@@ -33767,34 +33767,66 @@ test "Review recovery a Comment edit or delete failure after a Session switch na
 }
 
 test "Review recovery a Submission failure after a Session switch names its PullRequest" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
-    defer locks.deinit();
-    const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
-    const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
-    try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
-    var state = try Presentation.init(testing.allocator, .{
-        .reviews = store.store(),
-        .submission_locks = locks.locks(),
-    }, .{ .initial = .{ .key = first_key, .session = try testSession(testing.allocator, 1, 'a') } });
-    defer state.deinit();
-    try state.dispatch(.{ .action = .submit });
-    var post = state.takeCommand().?;
-    try state.dispatch(.{ .choose_pull_request = second_key });
-    const load = state.takeCommand().?.load_session;
-    try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
-        .command_id = load.command_id,
-        .intent = load.intent,
-        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
-    } });
-    try state.dispatch(try post.launchFailed(error.TestLaunchFailure));
+    const Case = enum { post_launch_failed, wait_launch_failed, recovery_check_failed, source_changed, duplicate_check_failed };
+    for ([_]Case{ .post_launch_failed, .wait_launch_failed, .recovery_check_failed, .source_changed, .duplicate_check_failed }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+        defer locks.deinit();
+        const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+        try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
+        const recovered = case == .duplicate_check_failed;
+        const operation_id = if (recovered) try store.store().beginSubmission(first_key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }}) else 0;
+        var state = try Presentation.init(testing.allocator, .{
+            .reviews = store.store(),
+            .submission_locks = locks.locks(),
+            .require_source_check = case == .recovery_check_failed or case == .source_changed,
+        }, .{ .initial = .{ .key = first_key, .session = try testSession(testing.allocator, 1, 'a') } });
+        defer state.deinit();
+        if (recovered) {
+            try state.dispatch(.{ .action = .recover_submission });
+            const check = state.takeCommand().?.check_recovery;
+            try state.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "new-head"));
+        } else {
+            try state.dispatch(.{ .action = .submit });
+        }
+        var command = state.takeCommand().?;
+        if (case == .wait_launch_failed) {
+            const rejected: OwnedInput = .{ .post_draft_completed = .{
+                .command_id = command.post_draft.command_id,
+                .operation_id = command.post_draft.operation_id,
+                .identity = .init(first_key),
+                .temp_id = 1,
+                .outcome = .{ .rejected = error.RateLimited },
+            } };
+            command.deinit();
+            try state.dispatch(rejected);
+            command = state.takeCommand().?;
+        }
+        try state.dispatch(.{ .choose_pull_request = second_key });
+        const load = state.takeCommand().?.load_session;
+        try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+        } });
+        switch (case) {
+            .post_launch_failed, .wait_launch_failed, .recovery_check_failed, .duplicate_check_failed => try state.dispatch(try command.launchFailed(error.TestLaunchFailure)),
+            .source_changed => try state.dispatch(recoveryCheckSucceeded(command.check_recovery.command_id, command.check_recovery.operation_id, null, "different-head")),
+        }
 
-    const projection = state.projection();
-    try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
-    try testing.expectEqual(@as(?ActionError, .submission_launch_failed), projection.action_error);
-    const shown_key = projection.action_error_key orelse return error.TestExpectedPullRequestKey;
-    try testing.expect(OwnedReviewIdentity.eql(first_key, shown_key.value));
+        const projection = state.projection();
+        try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
+        try testing.expectEqual(@as(?ActionError, switch (case) {
+            .post_launch_failed, .wait_launch_failed => .submission_launch_failed,
+            .recovery_check_failed => .recovery_check_failed,
+            .source_changed => .recovery_source_changed,
+            .duplicate_check_failed => .duplicate_check_failed,
+        }), projection.action_error);
+        const shown_key = projection.action_error_key orelse return error.TestExpectedPullRequestKey;
+        try testing.expect(OwnedReviewIdentity.eql(first_key, shown_key.value));
+    }
 }
 
 test "Review recovery a successful Comment delete clears an error of its own path" {
