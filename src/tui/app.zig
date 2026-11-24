@@ -359,7 +359,7 @@ fn presentationStatus(
     if (projection.fatal_error) |err| return @tagName(err);
     // The armed re-anchor banner outlives one refusal: it keeps naming the
     // Draft and whatever the source cursor currently proposes.
-    if (projection.reanchor) |reanchor| return reanchorStatus(frame, projection, reanchor);
+    if (projection.reanchor) |reanchor| return reanchorStatus(frame, projection, visible_key, reanchor);
     if (projection.review_search != null and projection.action_error != null) return actionErrorStatus(frame, projection, visible_key, switch (projection.action_error.?) {
         .buffer_search_query_too_long => "Review Search Query limit is 256 characters",
         .buffer_search_invalid_query => "Review Search Query is invalid",
@@ -557,6 +557,14 @@ fn actionErrorStatus(
     };
 }
 
+/// The shown action error unless it belongs to another PullRequest than the
+/// visible review.
+fn visibleActionError(projection: presentation.Projection, visible_key: ?presentation.OwnedReviewIdentity) ?presentation.ActionError {
+    const key = projection.action_error_key orelse return projection.action_error;
+    const visible = visible_key orelse return null;
+    return if (presentation.OwnedReviewIdentity.eql(key.value, visible)) projection.action_error else null;
+}
+
 fn actionErrorText(err: presentation.ActionError) []const u8 {
     return switch (err) {
         .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
@@ -663,6 +671,7 @@ fn themeSaveOutcome(err: anyerror) presentation.ThemePersisted.Outcome {
 fn reanchorStatus(
     frame: std.mem.Allocator,
     projection: presentation.Projection,
+    visible_key: ?presentation.OwnedReviewIdentity,
     reanchor: presentation.ReanchorProjection,
 ) []const u8 {
     const fallback = "Re-anchor local Draft · Enter accept · Esc cancel";
@@ -673,7 +682,7 @@ fn reanchorStatus(
         candidate.bottom,
     }) catch |err| switch (err) {
         error.OutOfMemory => return fallback,
-    } else actionErrorText(reanchor.refusal orelse projection.action_error orelse .action_refused);
+    } else actionErrorText(reanchor.refusal orelse visibleActionError(projection, visible_key) orelse .action_refused);
     return std.fmt.allocPrint(frame, "Re-anchor local Draft #{d} → {s} · Enter accept · Esc cancel", .{
         reanchor.temp_id,
         detail,
@@ -1972,6 +1981,30 @@ test "an action error of another PullRequest names that PullRequest" {
     projection.action_error = .out_of_memory;
     projection.action_error_key = null;
     try std.testing.expectEqualStrings(actionErrorText(.out_of_memory), presentationStatus(frame.allocator(), projection, other).?);
+}
+
+test "a re-anchor banner shows no action error of another PullRequest" {
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    var state = try presentation.Presentation.init(std.testing.allocator, .{ .reviews = store.store() }, .{});
+    defer state.deinit();
+    var frame = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer frame.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 42);
+    const visible = try presentation.OwnedReviewIdentity.init("workspace", "repo", 7);
+    var projection = state.projection();
+    projection.reanchor = .{ .temp_id = 3, .candidate = null, .refusal = null };
+    projection.action_error = .pull_request_author;
+    projection.action_error_key = .{ .value = key };
+
+    const refused = try std.fmt.allocPrint(frame.allocator(), "Re-anchor local Draft #3 → {s} · Enter accept · Esc cancel", .{actionErrorText(.action_refused)});
+    try std.testing.expectEqualStrings(refused, presentationStatus(frame.allocator(), projection, visible).?);
+    try std.testing.expectEqualStrings(refused, presentationStatus(frame.allocator(), projection, null).?);
+
+    const own = try std.fmt.allocPrint(frame.allocator(), "Re-anchor local Draft #3 → {s} · Enter accept · Esc cancel", .{actionErrorText(.pull_request_author)});
+    try std.testing.expectEqualStrings(own, presentationStatus(frame.allocator(), projection, key).?);
+    projection.action_error_key = null;
+    try std.testing.expectEqualStrings(own, presentationStatus(frame.allocator(), projection, visible).?);
 }
 
 const TestStatus = struct {
