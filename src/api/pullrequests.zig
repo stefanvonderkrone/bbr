@@ -647,6 +647,7 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
         .success, .reconciled_success => {},
         .api_error => |err| return err,
         .stale_source_commit => return error.ReviewerVerdictChangeFailed,
+        .pull_request_author => return error.PullRequestAuthorCannotSetReviewerVerdict,
         .unresolved => |unresolved| {
             const cause = unresolved orelse return error.ReviewerVerdictChangeFailed;
             return bbr.cli_failure.fail(init.io, bb.diagnostic, .execute, .{ .zig = cause }, @src(), writeVerdictFailure, .{ bb.error_detail, cause });
@@ -657,6 +658,7 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
         .reconciled_success => "reconciled_success",
         .api_error => "api_error",
         .stale_source_commit => "stale_source_commit",
+        .pull_request_author => "pull_request_author",
         .unresolved => "unresolved",
     };
     if (json) {
