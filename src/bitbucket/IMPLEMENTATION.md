@@ -28,6 +28,7 @@ A live check returned the same PullRequests for `state=DECLINED&state=OPEN` and 
 A full PullRequest or Repository page is slow to serve. The `fields` parameter selects only the decoded fields and makes the page much faster.
 `partialFields` in `client.zig` derives the `fields` value from the page type that the adapter decodes, so the two cannot drift.
 The `next` links keep the `fields` parameter.
+The commit PullRequests endpoint needs `fields` for correct output, not only for speed. Without it, Bitbucket returns a short PullRequest with only `id`, `title`, `draft`, `queued`, `links`, and `type`, and the summary does not decode. The test "API lifecycle commit lookup requests summary fields instead of the short default response" fails when the parameter is missing.
 Live checks on Workspace `check24` measured these wall times:
 
 - `list-repositories --pagelen 100`, six pages for 553 Repositories: 25.5 s and 12.4 s before, 3.8 s and 2.3 s with `fields`.

@@ -3986,6 +3986,8 @@ pub const Projection = struct {
     replacing: bool,
     replacement_error: ?ReplacementError,
     action_error: ?ActionError,
+    /// The PullRequest of `action_error` when it belongs to one PullRequest.
+    action_error_key: ?OwnedRemoteReviewIdentity,
     buffer_search: ?BufferSearchProjection,
     review_search: ?ReviewSearchProjection,
     clipboard_status: ?ClipboardStatus,
@@ -4321,6 +4323,7 @@ const ErrorOrigin = enum {
 const ShownError = struct {
     err: ActionError,
     origin: ErrorOrigin,
+    key: ?OwnedRemoteReviewIdentity,
 };
 
 pub const ActionError = enum {
@@ -6538,7 +6541,6 @@ const SubmissionTree = struct {
     omitted_drafts: []const bbr.review.TempId = &.{},
     selected: usize = 0,
     completion: ?bbr.review.SubmissionCompletion = null,
-    stale_repair: ?StaleRepairProjection = null,
     /// A jump to a Draft hides a terminal tree. Submit shows it again.
     hidden: bool = false,
 
@@ -6848,7 +6850,6 @@ const SubmissionTree = struct {
             .failed = failed,
             .skipped = skipped,
             .outcome_unknown = outcome_unknown,
-            .stale_repair = self.stale_repair,
         };
     }
 };
@@ -7259,7 +7260,14 @@ pub const Presentation = struct {
 
     /// Shows `err` with the origin of the work that runs.
     fn showError(self: *Presentation, err: ActionError) void {
-        self.action_error = .{ .err = err, .origin = self.errorOrigin() };
+        self.showErrorFor(err, null);
+    }
+
+    /// Shows `err` as an error of the PullRequest `key`, so the status can
+    /// name it as `repo#id` while another review is visible. Only a Remote
+    /// Review has that name.
+    fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedRemoteReviewIdentity) void {
+        self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key };
     }
 
     /// A user action clears any error. Other work clears only an error of its
@@ -7334,7 +7342,18 @@ pub const Presentation = struct {
             .submission_result = self.submission_result,
             .submission_tree = if (self.submission_tree) |tree| blk: {
                 if (tree.hidden or self.submissionRepairInteractionActive()) break :blk null;
-                break :blk tree.projection();
+                var view = tree.projection();
+                const retry_running = if (self.durable_submission) |durable|
+                    !durable.recovered and OwnedReviewIdentity.eql(durable.key, tree.key)
+                else
+                    false;
+                const gate = if (retry_running) null else self.staleRepairGate(tree.key);
+                if (gate) |stale| view.stale_repair = .{
+                    .loaded_source_commit = stale.loaded_source_commit.slice(),
+                    .observed_source_commit = stale.observed_source_commit.slice(),
+                    .reloaded = stale.reloaded,
+                };
+                break :blk view;
             } else null,
             .comment_edit_result = self.comment_edit_result,
             .comment_delete_result = self.comment_delete_result,
@@ -7377,6 +7396,7 @@ pub const Presentation = struct {
             .replacing = self.replacement != null,
             .replacement_error = self.replacement_error,
             .action_error = if (self.action_error) |shown| shown.err else null,
+            .action_error_key = if (self.action_error) |shown| shown.key else null,
             .buffer_search = if (self.published) |published| if (published.active_search == .buffer) published.buffer_search.projection() else null else null,
             .review_search = if (self.published) |published| blk: {
                 var search_view = published.review_search.projection(self.geometry) orelse break :blk null;
@@ -7862,7 +7882,7 @@ pub const Presentation = struct {
             return;
         };
         self.commands.appendAssumeCapacity(.{ .find_duplicate = command });
-        if (source_changed) self.showError(.recovery_source_changed) else self.clearError();
+        if (source_changed) self.showErrorFor(.recovery_source_changed, .init(durable.key)) else self.clearError();
     }
 
     fn requestShutdown(self: *Presentation) void {
@@ -8437,7 +8457,7 @@ pub const Presentation = struct {
             if (key.matches('A', .{})) self.abandonRecoveredSubmission();
             return;
         }
-        if (tree.stale_repair != null and key.matches('R', .{})) {
+        if (self.staleRepairGate(tree.key) != null and key.matches('R', .{})) {
             const published = self.published orelse return;
             if (OwnedReviewIdentity.eql(published.key, tree.key)) self.queueRefresh(tree.key);
             return;
@@ -8587,7 +8607,7 @@ pub const Presentation = struct {
         };
         tree.hidden = true;
         self.submission_result = null;
-        if (self.durable_submission != null or tree.completion == null or tree.completion.? != .clean or tree.stale_repair != null) return;
+        if (self.durable_submission != null or tree.completion == null or tree.completion.? != .clean or self.staleRepairGate(tree.key) != null) return;
         const published = self.published orelse return;
         if (!OwnedReviewIdentity.eql(published.key, tree.key)) return;
         if (tree.hasUnpostedOmittedDrafts(&published.review)) return;
@@ -8601,7 +8621,7 @@ pub const Presentation = struct {
         const temp_id = durable.current_temp_id orelse return;
         self.dependencies.reviews.abandonSubmission(durable.operation_id, durable.key.storeKey()) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         durable.review.setState(temp_id, .outcome_unknown);
@@ -11619,7 +11639,7 @@ pub const Presentation = struct {
             self.showError(.remote_write_busy);
             return;
         }
-        if (self.stale_repair) |gate| if (OwnedReviewIdentity.eql(gate.key, published.key)) {
+        if (self.staleRepairGate(published.key)) |gate| {
             const root = selected_root orelse {
                 self.showError(.recovery_source_changed);
                 return;
@@ -11628,7 +11648,7 @@ pub const Presentation = struct {
                 self.showError(.recovery_source_changed);
                 return;
             }
-        };
+        }
         if (self.durable_submission) |durable| {
             if (selected_root != null) {
                 self.showError(.submission_already_active);
@@ -11764,7 +11784,7 @@ pub const Presentation = struct {
         if (durable.operation_id != failed.operation_id or !durableIdentityMatches(durable.key, failed.identity) or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_post) return;
         durable.phase = .post_retry_paused;
         self.syncSubmissionTree(durable);
-        self.showError(.submission_launch_failed);
+        self.showErrorFor(.submission_launch_failed, .init(durable.key));
     }
 
     fn acceptCommentEdit(self: *Presentation, completed: CommentEditCompleted) void {
@@ -11778,9 +11798,9 @@ pub const Presentation = struct {
             }
             self.restoreCommentEditComposer(durable);
             self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+            self.showErrorFor(.comment_edit_failed, .init(durable.key));
             self.durable_comment_edit = null;
             durable.destroy();
-            self.showError(.comment_edit_failed);
             return;
         }
         durable.outcome = completed.outcome;
@@ -11805,9 +11825,9 @@ pub const Presentation = struct {
         if (!durableIdentityMatches(durable.key, failed.identity) or durable.comment_id != failed.comment_id) return;
         self.restoreCommentEditComposer(durable);
         self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+        self.showErrorFor(.comment_edit_launch_failed, .init(durable.key));
         self.durable_comment_edit = null;
         durable.destroy();
-        self.showError(.comment_edit_launch_failed);
     }
 
     fn acceptCommentDelete(self: *Presentation, completed: CommentDeleteCompleted) void {
@@ -11821,9 +11841,9 @@ pub const Presentation = struct {
             }
             self.restoreCommentDeleteConfirmation(durable);
             self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+            self.showErrorFor(.comment_delete_failed, .init(durable.key));
             self.durable_comment_delete = null;
             durable.destroy();
-            self.showError(.comment_delete_failed);
             return;
         }
         durable.outcome = completed.outcome;
@@ -11848,9 +11868,9 @@ pub const Presentation = struct {
         if (!durableIdentityMatches(durable.key, failed.identity) or durable.comment_id != failed.comment_id) return;
         self.restoreCommentDeleteConfirmation(durable);
         self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+        self.showErrorFor(.comment_delete_launch_failed, .init(durable.key));
         self.durable_comment_delete = null;
         durable.destroy();
-        self.showError(.comment_delete_launch_failed);
     }
 
     fn startReviewerVerdictChange(self: *Presentation, published: *Published, target: bbr.bitbucket.ReviewerVerdict) void {
@@ -11895,12 +11915,12 @@ pub const Presentation = struct {
             .completed => |result| result,
             .launch_failed => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_launch_failed);
+                self.showErrorFor(.reviewer_verdict_launch_failed, .init(durable.key));
                 return;
             },
             .adapter_failed => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_failed);
+                self.showErrorFor(.reviewer_verdict_failed, .init(durable.key));
                 return;
             },
         };
@@ -11926,15 +11946,19 @@ pub const Presentation = struct {
             },
             .stale_source_commit => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_source_changed);
+                self.showErrorFor(.reviewer_verdict_source_changed, .init(durable.key));
+            },
+            .pull_request_author => {
+                self.durable_reviewer_verdict = null;
+                self.showErrorFor(.pull_request_author, .init(durable.key));
             },
             .api_error => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_failed);
+                self.showErrorFor(.reviewer_verdict_failed, .init(durable.key));
             },
             .unresolved => {
                 self.durable_reviewer_verdict = null;
-                self.showError(.reviewer_verdict_unresolved);
+                self.showErrorFor(.reviewer_verdict_unresolved, .init(durable.key));
             },
         }
     }
@@ -11986,12 +12010,12 @@ pub const Presentation = struct {
             },
             error.DraftNotFound => {
                 self.reportFailure(.submission, .prepare, err, @src());
-                self.showError(.persistence_failed);
+                self.showErrorFor(.persistence_failed, .init(durable.key));
                 return;
             },
             error.InvalidSubmissionState => {
                 self.reportFailure(.submission, .prepare, err, @src());
-                self.showError(.submission_launch_failed);
+                self.showErrorFor(.submission_launch_failed, .init(durable.key));
                 return;
             },
         };
@@ -12004,7 +12028,7 @@ pub const Presentation = struct {
             self.reportFailure(.mutation, .write, err, @src());
             self.publishDurableCheckpoint(durable);
             self.syncSubmissionTree(durable);
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         self.publishSubmissionProgress(durable, progress);
@@ -12042,7 +12066,7 @@ pub const Presentation = struct {
             self.reportFailure(.mutation, .write, err, @src());
             self.publishDurableCheckpoint(durable);
             self.syncSubmissionTree(durable);
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         self.publishSubmissionProgress(durable, progress);
@@ -12083,7 +12107,7 @@ pub const Presentation = struct {
         const current_source = switch (checked.outcome) {
             .failed => {
                 durable.phase = .recovery_check_paused;
-                self.showError(.recovery_check_failed);
+                self.showErrorFor(.recovery_check_failed, .init(durable.key));
                 return;
             },
             .current_source => |source| source,
@@ -12136,7 +12160,7 @@ pub const Presentation = struct {
                 }
                 const draft = durable.review.getConst(post.temp_id) orelse {
                     durable.phase = .recovery_check_paused;
-                    self.showError(.recovery_check_failed);
+                    self.showErrorFor(.recovery_check_failed, .init(durable.key));
                     return;
                 };
                 const command = PostDraft.create(self.allocator, durable.key, draft.*, post) catch |err| switch (err) {
@@ -12154,7 +12178,7 @@ pub const Presentation = struct {
             .check => self.queueDuplicateCheck(durable),
             else => {
                 durable.phase = .recovery_check_paused;
-                self.showError(.recovery_check_failed);
+                self.showErrorFor(.recovery_check_failed, .init(durable.key));
             },
         }
     }
@@ -12162,14 +12186,14 @@ pub const Presentation = struct {
     fn abortChangedSubmission(self: *Presentation, durable: *DurableSubmission) void {
         const observed = durable.observed_source_commit orelse {
             durable.phase = .recovery_check_paused;
-            self.showError(.recovery_check_failed);
+            self.showErrorFor(.recovery_check_failed, .init(durable.key));
             return;
         };
         const completion: bbr.review.SubmissionCompletion = .{ .aborted = .draft };
         self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
             durable.phase = .recovery_check_paused;
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         if (durable.current_temp_id) |temp_id| durable.review.setState(temp_id, .draft);
@@ -12186,7 +12210,7 @@ pub const Presentation = struct {
         durable.destroy();
         self.submission_result = result;
         self.refreshStaleRepairTree();
-        self.showError(.recovery_source_changed);
+        self.showErrorFor(.recovery_source_changed, .init(result.key));
     }
 
     fn acceptDuplicateCheck(self: *Presentation, checked: DuplicateChecked) void {
@@ -12210,7 +12234,7 @@ pub const Presentation = struct {
         }
         if (checked.outcome == .failed or checked.outcome == .rejected) {
             durable.phase = .duplicate_check_paused;
-            self.showError(.duplicate_check_failed);
+            self.showErrorFor(.duplicate_check_failed, .init(durable.key));
             return;
         }
         durable.pending_duplicate = .{ .outcome = checked.outcome };
@@ -12255,7 +12279,7 @@ pub const Presentation = struct {
                 durable.phase = .wait_retry_paused;
                 self.dependencies.reviews.checkpointSubmissionRetry(durable.operation_id, durable.key.storeKey(), wait.temp_id, wait.checkpoint) catch |err| {
                     self.reportFailure(.submission, .write, err, @src());
-                    self.showError(.persistence_failed);
+                    self.showErrorFor(.persistence_failed, .init(durable.key));
                     return;
                 };
                 durable.pending_wait_retry = null;
@@ -12279,7 +12303,7 @@ pub const Presentation = struct {
                 durable.phase = .persistence_paused;
                 const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch |err| {
                     self.reportFailure(.submission, .write, err, @src());
-                    self.showError(.persistence_failed);
+                    self.showErrorFor(.persistence_failed, .init(durable.key));
                     return;
                 };
                 self.publishSubmissionProgress(durable, progress);
@@ -12301,7 +12325,7 @@ pub const Presentation = struct {
             self.dependencies.reviews.checkpointSubmission(durable.operation_id, durable.key.storeKey(), temp_id, outcome, null) catch |err| {
                 self.reportFailure(.submission, .write, err, @src());
                 durable.phase = .duplicate_persistence_paused;
-                self.showError(.persistence_failed);
+                self.showErrorFor(.persistence_failed, .init(durable.key));
                 return;
             };
             durable.recordCheckpoint(temp_id, outcome, null);
@@ -12316,7 +12340,7 @@ pub const Presentation = struct {
         self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch |err| {
             self.reportFailure(.submission, .write, err, @src());
             durable.phase = .duplicate_persistence_paused;
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         const result = durable.persistedResultProjection(completion);
@@ -12360,7 +12384,7 @@ pub const Presentation = struct {
         durable.pending_wait_retry = failed;
         durable.phase = .wait_retry_paused;
         self.syncSubmissionTree(durable);
-        self.showError(.submission_launch_failed);
+        self.showErrorFor(.submission_launch_failed, .init(durable.key));
     }
 
     fn resumeSubmissionWaitLaunch(self: *Presentation, durable: *DurableSubmission) void {
@@ -12379,7 +12403,7 @@ pub const Presentation = struct {
             checkpoint,
         ) catch |err| {
             self.reportFailure(.persistence, .write, err, @src());
-            self.showError(.persistence_failed);
+            self.showErrorFor(.persistence_failed, .init(durable.key));
             return;
         };
         durable.pending_wait_retry = null;
@@ -12394,10 +12418,10 @@ pub const Presentation = struct {
             self.reportFailure(.submission, .execute, err, @src());
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
-            self.showError(switch (err) {
-                error.OutOfMemory => .out_of_memory,
-                else => .persistence_failed,
-            });
+            switch (err) {
+                error.OutOfMemory => self.showError(.out_of_memory),
+                else => self.showErrorFor(.persistence_failed, .init(durable.key)),
+            }
             return;
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
@@ -12410,15 +12434,14 @@ pub const Presentation = struct {
             tree.sync(durable);
     }
 
+    fn staleRepairGate(self: *const Presentation, key: OwnedReviewIdentity) ?*const StaleRepairGate {
+        const gate = if (self.stale_repair) |*gate| gate else return null;
+        return if (OwnedReviewIdentity.eql(gate.key, key)) gate else null;
+    }
+
     fn refreshStaleRepairTree(self: *Presentation) void {
-        const gate = self.stale_repair orelse return;
         const tree = self.submission_tree orelse return;
-        if (!OwnedReviewIdentity.eql(tree.key, gate.key)) return;
-        tree.stale_repair = .{
-            .loaded_source_commit = gate.loaded_source_commit.slice(),
-            .observed_source_commit = gate.observed_source_commit.slice(),
-            .reloaded = gate.reloaded,
-        };
+        const gate = self.staleRepairGate(tree.key) orelse return;
         const published = self.published orelse return;
         if (!OwnedReviewIdentity.eql(published.key, gate.key)) return;
         for (tree.items.items) |*item| {
@@ -20848,6 +20871,7 @@ test "Reviewer Verdict rejects stale completions and keeps every terminal result
         action_error: ActionError,
     }{
         .{ .result = .stale_source_commit, .action_error = .reviewer_verdict_source_changed },
+        .{ .result = .pull_request_author, .action_error = .pull_request_author },
         .{ .result = .{ .api_error = error.Forbidden }, .action_error = .reviewer_verdict_failed },
         .{ .result = .{ .unresolved = null }, .action_error = .reviewer_verdict_unresolved },
     };
@@ -20883,6 +20907,7 @@ test "Reviewer Verdict rejects stale completions and keeps every terminal result
             .outcome = .{ .completed = case.result },
         } });
         try testing.expectEqual(case.action_error, presentation.projection().action_error.?);
+        try testing.expect(OwnedReviewIdentity.eql(key, presentation.projection().action_error_key.?.value));
         const result = presentation.projection().reviewer_verdict_result.?;
         try testing.expect(OwnedReviewIdentity.eql(key, result.key));
         try testing.expectEqual(command.target, result.target);
@@ -20926,6 +20951,55 @@ test "Reviewer Verdict survives a Session switch without projecting into the new
     try testing.expect(OwnedReviewIdentity.eql(first_key, presentation.projection().reviewer_verdict_result.?.key));
     try testing.expect(presentation.takeCommand() == null);
     try testing.expect(!presentation.remoteWriteBusy());
+}
+
+test "Reviewer Verdict error after a Session switch names its PullRequest" {
+    const cases = [_]struct {
+        outcome: ReviewerVerdictCommandOutcome,
+        action_error: ActionError,
+    }{
+        .{ .outcome = .{ .completed = .pull_request_author }, .action_error = .pull_request_author },
+        .{ .outcome = .{ .completed = .stale_source_commit }, .action_error = .reviewer_verdict_source_changed },
+        .{ .outcome = .launch_failed, .action_error = .reviewer_verdict_launch_failed },
+        .{ .outcome = .adapter_failed, .action_error = .reviewer_verdict_failed },
+    };
+    for (cases) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        const first = try testSession(testing.allocator, 1, 'a');
+        first.authenticated_account_uuid = "{me}";
+        first.source.remote.author_uuid = "{author}";
+        first.source.remote.reviewer_verdicts = &.{};
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = first_key, .session = first },
+            .viewport_rows = 8,
+        });
+        defer presentation.deinit();
+
+        try presentation.dispatch(.{ .action = .set_verdict_approved });
+        const verdict = presentation.takeCommand().?.change_reviewer_verdict;
+        const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+        try presentation.dispatch(.{ .choose_pull_request = second_key });
+        const load = presentation.takeCommand().?.load_session;
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+        } });
+        try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+            .command_id = verdict.command_id,
+            .identity = verdict.identity,
+            .target = verdict.target,
+            .outcome = case.outcome,
+        } });
+
+        const projection = presentation.projection();
+        try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
+        try testing.expectEqual(@as(?ActionError, case.action_error), projection.action_error);
+        const shown_key = projection.action_error_key orelse return error.TestExpectedPullRequestKey;
+        try testing.expect(OwnedReviewIdentity.eql(first_key, shown_key.value));
+    }
 }
 
 test "Reviewer Verdict replacement failure preserves the Session and qualified result" {
@@ -33002,6 +33076,83 @@ test "changed-source Duplicate guard records an existing Comment without posting
     try testing.expectEqual(@as(usize, 0), (try store.store().load(arena.allocator(), key.storeKey())).len);
 }
 
+test "Review recovery a clean changed-source Duplicate guard ends the stale repair of its tree" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "already posted" });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", &.{.{ .temp_id = 1, .parent = null }});
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 7, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .recover_submission });
+    const check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "new-head"));
+    try testing.expectEqualStrings("new-head", presentation.projection().submission_tree.?.stale_repair.?.observed_source_commit);
+    var duplicate = presentation.takeCommand().?;
+    duplicate.deinit();
+    try presentation.dispatch(.{ .duplicate_checked = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .found = 900 },
+    } });
+
+    const tree = presentation.projection().submission_tree.?;
+    try testing.expectEqual(bbr.review.SubmissionCompletion.clean, tree.completion.?);
+    try testing.expect(tree.stale_repair == null);
+    while (presentation.takeCommand()) |command_value| {
+        var command = command_value;
+        command.deinit();
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'R', .text = "R" } });
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.dismiss_submission_result);
+    try testing.expect(presentation.submission_tree == null);
+}
+
+test "Review recovery a stale repair gate of another PullRequest never shows in a Submission tree" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const stale_key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(stale_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "stale" });
+    const operation_id = try store.store().beginSubmission(stale_key.storeKey(), "old-head", &.{.{ .temp_id = 1, .parent = null }});
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "fresh" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .recover_submission });
+    const check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "new-head"));
+    var duplicate = presentation.takeCommand().?;
+    duplicate.deinit();
+    try presentation.dispatch(.{ .duplicate_checked = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .missing,
+    } });
+    try testing.expect(presentation.projection().submission_tree.?.stale_repair != null);
+
+    try presentation.dispatch(.{ .action = .submit });
+    const tree = presentation.projection().submission_tree.?;
+    try testing.expect(OwnedReviewIdentity.eql(key, tree.key));
+    try testing.expect(tree.stale_repair == null);
+}
+
 test "reviewer can mark a selected unresolved Draft as unpublished" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -33669,6 +33820,58 @@ test "stale repair reload evaluates each root scope independently and checks the
     try testing.expect(presentation.takeCommand() == null);
 }
 
+test "Review recovery a retry hides the stale repair banner until its source check finds a changed source" {
+    for ([_][]const u8{ "third-head", "new-head" }) |checked_source| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+        defer locks.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "review", .scope = .review });
+        var presentation = try Presentation.init(testing.allocator, .{
+            .reviews = store.store(),
+            .submission_locks = locks.locks(),
+            .require_source_check = true,
+        }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+        defer presentation.deinit();
+
+        try presentation.dispatch(.{ .action = .submit });
+        const first_check = presentation.takeCommand().?.check_recovery;
+        try presentation.dispatch(recoveryCheckSucceeded(first_check.command_id, first_check.operation_id, null, "new-head"));
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'R', .text = "R" } });
+        const reload = presentation.takeCommand().?.load_session;
+        const refreshed = try testSession(testing.allocator, 1, 'a');
+        refreshed.header.source_commit = "new-head";
+        refreshed.source.remote.source_commit = "new-head";
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+            .command_id = reload.command_id,
+            .intent = reload.intent,
+            .outcome = .{ .loaded = refreshed },
+        } });
+        try testing.expect(presentation.projection().submission_tree.?.stale_repair.?.reloaded);
+
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+        const retry_check = presentation.takeCommand().?.check_recovery;
+        const retrying = presentation.projection().submission_tree.?;
+        try testing.expect(retrying.completion == null);
+        try testing.expect(retrying.stale_repair == null);
+
+        try presentation.dispatch(recoveryCheckSucceeded(retry_check.command_id, retry_check.operation_id, null, checked_source));
+        const checked = presentation.projection().submission_tree.?;
+        if (std.mem.eql(u8, checked_source, "new-head")) {
+            try testing.expect(checked.stale_repair == null);
+            try testing.expect(presentation.stale_repair == null);
+        } else {
+            try testing.expectEqualStrings("new-head", checked.stale_repair.?.loaded_source_commit);
+            try testing.expectEqualStrings("third-head", checked.stale_repair.?.observed_source_commit);
+        }
+        while (presentation.takeCommand()) |command_value| {
+            var command = command_value;
+            command.deinit();
+        }
+    }
+}
+
 test "abandoning recovered ambiguity posts nothing and releases only settled Drafts" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -34216,6 +34419,150 @@ test "Review recovery a successful POST clears an error of its own path" {
         .outcome = .{ .posted = 900 },
     } });
     try testing.expect(state.projection().action_error == null);
+}
+
+test "Review recovery a Comment edit or delete failure after a Session switch names its PullRequest" {
+    const Case = enum { edit_failed, edit_launch_failed, delete_failed, delete_launch_failed };
+    for ([_]Case{ .edit_failed, .edit_launch_failed, .delete_failed, .delete_launch_failed }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = first_key, .session = try testCommentSession(testing.allocator, 1) },
+            .viewport_rows = 12,
+        });
+        defer state.deinit();
+        try cursorToCommentCard(&state, 99);
+        switch (case) {
+            .edit_failed, .edit_launch_failed => {
+                try state.dispatch(.{ .action = .edit_review_item });
+                try state.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" edited") } });
+                try state.dispatch(.{ .composer = .save });
+            },
+            .delete_failed, .delete_launch_failed => {
+                try state.dispatch(.{ .action = .delete_review_item });
+                try state.dispatch(.{ .delete_confirmation = .confirm });
+            },
+        }
+        var command = state.takeCommand().?;
+        try state.dispatch(.{ .choose_pull_request = second_key });
+        const load = state.takeCommand().?.load_session;
+        try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+        } });
+        switch (case) {
+            .edit_failed => {
+                defer command.deinit();
+                try state.dispatch(.{ .comment_edit_completed = .{
+                    .command_id = command.update_comment.command_id,
+                    .identity = command.update_comment.identity,
+                    .comment_id = 99,
+                    .outcome = .{ .definitive_failure = error.Forbidden },
+                } });
+            },
+            .delete_failed => {
+                defer command.deinit();
+                try state.dispatch(.{ .comment_delete_completed = .{
+                    .command_id = command.delete_comment.command_id,
+                    .identity = command.delete_comment.identity,
+                    .comment_id = 99,
+                    .outcome = .{ .definitive_failure = error.Forbidden },
+                } });
+            },
+            .edit_launch_failed, .delete_launch_failed => try state.dispatch(try command.launchFailed(error.TestLaunchFailure)),
+        }
+
+        const projection = state.projection();
+        try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
+        try testing.expectEqual(@as(?ActionError, switch (case) {
+            .edit_failed => .comment_edit_failed,
+            .edit_launch_failed => .comment_edit_launch_failed,
+            .delete_failed => .comment_delete_failed,
+            .delete_launch_failed => .comment_delete_launch_failed,
+        }), projection.action_error);
+        const shown_key = projection.action_error_key orelse return error.TestExpectedPullRequestKey;
+        try testing.expect(OwnedReviewIdentity.eql(first_key, shown_key.value));
+    }
+}
+
+fn failAbandonSubmission(_: *anyopaque, _: bbr.review.OperationId, _: bbr.review.RemoteReviewIdentity) anyerror!void {
+    return error.TestAbandonFailure;
+}
+
+test "Review recovery a Submission failure after a Session switch names its PullRequest" {
+    const Case = enum { post_launch_failed, wait_launch_failed, recovery_check_failed, source_changed, duplicate_check_failed, abandon_failed };
+    for ([_]Case{ .post_launch_failed, .wait_launch_failed, .recovery_check_failed, .source_changed, .duplicate_check_failed, .abandon_failed }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+        defer locks.deinit();
+        const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+        try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish" });
+        const recovered = case == .duplicate_check_failed or case == .abandon_failed;
+        const operation_id = if (recovered) try store.store().beginSubmission(first_key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }}) else 0;
+        var vtable = store.store().vtable.*;
+        vtable.abandon_submission = failAbandonSubmission;
+        var reviews = store.store();
+        reviews.vtable = &vtable;
+        var state = try Presentation.init(testing.allocator, .{
+            .reviews = reviews,
+            .submission_locks = locks.locks(),
+            .require_source_check = case == .recovery_check_failed or case == .source_changed,
+        }, .{ .initial = .{ .key = first_key, .session = try testSession(testing.allocator, 1, 'a') } });
+        defer state.deinit();
+        if (recovered) {
+            try state.dispatch(.{ .action = .recover_submission });
+            const check = state.takeCommand().?.check_recovery;
+            try state.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "new-head"));
+        } else {
+            try state.dispatch(.{ .action = .submit });
+        }
+        var command = state.takeCommand().?;
+        if (case == .wait_launch_failed) {
+            const rejected: OwnedInput = .{ .post_draft_completed = .{
+                .command_id = command.post_draft.command_id,
+                .operation_id = command.post_draft.operation_id,
+                .identity = .init(first_key),
+                .temp_id = 1,
+                .outcome = .{ .rejected = error.RateLimited },
+            } };
+            command.deinit();
+            try state.dispatch(rejected);
+            command = state.takeCommand().?;
+        }
+        if (case == .abandon_failed) {
+            try state.dispatch(try command.launchFailed(error.TestLaunchFailure));
+            try state.dispatch(.{ .key = .{ .codepoint = 'A', .text = "A" } });
+        }
+        try state.dispatch(.{ .choose_pull_request = second_key });
+        const load = state.takeCommand().?.load_session;
+        try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+        } });
+        switch (case) {
+            .post_launch_failed, .wait_launch_failed, .recovery_check_failed, .duplicate_check_failed => try state.dispatch(try command.launchFailed(error.TestLaunchFailure)),
+            .source_changed => try state.dispatch(recoveryCheckSucceeded(command.check_recovery.command_id, command.check_recovery.operation_id, null, "different-head")),
+            .abandon_failed => {},
+        }
+
+        const projection = state.projection();
+        try testing.expect(OwnedReviewIdentity.eql(second_key, projection.review.?.key));
+        try testing.expectEqual(@as(?ActionError, switch (case) {
+            .post_launch_failed, .wait_launch_failed => .submission_launch_failed,
+            .recovery_check_failed => .recovery_check_failed,
+            .source_changed => .recovery_source_changed,
+            .duplicate_check_failed => .duplicate_check_failed,
+            .abandon_failed => .persistence_failed,
+        }), projection.action_error);
+        const shown_key = projection.action_error_key orelse return error.TestExpectedPullRequestKey;
+        try testing.expect(OwnedReviewIdentity.eql(first_key, shown_key.value));
+    }
 }
 
 test "Review recovery a successful Comment delete clears an error of its own path" {

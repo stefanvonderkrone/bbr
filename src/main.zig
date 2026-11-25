@@ -729,7 +729,7 @@ fn checkVerdict(io: std.Io, gpa: std.mem.Allocator, bb: bbr.bitbucket.Client, re
     defer gpa.free(account_uuid);
     const initial_pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
     defer bbr.bitbucket.deinitPullRequest(gpa, initial_pull_request);
-    if (std.mem.eql(u8, account_uuid, initial_pull_request.author_uuid)) return error.PullRequestAuthorCannotSetReviewerVerdict;
+    if (std.mem.eql(u8, account_uuid, initial_pull_request.author_uuid)) return verdictChangeFailed(io, diagnostic, .pull_request_author, error.ReviewerVerdictChangeFailed, @src());
 
     const initial = initial_pull_request.reviewerVerdict(account_uuid);
     const target: bbr.bitbucket.ReviewerVerdict = if (initial == .approved) .changes_requested else .approved;
@@ -766,6 +766,7 @@ fn restoreReviewerVerdict(
 /// The cause that a failed change result names, else `failure`.
 fn verdictChangeCause(result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror) anyerror {
     return switch (result) {
+        .pull_request_author => error.PullRequestAuthorCannotSetReviewerVerdict,
         .api_error => |err| err,
         .unresolved => |err| err orelse failure,
         .success, .reconciled_success, .stale_source_commit => failure,
@@ -775,7 +776,7 @@ fn verdictChangeCause(result: bbr.bitbucket.ReviewerVerdictChangeResult, failure
 /// Shows a failed change with the cause that its result names, and records that cause once.
 fn verdictChangeFailed(io: std.Io, diagnostic: bbr.diagnostics.Handle, result: bbr.bitbucket.ReviewerVerdictChangeResult, failure: anyerror, comptime source: std.builtin.SourceLocation) error{Reported} {
     const cause = verdictChangeCause(result, failure);
-    return bbr.cli_failure.fail(io, diagnostic.forContext(.verdict, .{}), .execute, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) } });
+    return bbr.cli_failure.fail(io, diagnostic.forContext(.verdict, .{}), if (result == .pull_request_author) .validate else .execute, .{ .zig = cause }, source, std.Io.Writer.print, .{ "bbr: {s} ({s})\n", .{ @errorName(failure), @errorName(cause) } });
 }
 
 fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) bool {
@@ -1661,18 +1662,8 @@ test "diagnostics pending store fallback records preparation failure but not abs
     try testing.expect(std.mem.indexOf(u8, text, @errorName(cause)) != null);
 }
 
-test "diagnostics an unresolved check-verdict change has one record and reaches exitFailure as Reported" {
+test "diagnostics failed check-verdict changes have one record and reach exitFailure as Reported" {
     const testing = std.testing;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
-    defer testing.allocator.free(home);
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("XDG_STATE_HOME", home);
-    var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
-    defer sink.deinit();
-    try testing.expect(sink.setEnabled(true) == .on);
     const pr =
         "{\"id\":42,\"title\":\"Review\",\"state\":\"OPEN\",\"author\":{\"display_name\":\"Ada\",\"uuid\":\"{author}\"}," ++
         "\"source\":{\"branch\":{\"name\":\"feature\"},\"commit\":{\"hash\":\"abc123\"}}," ++
@@ -1686,23 +1677,43 @@ test "diagnostics an unresolved check-verdict change has one record and reaches 
         .{ .body = pr },
         .{ .body = pr },
     };
-    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
-    const handle = sink.handle(.verdict, .{});
-    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "w" }).withDiagnostics(handle);
-    try testing.expectError(error.Reported, checkVerdict(testing.io, testing.allocator, bb, "repo", 42, handle));
-    try testing.expectEqual(responses.len, fake.call_count);
-    _ = sink.setEnabled(false);
-    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
-    defer dir.close(testing.io);
-    var iterator = dir.iterate();
-    const entry = (try iterator.next(testing.io)).?;
-    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
-    defer testing.allocator.free(bytes);
-    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
-    _ = lines.next();
-    const only = lines.next().?;
-    try testing.expect(lines.next() == null);
-    try testing.expect(std.mem.endsWith(u8, only, "error=ConnectionResetByPeer"));
+    const author_responses = [_]bbr.http.Canned{
+        .{ .body = "{\"uuid\":\"{author}\"}" },
+        .{ .body = pr },
+    };
+    for ([_]struct { responses: []const bbr.http.Canned, phase: []const u8, cause: []const u8 }{
+        .{ .responses = &responses, .phase = "operation=verdict phase=execute", .cause = "error=ConnectionResetByPeer" },
+        .{ .responses = &author_responses, .phase = "operation=verdict phase=validate", .cause = "error=PullRequestAuthorCannotSetReviewerVerdict" },
+    }) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(home);
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        try env.put("XDG_STATE_HOME", home);
+        var sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+        defer sink.deinit();
+        try testing.expect(sink.setEnabled(true) == .on);
+        var fake: bbr.http.FakeHttpClient = .{ .responses = case.responses };
+        const handle = sink.handle(.verdict, .{});
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "w" }).withDiagnostics(handle);
+        try testing.expectError(error.Reported, checkVerdict(testing.io, testing.allocator, bb, "repo", 42, handle));
+        try testing.expectEqual(case.responses.len, fake.call_count);
+        _ = sink.setEnabled(false);
+        var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var iterator = dir.iterate();
+        const entry = (try iterator.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+        defer testing.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+        _ = lines.next();
+        const only = lines.next().?;
+        try testing.expect(lines.next() == null);
+        try testing.expect(std.mem.indexOf(u8, only, case.phase) != null);
+        try testing.expect(std.mem.endsWith(u8, only, case.cause));
+    }
 }
 
 test "login reader trims lines and preserves empty input and EOF errors" {

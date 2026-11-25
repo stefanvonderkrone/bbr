@@ -385,15 +385,15 @@ fn presentationStatus(
     if (projection.fatal_error) |err| return @tagName(err);
     // The armed re-anchor banner outlives one refusal: it keeps naming the
     // Draft and whatever the source cursor currently proposes.
-    if (projection.reanchor) |reanchor| return reanchorStatus(frame, projection, reanchor);
-    if (projection.review_search != null and projection.action_error != null) return switch (projection.action_error.?) {
+    if (projection.reanchor) |reanchor| return reanchorStatus(frame, projection, visible_key, reanchor);
+    if (projection.review_search != null and projection.action_error != null) return actionErrorStatus(frame, projection, visible_key, switch (projection.action_error.?) {
         .buffer_search_query_too_long => "Review Search Query limit is 256 characters",
         .buffer_search_invalid_query => "Review Search Query is invalid",
         .buffer_search_scan_failed => "Review Search failed",
         else => actionErrorText(projection.action_error.?),
-    };
+    });
     if (projection.buffer_search) |search_projection| return bufferSearchStatus(frame, projection, search_projection);
-    if (projection.action_error) |err| return actionErrorText(err);
+    if (projection.action_error) |err| return actionErrorStatus(frame, projection, visible_key, actionErrorText(err));
     if (projection.diagnostic_pending) return "changing diagnostic logging";
     if (projection.clipboard_status) |status| return switch (status) {
         .copied => "copied text",
@@ -443,6 +443,7 @@ fn presentationStatus(
                 .success, .reconciled_success => "Reviewer Verdict changed",
                 .api_error => "Reviewer Verdict change failed",
                 .stale_source_commit => "Reviewer Verdict unchanged; SourceCommit changed",
+                .pull_request_author => actionErrorText(.pull_request_author),
                 .unresolved => "Reviewer Verdict outcome unresolved",
             },
             .launch_failed => "Reviewer Verdict change could not start",
@@ -560,11 +561,34 @@ fn reviewerVerdictOutcomeLabel(outcome: presentation.ReviewerVerdictCommandOutco
             .reconciled_success => "changed after reconciliation",
             .api_error => "failed",
             .stale_source_commit => "refused because SourceCommit changed",
+            .pull_request_author => "refused for the PullRequest Author",
             .unresolved => "outcome unresolved",
         },
         .launch_failed => "could not start",
         .adapter_failed => "failed",
     };
+}
+
+/// Names the PullRequest of the shown action error when another one is visible.
+fn actionErrorStatus(
+    frame: std.mem.Allocator,
+    projection: presentation.Projection,
+    visible_key: ?presentation.OwnedReviewIdentity,
+    text: []const u8,
+) []const u8 {
+    const key = projection.action_error_key orelse return text;
+    if (visible_key) |visible| if (presentation.OwnedReviewIdentity.eql(key.value, visible)) return text;
+    return std.fmt.allocPrint(frame, "{s}#{d}: {s}", .{ key.repository(), key.pullRequestId(), text }) catch |err| switch (err) {
+        error.OutOfMemory => text,
+    };
+}
+
+/// The shown action error unless it belongs to another PullRequest than the
+/// visible review.
+fn visibleActionError(projection: presentation.Projection, visible_key: ?presentation.OwnedReviewIdentity) ?presentation.ActionError {
+    const key = projection.action_error_key orelse return projection.action_error;
+    const visible = visible_key orelse return null;
+    return if (presentation.OwnedReviewIdentity.eql(key.value, visible)) projection.action_error else null;
 }
 
 fn actionErrorText(err: presentation.ActionError) []const u8 {
@@ -603,7 +627,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .pull_request_not_open => "Reviewer Verdict requires an open PullRequest",
         .reviewer_verdict_unknown => "Reviewer Verdict data is unavailable; reload to retry",
         .pull_request_author_unknown => "PullRequest Author identity is unavailable; reload to retry",
-        .pull_request_author => "the PullRequest Author cannot set a Reviewer Verdict",
+        .pull_request_author => "bbr refuses to set a Reviewer Verdict for the PullRequest Author",
         .reviewer_verdict_unchanged => "the PullRequest already has this Reviewer Verdict",
         .reviewer_verdict_failed => "Bitbucket refused the Reviewer Verdict change",
         .reviewer_verdict_source_changed => "Reviewer Verdict unchanged; SourceCommit changed",
@@ -677,6 +701,7 @@ fn themeSaveOutcome(err: anyerror) presentation.ThemePersisted.Outcome {
 fn reanchorStatus(
     frame: std.mem.Allocator,
     projection: presentation.Projection,
+    visible_key: ?presentation.OwnedReviewIdentity,
     reanchor: presentation.ReanchorProjection,
 ) []const u8 {
     const fallback = "Re-anchor local Draft · Enter accept · Esc cancel";
@@ -687,7 +712,7 @@ fn reanchorStatus(
         candidate.bottom,
     }) catch |err| switch (err) {
         error.OutOfMemory => return fallback,
-    } else actionErrorText(reanchor.refusal orelse projection.action_error orelse .action_refused);
+    } else actionErrorText(reanchor.refusal orelse visibleActionError(projection, visible_key) orelse .action_refused);
     return std.fmt.allocPrint(frame, "Re-anchor local Draft #{d} → {s} · Enter accept · Esc cancel", .{
         reanchor.temp_id,
         detail,
@@ -1997,7 +2022,82 @@ test "status labels project every Reviewer Verdict" {
 test "qualified Reviewer Verdict results retain their outcome" {
     try std.testing.expectEqualStrings("changed", reviewerVerdictOutcomeLabel(.{ .completed = .success }));
     try std.testing.expectEqualStrings("refused because SourceCommit changed", reviewerVerdictOutcomeLabel(.{ .completed = .stale_source_commit }));
+    try std.testing.expectEqualStrings("refused for the PullRequest Author", reviewerVerdictOutcomeLabel(.{ .completed = .pull_request_author }));
     try std.testing.expectEqualStrings("outcome unresolved", reviewerVerdictOutcomeLabel(.{ .completed = .{ .unresolved = null } }));
+}
+
+test "Reviewer Verdict status names the PullRequest Author refusal" {
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    var state = try presentation.Presentation.init(std.testing.allocator, .{ .reviews = store.store() }, .{});
+    defer state.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 42);
+    var projection = state.projection();
+    projection.reviewer_verdict_result = .{ .key = key, .target = .approved, .outcome = .{ .completed = .pull_request_author } };
+    try std.testing.expectEqualStrings(
+        "bbr refuses to set a Reviewer Verdict for the PullRequest Author",
+        presentationStatus(std.testing.allocator, projection, key).?,
+    );
+    const other_status = presentationStatus(std.testing.allocator, projection, null).?;
+    defer std.testing.allocator.free(other_status);
+    try std.testing.expectEqualStrings("repo#42: Reviewer Verdict refused for the PullRequest Author", other_status);
+}
+
+test "an action error of another PullRequest names that PullRequest" {
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    var state = try presentation.Presentation.init(std.testing.allocator, .{ .reviews = store.store() }, .{});
+    defer state.deinit();
+    var frame = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer frame.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 42);
+    const other = try presentation.OwnedReviewIdentity.init("workspace", "repo", 7);
+    var projection = state.projection();
+    projection.action_error = .pull_request_author;
+    projection.action_error_key = .{ .value = key };
+
+    try std.testing.expectEqualStrings(
+        "repo#42: bbr refuses to set a Reviewer Verdict for the PullRequest Author",
+        presentationStatus(frame.allocator(), projection, other).?,
+    );
+    try std.testing.expectEqualStrings(
+        "bbr refuses to set a Reviewer Verdict for the PullRequest Author",
+        presentationStatus(frame.allocator(), projection, key).?,
+    );
+
+    projection.action_error = .reviewer_verdict_source_changed;
+    try std.testing.expectEqualStrings(
+        "repo#42: Reviewer Verdict unchanged; SourceCommit changed",
+        presentationStatus(frame.allocator(), projection, null).?,
+    );
+
+    projection.action_error = .out_of_memory;
+    projection.action_error_key = null;
+    try std.testing.expectEqualStrings(actionErrorText(.out_of_memory), presentationStatus(frame.allocator(), projection, other).?);
+}
+
+test "a re-anchor banner shows no action error of another PullRequest" {
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    var state = try presentation.Presentation.init(std.testing.allocator, .{ .reviews = store.store() }, .{});
+    defer state.deinit();
+    var frame = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer frame.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 42);
+    const visible = try presentation.OwnedReviewIdentity.init("workspace", "repo", 7);
+    var projection = state.projection();
+    projection.reanchor = .{ .temp_id = 3, .candidate = null, .refusal = null };
+    projection.action_error = .pull_request_author;
+    projection.action_error_key = .{ .value = key };
+
+    const refused = try std.fmt.allocPrint(frame.allocator(), "Re-anchor local Draft #3 → {s} · Enter accept · Esc cancel", .{actionErrorText(.action_refused)});
+    try std.testing.expectEqualStrings(refused, presentationStatus(frame.allocator(), projection, visible).?);
+    try std.testing.expectEqualStrings(refused, presentationStatus(frame.allocator(), projection, null).?);
+
+    const own = try std.fmt.allocPrint(frame.allocator(), "Re-anchor local Draft #3 → {s} · Enter accept · Esc cancel", .{actionErrorText(.pull_request_author)});
+    try std.testing.expectEqualStrings(own, presentationStatus(frame.allocator(), projection, key).?);
+    projection.action_error_key = null;
+    try std.testing.expectEqualStrings(own, presentationStatus(frame.allocator(), projection, visible).?);
 }
 
 const TestStatus = struct {

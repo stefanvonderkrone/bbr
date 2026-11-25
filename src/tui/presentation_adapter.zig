@@ -382,6 +382,7 @@ pub fn executeReviewerVerdict(
         .outcome = .adapter_failed,
     } };
     const cause: ?anyerror = switch (result) {
+        .pull_request_author => error.PullRequestAuthorCannotSetReviewerVerdict,
         .api_error => |err| err,
         .unresolved => |err| err,
         .success, .reconciled_success, .stale_source_commit => null,
@@ -389,7 +390,7 @@ pub fn executeReviewerVerdict(
     return .{ .reviewer_verdict_changed = .{
         .evidence = if (cause) |err| bbr.diagnostic.Failure.capture(
             .verdict,
-            if (bbr.bitbucket.asApiError(err) != null) .rejection else .execute,
+            if (result == .pull_request_author) .validate else if (bbr.bitbucket.asApiError(err) != null) .rejection else .execute,
             .{ .command_id = command.command_id },
             .{ .zig = err },
             @src(),
@@ -563,6 +564,30 @@ fn writeSummaryCache(io: std.Io, path: []const u8, bytes: []const u8) !void {
 }
 
 const testing = std.testing;
+
+test "diagnostics Reviewer Verdict Author refusal completes without an adapter failure" {
+    const pr =
+        \\{"id":42,"title":"Review","state":"OPEN","author":{"display_name":"Ada","uuid":"{author}"},
+        \\ "source":{"branch":{"name":"feature"},"commit":{"hash":"abc123"}},
+        \\ "destination":{"branch":{"name":"main"},"commit":{"hash":"def456"}},"participants":[]}
+    ;
+    var fake: bbr.http.FakeHttpClient = .{ .body = pr };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    const completed = executeReviewerVerdict(testing.allocator, .{
+        .command_id = 17,
+        .identity = .{ .value = try presentation.OwnedReviewIdentity.init("workspace", "repo", 42) },
+        .expected_source_commit = .{ .bytes = "abc123".* ++ [_]u8{0} ** 58, .len = 6 },
+        .authenticated_account_uuid = .{ .bytes = "{author}".* ++ [_]u8{0} ** 248, .len = 8 },
+        .target = .approved,
+    }, client).reviewer_verdict_changed;
+    try testing.expect(completed.outcome == .completed);
+    try testing.expectEqual(bbr.bitbucket.ReviewerVerdictChangeResult.pull_request_author, completed.outcome.completed);
+    try testing.expectEqual(bbr.diagnostic.Phase.validate, completed.evidence.?.phase);
+    try testing.expectEqual(error.PullRequestAuthorCannotSetReviewerVerdict, completed.evidence.?.cause.zig);
+    try testing.expectEqual(@as(?u64, 17), completed.evidence.?.context.command_id);
+    try testing.expectEqual(@as(usize, 1), fake.call_count);
+    try testing.expectEqual(bbr.http.client.Method.GET, fake.methodAt(0).?);
+}
 
 test "diagnostics Picker and recovery preserve distinct original adapter errors" {
     for ([_]anyerror{ error.ConnectionReset, error.HostUnreachable }) |err| {
