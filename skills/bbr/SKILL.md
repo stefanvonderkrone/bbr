@@ -29,11 +29,11 @@ Read [VERBS.md](./VERBS.md) and pick one verb from the matching group. Done when
 
 Groups: Workspaces, Repositories, Branches, PullRequests, Files, Comments, Tasks, Identity.
 
-## 3. Run VERB --help first
+## 3. Confirm flags
 
-Run `bbr api VERB --help` before first use with new flags. It prints options plus example and needs no login. Done when you quote the help example you follow.
+Copy the [VERBS.md](./VERBS.md) recipe or example of your verb when it shows every flag that you need. A test checks each command through the CLI parser and verb handler, including flag values and required flags. Run `bbr api VERB --help` only for a flag that no recipe or example of your verb shows, or after an `UnknownFlag` error. Help needs no login. Done when each flag in your command appears in a recipe or example of the same verb, or in `bbr api VERB --help`.
 
-Rules: `bbr api [--profile NAME] [--workspace SLUG] [--json] VERB [options]`. Globals go before or after the verb. All flags use long `--kebab-case`. No short flags.
+Rules: `bbr api [--profile NAME] [--workspace SLUG] [--json] VERB [options]`. Globals go before or after the verb. All flags are long kebab-case names, such as `--pull-request-id`. No short flags.
 
 ## 4. Run with output rule
 
@@ -43,11 +43,11 @@ Add `--json` for scripts. Default prints human lines. `get-diff`, `get-compare-d
 
 Reads run free. Writes need approval unless the user ordered the write. The write commands are `create-branch`, `create-pull-request`, `update-pull-request`, `decline-pull-request`, `create-comment`, `update-comment`, `delete-comment`, `resolve-comment`, `reopen-comment`, `create-task`, `update-task`, `delete-task`, `resolve-task`, `reopen-task`, and `set-verdict`. Done when approval exists or the user ordered it.
 
-`Resolve` closes without editing prose. `reopen` reverses it. A PullRequest Author cannot set a Reviewer Verdict on that PullRequest. `set-verdict` needs `--expected-source-commit`. Use `--body-file`, `--content-file`, or `--description-file` for long text. Use `whoami` for the Authenticated Account's UUID. For another account named by the user, follow the member lookup steps below.
+`Resolve` closes without editing prose. `reopen` reverses it. bbr refuses to set a Reviewer Verdict for the PullRequest Author. `set-verdict` needs `--expected-source-commit`. Use `--body-file`, `--content-file`, or `--description-file` for long text. Use `whoami` for the Authenticated Account's UUID. For another account named by the user, follow the member lookup steps below.
 
 ## Resolve an account ID or UUID
 
-Run `bbr api get-user --help`, then `bbr api get-user --user-id ID --json`.
+Run `bbr api get-user --user-id ID --json`.
 Use the exact ID supplied by the user. For a Bitbucket mention `@{ID}`, pass the ID without the mention wrapper.
 The response has `uuid`, `account_id`, `display_name`, and `nickname`. This read does not require Workspace membership.
 A public profile does not prove Repository access. Keep an unresolved mention literal if the lookup fails.
@@ -58,13 +58,12 @@ Files supplied through `--description-file` must not exceed 1 MiB.
 
 When the user names a reviewer or another account, resolve that name in the selected Workspace:
 
-1. Run `bbr api search-workspace-members --help`.
-2. Run `bbr api search-workspace-members --name 'Ada Lovelace' --json` with the user's name as the value.
+1. Run `bbr api search-workspace-members --name 'Ada Lovelace' --json` with the user's name as the value.
    For several names in the same Workspace, use one command with repeated `--name` flags:
    `bbr api search-workspace-members --name 'Ada Lovelace' --name 'Grace Hopper' --json`.
    The command fetches the member list once for all names.
    If the request fails, report the error and stop this lookup.
-3. Read the JSON array, which contains one group per supplied name in input order, including duplicate names.
+2. Read the JSON array, which contains one group per supplied name in input order, including duplicate names.
    Each group contains `name` and `matches`. Each match contains `uuid`, `display_name`, and `nickname` directly.
    Use the complete matches without `--limit` to check for ambiguity.
    Apply these selection rules independently to each group:
@@ -76,9 +75,9 @@ When the user names a reviewer or another account, resolve that name in the sele
    - For multiple results, ask the user to choose, even when one result matches exactly.
      Show each candidate's display name, nickname, and UUID.
    - For one result with larger differences or only a partial name match, ask the user to confirm that member.
-4. If a group contains no matches, ask for a more complete name, nickname, or another Workspace.
+3. If a group contains no matches, ask for a more complete name, nickname, or another Workspace.
    Search another Workspace only after the user selects it.
-5. Pass the selected UUID to the command's existing `--reviewer` or `--uuid` option.
+4. Pass the selected UUID to the command's existing `--reviewer` or `--uuid` option.
    Reviewer Verdict writes still use the Authenticated Account.
 
 Done when a single result with only minor name differences or the user's selection supplies the UUID for the next command.
@@ -89,19 +88,19 @@ Use `list-workspace-members --json` to read the member directory without a name 
 
 ## Branch and PullRequest workflow
 
-Use `create-branch --name NAME --target REV` with a commit hash or an existing branch name as the target. Branch names exclude the `refs/heads/` prefix.
+Use `create-branch --repository REPO --name NAME --target REV` with a commit hash or an existing branch name as the target. Branch names exclude the `refs/heads/` prefix.
 
 `create-pull-request` requires a title and a source branch. It creates a Ready PullRequest by default. Add `--draft true` for a Draft PullRequest. An omitted destination branch uses the Repository's main branch.
 
 For a fork source, use `--source-repository WORKSPACE/SLUG` with `--source-branch NAME`. The selected Workspace and `--repository` identify the destination Repository.
 
-Use `update-pull-request --draft false` to make a Draft PullRequest ready. Use `--draft true` to make it a draft. The command changes only supplied fields. An empty description clears the description.
+Use `update-pull-request --repository REPO --pull-request-id 42 --draft false` to make a Draft PullRequest ready. Use `--draft true` to make it a draft. The command changes only supplied fields. An empty description clears the description.
 
 Repeated `--reviewer UUID` options replace the complete reviewer list. `--clear-reviewers` sends an empty list. Do not combine `--reviewer` with `--clear-reviewers`. Without a reviewer flag, `create-pull-request` sends no reviewers and `update-pull-request` keeps them.
 
 The Bitbucket web UI adds the Default Reviewers of the Repository to a new PullRequest. The API adds none. When the user wants these reviewers, add `--default-reviewers`. The command then sends the Default Reviewers and the `--reviewer` values. Add `--effective` to use the Effective Default Reviewers, which also include the Default Reviewers of the Project. The command leaves out the PullRequest Author. It prints a warning on stderr when a `--reviewer` value names the Author. On update, `--default-reviewers` replaces the reviewer list. Do not combine `--default-reviewers` with `--clear-reviewers`. Run `list-default-reviewers --repository SLUG` to show the Default Reviewers before a write.
 
-Approval uses `set-verdict --verdict approved` with the expected SourceCommit. `decline-pull-request` closes the PullRequest without merging. Decline is not a Reviewer Verdict.
+Approval uses `set-verdict --repository REPO --pull-request-id 42 --verdict approved --expected-source-commit abc123` with the expected SourceCommit. `decline-pull-request` closes the PullRequest without merging. Decline is not a Reviewer Verdict.
 
 ## PullRequests by author or reviewer
 
@@ -109,7 +108,7 @@ Approval uses `set-verdict --verdict approved` with the expected SourceCommit. `
 
 ## Commit lookup
 
-`list-commit-pull-requests --commit HASH` lists PullRequests where Bitbucket reviewed the commit, including closed PullRequests. It follows pages by default. Use `--page`, `--pagelen`, `--no-follow`, and `--limit` to control the results.
+`list-commit-pull-requests --repository REPO --commit HASH` lists PullRequests where Bitbucket reviewed the commit, including closed PullRequests. It follows pages by default. Use `--page`, `--pagelen`, `--no-follow`, and `--limit` to control the results.
 
 The Pull Request Commit Links app must exist. Bitbucket installs it when someone selects `Go to pull request` on a commit's details page. Pending indexing fails with `PullRequestLinksIndexing`. Report the hint instead of treating that failure as an empty list. The command does not poll automatically. `NotFound` can also mean that links lack an index.
 
