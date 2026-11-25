@@ -14,6 +14,11 @@ pub const list_help =
     \\List comments (GET .../comments, follows pages). PR head is fetched
     \\automatically for outdated detection unless --no-head or explicit commits.
     \\--no-follow returns one page. --limit caps the number of comments fetched.
+    \\--query takes a Bitbucket filter on id, user.uuid, created_on, deleted, and
+    \\inline.path, such as 'user.uuid != "UUID"', with the uuid of whoami and its
+    \\braces. Bitbucket rejects resolution
+    \\and parent. Wrap each inline.path term in parentheses, because after AND
+    \\or OR Bitbucket reads "inline" as the in operator.
     \\Flags can appear in any order.
     \\
 ++ pages.pagelenHelp(bbr.bitbucket.max_pagelen.comments);
@@ -137,6 +142,10 @@ fn parseComment(args: []const []const u8, kind: enum { create, update, existing 
         if (parsed.body != null and parsed.body_file != null) return error.BadRequest;
         if (parsed.body == null and parsed.body_file == null) return error.MissingRequired;
     }
+    if (kind == .create and parsed.parent_id == null and parsed.path != null) {
+        if (parsed.to == null and parsed.from == null) return error.MissingRequired;
+        if (parsed.to != null and parsed.from != null) return error.BadRequest;
+    }
     return parsed;
 }
 
@@ -257,8 +266,6 @@ pub fn runCreate(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const
     if (p.parent_id) |pid| {
         nc.parent = pid;
     } else if (p.path) |pa| {
-        if (p.to == null and p.from == null) return error.MissingRequired;
-        if (p.to != null and p.from != null) return error.BadRequest;
         nc.scope = .{ .@"inline" = .{
             .path = pa,
             .to = p.to,
@@ -668,6 +675,20 @@ test "api comments create accepts scope before body and keeps literal global fla
         try std.testing.expectEqualStrings(body, parsed.value.content.raw);
         try std.testing.expectEqualStrings("f", parsed.value.@"inline".path);
         try std.testing.expectEqual(@as(u32, 1), parsed.value.@"inline".to);
+    }
+}
+
+test "create-comment checks inline options before reading the body" {
+    for ([_]bool{ false, true }) |json| {
+        for ([_]struct { args: []const []const u8, err: anyerror }{
+            .{ .args = &.{ "--repository=repo", "--pull-request-id=7", "--body-file=missing-comment-body.md", "--path=f" }, .err = error.MissingRequired },
+            .{ .args = &.{ "--repository=repo", "--pull-request-id=7", "--body-file=missing-comment-body.md", "--path=f", "--to=1", "--from=2" }, .err = error.BadRequest },
+        }) |case| {
+            var fake: bbr.http.FakeHttpClient = .{};
+            var output: TestOutput = .{};
+            try std.testing.expectError(case.err, runCreate(output.init(), testClient(&fake), case.args, json));
+            try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+        }
     }
 }
 

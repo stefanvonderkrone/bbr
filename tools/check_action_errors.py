@@ -3,7 +3,7 @@
 
 A shown action error records the path that set it. A completion of background
 work clears only an error of its own path, and a user action clears any error.
-`showError` and `clearError` apply that rule, so a raw write of `action_error`
+`showErrorFor` and `clearError` apply that rule, so a raw write of `action_error`
 would skip it. Both read the origin from `event_origin`. `dispatch` sets it
 from its input, and `withErrorOrigin` sets it for one piece of work, so a raw
 write of `event_origin` would give an error the wrong origin.
@@ -21,8 +21,8 @@ SOURCES = (Path("src/tui/presentation.zig"),)
 FIELDS = (
     (
         "action_error",
-        ("showError", "clearError"),
-        "Call showError(err) or clearError() instead. Both take the origin of the event that runs.",
+        ("showErrorFor", "clearError"),
+        "Call showError(err), showErrorFor(err, key), or clearError() instead. All take the origin of the event that runs.",
     ),
     (
         "event_origin",
@@ -69,7 +69,7 @@ def main():
         print(message, file=sys.stderr)
     if found:
         return 1
-    print("Only showError and clearError write action_error, and only dispatch and withErrorOrigin write event_origin.")
+    print("Only showErrorFor and clearError write action_error, and only dispatch and withErrorOrigin write event_origin.")
     return 0
 
 
