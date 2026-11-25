@@ -8779,8 +8779,8 @@ pub const Presentation = struct {
         const shown = self.action_error;
         self.replaceReviewSearchQuery((state.query orelse unreachable).query.text);
         // A failed retry runs again at the next focus check, so it keeps
-        // the shown message with its origin.
-        if (state.needs_scan) if (shown) |kept| self.withErrorOrigin(kept.origin, showError, .{ self, kept.err });
+        // the shown message with its origin and PullRequest.
+        if (state.needs_scan) if (shown) |kept| self.withErrorOrigin(kept.origin, showErrorFor, .{ self, kept.err, kept.key });
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {

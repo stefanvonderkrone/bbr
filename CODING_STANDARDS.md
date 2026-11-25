@@ -176,7 +176,7 @@ A speculative-only drop records the failure without a message.
 `failMaintenance` writes the record and the message of a failed queue or staging, so a new such site calls it in its `catch`.
 The query retry is the exception.
 `replaceReviewSearchQuery` also serves user input, so it records the failure and shows `out_of_memory`.
-After a failed retry, `retryReviewSearchQuery` shows the earlier error again with its own origin through `withErrorOrigin`.
+After a failed retry, `retryReviewSearchQuery` shows the earlier error again with its own origin and PullRequest key through `withErrorOrigin` and `showErrorFor`.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
 This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget, and it queues the File Enrichment of the active File again while the File is pending.
 While a cache update is pending, the focus check stages after that update commits.
