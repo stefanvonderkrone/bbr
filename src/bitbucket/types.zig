@@ -100,6 +100,7 @@ pub const ReviewerVerdictChangeResult = union(enum) {
     reconciled_success,
     api_error: ApiError,
     stale_source_commit,
+    pull_request_author,
     /// The error that left the outcome unknown: an `ApiError` or a transport error. Null when
     /// the mutation succeeded and the fresh read shows another Reviewer Verdict.
     unresolved: ?anyerror,

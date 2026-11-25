@@ -243,6 +243,7 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*cons
         try writer.print(": bad options ({s})\n", .{@errorName(err)});
         try writeHelp(writer, if (verb) |v| v.name else null);
     } else switch (err) {
+        error.PullRequestAuthorCannotSetReviewerVerdict => try writer.writeAll(": You are the Author of this PullRequest. bbr does not set a Reviewer Verdict on it.\n"),
         error.MissingUsername, error.MissingToken, error.MissingWorkspace => try writer.print(
             ": MissingCredential ({s})\nRun `bbr auth login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n",
             .{@errorName(err)},
@@ -494,6 +495,218 @@ test "skills/bbr/VERBS.md lists every bbr api verb once" {
     }
     try std.testing.expect(!failed);
 }
+
+test "every command in the bbr skill parses through its CLI handler" {
+    var failed = false;
+    for (verbs) |verb| {
+        const source = @embedFile("cli.zig");
+        const start = std.mem.indexOf(u8, source, verb.name) orelse return error.TestUnexpectedResult;
+        const command: DocCommand = .{
+            .path = "src/api/cli.zig",
+            .line = std.mem.count(u8, source[0..start], "\n") + 1,
+            .text = verb.example["bbr api ".len..],
+        };
+        if (!try command.check()) failed = true;
+    }
+    for ([_]struct { path: []const u8, doc: []const u8 }{
+        .{ .path = "skills/bbr/SKILL.md", .doc = @embedFile("bbr_skill_md") },
+        .{ .path = "skills/bbr/VERBS.md", .doc = @embedFile("bbr_verbs_md") },
+    }) |file| {
+        if (!try bbrApiCommandsParse(file.path, file.doc)) failed = true;
+        var lines = std.mem.splitScalar(u8, file.doc, '\n');
+        var line_number: usize = 0;
+        while (lines.next()) |line| {
+            line_number += 1;
+            var spans = std.mem.splitScalar(u8, line, '`');
+            var code = false;
+            while (spans.next()) |span| : (code = !code) {
+                if (code and !try codeSpanParses(file.path, line_number, span)) failed = true;
+            }
+        }
+    }
+    try std.testing.expect(!failed);
+}
+
+test "copied commands remove shell quote delimiters before option parsing" {
+    for ([_][]const u8{
+        "list-comments --repository='sample' --pull-request-id=\"42\" --no-head",
+        "update-pull-request --repository sample --pull-request-id '42' \\\n --draft \"false\"",
+    }) |text| {
+        const command: DocCommand = .{ .path = "quoted command", .line = 1, .text = text };
+        try std.testing.expect(try command.check());
+    }
+}
+
+test "create-comment with a missing body file sends no HTTP" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var output: TestOutput = .{};
+    var fake: bbr.http.FakeHttpClient = .{};
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    try std.testing.expectError(error.FileNotFound, comments.runCreate(
+        output.init(&env, &arena),
+        bb,
+        &.{ "--repository", "REPO", "--pull-request-id", "42", "--parent-id", "7", "--body-file", "reply.md" },
+        false,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+}
+
+fn bbrApiCommandsParse(path: []const u8, text: []const u8) !bool {
+    var ok = true;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, "bbr api")) |start| {
+        pos = start + "bbr api".len;
+        const command: DocCommand = .{
+            .path = path,
+            .line = std.mem.count(u8, text[0..start], "\n") + 1,
+            .text = text[pos..],
+        };
+        if (!try command.check()) ok = false;
+    }
+    return ok;
+}
+
+fn codeSpanParses(path: []const u8, line_number: usize, span: []const u8) !bool {
+    if (std.mem.indexOf(u8, span, "bbr api") != null) return true;
+    var tokens: DocTokens = .{ .text = span };
+    const first = tokens.next() orelse return true;
+    var args = tokens;
+    if ((findVerb(first) != null and args.next() != null) or (docVerbName(first) and hasDocFlag(tokens))) {
+        const command: DocCommand = .{ .path = path, .line = line_number, .text = span };
+        return command.check();
+    }
+    tokens = .{ .text = span };
+    var ok = true;
+    while (tokens.next()) |t| {
+        if (!std.mem.startsWith(u8, t, "--")) continue;
+        const name = flagName(t);
+        if (contains(&global_flags, name) or takesValue(name) or contains(flag_sets.switches, name)) continue;
+        std.debug.print("{s}:{d}: `{s}` names --{s}, which no row of `verbs` in src/api/cli.zig lists\n", .{ path, line_number, span, name });
+        ok = false;
+    }
+    return ok;
+}
+
+fn docVerbName(word: []const u8) bool {
+    if (word.len == 0) return false;
+    for (word) |c| if (!(std.ascii.isLower(c) or c == '-')) return false;
+    return word[0] != '-';
+}
+
+fn hasDocFlag(start: DocTokens) bool {
+    var tokens = start;
+    while (tokens.next()) |word| if (std.mem.startsWith(u8, word, "--")) return true;
+    return false;
+}
+
+const DocCommand = struct {
+    path: []const u8,
+    line: usize,
+    text: []const u8,
+
+    fn check(self: DocCommand) !bool {
+        const a = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var words: std.ArrayList([]const u8) = .empty;
+        var tokens: DocTokens = .{ .text = self.text };
+        while (tokens.next()) |raw| {
+            var word: std.ArrayList(u8) = .empty;
+            var quote: ?u8 = null;
+            for (raw) |c| {
+                if (quote) |q| {
+                    if (c == q) {
+                        quote = null;
+                        continue;
+                    }
+                } else if (c == '\'' or c == '"') {
+                    quote = c;
+                    continue;
+                }
+                try word.append(scratch, c);
+            }
+            try words.append(scratch, word.items);
+        }
+        const command: DocCommand = .{ .path = self.path, .line = self.line, .text = self.text[0..tokens.pos] };
+        const parsed = parseGlobal(scratch, words.items) catch |err| {
+            return command.reject(if (diagnosticVerb(words.items)) |row| row.name else "VERB", err);
+        };
+        const name = parsed.verb orelse {
+            if (parsed.rest.len != 0 and !parsed.help_only) return command.reject("VERB", error.UnknownFlag);
+            return true;
+        };
+        if (name.len == 0 or !std.ascii.isLower(name[0])) return true;
+        const row = findVerb(name) orelse {
+            if (std.mem.indexOfScalar(u8, name, '-') == null and !hasDocFlag(.{ .text = command.text })) return true;
+            return command.reject(name, error.UnknownVerb);
+        };
+        if (parsed.help_only) return true;
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        var output: TestOutput = .{};
+        var fake: bbr.http.FakeHttpClient = .{ .status = 403, .max_calls = 1 };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = parsed.workspace orelse "demo" });
+        row.handler(output.init(&env, &arena), bb, parsed.rest, parsed.json) catch |err| {
+            if (isOptionError(err)) return command.reject(name, err);
+        };
+        return true;
+    }
+
+    fn reject(self: DocCommand, name: []const u8, err: anyerror) bool {
+        std.debug.print("{s}:{d}: `bbr api{s}{s}` fails CLI parsing ({s}); see `bbr api {s} --help`\n", .{
+            self.path, self.line, if (std.mem.startsWith(u8, self.text, " ")) @as([]const u8, "") else " ", self.text, @errorName(err), name,
+        });
+        return false;
+    }
+};
+
+fn flagName(token: []const u8) []const u8 {
+    const name = token["--".len..];
+    return name[0 .. std.mem.indexOfScalar(u8, name, '=') orelse name.len];
+}
+
+/// Shell words of one doc command. Quoted text stays inside its word, and a
+/// backslash before a line break joins the lines. The words end at a line
+/// break, a backtick, a pipe, a list operator, a redirection, a closing
+/// parenthesis, or a comment.
+const DocTokens = struct {
+    text: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *DocTokens) ?[]const u8 {
+        while (self.pos < self.text.len) : (self.pos += 1) {
+            if (std.mem.startsWith(u8, self.text[self.pos..], "\\\n")) {
+                self.pos += 1;
+            } else if (self.text[self.pos] != ' ' and self.text[self.pos] != '\t') break;
+        }
+        if (self.pos == self.text.len) return null;
+        switch (self.text[self.pos]) {
+            '\n', '`', '|', ';', '&', '<', '>', ')', '#' => return null,
+            else => {},
+        }
+        const start = self.pos;
+        var quote: ?u8 = null;
+        while (self.pos < self.text.len) : (self.pos += 1) {
+            const c = self.text[self.pos];
+            if (c == '\n') break;
+            if (quote) |q| {
+                if (c == q) quote = null;
+            } else switch (c) {
+                '\'', '"' => quote = c,
+                ' ', '\t', '`', ')', ';', '|' => break,
+                else => {},
+            }
+        }
+        const word = self.text[start..self.pos];
+        if (std.mem.indexOf(u8, word, ">&") != null) return null;
+        return word;
+    }
+};
 
 fn bulletVerb(line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, "- `")) return null;
@@ -844,6 +1057,12 @@ test "Bitbucket rejection messages survive response cleanup and stay on stderr" 
             .expected = "bbr api list-comments: Bitbucket rejected request (Forbidden): Repository access denied\n",
         },
         .{
+            .status = 403,
+            .body = "{\"error\":{\"message\":\"Missing privileges\",\"detail\":{\"required\":[\"read:pullrequest:bitbucket\"],\"granted\":[]}}}",
+            .err = error.Forbidden,
+            .expected = "bbr api list-comments: Bitbucket rejected request (Forbidden): Missing privileges Missing token scopes: read:pullrequest:bitbucket\n",
+        },
+        .{
             .body = "{\"error\":{\"message\":\"Unsupported\\nfilter\\u001b\"}}",
             .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): Unsupported filter \n",
         },
@@ -873,6 +1092,77 @@ test "Bitbucket rejection messages survive response cleanup and stay on stderr" 
     }
 }
 
+test "scope rejections name only missing token scopes on stderr" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const message = "Your credentials lack one or more required privilege scopes.";
+    const scope = "write:repository:bitbucket";
+    const prefix = "bbr api create-branch: Bitbucket rejected request (Forbidden): ";
+    const envelope = "{\"type\":\"error\",\"error\":{\"message\":\"" ++ message ++ "\",\"detail\":";
+    const scope_prefix = "a" ** 127;
+    const edge_scopes = scope_prefix ++ "1\",\"" ++ scope_prefix ++ "2\",\"" ++ scope_prefix ++ "3\",\"" ++
+        scope_prefix ++ "4\",\"" ++ scope_prefix ++ "5\",\"" ++ scope_prefix ++ "6\",\"" ++ scope_prefix ++ "7\",\"";
+    const edge_list = scope_prefix ++ "1, " ++ scope_prefix ++ "2, " ++ scope_prefix ++ "3, " ++
+        scope_prefix ++ "4, " ++ scope_prefix ++ "5, " ++ scope_prefix ++ "6, " ++ scope_prefix ++ "7, ";
+    comptime std.debug.assert((edge_list ++ "b" ** 114).len == 1024);
+    for ([_]struct { body: []const u8, expected: []const u8 }{
+        .{
+            .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\",\"read:user:bitbucket\",\"" ++ scope ++ "\",\"read:user:bitbucket\"],\"granted\":[]}}}",
+            .expected = prefix ++ message ++ " Missing token scopes: " ++ scope ++ ", read:user:bitbucket\n",
+        },
+        .{
+            .body = envelope ++ "{\"required\":[\"read:user:bitbucket\",\"" ++ scope ++ "\",\"read:user:bitbucket\",\"" ++ scope ++ "\"],\"granted\":[\"read:user:bitbucket\"]}}}",
+            .expected = prefix ++ message ++ " Missing token scopes: " ++ scope ++ "\n",
+        },
+        .{
+            .body = envelope ++ "{\"required\":[\"write:repository:bitbucket\",\"read:repository:bitbucket\"],\"granted\":[\"read:wiki:bitbucket\",\"read:repository:bitbucket\",\"write:pullrequest:bitbucket\"]}}}",
+            .expected = prefix ++ message ++ " Missing token scopes: " ++ scope ++ "\n",
+        },
+        .{ .body = envelope ++ "\"other detail\"}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "null}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":42,\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":null}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[42],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":[42]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":[\"" ++ scope ++ "\"]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"test-token\"],\"granted\":[]}}}", .expected = prefix ++ message ++ " Missing token scopes: [redacted]\n" },
+        .{ .body = envelope ++ "{\"required\":[\"write\\nsecret\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ "a" ** 1025 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[" ++ "\"scope\"," ** 64 ++ "\"scope\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ scope ++ "\"],\"granted\":[" ++ "\"scope\"," ** 256 ++ "\"scope\"]}}}", .expected = prefix ++ message ++ "\n" },
+        .{
+            .body = envelope ++ "{\"required\":[\"" ++
+                scope_prefix ++ "1\",\"" ++ scope_prefix ++ "2\",\"" ++ scope_prefix ++ "3\",\"" ++
+                scope_prefix ++ "4\",\"" ++ scope_prefix ++ "5\",\"" ++ scope_prefix ++ "6\",\"" ++
+                scope_prefix ++ "7\",\"" ++ scope_prefix ++ "8\",\"" ++ scope_prefix ++ "9\"],\"granted\":[]}}}",
+            .expected = prefix ++ message ++ "\n",
+        },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ edge_scopes ++ "b" ** 114 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ " Missing token scopes: " ++ edge_list ++ "b" ** 114 ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"" ++ edge_scopes ++ "b" ** 115 ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ "\n" },
+        .{ .body = envelope ++ "{\"required\":[\"read:user:bitbucket\",\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ message ++ " Missing token scopes: read:user:bitbucket, " ++ scope ++ "\n" },
+        .{ .body = "{\"error\":{\"detail\":{\"required\":[\"" ++ scope ++ "\"],\"granted\":[]}}}", .expected = prefix ++ "Missing token scopes: " ++ scope ++ "\n" },
+    }) |case| {
+        for ([_]bool{ false, true }) |json| {
+            var output: TestOutput = .{};
+            var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+            defer detail.deinit();
+            var fake: bbr.http.FakeHttpClient = .{ .status = 403, .body = case.body };
+            var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" });
+            bb.error_detail = &detail;
+            const init = output.init(&env, &arena);
+            try std.testing.expectError(error.Forbidden, branches.runCreate(init, bb, &.{ "--repository=sample", "--name=probe", "--target=main" }, json));
+            try std.testing.expectEqual(error.Reported, reportFailure(init, findVerb("create-branch"), error.Forbidden, &detail, .{}));
+            try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
+            try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+            try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+        }
+    }
+}
+
 test "failed verdict changes produce no stdout success result" {
     const pr =
         \\{"id":42,"title":"Review","state":"OPEN","author":{"display_name":"Ada","uuid":"{author}"},
@@ -881,7 +1171,7 @@ test "failed verdict changes produce no stdout success result" {
     ;
     const cases = [_]struct { account: []const u8, expected_commit: []const u8, err: anyerror }{
         .{ .account = "{\"uuid\":\"{account}\"}", .expected_commit = "old", .err = error.ReviewerVerdictChangeFailed },
-        .{ .account = "{\"uuid\":\"{author}\"}", .expected_commit = "abc123", .err = error.Forbidden },
+        .{ .account = "{\"uuid\":\"{author}\"}", .expected_commit = "abc123", .err = error.PullRequestAuthorCannotSetReviewerVerdict },
     };
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
@@ -896,8 +1186,16 @@ test "failed verdict changes produce no stdout success result" {
             const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" });
             const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
             try std.testing.expectError(case.err, pullrequests.runSetVerdict(output.init(&env, &arena), bb, args, json));
+            if (std.mem.eql(u8, case.account, "{\"uuid\":\"{author}\"}")) {
+                var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+                defer detail.deinit();
+                try std.testing.expectEqual(error.Reported, reportFailure(output.init(&env, &arena), findVerb("set-verdict"), case.err, &detail, .{}));
+                try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), "You are the Author of this PullRequest. bbr does not set a Reviewer Verdict on it.") != null);
+            }
             try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
             try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+            try std.testing.expectEqual(bbr.http.client.Method.GET, fake.methodAt(0).?);
+            try std.testing.expectEqual(bbr.http.client.Method.GET, fake.methodAt(1).?);
         }
     }
 }
@@ -944,6 +1242,12 @@ test "diagnostics a refused set-verdict shows its message and has one record" {
         "\"destination\":{\"branch\":{\"name\":\"main\"},\"commit\":{\"hash\":\"def456\"}},\"participants\":[]}";
     const account: bbr.http.Canned = .{ .body = "{\"uuid\":\"{account}\"}" };
     const cases = [_]struct { responses: []const bbr.http.Canned, expected_commit: []const u8 = "abc123", message: []const u8, phase: []const u8 = "", cause: []const u8 }{
+        .{
+            .responses = &.{ .{ .body = "{\"uuid\":\"{author}\"}" }, .{ .body = pr } },
+            .message = "bbr api set-verdict: You are the Author of this PullRequest. bbr does not set a Reviewer Verdict on it.\n",
+            .phase = "phase=validate",
+            .cause = "error=PullRequestAuthorCannotSetReviewerVerdict",
+        },
         .{
             .responses = &.{ account, .{ .body = pr }, .{ .send_error = error.ConnectionResetByPeer }, .{ .body = pr } },
             .message = "bbr api set-verdict: ReviewerVerdictChangeFailed: ConnectionResetByPeer\n",
