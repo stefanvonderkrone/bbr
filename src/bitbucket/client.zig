@@ -3523,7 +3523,7 @@ test "API lifecycle PullRequest mutations return optional detail fields without 
 
 test "API lifecycle commit lookup requests summary fields instead of the short default response" {
     const a = testing.allocator;
-    const fields = "values.id,values.title,values.state,values.author.display_name,values.source.branch.name,values.destination.branch.name,values.destination.repository.full_name,values.draft,next,page,pagelen,size";
+    const fields = "values.id,values.title,values.state,values.author.display_name,values.source.branch.name,values.destination.branch.name,values.destination.repository.full_name,values.draft,values.updated_on,values.participants.approved,values.participants.state,next,page,pagelen,size";
     const endpoint = base_url ++ "/repositories/check24/myrepo/commit/abc123/pullrequests";
     const next = endpoint ++ "?fields=" ++ fields ++ "&pagelen=1&page=2";
     const short = "{\"repo_indexed\":true,\"type\":\"paginated_pullrequests\",\"page\":1,\"pagelen\":1,\"values\":[{\"draft\":false,\"id\":2389,\"links\":{\"self\":{\"href\":\"" ++ base_url ++ "/repositories/check24/myrepo/pullrequests/2389\"}},\"queued\":false,\"title\":\"Change\",\"type\":\"pullrequest\"}]}";
