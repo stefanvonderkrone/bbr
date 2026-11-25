@@ -1,6 +1,27 @@
 # bbr api verbs
 
-Run `bbr api VERB --help` for flags. No flag tables here.
+Each recipe and example passes only flags that its verb takes. Run `bbr api VERB --help` for a flag that none of them shows.
+
+A PullRequest is always `--pull-request-id`, a Comment `--comment-id`, and a Task `--task-id`. No verb takes --id.
+
+## Recipes
+
+Replace `REPO`, `42`, and `7` with real values. Replace `UUID` with the `uuid` of `bbr api whoami --json`, which includes its braces. A write recipe still needs the approval of the mutation guard in SKILL.md.
+
+```sh
+# Find the PullRequest of the current Branch
+bbr api list-pull-requests --repository REPO --source-branch "$(git branch --show-current)" --state OPEN --json
+# Read every Comment on a PullRequest
+bbr api list-comments --repository REPO --pull-request-id 42 --json
+# Read only the Comments of other accounts, such as review findings
+bbr api list-comments --repository REPO --pull-request-id 42 --query 'user.uuid != "UUID"' --json
+# Bitbucket cannot filter resolution or parent. Read the `resolved` and `parent_id` fields of the JSON instead.
+# Wrap each inline.path term in parentheses, such as 'user.uuid != "UUID" AND (inline.path != null)'.
+# Reply to Comment 7 (write)
+bbr api create-comment --repository REPO --pull-request-id 42 --parent-id 7 --body-file reply.md
+# Replace the PullRequest description (write)
+bbr api update-pull-request --repository REPO --pull-request-id 42 --description-file body.md
+```
 
 ## Workspaces
 
@@ -43,7 +64,7 @@ Run `bbr api VERB --help` for flags. No flag tables here.
 
 - `list-comments` — list Comments on a PullRequest. Example: `bbr api list-comments --repository sample --pull-request-id 42 --no-head --limit 10`
 - `get-comment` — get one Comment. Example: `bbr api get-comment --repository sample --pull-request-id 42 --comment-id 7`
-- `create-comment` — create a Comment or reply (live). Example: `bbr api create-comment --repository sample --pull-request-id 42 --body 'Please add a test.'`
+- `create-comment` — create a Comment or reply (live). Example: `bbr api create-comment --repository sample --pull-request-id 42 --body 'Please add a test.'`. Reply: `bbr api create-comment --repository sample --pull-request-id 42 --parent-id 7 --body 'Done.'`
 - `update-comment` — edit a Comment body (live). Example: `bbr api update-comment --repository sample --pull-request-id 42 --comment-id 7 --body 'Please test this case.'`
 - `delete-comment` — delete a Comment (live). Example: `bbr api delete-comment --repository sample --pull-request-id 42 --comment-id 7`
 - `resolve-comment` — resolve a thread without editing prose (live). Example: `bbr api resolve-comment --repository sample --pull-request-id 42 --comment-id 7`
@@ -64,4 +85,4 @@ Run `bbr api VERB --help` for flags. No flag tables here.
 - `whoami` — Authenticated Account UUID. Example: `bbr api whoami --json`
 - `get-user`. Read public account information by Atlassian account ID or Bitbucket UUID. Example: `bbr api get-user --user-id ACCOUNT_ID --json`
 - `get-verdict` — Reviewer Verdict for an account. Example: `bbr api get-verdict --repository sample --pull-request-id 42 --uuid '{reviewer}'`
-- `set-verdict` — set Reviewer Verdict (live). Example: `bbr api set-verdict --repository sample --pull-request-id 42 --verdict approved --expected-source-commit abc123`
+- `set-verdict` — set Reviewer Verdict (live). bbr refuses to set a Reviewer Verdict for the PullRequest Author. Example: `bbr api set-verdict --repository sample --pull-request-id 42 --verdict approved --expected-source-commit abc123`
