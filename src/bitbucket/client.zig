@@ -106,11 +106,22 @@ pub const Client = struct {
             defer self.mutex.unlock(self.io);
             self.deinit();
             self.reason = reason;
-            const Envelope = struct { @"error": ?struct { message: ?[]const u8 = null } = null };
+            const Envelope = struct { @"error": ?struct { message: ?[]const u8 = null, detail: std.json.Value = .null } = null };
             const parsed = std.json.parseFromSlice(Envelope, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return;
             defer parsed.deinit();
             const api_error = parsed.value.@"error" orelse return;
-            const message = api_error.message orelse return;
+            var scope_buffer: [1024]u8 = undefined;
+            const missing = missingTokenScopes(api_error.detail, &scope_buffer);
+            const original: []const u8 = api_error.message orelse "";
+            const expanded = if (missing.len == 0) null else std.fmt.allocPrint(
+                self.allocator,
+                "{s}{s}Missing token scopes: {s}",
+                .{ original, if (original.len == 0) "" else " ", missing },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return,
+            };
+            defer if (expanded) |text| self.allocator.free(text);
+            const message: []const u8 = if (expanded) |text| text else api_error.message orelse return;
             if (message.len == 0) return;
             var redacted: std.ArrayList(u8) = .empty;
             defer redacted.deinit(self.allocator);
@@ -241,7 +252,7 @@ pub const Client = struct {
         defer suffix.deinit(allocator);
         try suffix.appendSlice(allocator, "/commit/");
         try percentEncodeInto(allocator, &suffix, commit);
-        try suffix.appendSlice(allocator, "/pullrequests");
+        try suffix.appendSlice(allocator, "/pullrequests?fields=" ++ comptime partialFields(PrListPage));
         const url = try self.repositoryEndpoint(allocator, repo_slug, suffix.items);
         defer allocator.free(url);
         return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url, largestPage(opts, max_pagelen.commit_pull_requests), null, true);
@@ -675,7 +686,10 @@ pub const Client = struct {
             return .{ .api_error = asApiError(err) orelse return err };
         defer deinitPullRequest(allocator, before);
         if (!std.mem.eql(u8, before.source_commit, expected_source_commit)) return .stale_source_commit;
-        if (before.author_uuid.len != 0 and std.mem.eql(u8, before.author_uuid, authenticated_account_uuid)) return .{ .api_error = noted(self.diagnostic, error.Forbidden, .validate, null) };
+        if (before.author_uuid.len != 0 and std.mem.eql(u8, before.author_uuid, authenticated_account_uuid)) {
+            self.diagnostic.note(.{ .err = error.PullRequestAuthorCannotSetReviewerVerdict, .phase = .validate });
+            return .pull_request_author;
+        }
 
         const current = before.reviewerVerdict(authenticated_account_uuid);
         if (current == target) return .success;
@@ -1710,6 +1724,53 @@ pub const Client = struct {
         };
     }
 };
+
+fn tokenScope(value: std.json.Value) ?[]const u8 {
+    const text = switch (value) {
+        .string => |text| text,
+        else => return null,
+    };
+    if (text.len == 0 or text.len > 128) return null;
+    for (text) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != ':' and byte != '_' and byte != '-') return null;
+    return text;
+}
+
+fn missingTokenScopes(detail: std.json.Value, buffer: []u8) []const u8 {
+    const object = switch (detail) {
+        .object => |object| object,
+        else => return "",
+    };
+    const required = switch (object.get("required") orelse return "") {
+        .array => |array| array.items,
+        else => return "",
+    };
+    const granted = switch (object.get("granted") orelse return "") {
+        .array => |array| array.items,
+        else => return "",
+    };
+    if (required.len > 64 or granted.len > 256) return "";
+    for (required) |value| _ = tokenScope(value) orelse return "";
+    for (granted) |value| _ = tokenScope(value) orelse return "";
+    var length: usize = 0;
+    for (required, 0..) |value, index| {
+        const scope = value.string;
+        const duplicate = for (required[0..index]) |entry| {
+            if (std.mem.eql(u8, scope, entry.string)) break true;
+        } else false;
+        if (duplicate) continue;
+        const found = for (granted) |entry| {
+            if (std.mem.eql(u8, scope, entry.string)) break true;
+        } else false;
+        if (found) continue;
+        const separator = if (length == 0) "" else ", ";
+        if (separator.len + scope.len > buffer.len - length) return "";
+        @memcpy(buffer[length..][0..separator.len], separator);
+        length += separator.len;
+        @memcpy(buffer[length..][0..scope.len], scope);
+        length += scope.len;
+    }
+    return buffer[0..length];
+}
 
 /// Paging for list endpoints. `follow` follows `next` links (default true:
 /// return all items). With `follow=false` a single page is returned.
@@ -3336,6 +3397,37 @@ test "API lifecycle PullRequest mutations return optional detail fields without 
     try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .source_repository = "fork/sample" }));
     try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .title = "Change", .source_repository = "fork/sample" }));
     try testing.expectEqual(@as(usize, 3), fake.call_count);
+}
+
+test "API lifecycle commit lookup requests summary fields instead of the short default response" {
+    const a = testing.allocator;
+    const fields = "values.id,values.title,values.state,values.author.display_name,values.source.branch.name,values.destination.branch.name,values.destination.repository.full_name,values.draft,next,page,pagelen,size";
+    const endpoint = base_url ++ "/repositories/check24/myrepo/commit/abc123/pullrequests";
+    const next = endpoint ++ "?fields=" ++ fields ++ "&pagelen=1&page=2";
+    const short = "{\"repo_indexed\":true,\"type\":\"paginated_pullrequests\",\"page\":1,\"pagelen\":1,\"values\":[{\"draft\":false,\"id\":2389,\"links\":{\"self\":{\"href\":\"" ++ base_url ++ "/repositories/check24/myrepo/pullrequests/2389\"}},\"queued\":false,\"title\":\"Change\",\"type\":\"pullrequest\"}]}";
+    const summary = "{\"id\":2389,\"title\":\"Change\",\"state\":\"MERGED\",\"author\":{\"display_name\":\"Ada\"},\"source\":{\"branch\":{\"name\":\"feature\"}},\"destination\":{\"branch\":{\"name\":\"main\"},\"repository\":{\"full_name\":\"check24/myrepo\"}},\"draft\":false}";
+    const responses = [_]httpc_fixture.Canned{
+        .{ .request_key = "?fields=" ++ fields ++ "&pagelen=1&page=2", .body = "{\"page\":2,\"pagelen\":1,\"values\":[" ++ summary ++ "]}" },
+        .{ .request_key = "?fields=" ++ fields, .body = "{\"page\":1,\"pagelen\":1,\"values\":[" ++ summary ++ "],\"next\":\"" ++ next ++ "\"}" },
+    };
+    var fake: FakeHttpClient = .{ .body = short, .responses = &responses, .max_calls = 2 };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const result = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{ .pagelen = 1 });
+    defer deinitSummaries(a, result);
+    try testing.expectEqual(@as(usize, 2), result.len);
+    try testing.expectEqual(@as(usize, 2), fake.call_count);
+    try testing.expectEqualStrings(endpoint ++ "?fields=" ++ fields ++ "&pagelen=1", fake.urlAt(0).?);
+    try testing.expectEqualStrings(next, fake.urlAt(1).?);
+    for (result) |pr| {
+        try testing.expectEqual(@as(u64, 2389), pr.id);
+        try testing.expectEqualStrings("Change", pr.title);
+        try testing.expectEqualStrings("MERGED", pr.state);
+        try testing.expectEqualStrings("Ada", pr.author_display_name);
+        try testing.expectEqualStrings("feature", pr.source_branch);
+        try testing.expectEqualStrings("main", pr.destination_branch);
+        try testing.expectEqualStrings("check24/myrepo", pr.destination_repository);
+        try testing.expect(!pr.draft);
+    }
 }
 
 test "API lifecycle commit lookup has no state filter and reports pending pages" {
@@ -6434,7 +6526,7 @@ test "a list without a requested pagelen requests the largest page of its endpoi
     a.free(try bb.listWorkspaceMembers(a, .{}));
     try testing.expectEqualStrings(base_url ++ "/workspaces/check24/members?pagelen=100", fake.lastUrl().?);
     a.free(try bb.listCommitPullRequests(a, "repo", "abc", .{}));
-    try testing.expectEqualStrings(base_url ++ "/repositories/check24/repo/commit/abc/pullrequests?pagelen=100", fake.lastUrl().?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/repo/commit/abc/pullrequests?fields=" ++ comptime partialFields(PrListPage) ++ "&pagelen=100", fake.lastUrl().?);
 }
 
 test "review fixes typed pagers free in-flight URL and previous items on errors" {
@@ -6535,7 +6627,7 @@ test "review followups Reviewer Verdict rejects the PullRequest Author before mu
     for ([_]types.ReviewerVerdict{ .approved, .changes_requested, .no_verdict }) |target| {
         var fake: FakeHttpClient = .{ .body = verdict_none };
         const result = try Client.init(fake.httpClient(), testCredential()).changeReviewerVerdict(testing.allocator, "repo", 42, "abc123", "{ada}", target);
-        try testing.expectEqual(error.Forbidden, result.api_error);
+        try testing.expectEqual(types.ReviewerVerdictChangeResult.pull_request_author, result);
         try testing.expectEqual(@as(usize, 1), fake.call_count);
         try testing.expectEqual(httpc.Method.GET, fake.methodAt(0).?);
     }
