@@ -37282,6 +37282,41 @@ test "M21 kernel Review Search keeps another message of the same event when a re
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
 }
 
+test "M21 kernel Review Search keeps the PullRequest of a shown error when a reopened query retry fails" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+    const other = OwnedRemoteReviewIdentity.init(try OwnedReviewIdentity.init("workspace", "other", 7));
+    presentation.withErrorOrigin(.reviewer_verdict, Presentation.showErrorFor, .{ &presentation, .reviewer_verdict_launch_failed, other });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(presentation.published.?.review_search.needs_scan);
+    const shown = presentation.action_error orelse return error.TestExpectedActionError;
+    try testing.expectEqual(ActionError.reviewer_verdict_launch_failed, shown.err);
+    try testing.expectEqual(ErrorOrigin.reviewer_verdict, shown.origin);
+    const shown_key = shown.key orelse return error.TestExpectedPullRequestKey;
+    try testing.expect(OwnedRemoteReviewIdentity.eql(other, shown_key));
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+}
+
 test "M21 kernel Review Search starts no source scan while a query edit is pending" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
