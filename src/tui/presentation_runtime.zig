@@ -314,6 +314,62 @@ test "diagnostics a refused Reviewer Verdict change has one record from the work
     }
 }
 
+test "diagnostics a failed Buffer build has one record from the worker boundary" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", home);
+    var diagnostic_sink = bbr.diagnostics.Sink.init(testing.allocator, testing.io, &env);
+    defer diagnostic_sink.deinit();
+    try testing.expect(diagnostic_sink.setEnabled(true) == .on);
+    const session = try @import("session.zig").create(testing.allocator);
+    session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+    session.source = .{ .local = .{ .common_dir = "." } };
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\n");
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature"), .session = session },
+    });
+    defer state.deinit();
+    while (state.takeCommand()) |command| {
+        var owned = command;
+        owned.deinit();
+    }
+    try state.dispatch(.{ .action = .toggle_layout });
+    const job = state.takeCommand().?.build_buffer_disclosure;
+    var saved_arena = job.arena;
+    defer saved_arena.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    job.arena = std.heap.ArenaAllocator.init(failing.allocator());
+    job.build();
+    try testing.expect(job.failed);
+    var sink: CapturingSink = .{};
+    var completion = sink.sink();
+    completion.diagnostic = diagnostic_sink.handle(.buffer_build, .{});
+    deliver(completion, .{ .buffer_disclosure_built = job });
+    try state.dispatch(sink.input.?);
+    sink.input = null;
+    try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+    try testing.expect(state.takeCommand() == null);
+    _ = diagnostic_sink.setEnabled(false);
+    var dir = try tmp.dir.openDir(testing.io, "bbr/diagnostics", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(testing.io)).?;
+    const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    _ = lines.next();
+    const only = lines.next().?;
+    try testing.expect(lines.next() == null);
+    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
+}
+
 test "diagnostics launch failure retains actual cause and command work identities" {
     var command: presentation.OwnedCommand = .{ .list_pull_requests = .{ .command_id = 19, .work_id = 29, .repository = .{ .bytes = undefined, .len = 0 } } };
     var input = try command.launchFailed(error.ConcurrencyUnavailable);
