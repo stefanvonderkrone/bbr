@@ -76,7 +76,7 @@ A user handler overrides only for an error that a later completion of another pa
 Name the reason in a comment at each override.
 When an error must stay through a completion of its own event path, give the path its own `ErrorOrigin` instead of an override, as Draft builds have `.draft`.
 
-No check: the type and the line check see that only the event and `withErrorOrigin` set the origin, but not that an override names the right path. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
+No check: the type and the line check see that only the event and `withErrorOrigin` set the origin, and that each override names an enum literal, but not that an override names the right path. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
 
 ### Reserve storage in every rebuild
 
@@ -174,9 +174,8 @@ These sites are maintenance work:
 A speculative-only drop records the failure without a message.
 
 `failMaintenance` writes the record and the message of a failed queue or staging, so a new such site calls it in its `catch`.
-The query retry is the exception.
-`replaceReviewSearchQuery` also serves user input, so it records the failure and shows `out_of_memory`.
-After a failed retry, `retryReviewSearchQuery` shows the earlier error again with its own origin and PullRequest key through `withErrorOrigin` and `showErrorFor`.
+A function that also serves user input, such as `setReviewSearchQuery`, records its failure and returns `error.Reported` without a message.
+Then each caller picks the message.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
 This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget, and it queues the File Enrichment of the active File again while the File is pending.
 While a cache update is pending, the focus check stages after that update commits.
@@ -193,6 +192,7 @@ The failure of a user input is the outcome of that input. So the retry records t
 `failDroppedInput` does both.
 These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and the `.draft_save` and `.draft_mutation` prongs of `retryContentBuild`.
 `selectVersion` also calls it when its view build or its File Enrichment cannot queue, because no later check does that input again.
+So does `replaceReviewSearchQuery` when the scan of a query edit cannot queue.
 An enrichment failure can cancel the pending reading location from a refresh or Reconciliation.
 That cancellation drops part of the refresh or Reconciliation.
 No later check restores the canceled location.
