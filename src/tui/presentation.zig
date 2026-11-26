@@ -37449,6 +37449,42 @@ test "M21 kernel Review Search keeps another message of the same event when a re
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
 }
 
+/// Fails the next allocation after `armed` is set, and every later one succeeds.
+const FailOnceAllocator = struct {
+    child: Allocator,
+    armed: bool = false,
+    failed: bool = false,
+
+    fn allocator(self: *FailOnceAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        if (self.armed) {
+            self.armed = false;
+            self.failed = true;
+            return null;
+        }
+        return self.child.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, return_address);
+    }
+};
+
 fn drainTestCommands(presentation: *Presentation) usize {
     var records: usize = 0;
     while (presentation.takeCommand()) |next| {
@@ -37519,6 +37555,50 @@ test "M21 kernel a Review Search destination shows the failure of its cache stag
         try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
         // The discarded source scan and the released holds each fail to stage.
         try testing.expectEqual(@as(usize, 2), drainTestCommands(&presentation));
+    }
+}
+
+test "M21 kernel a successful acquisition pump keeps the failure of the Review Search query retry before it" {
+    for ([_]bool{ false, true }) |focus_check| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+        // Escape while the query scan is pending leaves the reopened query
+        // without a scan.
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        try testing.expect(presentation.published.?.review_search.needs_scan);
+        _ = drainTestCommands(&presentation);
+        // The first allocation is the queue slot of the query retry, and the
+        // pump that follows queues the Files.
+        presentation.commands.clearAndFree(presentation.allocator);
+        presentation.issued_enrichments.clearAndFree(presentation.allocator);
+        once.armed = true;
+        if (focus_check) {
+            // The open fails its retry, so the query stays without a scan
+            // while Review Search is open.
+            try presentation.dispatch(.{ .action = .open_review_search });
+            try testing.expect(once.failed);
+            presentation.discardQueuedSearchEnrichments(presentation.published.?);
+            _ = drainTestCommands(&presentation);
+            presentation.commands.clearAndFree(presentation.allocator);
+            presentation.issued_enrichments.clearAndFree(presentation.allocator);
+            once.armed = true;
+        }
+        try presentation.dispatch(if (focus_check) .ensure_focused_enrichment else .{ .action = .open_review_search });
+        try testing.expect(once.failed);
+        try testing.expect(presentation.published.?.review_search.needs_scan);
+        var queued: usize = 0;
+        for (presentation.commands.items) |command| queued += @intFromBool(command == .enrich_file);
+        try testing.expect(queued > 0);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        try testing.expectEqual(@as(usize, 1), drainTestCommands(&presentation));
     }
 }
 
