@@ -12751,14 +12751,21 @@ pub const Presentation = struct {
         }
     }
 
+    /// The pump runs after the range work, so no early return of the range
+    /// work skips it.
+    fn ensureFocusedEnrichment(self: *Presentation) void {
+        if (self.shutdown_requested) return;
+        const published = self.published orelse return;
+        self.ensureFocusedRange(published);
+        self.pumpReviewSearchAcquisition(published);
+    }
+
     /// Keep File Enrichment for the Enrichment Range. The active File is
     /// demand work. Once it is terminal, the other Files in the range follow
     /// as speculative work, up to `max_speculative_enrichments` at once: the
     /// visible Files from top to bottom, then the overscan Files above, then
     /// the overscan Files below.
-    fn ensureFocusedEnrichment(self: *Presentation) void {
-        if (self.shutdown_requested) return;
-        const published = self.published orelse return;
+    fn ensureFocusedRange(self: *Presentation, published: *Published) void {
         const files = @min(published.session.diff.files.len, published.session.enrichment.len());
         const active = if (published.activeFile()) |index| if (index < files) index else null else null;
         const range = enrichmentRange(published, active, files);
@@ -12776,7 +12783,7 @@ pub const Presentation = struct {
         }
         const enrichment = &published.session.enrichment;
         enrichment.focusAdmitted(range.focused);
-        if (published.review_search.open) return self.pumpReviewSearchAcquisition(published);
+        if (published.review_search.open) return;
         if (active) |file_index| {
             if (enrichment.needsEnrichment(file_index)) {
                 _ = self.queueMaintenanceFileEnrichment(published, file_index);
