@@ -34256,6 +34256,26 @@ test "Review recovery a completed cache update clears a failed build of its own 
     try testing.expect(state.projection().action_error == null);
 }
 
+test "Review recovery a failed cache update keeps the shown message" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        });
+        defer state.deinit();
+        if (message_shown) try showTestPickerLoadFailure(&state);
+        const published = state.published.?;
+        try state.queueCacheBuild(published, published.session.enrichment.focused);
+        const job = state.takeCommand().?.build_buffer_disclosure;
+        job.failed = true;
+        try state.dispatch(.{ .buffer_disclosure_built = job });
+        const shown: ActionError = if (message_shown) .picker_load_failed else .buffer_build_failed;
+        try testing.expectEqual(@as(?ActionError, shown), state.projection().action_error);
+        try testing.expect(published.pending_cache_update == null);
+    }
+}
+
 test "Review recovery Picker error survives the focus check that starts a File Enrichment" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
