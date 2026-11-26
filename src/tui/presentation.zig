@@ -7047,6 +7047,7 @@ pub const Presentation = struct {
     /// Review has that name.
     fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedRemoteReviewIdentity) void {
         self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key };
+        self.status_revision +%= 1;
     }
 
     /// A user action clears any error. Other work clears only an error of its
@@ -7054,7 +7055,9 @@ pub const Presentation = struct {
     fn clearError(self: *Presentation) void {
         const shown = self.action_error orelse return;
         const origin = self.errorOrigin();
-        if (origin == .user or shown.origin == origin) self.action_error = null;
+        if (origin != .user and shown.origin != origin) return;
+        self.action_error = null;
+        self.status_revision +%= 1;
     }
 
     fn errorOrigin(self: *const Presentation) ErrorOrigin {
@@ -24220,7 +24223,10 @@ test "a failed Selected Version change preserves the complete published interact
 
     const after = presentation.projection();
     try testing.expect(failing.has_induced_failure);
-    try testing.expect(std.meta.eql(before.revision, after.revision));
+    try testing.expectEqual(before.revision.interaction, after.revision.interaction);
+    try testing.expectEqual(before.revision.frame, after.revision.frame);
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), after.action_error);
+    try testing.expect(before.revision.status != after.revision.status);
     try testing.expectEqual(before.review.?.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
     try testing.expect(std.meta.eql(before.review.?.navigation, after.review.?.navigation));
     try testing.expectEqual(SelectedVersion.new, after.review.?.selected_version);
