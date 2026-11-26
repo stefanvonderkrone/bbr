@@ -189,6 +189,11 @@ class ActionErrorsTest(unittest.TestCase):
         self.assertIn("is not an enum literal", found[0])
         self.assertIn("failMaintenance", found[0])
 
+    def test_a_file_without_the_presentation_struct_is_rejected(self):
+        found = self.check(COPIED_ORIGIN.replace("pub const Presentation = struct {", "pub const Renamed = struct {"))
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("src/tui/presentation.zig:1: has no line `pub const Presentation = struct {`", found[0])
+
 
 if __name__ == "__main__":
     unittest.main()
