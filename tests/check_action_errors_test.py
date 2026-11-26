@@ -191,6 +191,18 @@ class ActionErrorsTest(unittest.TestCase):
         self.assertIn("is not an enum literal", found[0])
         self.assertIn("failMaintenance", found[0])
 
+    def test_a_qualified_origin_is_rejected(self):
+        found = self.check(
+            "pub const Presentation = struct {\n"
+            "    fn retry(self: *Presentation) void {\n"
+            "        self.withErrorOrigin(ErrorOrigin.user, showError, .{ self, .out_of_memory });\n"
+            "        self.withErrorOrigin(.user, showError, .{ self, .out_of_memory });\n"
+            "    }\n"
+            "};\n"
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("src/tui/presentation.zig:3: passes a withErrorOrigin origin that is not an enum literal.", found[0])
+
     def test_a_file_without_the_presentation_struct_is_rejected(self):
         found = self.check(COPIED_ORIGIN.replace("pub const Presentation = struct {", "pub const Renamed = struct {"))
         self.assertEqual(len(found), 1, found)
