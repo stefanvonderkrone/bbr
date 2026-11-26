@@ -12,7 +12,7 @@ Thus a TUI rule with a check in `tools/` still goes in a TUI area doc.
 Take the first area that matches:
 
 1. The rule is about a failure: a `catch`, an error return, an error comparison, a failure record, diagnostic evidence, or a task spawn. Use [`diagnostics.md`](../rules/diagnostics.md).
-2. The rule governs only `src/persist/` or `src/bitbucket/`, such as a schema migration step, a migration test fixture in `src/persist/`, a Bitbucket URL path, or a cache of the Bitbucket client. Use [`persist-and-bitbucket.md`](../rules/persist-and-bitbucket.md). A rule for a check in `tests/` or `tools/`, such as a CLI check that needs the schema version, goes to the next area.
+2. The rule governs only `src/persist/` or `src/bitbucket/`, such as a schema migration step or a migration test in `src/persist/sqlite_store.zig`, a REST path in `src/bitbucket/client.zig`, or the pull-request URL parse in `src/bitbucket/url.zig`. Use [`persist-and-bitbucket.md`](../rules/persist-and-bitbucket.md).
 3. The rule governs `build.zig`, `tools/`, `tests/`, `src/benchmark*`, the libraries and system calls of the core module of `src/root.zig`, or the release publication. Use [`build-and-checks.md`](../rules/build-and-checks.md).
 4. The rule governs `src/main.zig`, `src/api/`, `src/completion.zig`, `src/stdout.zig`, or `src/xdg.zig`. Use [`cli.md`](../rules/cli.md).
 5. The rule decides what a terminal cell shows: a border, a glyph, a color, a Title, the status, or where a Slot sits. Use [`tui-paint.md`](../rules/tui-paint.md).
