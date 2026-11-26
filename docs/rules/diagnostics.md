@@ -108,6 +108,16 @@ In Presentation, `failMaintenance` and `failDroppedInput` write the one record o
 
 Enforcement: `Handle.record` in `src/diagnostics.zig` drops `error.Reported` in every build. `Sink.record` is private, so no record reaches the Sink another way. `SqliteStore.native` returns an error union, so a plain SQLite error after a recorded result does not compile. The `diagnostics` tests in `src/diagnostics.zig`, `src/tui/presentation.zig`, `src/tui/presentation_runtime.zig`, `src/tui/app.zig`, `src/api/cli.zig`, `src/main.zig`, and `src/bitbucket/client.zig` read exactly one record per failure at each boundary kind. So do `tests/record_once_cli_test.py`, `tests/config_load_cli_test.py`, and `tests/store_message_cli_test.py`. `zig build test` runs them.
 
+## A failed Buffer build has its record from the worker boundary
+
+A failed Buffer build carries its cause as `evidence` in the `DisclosureBuild`.
+`recordFailures` in `src/tui/presentation_runtime.zig` writes the one record of that evidence.
+`deliver` calls it for a worker result before it posts the completion.
+The command drain in `src/tui/app.zig` calls it for a launch failure.
+So `acceptBufferDisclosure` writes no record for a failed build of any kind. It only shows the message.
+
+Enforcement: the test "diagnostics a failed Buffer build has one record from the worker boundary" in `src/tui/presentation_runtime.zig` reads exactly one record in the Sink and no report command from Presentation. It fails when `recordFailures` skips the evidence and when Presentation writes a second record. `zig build test` runs it. No test covers the launch failure path.
+
 ## A client notes leaf evidence in the boundary slot
 
 The HTTP, Bitbucket, and Git clients are not boundaries. Their callers branch on the error name, so the clients return the typed error without a record. A client notes the evidence that only it has through `Handle.note` in the slot of the boundary. Examples are the HTTP status, the transport phase, the JSON parse error, the page, and the Git termination. `Handle.record` puts that evidence into the one record of the same error.
