@@ -31343,6 +31343,51 @@ test "M21 kernel Review Search acquisition queue failure records once and keeps 
     try testing.expectEqual(@as(usize, 8), command.enrich_file.file_index);
 }
 
+test "M21 kernel opening Review Search shows the failure of its acquisition queue" {
+    for ([_]bool{ false, true }) |reopened_query| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_review_search });
+        if (reopened_query) try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        try testing.expectEqual(reopened_query, presentation.published.?.review_search.needs_scan);
+        while (presentation.takeCommand()) |next| {
+            var queued = next;
+            queued.deinit();
+        }
+        try testing.expectEqual(@as(usize, 0), presentation.issued_enrichments.items.len);
+        presentation.issued_enrichments.clearAndFree(presentation.allocator);
+        try presentation.commands.ensureTotalCapacity(presentation.allocator, 32);
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.{ .action = .open_review_search });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        var records: usize = 0;
+        var query_scans: usize = 0;
+        while (presentation.takeCommand()) |next| {
+            var command = next;
+            defer command.deinit();
+            switch (command) {
+                .report_diagnostic => |failure| {
+                    try testing.expectEqual(bbr.diagnostic.Operation.file_enrichment, failure.operation);
+                    records += 1;
+                },
+                .scan_buffer_search => query_scans += 1,
+                else => {},
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), records);
+        try testing.expectEqual(@as(usize, @intFromBool(reopened_query)), query_scans);
+    }
+}
+
 test "M21 kernel cache focus supersedes queued and issued focus changes" {
     for ([_]bool{ false, true }) |issued| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
