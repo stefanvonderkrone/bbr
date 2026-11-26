@@ -8845,8 +8845,8 @@ pub const Presentation = struct {
         self.replaceReviewSearchQuery(text[0..end]);
     }
 
-    /// A query edit of the person is not retried when its scan cannot
-    /// queue, so the failure shows over another message.
+    /// A query edit or a reopened query is the outcome of a user input, so
+    /// its failure shows over another message.
     fn replaceReviewSearchQuery(self: *Presentation, text: []const u8) void {
         self.setReviewSearchQuery(text) catch |err| self.failDroppedInput(err, @src());
     }
