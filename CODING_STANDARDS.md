@@ -157,6 +157,9 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 A failure of maintenance work records its cause once and shows its failure message only when no message shows.
 An allocation failure uses `out_of_memory`.
 A failed enrichment build uses `buffer_build_failed`.
+The worker boundary writes the one record of a failed build of any kind.
+`deliver` in `src/tui/presentation_runtime.zig` records the evidence of the build before it posts the completion.
+So `acceptBufferDisclosure` writes no record for a failed build. The test "diagnostics a failed Buffer build has one record from the worker boundary" fails when either layer changes.
 A success clears only an error of its own origin, by [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
 A successful cache staging writes no message.
 A user action that hands its work to maintenance work calls `clearError` before it does so, as `openReviewSearchOccurrence` does before the acquisition pump for an evicted File.
