@@ -4106,7 +4106,7 @@ pub const DeleteConfirmationProjection = struct {
 /// The path that shows an action error. A completion of background work
 /// clears only an error of its own path, so it keeps an error that the user
 /// has not read yet. A key, a mouse action, or an Overlay action is `.user`
-/// and clears any error.
+/// and clears any error of an earlier event.
 const ErrorOrigin = enum {
     user,
     picker,
@@ -4123,10 +4123,18 @@ const ErrorOrigin = enum {
     review_search,
 };
 
+const KeptFailure = struct {
+    err: ActionError,
+    /// The `Presentation.event_serial` of the event of the failed step.
+    event: u64,
+};
+
 const ShownError = struct {
     err: ActionError,
     origin: ErrorOrigin,
     key: ?OwnedRemoteReviewIdentity,
+    /// The `Presentation.event_serial` of the event that showed it.
+    event: u64,
 };
 
 pub const ActionError = enum {
@@ -6755,6 +6763,11 @@ pub const Presentation = struct {
     /// for one piece of work. It is null outside both, and then an action
     /// error is a bug.
     event_origin: ?ErrorOrigin = null,
+    /// Counts the events, so a clear can tell the message of the event that
+    /// runs from an older one.
+    event_serial: u64 = 0,
+    /// The failure of a maintenance step that kept an older message.
+    kept_failure: ?KeptFailure = null,
     diagnostic_state: bbr.diagnostic.State = .off,
     diagnostic_pending: bool = false,
     fatal_error: ?FatalError = null,
@@ -6841,6 +6854,7 @@ pub const Presentation = struct {
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
         const outer_origin = self.event_origin;
+        if (outer_origin == null) self.event_serial +%= 1;
         self.event_origin = input.errorOrigin();
         defer self.event_origin = outer_origin;
         // The preview hold acquires Files for the Review Search after every event.
@@ -7046,16 +7060,22 @@ pub const Presentation = struct {
     /// name it as `repo#id` while another review is visible. Only a Remote
     /// Review has that name.
     fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedRemoteReviewIdentity) void {
-        self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key };
+        self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key, .event = self.event_serial };
         self.status_revision +%= 1;
     }
 
-    /// A user action clears any error. Other work clears only an error of its
-    /// own origin.
+    /// A user action clears any error of an earlier event. Other work clears
+    /// only such an error of its own origin. A message of the event that runs
+    /// is the outcome of one of its steps, so no clear of that event removes
+    /// it. The order of a clear and the steps of an event does not matter.
     fn clearError(self: *Presentation) void {
         const shown = self.action_error orelse return;
         const origin = self.errorOrigin();
+        if (shown.event == self.event_serial) return;
         if (origin != .user and shown.origin != origin) return;
+        // A failed maintenance step of this event kept this message, so the
+        // failure takes its place.
+        if (self.kept_failure) |kept| if (kept.event == self.event_serial) return self.showError(kept.err);
         self.action_error = null;
         self.status_revision +%= 1;
     }
@@ -7068,6 +7088,7 @@ pub const Presentation = struct {
     /// path, and then restores the origin of the event.
     fn withErrorOrigin(self: *Presentation, origin: ErrorOrigin, comptime work: anytype, args: anytype) @typeInfo(@TypeOf(work)).@"fn".return_type.? {
         const outer = self.event_origin;
+        if (outer == null) self.event_serial +%= 1;
         self.event_origin = origin;
         defer self.event_origin = outer;
         return @call(.auto, work, args);
@@ -8782,9 +8803,7 @@ pub const Presentation = struct {
 
     /// A reopened query whose scan could not queue stays pending with
     /// `needs_scan`. A failure keeps the shown message, and a success clears
-    /// only a Review Search error. A successful acquisition pump after a
-    /// failed retry clears its message, a gap that the rule in
-    /// `docs/rules/tui-state.md` names.
+    /// only a Review Search error.
     fn retryReviewSearchQuery(self: *Presentation) void {
         const published = self.published orelse return;
         const state = &published.review_search;
@@ -9126,7 +9145,14 @@ pub const Presentation = struct {
     /// failure has one record and keeps the shown message.
     fn failMaintenance(self: *Presentation, operation: bbr.diagnostic.Operation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
         self.reportFailure(operation, .prepare, err, source);
-        if (self.action_error == null) self.showError(.out_of_memory);
+        self.showMaintenanceError(.out_of_memory);
+    }
+
+    /// A later check does the failed step again, so its failure keeps a
+    /// shown message. A clear of the same event then shows `err` instead.
+    fn showMaintenanceError(self: *Presentation, err: ActionError) void {
+        if (self.action_error == null) return self.showError(err);
+        self.kept_failure = .{ .err = err, .event = self.event_serial };
     }
 
     /// No later check retries this input, so its failure replaces the shown message.
@@ -10225,8 +10251,9 @@ pub const Presentation = struct {
             if (job.kind == .card_destination) return self.failCardDestination(published, .buffer_build_failed);
             const dropped_location = releaseEnrichments(published, job.enrichments.items);
             const speculative = job.kind == .enrichment and EnrichedFile.allSpeculative(job.enrichments.items);
-            if (!job.kind.isMaintenance() or dropped_location or (!speculative and self.action_error == null))
+            if (!job.kind.isMaintenance() or dropped_location) {
                 self.showError(.buffer_build_failed);
+            } else if (!speculative) self.showMaintenanceError(.buffer_build_failed);
             return;
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -10701,7 +10728,7 @@ pub const Presentation = struct {
             self.failDroppedInput(err, source);
         } else {
             self.reportFailure(.completion, .admission, err, source);
-            if (!EnrichedFile.allSpeculative(enrichments) and self.action_error == null) self.showError(.out_of_memory);
+            if (!EnrichedFile.allSpeculative(enrichments)) self.showMaintenanceError(.out_of_memory);
         }
         for (enrichments) |*enriched| enriched.result.deinit();
     }

@@ -155,12 +155,12 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 
 [Maintenance work](src/tui/GLOSSARY.md) is work that no input asked for and that a later check does again.
 A failure of maintenance work records its cause once and shows its failure message only when no message shows.
+`showMaintenanceError` makes that decision, and a later clear of the same event shows the kept failure.
 An allocation failure uses `out_of_memory`.
 A failed enrichment or cache update build uses `buffer_build_failed`.
 [A failed Buffer build has its record from the worker boundary](docs/rules/diagnostics.md#a-failed-buffer-build-has-its-record-from-the-worker-boundary).
 A success clears only an error of its own origin, by [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
 A successful cache staging writes no message.
-A user action that hands its work to maintenance work calls `clearError` before it does so, as `openReviewSearchOccurrence` does before the acquisition pump for an evicted File.
 
 These sites are maintenance work:
 
@@ -186,7 +186,7 @@ A File that the acquisition cannot queue stays pending and unacquired, so a late
 So a failure loses no work and keeps the session.
 The message of the event outcome stays, such as `buffer_search_scan_failed` or `file_enrichment_launch_failed`.
 
-No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and calls `showError` without the check of a shown message passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and calls `showError` instead of `showMaintenanceError` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
 ### A dropped user input shows its failure
 
