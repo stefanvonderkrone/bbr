@@ -167,7 +167,7 @@ These sites are maintenance work:
 - The retry of a stale cache update in `retryContentBuild`.
 - The File Enrichment of the active File in the focus check, and the File Enrichments of the Review Search acquisition, `pumpReviewSearchAcquisition`. Both go through `queueMaintenanceFileEnrichment`.
 - The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
-- A failed enrichment build in `acceptBufferDisclosure` that cancels no pending reading location, `pending_review_location`.
+- A failed enrichment build in `acceptBufferDisclosure` that cancels no pending reading location, `pending_review_location`, and a failed cache update build. `DisclosureBuild.Kind.isMaintenance` names these two build kinds, and its exhaustive switch makes a new build kind choose.
 - A non-speculative result that `dropEnrichments` drops when it cancels no pending reading location.
 
 `dropEnrichments` records with operation `.completion` and phase `.admission`.

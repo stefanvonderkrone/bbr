@@ -2922,6 +2922,15 @@ pub const DisclosureBuild = struct {
             };
         }
 
+        /// Whether a later check does the work of a build of this kind
+        /// again, so that its failure keeps a shown message.
+        fn isMaintenance(kind: Kind) bool {
+            return switch (kind) {
+                .enrichment, .cache_update => true,
+                .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => false,
+            };
+        }
+
         /// Whether a build of this kind opens the Buffer Search occurrence in
         /// `destination_active`. Every other kind keeps the current occurrence.
         fn opensOccurrence(kind: Kind) bool {
@@ -10211,8 +10220,8 @@ pub const Presentation = struct {
             if (job.kind == .draft_mutation) published.pending_draft_mutation = null;
             if (job.kind == .card_destination) return self.failCardDestination(published, .buffer_build_failed);
             const dropped_location = releaseEnrichments(published, job.enrichments.items);
-            if (job.kind != .enrichment or dropped_location or
-                (!EnrichedFile.allSpeculative(job.enrichments.items) and self.action_error == null))
+            const speculative = job.kind == .enrichment and EnrichedFile.allSpeculative(job.enrichments.items);
+            if (!job.kind.isMaintenance() or dropped_location or (!speculative and self.action_error == null))
                 self.showError(.buffer_build_failed);
             return;
         }
