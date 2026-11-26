@@ -8781,9 +8781,10 @@ pub const Presentation = struct {
     }
 
     /// A reopened query whose scan could not queue stays pending with
-    /// `needs_scan`. The retry runs after the inputs of an event, so a
-    /// failure keeps the shown message, and a success clears only an error
-    /// from the Review Search scan path.
+    /// `needs_scan`. A failure keeps the shown message, and a success clears
+    /// only a Review Search error. A successful acquisition pump after a
+    /// failed retry clears its message, a gap that the rule in
+    /// `docs/rules/tui-state.md` names.
     fn retryReviewSearchQuery(self: *Presentation) void {
         const published = self.published orelse return;
         const state = &published.review_search;
@@ -9012,7 +9013,7 @@ pub const Presentation = struct {
     }
 
     /// Each queue runs as `.review_search`, because it acquires a File for
-    /// Review Search. So a success keeps an error of the event that pumps.
+    /// Review Search. So a success keeps an error of another path.
     fn pumpReviewSearchAcquisition(self: *Presentation, published: *Published) void {
         if (!published.review_search.open) return;
         const acquired = published.review_search.acquired orelse return;
