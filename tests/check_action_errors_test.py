@@ -102,6 +102,24 @@ ORIGIN_HELPERS = """pub const Presentation = struct {
     }
 };
 """
+# The query retry of ticket 06 before main added the PullRequest key.
+COPIED_ORIGIN = """pub const Presentation = struct {
+    fn retryReviewSearchQuery(self: *Presentation) void {
+        const shown = self.action_error;
+        self.replaceReviewSearchQuery(text);
+        if (state.needs_scan) if (shown) |kept| self.withErrorOrigin(kept.origin, showError, .{ self, kept.err });
+        self.withErrorOrigin(
+            kept.origin,
+            showErrorFor,
+            .{ self, kept.err, kept.key },
+        );
+    }
+};
+
+fn showTestError(state: *Presentation, origin: ErrorOrigin, err: ActionError) void {
+    state.withErrorOrigin(origin, Presentation.showError, .{ state, err });
+}
+"""
 
 
 class ActionErrorsTest(unittest.TestCase):
@@ -149,6 +167,7 @@ class ActionErrorsTest(unittest.TestCase):
 
     def test_a_multiline_helper_signature_keeps_its_exemption(self):
         found = self.check(
+            "pub const Presentation = struct {\n"
             "    fn withErrorOrigin(\n"
             "        self: *Presentation,\n"
             "        origin: ErrorOrigin,\n"
@@ -158,12 +177,52 @@ class ActionErrorsTest(unittest.TestCase):
             "    fn other(self: *Presentation) void {\n"
             "        self.event_origin = null;\n"
             "    }\n"
+            "};\n"
         )
         self.assertEqual(len(found), 1, found)
-        self.assertIn("src/tui/presentation.zig:8: writes event_origin outside", found[0])
+        self.assertIn("src/tui/presentation.zig:9: writes event_origin outside", found[0])
 
     def test_dispatch_and_the_override_helper_may_set_the_event_origin(self):
         self.assertEqual(self.check(ORIGIN_HELPERS), [])
+
+    def test_a_copied_origin_in_presentation_is_rejected(self):
+        found = self.check(COPIED_ORIGIN)
+        self.assertEqual([message.split(":")[1] for message in found], ["5", "6"])
+        self.assertIn("is not an enum literal", found[0])
+        self.assertIn("failMaintenance", found[0])
+
+    def test_a_qualified_origin_is_rejected(self):
+        found = self.check(
+            "pub const Presentation = struct {\n"
+            "    fn retry(self: *Presentation) void {\n"
+            "        self.withErrorOrigin(ErrorOrigin.user, showError, .{ self, .out_of_memory });\n"
+            "        self.withErrorOrigin(.user, showError, .{ self, .out_of_memory });\n"
+            "    }\n"
+            "};\n"
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("src/tui/presentation.zig:3: passes a withErrorOrigin origin that is not an enum literal.", found[0])
+
+    def test_an_enum_literal_after_a_space_or_a_line_break_is_allowed(self):
+        found = self.check(
+            "pub const Presentation = struct {\n"
+            "    fn retry(self: *Presentation) void {\n"
+            "        self.withErrorOrigin( .user, showError, .{ self, .out_of_memory });\n"
+            "        self.withErrorOrigin(\n"
+            "            .review_search,\n"
+            "            showError,\n"
+            "            .{ self, .out_of_memory },\n"
+            "        );\n"
+            "        self.withErrorOrigin( ErrorOrigin.user, showError, .{ self, .out_of_memory });\n"
+            "    }\n"
+            "};\n"
+        )
+        self.assertEqual([message.split(":")[1] for message in found], ["9"])
+
+    def test_a_file_without_the_presentation_struct_is_rejected(self):
+        found = self.check(COPIED_ORIGIN.replace("pub const Presentation = struct {", "pub const Renamed = struct {"))
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("src/tui/presentation.zig:1: has no line `pub const Presentation = struct {`", found[0])
 
 
 if __name__ == "__main__":
