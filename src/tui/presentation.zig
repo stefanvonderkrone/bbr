@@ -30802,6 +30802,37 @@ test "M21 kernel focus check File Enrichment of the active File keeps the shown 
     }
 }
 
+test "M21 kernel the paint revision changes when a focus check shows or clears a message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+    });
+    defer presentation.deinit();
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    const before_failure = presentation.projection().revision;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+    try testing.expect(!std.meta.eql(before_failure, presentation.projection().revision));
+    try testing.expect(presentation.takeCommand().? == .report_diagnostic);
+
+    const before_retry = presentation.projection().revision;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+    try testing.expect(!std.meta.eql(before_retry, presentation.projection().revision));
+
+    const settled = presentation.projection().revision;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(settled, presentation.projection().revision);
+}
+
 /// Opens the Review Search on ten Files and takes the File Enrichments that
 /// its acquisition queues, so a completion opens a slot for the ninth File.
 fn openTestReviewSearchAcquisition(presentation: *Presentation, taken: []EnrichFile) !void {
