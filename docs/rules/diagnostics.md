@@ -113,10 +113,10 @@ Enforcement: `Handle.record` in `src/diagnostics.zig` drops `error.Reported` in 
 A failed Buffer build carries its cause as `evidence` in the `DisclosureBuild`.
 `recordFailures` in `src/tui/presentation_runtime.zig` writes the one record of that evidence.
 `deliver` calls it for a worker result before it posts the completion.
-The command drain in `src/tui/app.zig` calls it for a launch failure.
+For a launch failure, the command drain in `src/tui/app.zig` calls `dispatchLaunchFailure`, which calls it.
 So `acceptBufferDisclosure` writes no record for a failed build of any kind. It only shows the message.
 
-Enforcement: the test "diagnostics a failed Buffer build has one record from the worker boundary" in `src/tui/presentation_runtime.zig` reads exactly one record in the Sink and no report command from Presentation. It fails when `recordFailures` skips the evidence and when Presentation writes a second record. `zig build test` runs it. No test covers the launch failure path.
+Enforcement: the tests "diagnostics a failed Buffer build has one record from the worker boundary" and "diagnostics a failed Buffer build launch has one record from the command drain" in `src/tui/presentation_runtime.zig` read exactly one record in the Sink and no report command from Presentation. They fail when `recordFailures` skips the evidence, when `dispatchLaunchFailure` skips `recordFailures`, and when Presentation writes a second record. `zig build test` runs them. The drain needs a terminal, so they do not run it. They do not see a drain that stops calling `dispatchLaunchFailure`.
 
 ## A client notes leaf evidence in the boundary slot
 
