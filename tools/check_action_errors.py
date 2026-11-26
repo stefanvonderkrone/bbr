@@ -9,6 +9,10 @@ from its input, and `withErrorOrigin` sets it for one piece of work, so a raw
 write of `event_origin` would give an error the wrong origin.
 A struct literal field such as `.action_error = ...` in the Projection is not
 a write of the Presentation field.
+
+A `withErrorOrigin` call in Presentation names its origin as an enum literal.
+A copied origin, such as the origin of a saved error that the code shows
+again, can drop a field of the copy without a compile error.
 """
 
 from pathlib import Path
@@ -41,9 +45,48 @@ CHECKS = tuple(
 )
 
 
+PRESENTATION = re.compile(r"^pub const Presentation = struct \{")
+ORIGIN_CALL = re.compile(r"(?<!fn )withErrorOrigin\((?!\s*\.[A-Za-z_]\w*\s*,)")
+ORIGIN_MESSAGE = (
+    "passes a withErrorOrigin origin that is not an enum literal. Name the path, such as "
+    "withErrorOrigin(.review_search, work, args). To keep a shown error after a failure, "
+    "call failMaintenance instead of showing a saved copy again."
+)
+MISSING_MESSAGE = (
+    "has no line `pub const Presentation = struct {`, so the withErrorOrigin check reads nothing. "
+    "Update PRESENTATION in tools/check_action_errors.py to the new name of the struct."
+)
+
+
+def presentation_span(lines):
+    """The first and the last line index of the Presentation struct body."""
+    for start, line in enumerate(lines):
+        if PRESENTATION.match(line):
+            depth = 0
+            for end in range(start, len(lines)):
+                depth += lines[end].count("{") - lines[end].count("}")
+                if depth == 0:
+                    return start, end
+    return None
+
+
+def literal_origin_violations(relative, lines):
+    span = presentation_span(lines)
+    if span is None:
+        return [(str(relative), 1, f"{relative}:1: {MISSING_MESSAGE}")]
+    start, end = span
+    text = "\n".join(lines[start : end + 1])
+    found = []
+    for match in ORIGIN_CALL.finditer(text):
+        number = start + 1 + text.count("\n", 0, match.start())
+        found.append((str(relative), number, f"{relative}:{number}: {ORIGIN_MESSAGE}"))
+    return found
+
+
 def violations(root):
     found = []
     for relative, lines in zig_files(root, SOURCES, literals=False):
+        found.extend(literal_origin_violations(relative, lines))
         for _, helpers, write, message in CHECKS:
             helper_depth = None
             body_open = False
@@ -69,7 +112,10 @@ def main():
         print(message, file=sys.stderr)
     if found:
         return 1
-    print("Only showErrorFor and clearError write action_error, and only dispatch and withErrorOrigin write event_origin.")
+    print(
+        "Only showErrorFor and clearError write action_error, only dispatch and withErrorOrigin write event_origin, "
+        "and each withErrorOrigin call in Presentation names an enum literal."
+    )
     return 0
 
 
