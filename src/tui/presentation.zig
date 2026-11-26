@@ -37317,6 +37317,28 @@ test "M21 kernel Review Search keeps the PullRequest of a shown error when a reo
     }
 }
 
+test "M21 kernel a failed Review Search query edit shows its failure over another message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    presentation.withErrorOrigin(.reviewer_verdict, Presentation.showError, .{ &presentation, .reviewer_verdict_launch_failed });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+    var records: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        if (queued == .report_diagnostic) records += 1;
+        queued.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), records);
+}
+
 test "M21 kernel Review Search starts no source scan while a query edit is pending" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
