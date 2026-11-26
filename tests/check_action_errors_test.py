@@ -203,6 +203,22 @@ class ActionErrorsTest(unittest.TestCase):
         self.assertEqual(len(found), 1, found)
         self.assertIn("src/tui/presentation.zig:3: passes a withErrorOrigin origin that is not an enum literal.", found[0])
 
+    def test_an_enum_literal_after_a_space_or_a_line_break_is_allowed(self):
+        found = self.check(
+            "pub const Presentation = struct {\n"
+            "    fn retry(self: *Presentation) void {\n"
+            "        self.withErrorOrigin( .user, showError, .{ self, .out_of_memory });\n"
+            "        self.withErrorOrigin(\n"
+            "            .review_search,\n"
+            "            showError,\n"
+            "            .{ self, .out_of_memory },\n"
+            "        );\n"
+            "        self.withErrorOrigin( ErrorOrigin.user, showError, .{ self, .out_of_memory });\n"
+            "    }\n"
+            "};\n"
+        )
+        self.assertEqual([message.split(":")[1] for message in found], ["9"])
+
     def test_a_file_without_the_presentation_struct_is_rejected(self):
         found = self.check(COPIED_ORIGIN.replace("pub const Presentation = struct {", "pub const Renamed = struct {"))
         self.assertEqual(len(found), 1, found)
