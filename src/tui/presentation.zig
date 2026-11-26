@@ -31390,6 +31390,43 @@ test "M21 kernel opening Review Search shows the failure of its acquisition queu
     }
 }
 
+test "M21 kernel the focus check queues a Review Search acquisition that failed with no work in flight" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+    presentation.issued_enrichments.clearAndFree(presentation.allocator);
+    try presentation.commands.ensureTotalCapacity(presentation.allocator, 32);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    var record = presentation.takeCommand() orelse return error.TestExpectedRecord;
+    defer record.deinit();
+    try testing.expect(record == .report_diagnostic);
+    try testing.expect(presentation.takeCommand() == null);
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+
+    var queued: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        defer command.deinit();
+        if (command == .enrich_file) queued += 1;
+    }
+    try testing.expectEqual(@as(usize, 8), queued);
+}
+
 test "M21 kernel cache focus supersedes queued and issued focus changes" {
     for ([_]bool{ false, true }) |issued| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
