@@ -76,7 +76,7 @@ A user handler overrides only for an error that a later completion of another pa
 Name the reason in a comment at each override.
 When an error must stay through a completion of its own event path, give the path its own `ErrorOrigin` instead of an override, as Draft builds have `.draft`.
 
-No check: the type and the line check see that only the event and `withErrorOrigin` set the origin, but not that an override names the right path. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
+No check: the type and the line check see that only the event and `withErrorOrigin` set the origin, and that each override names an enum literal, but not that an override names the right path. Related checked rule: [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
 
 ### Reserve storage in every rebuild
 
@@ -164,17 +164,58 @@ It also stages no cache build, because the lease of the scan keeps its File. The
 
 No check: the test "M21 kernel Review Search starts a source scan when no allocation succeeds" fails only when a failed allocation from the Presentation allocator stops the start. An allocation from `std.heap.page_allocator` or from the Session allocator passes it, and so does an allocation whose failure the start ignores. A `catch` makes any allocation compile in a function that returns no error union. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
-### A cache staging failure keeps the shown message
+### Maintenance work keeps the shown message
 
-A lease release that cannot stage its cache build records the cause and shows `out_of_memory` only when no message shows.
+[Maintenance work](src/tui/GLOSSARY.md) is work that no input asked for and that a later check does again.
+A failure of maintenance work records its cause once and shows its failure message only when no message shows.
+An allocation failure uses `out_of_memory`.
+A failed enrichment or cache update build uses `buffer_build_failed`.
+[A failed Buffer build has its record from the worker boundary](docs/rules/diagnostics.md#a-failed-buffer-build-has-its-record-from-the-worker-boundary).
+A success clears only an error of its own origin, by [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
+A successful cache staging writes no message.
+A user action that hands its work to maintenance work calls `clearError` before it does so, as `openReviewSearchOccurrence` does before the acquisition pump for an evicted File.
+
+These sites are maintenance work:
+
+- A cache staging after a lease release or in the focus check. Both go through `stageCacheBuild`.
+- The retry of a stale cache update in `retryContentBuild`.
+- The File Enrichment of the active File in the focus check, and the File Enrichments of the Review Search acquisition, `pumpReviewSearchAcquisition`. Both go through `queueMaintenanceFileEnrichment`.
+- The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
+- A failed enrichment build in `acceptBufferDisclosure` that cancels no pending reading location, `pending_review_location`, and a failed cache update build. `DisclosureBuild.Kind.isMaintenance` names these two build kinds, and its exhaustive switch makes a new build kind choose.
+- A non-speculative result that `dropEnrichments` drops when it cancels no pending reading location.
+
+`dropEnrichments` records with operation `.completion` and phase `.admission`.
+A speculative-only drop records the failure without a message.
+
+`failMaintenance` writes the record and the message of a failed queue or staging, so a new such site calls it in its `catch`.
+A function that also serves user input, such as `setReviewSearchQuery`, records its failure and returns `error.Reported` without a message.
+Then each caller picks the message.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
-This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget.
-While a cache update is pending, the focus check stages after that update commits.
-So the failure loses no work, also when no lease release follows, such as after a second failed source scan stops the pass.
-A failed staging in the focus check returns `OutOfMemory` from `dispatch` and ends the event loop.
-The message of the event outcome stays, such as `buffer_search_scan_failed`.
+This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget, and it queues the File Enrichment of the active File again while the File is pending.
+While Review Search is open, the focus check queues no File of its range and pumps the acquisition after its range work, also after a cache staging or with an empty range.
+A failed queue can leave no File Enrichment in flight, and then no completion pumps again.
+While a cache update is pending, the focus check stages a new cache build only when the focus changed since that update was staged.
+A File that the acquisition cannot queue stays pending and unacquired, so a later pump queues it again, such as the pump of a later focus check while Review Search is open.
+So a failure loses no work and keeps the session.
+The message of the event outcome stays, such as `buffer_search_scan_failed` or `file_enrichment_launch_failed`.
 
-No check: the test "M21 kernel Review Search shows its scan failure when the cache build of the released File cannot stage" covers only `stageReleasedSearchLeases`, and it dispatches `ensure_focused_enrichment` itself. A new site that stages a cache build and sets `action_error` passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and calls `showError` without the check of a shown message passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+
+### A dropped user input shows its failure
+
+A completion that finds its build stale queues the work of a user input again. When the retry cannot queue, the work is dropped, and no later check does it again. So it is not maintenance work.
+The failure of a user input is the outcome of that input. So the retry records the cause once and shows `out_of_memory` over another message.
+`failDroppedInput` does both.
+These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and the `.draft_save` and `.draft_mutation` prongs of `retryContentBuild`.
+`selectVersion` also calls it when its view build or its File Enrichment cannot queue, because no later check does that input again.
+So does `replaceReviewSearchQuery` when a query edit or a reopened query cannot allocate or queue its scan.
+An enrichment failure can cancel the pending reading location from a refresh or Reconciliation.
+That cancellation drops part of the refresh or Reconciliation.
+No later check restores the canceled location.
+`dropEnrichments` calls `failDroppedInput` for that case too.
+The completion of a failed enrichment build shows `buffer_build_failed` for that case.
+
+No check: the tests cover only the current retries. A new retry that shows `out_of_memory` without a record passes `tools/check_diagnostics.py`, because the check accepts a `catch` that names `error.OutOfMemory` in a switch prong and drops it. Related checked rule: [A failure has one record](docs/rules/diagnostics.md#a-failure-has-one-record).
 
 ### Make Line row identities through LineOwner.of
 
