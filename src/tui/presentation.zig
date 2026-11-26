@@ -12775,7 +12775,7 @@ pub const Presentation = struct {
         }
         const enrichment = &published.session.enrichment;
         enrichment.focusAdmitted(range.focused);
-        if (published.review_search.open) return;
+        if (published.review_search.open) return self.pumpReviewSearchAcquisition(published);
         if (active) |file_index| {
             if (enrichment.needsEnrichment(file_index)) {
                 _ = self.queueMaintenanceFileEnrichment(published, file_index);

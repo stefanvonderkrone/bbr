@@ -179,8 +179,9 @@ A function that also serves user input, such as `setReviewSearchQuery`, records 
 Then each caller picks the message.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
 This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget, and it queues the File Enrichment of the active File again while the File is pending.
+While Review Search is open, the focus check pumps the acquisition instead, because a failed queue can leave no File Enrichment in flight, and then no completion pumps again.
 While a cache update is pending, the focus check stages after that update commits.
-A File that the acquisition cannot queue stays pending and unacquired, so the next pump queues it again.
+A File that the acquisition cannot queue stays pending and unacquired, so the next pump queues it again, at the latest in the next focus check.
 So a failure loses no work and keeps the session.
 The message of the event outcome stays, such as `buffer_search_scan_failed` or `file_enrichment_launch_failed`.
 
