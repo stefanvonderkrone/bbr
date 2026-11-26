@@ -12751,8 +12751,8 @@ pub const Presentation = struct {
         }
     }
 
-    /// The pump runs after the range work, so no early return of the range
-    /// work skips it.
+    /// A failed acquisition queue can leave no File Enrichment in flight, so
+    /// this check can be the only later pump.
     fn ensureFocusedEnrichment(self: *Presentation) void {
         if (self.shutdown_requested) return;
         const published = self.published orelse return;
@@ -12764,7 +12764,8 @@ pub const Presentation = struct {
     /// demand work. Once it is terminal, the other Files in the range follow
     /// as speculative work, up to `max_speculative_enrichments` at once: the
     /// visible Files from top to bottom, then the overscan Files above, then
-    /// the overscan Files below.
+    /// the overscan Files below. While Review Search is open, it only stages
+    /// the cache and admits the focus.
     fn ensureFocusedRange(self: *Presentation, published: *Published) void {
         const files = @min(published.session.diff.files.len, published.session.enrichment.len());
         const active = if (published.activeFile()) |index| if (index < files) index else null else null;
@@ -31415,8 +31416,6 @@ test "M21 kernel the focus check queues a Review Search acquisition that failed 
             .geometry = .{ .cols = 80, .rows = 10 },
         });
         defer presentation.deinit();
-        const published = presentation.published.?;
-        try testing.expectEqual(on_review_card, Presentation.enrichmentRange(published, published.activeFile(), published.session.diff.files.len).focused.isEmpty());
         try presentation.dispatch(.{ .action = .open_review_search });
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
         while (presentation.takeCommand()) |next| {
@@ -31433,6 +31432,8 @@ test "M21 kernel the focus check queues a Review Search acquisition that failed 
         defer record.deinit();
         try testing.expect(record == .report_diagnostic);
         try testing.expect(presentation.takeCommand() == null);
+        const published = presentation.published.?;
+        try testing.expectEqual(on_review_card, Presentation.enrichmentRange(published, published.activeFile(), published.session.diff.files.len).focused.isEmpty());
 
         try presentation.dispatch(.ensure_focused_enrichment);
 

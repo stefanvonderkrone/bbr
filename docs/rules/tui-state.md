@@ -78,7 +78,7 @@ A key, a mouse action, or an Overlay action has the origin `.user`, and its `cle
 Two known gaps remain, and `.scratch/query-edit-clear-order/` on the branch `query-edit-clear-order` owns them.
 A query edit clears after `releaseReviewSearchHolds` and `discardQueuedReviewSourceScans`, so it removes the message of a failed cache staging of those steps.
 The query retry and the acquisition pump share the origin `.review_search`, so a successful pump after a failed retry removes the message of the retry.
-`openReviewSearch` and the focus check both run the retry right before the pump.
+`openReviewSearch` runs the retry right before the pump, and the focus check runs the retry, then its range work, then the pump.
 A completion of background work has the origin of its own path, and its `clearError` clears only an error of that origin.
 Thus a completion keeps an error that another path showed and that the user has not read yet.
 A helper that keys and completions both reach takes the origin of the event that reaches it.
