@@ -52,6 +52,10 @@ ORIGIN_MESSAGE = (
     "withErrorOrigin(.review_search, work, args). To keep a shown error after a failure, "
     "call failMaintenance instead of showing a saved copy again."
 )
+MISSING_MESSAGE = (
+    "has no line `pub const Presentation = struct {`, so the withErrorOrigin check reads nothing. "
+    "Update PRESENTATION in tools/check_action_errors.py to the new name of the struct."
+)
 
 
 def presentation_span(lines):
@@ -69,7 +73,7 @@ def presentation_span(lines):
 def literal_origin_violations(relative, lines):
     span = presentation_span(lines)
     if span is None:
-        return []
+        return [(str(relative), 1, f"{relative}:1: {MISSING_MESSAGE}")]
     start, end = span
     text = "\n".join(lines[start : end + 1])
     found = []
