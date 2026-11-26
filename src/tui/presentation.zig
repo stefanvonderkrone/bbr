@@ -2924,6 +2924,15 @@ pub const DisclosureBuild = struct {
             };
         }
 
+        /// Whether a later check does the work of a build of this kind
+        /// again, so that its failure keeps a shown message.
+        fn isMaintenance(kind: Kind) bool {
+            return switch (kind) {
+                .enrichment, .cache_update => true,
+                .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => false,
+            };
+        }
+
         /// Whether a build of this kind opens the Buffer Search occurrence in
         /// `destination_active`. Every other kind keeps the current occurrence.
         fn opensOccurrence(kind: Kind) bool {
@@ -4428,11 +4437,14 @@ const ReviewSearchState = struct {
     }
 };
 
-fn releaseEnrichments(published: *Published, enrichments: []const EnrichedFile) void {
+/// Returns true if the release cancels the pending reading location.
+fn releaseEnrichments(published: *Published, enrichments: []const EnrichedFile) bool {
+    const restoring_location = published.pending_review_location != null;
     for (enrichments) |enriched| {
         published.cancelReviewLocationForFile(enriched.index);
         published.session.enrichment.resetLoading(enriched.index);
     }
+    return restoring_location and published.pending_review_location == null;
 }
 
 /// The Storage takes a result once, and a build takes one result for each File.
@@ -6921,7 +6933,7 @@ pub const Presentation = struct {
                 // The App dispatches this after each event, so a failed
                 // retry waits for the next event.
                 self.withErrorOrigin(.review_search, retryReviewSearchQuery, .{self});
-                try self.ensureFocusedEnrichment();
+                self.ensureFocusedEnrichment();
             },
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
             .code_highlight_completed => |completed| self.acceptCodeHighlight(completed),
@@ -7066,6 +7078,7 @@ pub const Presentation = struct {
     /// Review has that name.
     fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedRemoteReviewIdentity) void {
         self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key };
+        self.status_revision +%= 1;
     }
 
     /// A user action clears any error. Other work clears only an error of its
@@ -7073,7 +7086,9 @@ pub const Presentation = struct {
     fn clearError(self: *Presentation) void {
         const shown = self.action_error orelse return;
         const origin = self.errorOrigin();
-        if (origin == .user or shown.origin == origin) self.action_error = null;
+        if (origin != .user and shown.origin != origin) return;
+        self.action_error = null;
+        self.status_revision +%= 1;
     }
 
     fn errorOrigin(self: *const Presentation) ErrorOrigin {
@@ -8841,10 +8856,6 @@ pub const Presentation = struct {
         if (state.query != null) holdReviewSearchFiles(published);
         state.open = true;
         self.pauseQueuedSpeculativeEnrichment(published);
-        self.pumpReviewSearchAcquisition(published);
-        self.maybeQueueReviewSourceScan(published);
-        published.active_search = .review;
-        published.navigation.count = 0;
         self.clearError();
         if (state.needs_scan) {
             const text = (state.query orelse unreachable).query.text;
@@ -8854,17 +8865,23 @@ pub const Presentation = struct {
             // without the pending mark, also when its scan cannot queue.
             state.pending = true;
         }
+        self.pumpReviewSearchAcquisition(published);
+        self.maybeQueueReviewSourceScan(published);
+        published.active_search = .review;
+        published.navigation.count = 0;
         published.frame_revision += 1;
     }
 
     /// A reopened query whose scan could not queue stays pending with
-    /// `needs_scan`. The retry runs after the inputs of an event, so a
-    /// success clears only an error from the Review Search scan path.
+    /// `needs_scan`. A failure keeps the shown message, and a success clears
+    /// only a Review Search error. A successful acquisition pump after a
+    /// failed retry clears its message, a gap that the rule in
+    /// `docs/rules/tui-state.md` names.
     fn retryReviewSearchQuery(self: *Presentation) void {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (!state.open or !state.pending or !state.needs_scan) return;
-        self.replaceReviewSearchQuery((state.query orelse unreachable).query.text);
+        self.setReviewSearchQuery((state.query orelse unreachable).query.text) catch |err| self.failMaintenance(.review_search, err, @src());
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
@@ -8933,22 +8950,26 @@ pub const Presentation = struct {
         self.replaceReviewSearchQuery(text[0..end]);
     }
 
+    /// A query edit or a reopened query is the outcome of a user input, so
+    /// its failure shows over another message.
     fn replaceReviewSearchQuery(self: *Presentation, text: []const u8) void {
+        self.setReviewSearchQuery(text) catch |err| self.failDroppedInput(err, @src());
+    }
+
+    /// Records an allocation failure and returns `error.Reported` without a
+    /// message, because the caller knows whether a later check retries it.
+    fn setReviewSearchQuery(self: *Presentation, text: []const u8) error{Reported}!void {
         const published = self.published orelse return;
         const state = &published.review_search;
         state.opening_source = false;
         state.opening_identity = null;
-        const query = SharedQuery.create(text) catch |err| {
-            switch (err) {
-                error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
-                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
-            }
-            self.showError(switch (err) {
-                error.TooLong => .buffer_search_query_too_long,
-                error.OutOfMemory => .out_of_memory,
-                else => .buffer_search_invalid_query,
-            });
-            return;
+        const query = SharedQuery.create(text) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.reportFailure(.review_search, .prepare, err, @src());
+                return error.Reported;
+            },
+            error.TooLong => return self.showError(.buffer_search_query_too_long),
+            error.InvalidUtf8, error.Nul, error.LineEnding => return self.showError(.buffer_search_invalid_query),
         };
         if (text.len == 0) {
             query.release();
@@ -8976,16 +8997,14 @@ pub const Presentation = struct {
             return;
         }
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
-            switch (err) {
-                error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
-                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
-            }
             query.release();
-            self.showError(switch (err) {
-                error.OutOfMemory => .out_of_memory,
-                else => .buffer_search_invalid_query,
-            });
-            return;
+            switch (err) {
+                error.OutOfMemory => {
+                    self.reportFailure(.review_search, .prepare, err, @src());
+                    return error.Reported;
+                },
+                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => return self.showError(.buffer_search_invalid_query),
+            }
         };
         const corpus = state.corpus orelse {
             query.release();
@@ -9004,8 +9023,7 @@ pub const Presentation = struct {
             self.reportFailure(.completion, .admission, err, @src());
             command.deinit();
             query.release();
-            self.showError(.out_of_memory);
-            return;
+            return error.Reported;
         };
         self.discardQueuedReviewSearchScans();
         // The query scan takes the reserved slot before a discarded source
@@ -9086,6 +9104,8 @@ pub const Presentation = struct {
         }
     }
 
+    /// Each queue runs as `.review_search`, because it acquires a File for
+    /// Review Search. So a success keeps an error of another path.
     fn pumpReviewSearchAcquisition(self: *Presentation, published: *Published) void {
         if (!published.review_search.open) return;
         const acquired = published.review_search.acquired orelse return;
@@ -9104,13 +9124,10 @@ pub const Presentation = struct {
             else
                 null;
             if (next != null) {
-                self.queueFileEnrichment(published, next.?, false) catch |err| switch (err) {
-                    error.OutOfMemory => {
-                        self.showError(.out_of_memory);
-                        published.review_search.opening_source = false;
-                        break;
-                    },
-                };
+                if (!self.withErrorOrigin(.review_search, queueMaintenanceFileEnrichment, .{ self, published, next.? })) {
+                    published.review_search.opening_source = false;
+                    break;
+                }
                 if (published.session.enrichment.needsEnrichment(next.?)) break;
                 active += 1;
                 continue;
@@ -9125,12 +9142,7 @@ pub const Presentation = struct {
                 if (next == null or std.mem.order(u8, file.displayPath(), published.session.diff.files[next.?].displayPath()) == .lt) next = index;
             }
             if (next == null) break;
-            self.queueFileEnrichment(published, next.?, false) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    self.showError(.out_of_memory);
-                    break;
-                },
-            };
+            if (!self.withErrorOrigin(.review_search, queueMaintenanceFileEnrichment, .{ self, published, next.? })) break;
             // A refused path does not consume a slot; stop instead of looping.
             if (published.session.enrichment.needsEnrichment(next.?)) break;
             active += 1;
@@ -9194,12 +9206,25 @@ pub const Presentation = struct {
         if (self.shutdown_requested) return;
         const focused = if (published.pending_cache_update != null) published.pending_cache_focus else published.session.enrichment.focused;
         if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
-        self.queueCacheBuild(published, focused) catch |err| {
-            self.reportFailure(.buffer_build, .prepare, err, @src());
-            // The focus check after the event stages again, so this failure
-            // does not replace the shown outcome.
-            if (self.action_error == null) self.showError(.out_of_memory);
-        };
+        self.stageCacheBuild(published, focused);
+    }
+
+    fn stageCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) void {
+        self.queueCacheBuild(published, focused) catch |err| self.failMaintenance(.buffer_build, err, @src());
+    }
+
+    /// Work that no input asked for, such as a cache staging or a File
+    /// Enrichment of the focus check, runs again at a later check. So its
+    /// failure has one record and keeps the shown message.
+    fn failMaintenance(self: *Presentation, operation: bbr.diagnostic.Operation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
+        self.reportFailure(operation, .prepare, err, source);
+        if (self.action_error == null) self.showError(.out_of_memory);
+    }
+
+    /// No later check retries this input, so its failure replaces the shown message.
+    fn failDroppedInput(self: *Presentation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
+        self.reportFailure(.completion, .admission, err, source);
+        self.showError(.out_of_memory);
     }
 
     fn acceptReviewSourceScanned(self: *Presentation, completed_value: ReviewSourceScanned) void {
@@ -9541,6 +9566,7 @@ pub const Presentation = struct {
                 if (side == .pending) {
                     state.opening_source = true;
                     if (state.acquired) |acquired| acquired[source.file_index] = false;
+                    self.clearError();
                     self.pumpReviewSearchAcquisition(published);
                 } else if (published.session.enrichment.status(source.file_index).old != .loading and published.session.enrichment.status(source.file_index).new != .loading) {
                     state.opening_source = false;
@@ -10289,8 +10315,10 @@ pub const Presentation = struct {
             if (job.kind == .draft_save) published.pending_draft_save = null;
             if (job.kind == .draft_mutation) published.pending_draft_mutation = null;
             if (job.kind == .card_destination) return self.failCardDestination(published, .buffer_build_failed);
-            if (job.kind != .enrichment or !EnrichedFile.allSpeculative(job.enrichments.items)) self.showError(.buffer_build_failed);
-            releaseEnrichments(published, job.enrichments.items);
+            const dropped_location = releaseEnrichments(published, job.enrichments.items);
+            const speculative = job.kind == .enrichment and EnrichedFile.allSpeculative(job.enrichments.items);
+            if (!job.kind.isMaintenance() or dropped_location or (!speculative and self.action_error == null))
+                self.showError(.buffer_build_failed);
             return;
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -10571,24 +10599,22 @@ pub const Presentation = struct {
                 self.openReviewSearchOccurrence();
             },
             .enrichment => self.retryEnrichmentBuild(published, job),
-            .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    published.pending_cache_update = null;
-                    self.showError(.out_of_memory);
-                },
+            .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch |err| {
+                published.pending_cache_update = null;
+                self.failMaintenance(.buffer_build, err, @src());
             },
             .draft_save => {
                 self.queueDraftBuild(published, job.new_draft.?) catch |err| switch (err) {
                     error.OutOfMemory => {
                         published.pending_draft_save = null;
-                        self.showError(.out_of_memory);
+                        self.failDroppedInput(err, @src());
                     },
                 };
             },
             .draft_mutation => self.queueDraftMutation(published, job.mutation.?, job.mutation_id) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.pending_draft_mutation = null;
-                    self.showError(.out_of_memory);
+                    self.failDroppedInput(err, @src());
                 },
             },
             .card_destination => self.queueCardDestination(published, job.destination_card.?, job.target.add, job.isolated_file, job.destination_attempt) catch |err| switch (err) {
@@ -10674,7 +10700,7 @@ pub const Presentation = struct {
         self.queueViewBuild(published, job.preferences, job.isolated_file, job.geometry, job.navigation_policy) catch |err| switch (err) {
             error.OutOfMemory => {
                 published.pending_view = null;
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
@@ -10701,17 +10727,16 @@ pub const Presentation = struct {
                 .back => queued.enrichments.items.len,
             };
             queued.enrichments.insertSlice(queued.arena.allocator(), index, enrichments) catch |err| switch (err) {
-                error.OutOfMemory => return self.dropEnrichments(published, enrichments),
+                error.OutOfMemory => return self.dropEnrichments(published, enrichments, err, @src()),
             };
             for (queued.enrichments.items[index..][0..enrichments.len]) |*enriched| enriched.hold = reviewSearchHolds(published, enriched.index);
             return;
         }
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
-            self.reportFailure(.completion, .admission, err, @src());
-            return self.dropEnrichments(published, enrichments);
+            return self.dropEnrichments(published, enrichments, err, @src());
         };
         const job = self.createEnrichmentBuild(published, enrichments) catch |err| switch (err) {
-            error.OutOfMemory => return self.dropEnrichments(published, enrichments),
+            error.OutOfMemory => return self.dropEnrichments(published, enrichments, err, @src()),
         };
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
@@ -10764,9 +10789,13 @@ pub const Presentation = struct {
         self.commands.items[index] = .{ .build_buffer_disclosure = job };
     }
 
-    fn dropEnrichments(self: *Presentation, published: *Published, enrichments: []EnrichedFile) void {
-        if (!EnrichedFile.allSpeculative(enrichments)) self.showError(.out_of_memory);
-        releaseEnrichments(published, enrichments);
+    fn dropEnrichments(self: *Presentation, published: *Published, enrichments: []EnrichedFile, err: anyerror, comptime source: std.builtin.SourceLocation) void {
+        if (releaseEnrichments(published, enrichments)) {
+            self.failDroppedInput(err, source);
+        } else {
+            self.reportFailure(.completion, .admission, err, source);
+            if (!EnrichedFile.allSpeculative(enrichments) and self.action_error == null) self.showError(.out_of_memory);
+        }
         for (enrichments) |*enriched| enriched.result.deinit();
     }
 
@@ -10790,7 +10819,7 @@ pub const Presentation = struct {
         const inputs = DisclosureInputs.create(published) catch |err| switch (err) {
             error.OutOfMemory => {
                 published.disclosure_inputs_current = false;
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
@@ -10804,7 +10833,7 @@ pub const Presentation = struct {
             self.queueViewBuild(published, self.preferences, published.isolated_file, self.geometry, .restore);
         result catch |err| switch (err) {
             error.OutOfMemory => {
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
             },
         };
     }
@@ -10987,7 +11016,7 @@ pub const Presentation = struct {
             self.queueBufferSearchOpening(published, job.target.base) catch |err| switch (err) {
                 error.OutOfMemory => {
                     published.buffer_search.input.?.pending = false;
-                    self.showError(.out_of_memory);
+                    self.failDroppedInput(err, @src());
                 },
             };
             return;
@@ -11005,7 +11034,7 @@ pub const Presentation = struct {
         const replacement = self.queueAcceptedDisclosure(published, job.target, destination, job.kind, job.result_error) catch |err| switch (err) {
             error.OutOfMemory => {
                 if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
@@ -11027,7 +11056,7 @@ pub const Presentation = struct {
         const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch |err| switch (err) {
             error.OutOfMemory => {
                 input.pending = false;
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
                 return;
             },
             error.TooLong => {
@@ -11056,7 +11085,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 command.deinit();
                 input.pending = false;
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
@@ -12816,14 +12845,22 @@ pub const Presentation = struct {
         }
     }
 
+    /// A failed acquisition queue can leave no File Enrichment in flight, so
+    /// this check can be the only later pump.
+    fn ensureFocusedEnrichment(self: *Presentation) void {
+        if (self.shutdown_requested) return;
+        const published = self.published orelse return;
+        self.ensureFocusedRange(published);
+        self.pumpReviewSearchAcquisition(published);
+    }
+
     /// Keep File Enrichment for the Enrichment Range. The active File is
     /// demand work. Once it is terminal, the other Files in the range follow
     /// as speculative work, up to `max_speculative_enrichments` at once: the
     /// visible Files from top to bottom, then the overscan Files above, then
-    /// the overscan Files below.
-    fn ensureFocusedEnrichment(self: *Presentation) !void {
-        if (self.shutdown_requested) return;
-        const published = self.published orelse return;
+    /// the overscan Files below. While Review Search is open, it only stages
+    /// the cache and admits the focus.
+    fn ensureFocusedRange(self: *Presentation, published: *Published) void {
         const files = @min(published.session.diff.files.len, published.session.enrichment.len());
         const active = if (published.activeFile()) |index| if (index < files) index else null else null;
         const range = enrichmentRange(published, active, files);
@@ -12832,18 +12869,21 @@ pub const Presentation = struct {
         // the rest of this check.
         if (active) |file_index| self.promoteSpeculativeEnrichment(published.epoch, file_index);
         if (published.pending_cache_update != null) {
-            if (!std.meta.eql(published.pending_cache_focus, range.focused)) try self.queueCacheBuild(published, range.focused);
+            if (!std.meta.eql(published.pending_cache_focus, range.focused)) self.stageCacheBuild(published, range.focused);
             return;
         }
         if (published.session.enrichment.requiresCacheEnforcement(range.focused)) {
-            try self.queueCacheBuild(published, range.focused);
+            self.stageCacheBuild(published, range.focused);
             return;
         }
         const enrichment = &published.session.enrichment;
         enrichment.focusAdmitted(range.focused);
         if (published.review_search.open) return;
         if (active) |file_index| {
-            if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, false);
+            if (enrichment.needsEnrichment(file_index)) {
+                _ = self.queueMaintenanceFileEnrichment(published, file_index);
+                return;
+            }
             if (!enrichment.isTerminal(file_index)) return;
         }
         // Speculative work fails silently. A File that fails to queue stays
@@ -12971,6 +13011,16 @@ pub const Presentation = struct {
         self.next_work_id = work_id;
         published.session.enrichment.markLoading(file_index);
         if (!speculative) self.clearError();
+    }
+
+    /// Queues a File Enrichment that no input asked for. The File stays
+    /// pending after a failure, so a later check queues it again.
+    fn queueMaintenanceFileEnrichment(self: *Presentation, published: *Published, file_index: usize) bool {
+        self.queueFileEnrichment(published, file_index, false) catch |err| {
+            self.failMaintenance(.file_enrichment, err, @src());
+            return false;
+        };
+        return true;
     }
 
     /// Reads of a replaced Session also count. They run until they finish.
@@ -13230,19 +13280,15 @@ pub const Presentation = struct {
         if (requested == desired.selected_version) return;
         var candidate = desired;
         candidate.selected_version = requested;
-        self.queueViewBuild(published, candidate, if (published.pending_view) |view| view.isolated_file else published.isolated_file, if (published.pending_view) |view| view.geometry else published.geometry, .version) catch |err| switch (err) {
-            error.OutOfMemory => {
-                self.showError(.out_of_memory);
-                return;
-            },
+        self.queueViewBuild(published, candidate, if (published.pending_view) |view| view.isolated_file else published.isolated_file, if (published.pending_view) |view| view.geometry else published.geometry, .version) catch |err| {
+            self.failDroppedInput(err, @src());
+            return;
         };
         const file_index = published.activeFile();
         if (candidate.scope == .whole and file_index != null and versionNeedsEnrichment(published, candidate.layout, requested, file_index.?)) {
-            self.queueFileEnrichment(published, file_index.?, false) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    self.cancelQueuedViewBuild(published);
-                    self.showError(.out_of_memory);
-                },
+            self.queueFileEnrichment(published, file_index.?, false) catch |err| {
+                self.cancelQueuedViewBuild(published);
+                self.failDroppedInput(err, @src());
             };
         }
     }
@@ -13781,8 +13827,8 @@ pub const Presentation = struct {
     }
 
     /// Ends a replacement with an error. A completion input bumps no
-    /// revision in `dispatch`, so this bump repaints the failure, and a
-    /// pending-replacement notice must not outlive its replacement.
+    /// revision in `dispatch`, so this bump repaints `replacement_error`, and
+    /// a pending-replacement notice must not outlive its replacement.
     fn failReplacement(self: *Presentation, replacement: Replacement, err: ReplacementError) void {
         if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
         self.replacement = null;
@@ -24280,7 +24326,10 @@ test "a failed Selected Version change preserves the complete published interact
 
     const after = presentation.projection();
     try testing.expect(failing.has_induced_failure);
-    try testing.expect(std.meta.eql(before.revision, after.revision));
+    try testing.expectEqual(before.revision.interaction, after.revision.interaction);
+    try testing.expectEqual(before.revision.frame, after.revision.frame);
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), after.action_error);
+    try testing.expect(before.revision.status != after.revision.status);
     try testing.expectEqual(before.review.?.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
     try testing.expect(std.meta.eql(before.review.?.navigation, after.review.?.navigation));
     try testing.expectEqual(SelectedVersion.new, after.review.?.selected_version);
@@ -30717,7 +30766,7 @@ test "M21 kernel cache focus failure preserves content and focus before retry" {
     presentation.commands.deinit(presentation.allocator);
     presentation.commands = .empty;
     failing.fail_index = failing.alloc_index;
-    try testing.expectError(error.OutOfMemory, presentation.dispatch(.ensure_focused_enrichment));
+    try presentation.dispatch(.ensure_focused_enrichment);
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
     try testing.expectEqual(file_enrichment.FileRange.single(0), published.session.enrichment.focused);
@@ -30733,6 +30782,763 @@ test "M21 kernel cache focus failure preserves content and focus before retry" {
     try presentation.dispatch(.ensure_focused_enrichment);
     try completeDisclosureBuild(&presentation);
     try testing.expect(published.session.enrichment.file(0).new == .pending);
+}
+
+test "M21 kernel cache focus staging failure keeps the session and stages again" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .to_bottom });
+        if (message_shown) try presentation.dispatch(.{ .action = .recover_submission });
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.ensure_focused_enrichment);
+        failing.fail_index = std.math.maxInt(usize);
+        const shown: ActionError = if (message_shown) .action_refused else .out_of_memory;
+        try testing.expectEqual(shown, presentation.projection().action_error.?);
+        const failure = presentation.takeCommand().?.report_diagnostic;
+        try testing.expectEqual(bbr.diagnostic.Operation.buffer_build, failure.operation);
+        try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+        try testing.expect(presentation.takeCommand() == null);
+        const epoch = presentation.published.?.epoch;
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try testing.expect(presentation.queuedBuildIndex(.cache_update, epoch) != null);
+    }
+}
+
+test "M21 kernel stale cache update retry failure records once and keeps the shown message" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .to_bottom });
+        try presentation.dispatch(.ensure_focused_enrichment);
+        const job = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.cache_update, job.kind);
+        job.build();
+        try testing.expect(!job.failed);
+        presentation.published.?.session.enrichment.hold(0);
+        if (message_shown) try presentation.dispatch(.{ .action = .recover_submission });
+        try testing.expect(presentation.takeCommand() == null);
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        const shown: ActionError = if (message_shown) .action_refused else .out_of_memory;
+        try testing.expectEqual(shown, presentation.projection().action_error.?);
+        const failure = (presentation.takeCommand() orelse return error.TestExpectedRecord).report_diagnostic;
+        try testing.expectEqual(bbr.diagnostic.Operation.buffer_build, failure.operation);
+        try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+        try testing.expect(presentation.takeCommand() == null);
+        presentation.published.?.session.enrichment.finishLeaseDeferred(0);
+        const epoch = presentation.published.?.epoch;
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try testing.expect(presentation.queuedBuildIndex(.cache_update, epoch) != null);
+    }
+}
+
+test "M21 kernel focus check keeps the session when the File Enrichment of the active File cannot queue" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        });
+        defer presentation.deinit();
+        if (message_shown) try presentation.dispatch(.{ .action = .recover_submission });
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.ensure_focused_enrichment);
+        failing.fail_index = std.math.maxInt(usize);
+        const shown: ActionError = if (message_shown) .action_refused else .out_of_memory;
+        try testing.expectEqual(shown, presentation.projection().action_error.?);
+        const failure = presentation.takeCommand().?.report_diagnostic;
+        try testing.expectEqual(bbr.diagnostic.Operation.file_enrichment, failure.operation);
+        try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+        try testing.expect(presentation.takeCommand() == null);
+        try presentation.dispatch(.ensure_focused_enrichment);
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqual(@as(usize, 0), command.enrich_file.file_index);
+        try testing.expect(!command.enrich_file.speculative);
+    }
+}
+
+test "M21 kernel focus check File Enrichment of the active File keeps the shown message" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        });
+        defer presentation.deinit();
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        if (message_shown) {
+            try presentation.dispatch(.{ .action = .recover_submission });
+        } else {
+            failing.fail_index = failing.alloc_index;
+            try presentation.dispatch(.ensure_focused_enrichment);
+            failing.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+            try testing.expect(presentation.takeCommand().? == .report_diagnostic);
+        }
+        try presentation.dispatch(.ensure_focused_enrichment);
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqual(@as(usize, 0), command.enrich_file.file_index);
+        const shown: ?ActionError = if (message_shown) .action_refused else null;
+        try testing.expectEqual(shown, presentation.projection().action_error);
+    }
+}
+
+test "M21 kernel the paint revision changes when a focus check shows or clears a message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+    });
+    defer presentation.deinit();
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    const before_failure = presentation.projection().revision;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+    try testing.expect(!std.meta.eql(before_failure, presentation.projection().revision));
+    try testing.expect(presentation.takeCommand().? == .report_diagnostic);
+
+    const before_retry = presentation.projection().revision;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+    try testing.expect(!std.meta.eql(before_retry, presentation.projection().revision));
+
+    const settled = presentation.projection().revision;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(settled, presentation.projection().revision);
+}
+
+/// Opens the Review Search on ten Files and takes the File Enrichments that
+/// its acquisition queues, so a completion opens a slot for the ninth File.
+fn openTestReviewSearchAcquisition(presentation: *Presentation, taken: []EnrichFile) !void {
+    try presentation.dispatch(.{ .action = .open_review_search });
+    var count: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        defer command.deinit();
+        if (command != .enrich_file) continue;
+        if (count < taken.len) taken[count] = command.enrich_file;
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 8), count);
+}
+
+fn failTestEnrichment(presentation: *Presentation, enrich: EnrichFile) !void {
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = enrich.command_id,
+        .work_id = enrich.work_id,
+        .session_epoch = enrich.session_epoch,
+        .file_index = enrich.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    } });
+}
+
+test "M21 kernel failed view retry records the dropped input once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    worker.build();
+    presentation.published.?.tree.cursor = 1;
+    const before = presentation.projection().review.?.frame;
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.action_refused, presentation.projection().action_error.?);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.published.?.pending_view == null);
+    try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed Draft save retry records the dropped input once" {
+    try expectFailedDraftRetry(false);
+}
+
+test "M21 kernel failed Draft mutation retry records the dropped input once" {
+    try expectFailedDraftRetry(true);
+}
+
+fn expectFailedDraftRetry(mutation: bool) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    if (mutation) try seedDeletableSubtree(store.store(), key);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+    if (mutation) {
+        try startTestDraftMutation(&presentation, .body);
+    } else {
+        try presentation.dispatch(.{ .action = .review_comment });
+        try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("keep this Draft") } });
+        try presentation.dispatch(.{ .composer = .save });
+    }
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(if (mutation) DisclosureBuild.Kind.draft_mutation else .draft_save, worker.kind);
+    worker.build();
+    presentation.published.?.tree.scroll += 1;
+    const before = presentation.projection().review.?.frame;
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.published.?.pending_draft_save == null);
+    try testing.expect(presentation.published.?.pending_draft_mutation == null);
+    try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try testing.expect(presentation.projection().composer != null);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed accepted disclosure retry records the dropped input once" {
+    try expectFailedAcceptedDisclosureRetry(false);
+}
+
+test "M21 kernel failed Buffer Search opening retry records the dropped input once" {
+    try expectFailedAcceptedDisclosureRetry(true);
+}
+
+fn expectFailedAcceptedDisclosureRetry(opening: bool) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    if (opening) {
+        try revealTemporaryReviewFold(&presentation);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+    } else {
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+        try completeBufferSearchScan(&presentation);
+        try presentation.replaceBufferSearchQuery("");
+    }
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(if (opening) DisclosureBuild.Kind.open_input else .clear_input, worker.kind);
+    worker.build();
+    presentation.published.?.tree.scroll += 1;
+    const before = presentation.projection().review.?.frame;
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.action_refused, presentation.projection().action_error.?);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(!presentation.projection().buffer_search.?.pending);
+    try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed stale Buffer Search retry records the dropped input once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+    var scan = presentation.takeCommand().?;
+    defer scan.deinit();
+    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.input, worker.kind);
+    worker.build();
+    presentation.published.?.tree.scroll += 1;
+    const before = presentation.projection().review.?.frame;
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.action_refused, presentation.projection().action_error.?);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(!presentation.projection().buffer_search.?.pending);
+    try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed posted parent rebuild records the dropped input once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), try store.store().reserveTempId(key.storeKey()));
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reply });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("stale Reply") } });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }});
+    try store.store().checkpointSubmission(operation_id, key.storeKey(), 1, .{ .posted = 900 }, null);
+    try store.store().completeSubmission(operation_id, key.storeKey(), .clean);
+    try presentation.dispatch(.{ .composer = .save });
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    worker.build();
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expectEqual(@as(bbr.review.CommentId, 900), presentation.published.?.review.getConst(1).?.state.posted);
+    try testing.expect(presentation.published.?.disclosure_inputs_current);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed maintenance enrichment queue keeps the shown message and records once" {
+    try expectFailedEnrichmentQueue(.queue);
+}
+
+test "M21 kernel failed maintenance enrichment snapshot keeps the shown message and records once" {
+    try expectFailedEnrichmentQueue(.snapshot);
+}
+
+test "M21 kernel failed maintenance enrichment merge keeps the shown message and records once" {
+    try expectFailedEnrichmentQueue(.merge);
+}
+
+fn expectFailedEnrichmentQueue(failure: enum { queue, snapshot, merge }) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 2) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    var buffer: [2]EnrichFile = undefined;
+    const commands = takeQueuedTestEnrichments(&presentation, &buffer);
+    try testing.expectEqual(@as(usize, 2), commands.len);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0x2603, .text = "\x00" } });
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+    var saved_arena: ?std.heap.ArenaAllocator = null;
+    defer if (saved_arena) |*arena| arena.deinit();
+    var saved_enrichments: std.ArrayList(EnrichedFile) = .empty;
+    var merge_failing = testing.FailingAllocator.init(testing.allocator, .{});
+    if (failure == .merge) {
+        try deliverTestEnrichment(&presentation, commands[0]);
+        const queued = presentation.commands.items[0].build_buffer_disclosure;
+        saved_arena = queued.arena;
+        saved_enrichments = queued.enrichments;
+        queued.arena = std.heap.ArenaAllocator.init(merge_failing.allocator());
+        queued.enrichments = .fromOwnedSlice(try queued.arena.allocator().dupe(EnrichedFile, saved_enrichments.items));
+        _ = try queued.arena.allocator().alloc(u8, 1);
+        merge_failing.fail_index = merge_failing.alloc_index;
+    } else if (failure == .snapshot) {
+        presentation.published.?.disclosure_inputs_current = false;
+    } else {
+        presentation.commands.deinit(presentation.allocator);
+        presentation.commands = .empty;
+        failing.fail_index = failing.alloc_index;
+    }
+    const dropped = commands[if (failure == .merge) @as(usize, 1) else 0];
+    try deliverTestEnrichment(&presentation, dropped);
+    failing.fail_index = std.math.maxInt(usize);
+    if (failure == .merge) {
+        try testing.expect(merge_failing.has_induced_failure);
+        const queued = presentation.commands.orderedRemove(0).build_buffer_disclosure;
+        queued.arena.deinit();
+        queued.arena = saved_arena.?;
+        queued.enrichments = saved_enrichments;
+        saved_arena = null;
+        queued.destroy();
+    }
+    try testing.expect(presentation.published.?.session.enrichment.file(dropped.file_index).new == .pending);
+    try testing.expectEqual(@as(?ActionError, .buffer_search_invalid_query), presentation.projection().action_error);
+    try expectCompletionAllocationRecord(&presentation);
+}
+
+fn expectDroppedInputRecord(presentation: *Presentation) !void {
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+    try expectCompletionAllocationRecord(presentation);
+}
+
+fn expectCompletionAllocationRecord(presentation: *Presentation) !void {
+    const command = presentation.takeCommand() orelse return error.TestExpectedRecord;
+    try testing.expect(command == .report_diagnostic);
+    const failure = command.report_diagnostic;
+    try testing.expectEqual(bbr.diagnostic.Operation.completion, failure.operation);
+    try testing.expectEqual(bbr.diagnostic.Phase.admission, failure.phase);
+    try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "M21 kernel dropped Selected Version enrichment retries and restores the reading location" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .select_old_version });
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(cursorOwner(&presentation) == .file);
+    const command = presentation.takeCommand() orelse return error.MissingEnrichment;
+    try testing.expect(command == .enrich_file);
+    const waiting = command.enrich_file;
+    try testing.expectEqual(@as(usize, 1), waiting.file_index);
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    failing.fail_index = failing.alloc_index;
+    try deliverTestEnrichment(&presentation, waiting);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try expectCompletionAllocationRecord(&presentation);
+    try testing.expect(cursorOwner(&presentation) == .file);
+
+    const retry = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(waiting.file_index, retry.file_index);
+    try deliverSizedTestEnrichment(&presentation, retry, "old b\n", "new b\n");
+    try completeDisclosureBuild(&presentation);
+
+    const review = presentation.projection().review.?;
+    try testing.expectEqual(SelectedVersion.old, review.selected_version);
+    const row = review.frame.visual_rows[review.navigation.cursor];
+    try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(row.buffer_index));
+    try testing.expectEqualStrings("old b", (frame_mod.selectedSource(row, .old) orelse return error.VersionLocationLost).text);
+}
+
+test "M21 kernel failed Selected Version view build queue shows its failure once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .select_old_version });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.published.?.pending_view == null);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed Selected Version enrichment queue shows its failure once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var allocations: usize = 0;
+    for (0..2) |attempt| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 10 },
+        });
+        defer presentation.deinit();
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
+        try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
+        for (presentation.commands.items) |*queued| queued.deinit();
+        presentation.commands.clearRetainingCapacity();
+        try presentation.dispatch(.{ .action = .recover_submission });
+        const start = failing.alloc_index;
+        if (attempt == 1) failing.fail_index = start + allocations - 1;
+        try presentation.dispatch(.{ .action = .select_old_version });
+        failing.fail_index = std.math.maxInt(usize);
+        if (attempt == 0) {
+            allocations = failing.alloc_index - start;
+            try testing.expectEqual(@as(usize, 2), presentation.commands.items.len);
+            try testing.expect(presentation.commands.items[1] == .enrich_file);
+            for (presentation.commands.items) |*queued| queued.deinit();
+            presentation.commands.clearRetainingCapacity();
+            continue;
+        }
+        try testing.expect(failing.has_induced_failure);
+        try testing.expect(presentation.published.?.pending_view == null);
+        try expectDroppedInputRecord(&presentation);
+    }
+}
+
+test "M21 kernel dropped enrichment that cancels a Refresh location shows its failure once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try presentation.dispatch(.{ .action = .next_file });
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    try refreshRecoverySession(&presentation, try testTwoFileSession(testing.allocator, 1));
+    try testing.expect(cursorOwner(&presentation) == .file);
+    const waiting = try takeTestEnrichment(&presentation);
+    try testing.expect(presentation.published.?.pending_review_location != null);
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+    failing.fail_index = failing.alloc_index;
+    try deliverTestEnrichment(&presentation, waiting);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(presentation.published.?.pending_review_location == null);
+    try testing.expect(presentation.published.?.session.enrichment.file(waiting.file_index).new == .pending);
+    try expectDroppedInputRecord(&presentation);
+}
+
+test "M21 kernel failed enrichment build that cancels a Refresh location shows its failure" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try presentation.dispatch(.{ .action = .next_file });
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try moveToRecoverySource(&presentation, "b.zig", .new, 1);
+    try refreshRecoverySession(&presentation, try testTwoFileSession(testing.allocator, 1));
+    try testing.expect(cursorOwner(&presentation) == .file);
+    const waiting = try takeTestEnrichment(&presentation);
+    try deliverTestEnrichment(&presentation, waiting);
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    var saved_arena = worker.arena;
+    defer saved_arena.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    worker.arena = std.heap.ArenaAllocator.init(failing.allocator());
+    worker.build();
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(worker.failed);
+    try testing.expect(presentation.published.?.pending_review_location != null);
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+
+    try testing.expectEqual(@as(?ActionError, .buffer_build_failed), presentation.projection().action_error);
+    try testing.expect(presentation.published.?.pending_review_location == null);
+    try testing.expect(cursorOwner(&presentation) == .file);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "M21 kernel Review Search acquisition queue keeps the shown message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+    });
+    defer presentation.deinit();
+    var taken: [1]EnrichFile = undefined;
+    try openTestReviewSearchAcquisition(&presentation, &taken);
+    try failTestEnrichment(&presentation, taken[0]);
+    try testing.expectEqual(@as(?ActionError, .file_enrichment_launch_failed), presentation.projection().action_error);
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqual(@as(usize, 8), command.enrich_file.file_index);
+}
+
+test "M21 kernel Review Search acquisition queue failure records once and keeps the shown message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+    });
+    defer presentation.deinit();
+    var taken: [2]EnrichFile = undefined;
+    try openTestReviewSearchAcquisition(&presentation, &taken);
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    failing.fail_index = failing.alloc_index;
+    try failTestEnrichment(&presentation, taken[0]);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(?ActionError, .file_enrichment_launch_failed), presentation.projection().action_error);
+    const failure = (presentation.takeCommand() orelse return error.TestExpectedRecord).report_diagnostic;
+    try testing.expectEqual(bbr.diagnostic.Operation.file_enrichment, failure.operation);
+    try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+    try testing.expect(presentation.takeCommand() == null);
+    try failTestEnrichment(&presentation, taken[1]);
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqual(@as(usize, 8), command.enrich_file.file_index);
+}
+
+test "M21 kernel opening Review Search shows the failure of its acquisition queue" {
+    for ([_]bool{ false, true }) |reopened_query| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_review_search });
+        if (reopened_query) try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        try testing.expectEqual(reopened_query, presentation.published.?.review_search.needs_scan);
+        while (presentation.takeCommand()) |next| {
+            var queued = next;
+            queued.deinit();
+        }
+        // The first allocation of the open is then the acquisition queue,
+        // because the command list has its capacity.
+        try testing.expectEqual(@as(usize, 0), presentation.issued_enrichments.items.len);
+        presentation.issued_enrichments.clearAndFree(presentation.allocator);
+        try presentation.commands.ensureTotalCapacity(presentation.allocator, 32);
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.{ .action = .open_review_search });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        var records: usize = 0;
+        var query_scans: usize = 0;
+        while (presentation.takeCommand()) |next| {
+            var command = next;
+            defer command.deinit();
+            switch (command) {
+                .report_diagnostic => |failure| {
+                    try testing.expectEqual(bbr.diagnostic.Operation.file_enrichment, failure.operation);
+                    records += 1;
+                },
+                .scan_buffer_search => query_scans += 1,
+                else => {},
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), records);
+        try testing.expectEqual(@as(usize, @intFromBool(reopened_query)), query_scans);
+    }
+}
+
+test "M21 kernel the focus check queues a Review Search acquisition that failed with no work in flight" {
+    for ([_]bool{ false, true }) |on_review_card| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testManyFileSession(testing.allocator, 1, 10);
+        if (on_review_card) {
+            var comments: [8]bbr.review.Comment = undefined;
+            for (&comments, 0..) |*comment, index| comment.* = .{ .id = 100 + index, .author = "Author", .body = "Review-level Comment", .scope = .review };
+            session.threads = try bbr.review.buildThreads(session.arena.allocator(), try session.arena.allocator().dupe(bbr.review.Comment, &comments));
+        }
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 80, .rows = 10 },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        while (presentation.takeCommand()) |next| {
+            var queued = next;
+            queued.deinit();
+        }
+        presentation.issued_enrichments.clearAndFree(presentation.allocator);
+        try presentation.commands.ensureTotalCapacity(presentation.allocator, 32);
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.{ .action = .open_review_search });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        var record = presentation.takeCommand() orelse return error.TestExpectedRecord;
+        defer record.deinit();
+        try testing.expect(record == .report_diagnostic);
+        try testing.expect(presentation.takeCommand() == null);
+        const published = presentation.published.?;
+        try testing.expectEqual(on_review_card, Presentation.enrichmentRange(published, published.activeFile(), published.session.diff.files.len).focused.isEmpty());
+
+        try presentation.dispatch(.ensure_focused_enrichment);
+
+        var queued: usize = 0;
+        while (presentation.takeCommand()) |next| {
+            var command = next;
+            defer command.deinit();
+            if (command == .enrich_file) queued += 1;
+        }
+        try testing.expectEqual(@as(usize, 8), queued);
+    }
 }
 
 test "M21 kernel cache focus supersedes queued and issued focus changes" {
@@ -31470,6 +32276,79 @@ test "M21 kernel a scanned File that the Review Search Preview acquires again is
     try testing.expect(storage.file(file_index).new != .content);
 }
 
+test "M21 kernel opening a Review Search hit in an evicted File clears an older message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 16) },
+    });
+    defer presentation.deinit();
+    const storage = &presentation.published.?.session.enrichment;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+    for (0..64) |_| {
+        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+        const view = presentation.projection().review_search.?;
+        const location = view.results[view.selected.?].occurrence.location;
+        if (location == .source and storage.file(location.source.file_index).new == .pending) break;
+    } else return error.TestUnexpectedResult;
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0x2603, .text = "\x00" } });
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .action = .open_search_occurrence });
+    try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+    try testing.expect(presentation.projection().review_search == null);
+}
+
+test "M21 kernel Review Search completion openings keep the shown message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 16) },
+    });
+    defer presentation.deinit();
+    const storage = &presentation.published.?.session.enrichment;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try runReviewSearchTestWork(&presentation, std.math.maxInt(usize));
+    var other: ?EnrichFile = null;
+    const file_index = for (0..64) |_| {
+        try presentation.dispatch(.{ .action = .next_review_search_occurrence });
+        const view = presentation.projection().review_search.?;
+        const location = view.results[view.selected.?].occurrence.location;
+        if (location != .source or storage.file(location.source.file_index).new != .pending) continue;
+        if (other) |command| {
+            if (location.source.file_index != command.file_index) break location.source.file_index;
+        } else {
+            try runReviewSearchTestWork(&presentation, 0);
+            other = presentation.takeCommand().?.enrich_file;
+        }
+    } else return error.TestUnexpectedResult;
+    try presentation.dispatch(.{ .action = .open_search_occurrence });
+    try testing.expect(storage.files[file_index].leases > 0);
+    try runReviewSearchTestWork(&presentation, 0);
+    const enrichment = presentation.takeCommand().?.enrich_file;
+    try testing.expectEqual(file_index, enrichment.file_index);
+    try deliverTestEnrichment(&presentation, enrichment);
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(storage.file(file_index).new == .content);
+    const destination = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.review_destination, destination.kind);
+    destination.build();
+    try failTestEnrichment(&presentation, other.?);
+    try presentation.dispatch(.{ .resize = .{ .cols = presentation.geometry.cols, .rows = presentation.geometry.rows + 1 } });
+    try presentation.dispatch(.{ .buffer_disclosure_built = destination });
+    try testing.expect(storage.file(file_index).new == .content);
+    try testing.expectEqual(@as(?ActionError, .file_enrichment_launch_failed), presentation.projection().action_error);
+}
+
 test "M21 kernel reopening Review Search holds no File that its query already scanned" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -31494,8 +32373,8 @@ test "M21 kernel reopening Review Search holds no File that its query already sc
         try testing.expectEqual(@as(usize, @intFromBool(std.meta.eql(preview, @as(?usize, index)))), stored.leases);
 }
 
-test "a failed enrichment rebuild releases each File and reports only demanded Files" {
-    for ([_]bool{ false, true }) |demanded| {
+test "M21 kernel a failed enrichment rebuild keeps a shown message and reports only demanded Files" {
+    for ([_]bool{ false, true }) |demanded| for ([_]bool{ false, true }) |message_shown| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -31525,18 +32404,24 @@ test "a failed enrichment rebuild releases each File and reports only demanded F
         worker.arena = std.heap.ArenaAllocator.init(failing.allocator());
         worker.build();
         try testing.expect(worker.failed);
+        if (message_shown) {
+            try presentation.dispatch(.{ .action = .recover_submission });
+            try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error);
+        }
         try presentation.dispatch(.{ .buffer_disclosure_built = worker });
 
         for (batch[0..2]) |command| {
             try testing.expect(presentation.published.?.session.enrichment.file(command.file_index).new == .pending);
             try testing.expect(presentation.published.?.session.enrichment.needsEnrichment(command.file_index));
         }
-        if (demanded)
+        if (message_shown)
+            try testing.expectEqual(@as(?ActionError, .action_refused), presentation.projection().action_error)
+        else if (demanded)
             try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?)
         else
             try testing.expect(presentation.projection().action_error == null);
         for (batch[2..]) |command| try deliverTestEnrichment(&presentation, command);
-    }
+    };
 }
 
 test "Review recovery a refused speculative enrichment build shows no action error" {
@@ -33613,6 +34498,26 @@ test "Review recovery a completed cache update clears a failed build of its own 
     try state.queueCacheBuild(published, published.session.enrichment.focused);
     try completeDisclosureBuild(&state);
     try testing.expect(state.projection().action_error == null);
+}
+
+test "Review recovery a failed cache update keeps the shown message" {
+    for ([_]bool{ false, true }) |message_shown| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        });
+        defer state.deinit();
+        if (message_shown) try showTestPickerLoadFailure(&state);
+        const published = state.published.?;
+        try state.queueCacheBuild(published, published.session.enrichment.focused);
+        const job = state.takeCommand().?.build_buffer_disclosure;
+        job.failed = true;
+        try state.dispatch(.{ .buffer_disclosure_built = job });
+        const shown: ActionError = if (message_shown) .picker_load_failed else .buffer_build_failed;
+        try testing.expectEqual(@as(?ActionError, shown), state.projection().action_error);
+        try testing.expect(published.pending_cache_update == null);
+    }
 }
 
 test "Review recovery Picker error survives the focus check that starts a File Enrichment" {
@@ -37894,6 +38799,95 @@ test "M21 kernel Review Search keeps another message of the same event when a re
     try testing.expectEqualStrings("newe", view.review_search.?.query);
     try testing.expect(!view.review_search.?.pending);
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
+}
+
+test "M21 kernel Review Search keeps another message of the same event when a reopened query retry fails" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0x2603, .text = "\x00" } });
+    try testing.expectEqual(ActionError.buffer_search_invalid_query, presentation.projection().action_error.?);
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(?ActionError, .buffer_search_invalid_query), presentation.projection().action_error);
+    const failure = (presentation.takeCommand() orelse return error.TestExpectedRecord).report_diagnostic;
+    try testing.expectEqual(error.OutOfMemory, failure.cause.zig);
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try completeBufferSearchScan(&presentation);
+    try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
+}
+
+test "M21 kernel Review Search keeps the PullRequest of a shown error when a reopened query retry fails" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .open_review_search });
+    failing.fail_index = std.math.maxInt(usize);
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+    const other = OwnedRemoteReviewIdentity.init(try OwnedReviewIdentity.init("workspace", "other", 7));
+    presentation.withErrorOrigin(.reviewer_verdict, Presentation.showErrorFor, .{ &presentation, .reviewer_verdict_launch_failed, other });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(presentation.published.?.review_search.needs_scan);
+    const shown = presentation.action_error orelse return error.TestExpectedActionError;
+    try testing.expectEqual(ActionError.reviewer_verdict_launch_failed, shown.err);
+    try testing.expectEqual(ErrorOrigin.reviewer_verdict, shown.origin);
+    const shown_key = shown.key orelse return error.TestExpectedPullRequestKey;
+    try testing.expect(OwnedRemoteReviewIdentity.eql(other, shown_key));
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        queued.deinit();
+    }
+}
+
+test "M21 kernel a failed Review Search query edit shows its failure over another message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 2, .{ .diagnostic_state = .on });
+    defer presentation.deinit();
+    try runTestUntilSourceScanWaits(&presentation, 0);
+    presentation.withErrorOrigin(.reviewer_verdict, Presentation.showError, .{ &presentation, .reviewer_verdict_launch_failed });
+    presentation.commands.clearAndFree(presentation.allocator);
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+    var records: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var queued = next;
+        if (queued == .report_diagnostic) records += 1;
+        queued.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), records);
 }
 
 test "M21 kernel Review Search starts no source scan while a query edit is pending" {
