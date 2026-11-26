@@ -54,6 +54,14 @@ pub fn deliver(sink: CompletionSink, input_value: presentation.OwnedInput) void 
     };
 }
 
+/// The terminal thread could not start the worker of `command`. Records the
+/// launch failure once and dispatches its completion.
+pub fn dispatchLaunchFailure(state: *presentation.Presentation, handle: bbr.diagnostics.Handle, command: *presentation.OwnedCommand, cause: anyerror) !void {
+    const input = try command.launchFailed(cause);
+    recordFailures(handle, input);
+    try state.dispatch(input);
+}
+
 pub fn commandHandle(command: presentation.OwnedCommand, handle: bbr.diagnostics.Handle, work_id: ?u64) bbr.diagnostics.Handle {
     const diagnostic = command.diagnosticContext(work_id);
     return handle.forContext(diagnostic.operation, diagnostic.context);
