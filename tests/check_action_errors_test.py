@@ -102,6 +102,24 @@ ORIGIN_HELPERS = """pub const Presentation = struct {
     }
 };
 """
+# The query retry of ticket 06 before main added the PullRequest key.
+COPIED_ORIGIN = """pub const Presentation = struct {
+    fn retryReviewSearchQuery(self: *Presentation) void {
+        const shown = self.action_error;
+        self.replaceReviewSearchQuery(text);
+        if (state.needs_scan) if (shown) |kept| self.withErrorOrigin(kept.origin, showError, .{ self, kept.err });
+        self.withErrorOrigin(
+            kept.origin,
+            showErrorFor,
+            .{ self, kept.err, kept.key },
+        );
+    }
+};
+
+fn showTestError(state: *Presentation, origin: ErrorOrigin, err: ActionError) void {
+    state.withErrorOrigin(origin, Presentation.showError, .{ state, err });
+}
+"""
 
 
 class ActionErrorsTest(unittest.TestCase):
@@ -164,6 +182,12 @@ class ActionErrorsTest(unittest.TestCase):
 
     def test_dispatch_and_the_override_helper_may_set_the_event_origin(self):
         self.assertEqual(self.check(ORIGIN_HELPERS), [])
+
+    def test_a_copied_origin_in_presentation_is_rejected(self):
+        found = self.check(COPIED_ORIGIN)
+        self.assertEqual([message.split(":")[1] for message in found], ["5", "6"])
+        self.assertIn("is not an enum literal", found[0])
+        self.assertIn("failMaintenance", found[0])
 
 
 if __name__ == "__main__":
