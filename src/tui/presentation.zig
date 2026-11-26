@@ -2967,7 +2967,7 @@ pub const DisclosureBuild = struct {
         fn isMaintenance(kind: Kind) bool {
             return switch (kind) {
                 .enrichment, .cache_update => true,
-                .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .card_destination => false,
+                .input, .accepted, .restore, .general, .clear_input, .open_input, .view, .draft_save, .draft_mutation, .review_destination, .overview_destination, .card_destination => false,
             };
         }
 
