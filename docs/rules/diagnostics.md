@@ -104,7 +104,19 @@ A boundary records every error except `error.Reported` once. Then it restores st
 
 `Handle.record` drops a Failure whose cause is `error.Reported`, so a boundary that records it writes no second record. A boundary that maps errors to user messages names `error.Reported` in its own prong.
 
+In Presentation, `failMaintenance` and `failDroppedInput` write the one record of a failed queue and show its message. [Maintenance work keeps the shown message](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message) and [A dropped user input shows its failure](../../CODING_STANDARDS.md#a-dropped-user-input-shows-its-failure) say which message each shows.
+
 Enforcement: `Handle.record` in `src/diagnostics.zig` drops `error.Reported` in every build. `Sink.record` is private, so no record reaches the Sink another way. `SqliteStore.native` returns an error union, so a plain SQLite error after a recorded result does not compile. The `diagnostics` tests in `src/diagnostics.zig`, `src/tui/presentation.zig`, `src/tui/presentation_runtime.zig`, `src/tui/app.zig`, `src/api/cli.zig`, `src/main.zig`, and `src/bitbucket/client.zig` read exactly one record per failure at each boundary kind. So do `tests/record_once_cli_test.py`, `tests/config_load_cli_test.py`, and `tests/store_message_cli_test.py`. `zig build test` runs them.
+
+## A failed Buffer build has its record from the worker boundary
+
+A failed Buffer build carries its cause as `evidence` in the `DisclosureBuild`.
+`recordFailures` in `src/tui/presentation_runtime.zig` writes the one record of that evidence.
+`deliver` calls it for a worker result before it posts the completion.
+For a launch failure, the command drain in `src/tui/app.zig` calls `dispatchLaunchFailure`, which calls it.
+So `acceptBufferDisclosure` writes no record for a failed build of any kind. It only shows the message.
+
+Enforcement: the tests "diagnostics a failed Buffer build has one record from the worker boundary" and "diagnostics a failed Buffer build launch has one record from the command drain" in `src/tui/presentation_runtime.zig` read exactly one record in the Sink and no report command from Presentation. They fail when `recordFailures` skips the evidence, when `dispatchLaunchFailure` skips `recordFailures`, and when Presentation writes a second record. `zig build test` runs them. The drain needs a terminal, so they do not run it. They do not see a drain that stops calling `dispatchLaunchFailure`.
 
 ## A client notes leaf evidence in the boundary slot
 
