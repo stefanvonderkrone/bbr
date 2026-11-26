@@ -18,6 +18,7 @@ Source: the Standards and Spec reviews of ticket 09 in `.scratch/focus-check-sta
    When the retry fails with `out_of_memory` and the next allocation succeeds, the pump's successful `queueFileEnrichment` clears the message of the retry.
    `std.testing.FailingAllocator` keeps failing after its first failure, so no current test can make this case.
    With a lasting allocation failure, the pump fails too, and `failMaintenance` keeps the message.
+   The focus check of PR #45 (ticket 10) runs the same reopened query retry right before the same pump while Review Search is open, so the case also applies there. The fix must cover both `openReviewSearch` and the focus check.
 
 ## Proposal
 
