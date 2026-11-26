@@ -323,6 +323,14 @@ test "diagnostics a refused Reviewer Verdict change has one record from the work
 }
 
 test "diagnostics a failed Buffer build has one record from the worker boundary" {
+    try expectOneBufferBuildRecord(.worker);
+}
+
+test "diagnostics a failed Buffer build launch has one record from the command drain" {
+    try expectOneBufferBuildRecord(.launch);
+}
+
+fn expectOneBufferBuildRecord(path: enum { worker, launch }) !void {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
@@ -349,19 +357,26 @@ test "diagnostics a failed Buffer build has one record from the worker boundary"
         owned.deinit();
     }
     try state.dispatch(.{ .action = .toggle_layout });
-    const job = state.takeCommand().?.build_buffer_disclosure;
-    var saved_arena = job.arena;
-    defer saved_arena.deinit();
-    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    job.arena = std.heap.ArenaAllocator.init(failing.allocator());
-    job.build();
-    try testing.expect(job.failed);
-    var sink: CapturingSink = .{};
-    var completion = sink.sink();
-    completion.diagnostic = diagnostic_sink.handle(.buffer_build, .{});
-    deliver(completion, .{ .buffer_disclosure_built = job });
-    try state.dispatch(sink.input.?);
-    sink.input = null;
+    var command = state.takeCommand().?;
+    const handle = diagnostic_sink.handle(.buffer_build, .{});
+    switch (path) {
+        .worker => {
+            const job = command.build_buffer_disclosure;
+            var saved_arena = job.arena;
+            defer saved_arena.deinit();
+            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+            job.arena = std.heap.ArenaAllocator.init(failing.allocator());
+            job.build();
+            try testing.expect(job.failed);
+            var sink: CapturingSink = .{};
+            var completion = sink.sink();
+            completion.diagnostic = handle;
+            deliver(completion, .{ .buffer_disclosure_built = job });
+            try state.dispatch(sink.input.?);
+            sink.input = null;
+        },
+        .launch => try dispatchLaunchFailure(&state, handle, &command, error.ConcurrencyUnavailable),
+    }
     try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
     try testing.expect(state.takeCommand() == null);
     _ = diagnostic_sink.setEnabled(false);
@@ -375,7 +390,10 @@ test "diagnostics a failed Buffer build has one record from the worker boundary"
     _ = lines.next();
     const only = lines.next().?;
     try testing.expect(lines.next() == null);
-    try testing.expect(std.mem.endsWith(u8, only, "cause=zig error=OutOfMemory"));
+    try testing.expect(std.mem.endsWith(u8, only, switch (path) {
+        .worker => "cause=zig error=OutOfMemory",
+        .launch => "cause=zig error=ConcurrencyUnavailable",
+    }));
 }
 
 test "diagnostics launch failure retains actual cause and command work identities" {
