@@ -37492,6 +37492,36 @@ test "M21 kernel a Review Search query edit shows the failure of its cache stagi
     };
 }
 
+test "M21 kernel a Review Search destination shows the failure of its cache staging" {
+    for ([_]bool{ false, true }) |older_message| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 12, .{ .diagnostic_state = .on, .inactive_file_cache_max_bytes = 1 });
+        defer presentation.deinit();
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try runTestUntilSourceScanWaits(&presentation, 11);
+        try presentation.dispatch(.{ .action = .open_search_occurrence });
+        const destination = presentation.commands.orderedRemove(0).build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.review_destination, destination.kind);
+        try testing.expect(presentation.queued_source_scan != null);
+        destination.build();
+        try testing.expect(!destination.failed);
+        if (older_message) showTestError(&presentation, .buffer, .buffer_search_no_matches);
+        presentation.commands.clearAndFree(presentation.allocator);
+        // The first allocation copies the disclosures of the destination.
+        try testing.expect(destination.disclosures.len > 0);
+        failing.fail_index = failing.alloc_index + 1;
+        try presentation.dispatch(.{ .buffer_disclosure_built = destination });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        try testing.expect(presentation.projection().review_search == null);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        // The discarded source scan and the released holds each fail to stage.
+        try testing.expectEqual(@as(usize, 2), drainTestCommands(&presentation));
+    }
+}
+
 test "M21 kernel Review Search keeps the PullRequest of a shown error when a reopened query retry fails" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
