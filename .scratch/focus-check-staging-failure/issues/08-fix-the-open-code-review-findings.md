@@ -1,6 +1,7 @@
 # Fix the Open Code Review findings of PR #45
 
-Status: ready-for-agent
+Status: claimed
+Claimed by: /Volumes/Work/t3-code/focus-check-staging-failure
 Blocked by: none
 
 Source: Open Code Review of PR #45.
