@@ -181,7 +181,7 @@ The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after
 This focus check, `ensureFocusedEnrichment`, stages the cache build again while the cache is over the budget, and it queues the File Enrichment of the active File again while the File is pending.
 While Review Search is open, the focus check queues no File of its range and pumps the acquisition after its range work, also after a cache staging or with an empty range.
 A failed queue can leave no File Enrichment in flight, and then no completion pumps again.
-While a cache update is pending, the focus check stages after that update commits.
+While a cache update is pending, the focus check stages a new cache build only when the focus changed since that update was staged.
 A File that the acquisition cannot queue stays pending and unacquired, so a later pump queues it again, such as the pump of a later focus check while Review Search is open.
 So a failure loses no work and keeps the session.
 The message of the event outcome stays, such as `buffer_search_scan_failed` or `file_enrichment_launch_failed`.
