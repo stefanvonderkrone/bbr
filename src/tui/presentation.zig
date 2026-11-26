@@ -8764,10 +8764,6 @@ pub const Presentation = struct {
         if (state.query != null) holdReviewSearchFiles(published);
         state.open = true;
         self.pauseQueuedSpeculativeEnrichment(published);
-        self.pumpReviewSearchAcquisition(published);
-        self.maybeQueueReviewSourceScan(published);
-        published.active_search = .review;
-        published.navigation.count = 0;
         self.clearError();
         if (state.needs_scan) {
             const text = (state.query orelse unreachable).query.text;
@@ -8777,6 +8773,10 @@ pub const Presentation = struct {
             // without the pending mark, also when its scan cannot queue.
             state.pending = true;
         }
+        self.pumpReviewSearchAcquisition(published);
+        self.maybeQueueReviewSourceScan(published);
+        published.active_search = .review;
+        published.navigation.count = 0;
         published.frame_revision += 1;
     }
 
