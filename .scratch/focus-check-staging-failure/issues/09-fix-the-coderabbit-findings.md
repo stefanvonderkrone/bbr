@@ -43,7 +43,7 @@ Source: CodeRabbit review of PR #45.
 3. Valid. A reopened query retry runs as `.review_search` and clears a Review Search message on success, so it also removed the message of the pump. The open now clears first, then retries the query, then pumps.
 4. Valid. `docs/rules/tui-state.md` already states how `dispatch` and `withErrorOrigin` set an origin.
 
-The reviews found two more cases of item 3. [Ticket 10](10-clear-before-the-maintenance-steps-of-a-query-edit.md) holds them.
+The reviews found two more cases of item 3. The follow-up branch `query-edit-clear-order` holds them as ticket 01 of `.scratch/query-edit-clear-order/`.
 
 ## Completion
 
