@@ -37449,6 +37449,49 @@ test "M21 kernel Review Search keeps another message of the same event when a re
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
 }
 
+fn drainTestCommands(presentation: *Presentation) usize {
+    var records: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command == .report_diagnostic) records += 1;
+        command.deinit();
+    }
+    return records;
+}
+
+test "M21 kernel a Review Search query edit shows the failure of its cache staging" {
+    for ([_]bool{ false, true }) |empty_query| for ([_]bool{ false, true }) |older_message| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        // File 11 is outside the focus of the first Files on screen.
+        var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 12, .{ .diagnostic_state = .on, .inactive_file_cache_max_bytes = 1 });
+        defer presentation.deinit();
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try runTestUntilSourceScanWaits(&presentation, 11);
+        // A released lease stages a cache build while a cache update runs.
+        const published = presentation.published.?;
+        try presentation.queueCacheBuild(published, published.session.enrichment.focused);
+        var running = presentation.commands.pop().?;
+        defer running.deinit();
+        try testing.expect(running == .build_buffer_disclosure);
+        if (older_message) showTestError(&presentation, .file_enrichment, .file_enrichment_launch_failed);
+        // A query scan takes the one free slot, so the staging cannot grow
+        // the queue.
+        presentation.commands.clearAndFree(presentation.allocator);
+        if (!empty_query) try presentation.commands.ensureTotalCapacityPrecise(presentation.allocator, 1);
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.{ .key = if (empty_query) .{ .codepoint = 'k', .mods = .{ .ctrl = true } } else .{ .codepoint = keymap_mod.special.backspace } });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        try testing.expect(presentation.queued_source_scan == null);
+        try testing.expectEqualStrings(if (empty_query) "" else "ne", presentation.projection().review_search.?.query);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        // An empty query also releases the holds, and that staging fails too.
+        try testing.expectEqual(@as(usize, if (empty_query) 2 else 1), drainTestCommands(&presentation));
+    };
+}
+
 test "M21 kernel Review Search keeps the PullRequest of a shown error when a reopened query retry fails" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
