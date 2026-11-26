@@ -8776,11 +8776,7 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (!state.open or !state.pending or !state.needs_scan) return;
-        const shown = self.action_error;
-        self.replaceReviewSearchQuery((state.query orelse unreachable).query.text);
-        // A failed retry runs again at the next focus check, so it keeps
-        // the shown message with its origin and PullRequest.
-        if (state.needs_scan) if (shown) |kept| self.withErrorOrigin(kept.origin, showErrorFor, .{ self, kept.err, kept.key });
+        self.setReviewSearchQuery((state.query orelse unreachable).query.text) catch |err| self.failMaintenance(.review_search, err, @src());
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
@@ -8849,22 +8845,26 @@ pub const Presentation = struct {
         self.replaceReviewSearchQuery(text[0..end]);
     }
 
+    /// A query edit of the person is not retried when its scan cannot
+    /// queue, so the failure shows over another message.
     fn replaceReviewSearchQuery(self: *Presentation, text: []const u8) void {
+        self.setReviewSearchQuery(text) catch |err| self.failDroppedInput(err, @src());
+    }
+
+    /// Records an allocation failure and returns `error.Reported` without a
+    /// message, because the caller knows whether a later check retries it.
+    fn setReviewSearchQuery(self: *Presentation, text: []const u8) error{Reported}!void {
         const published = self.published orelse return;
         const state = &published.review_search;
         state.opening_source = false;
         state.opening_identity = null;
-        const query = SharedQuery.create(text) catch |err| {
-            switch (err) {
-                error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
-                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
-            }
-            self.showError(switch (err) {
-                error.TooLong => .buffer_search_query_too_long,
-                error.OutOfMemory => .out_of_memory,
-                else => .buffer_search_invalid_query,
-            });
-            return;
+        const query = SharedQuery.create(text) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.reportFailure(.review_search, .prepare, err, @src());
+                return error.Reported;
+            },
+            error.TooLong => return self.showError(.buffer_search_query_too_long),
+            error.InvalidUtf8, error.Nul, error.LineEnding => return self.showError(.buffer_search_invalid_query),
         };
         if (text.len == 0) {
             query.release();
@@ -8892,16 +8892,14 @@ pub const Presentation = struct {
             return;
         }
         var worker_query = search.Query.init(std.heap.page_allocator, text) catch |err| {
-            switch (err) {
-                error.OutOfMemory => self.reportFailure(.review_search, .prepare, err, @src()),
-                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => {},
-            }
             query.release();
-            self.showError(switch (err) {
-                error.OutOfMemory => .out_of_memory,
-                else => .buffer_search_invalid_query,
-            });
-            return;
+            switch (err) {
+                error.OutOfMemory => {
+                    self.reportFailure(.review_search, .prepare, err, @src());
+                    return error.Reported;
+                },
+                error.InvalidUtf8, error.Nul, error.LineEnding, error.TooLong => return self.showError(.buffer_search_invalid_query),
+            }
         };
         const corpus = state.corpus orelse {
             query.release();
@@ -8920,8 +8918,7 @@ pub const Presentation = struct {
             self.reportFailure(.completion, .admission, err, @src());
             command.deinit();
             query.release();
-            self.showError(.out_of_memory);
-            return;
+            return error.Reported;
         };
         self.discardQueuedReviewSearchScans();
         // The query scan takes the reserved slot before a discarded source
