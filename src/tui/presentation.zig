@@ -13724,8 +13724,8 @@ pub const Presentation = struct {
     }
 
     /// Ends a replacement with an error. A completion input bumps no
-    /// revision in `dispatch`, so this bump repaints the failure, and a
-    /// pending-replacement notice must not outlive its replacement.
+    /// revision in `dispatch`, so this bump repaints `replacement_error`, and
+    /// a pending-replacement notice must not outlive its replacement.
     fn failReplacement(self: *Presentation, replacement: Replacement, err: ReplacementError) void {
         if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
         self.replacement = null;
@@ -31361,6 +31361,8 @@ test "M21 kernel opening Review Search shows the failure of its acquisition queu
             var queued = next;
             queued.deinit();
         }
+        // The first allocation of the open is then the acquisition queue,
+        // because the command list has its capacity.
         try testing.expectEqual(@as(usize, 0), presentation.issued_enrichments.items.len);
         presentation.issued_enrichments.clearAndFree(presentation.allocator);
         try presentation.commands.ensureTotalCapacity(presentation.allocator, 32);
