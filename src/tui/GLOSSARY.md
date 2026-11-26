@@ -18,6 +18,10 @@ _Avoid_: PullRequest header, comparison string, byline.
 The lazily acquired old/new full-file content and Highlighting attached to a File during a Session. Each side becomes available independently; failure on one side does not suppress usable content from the other.
 _Avoid_: blob load, highlight job, hydration.
 
+**Maintenance work**:
+Work that Presentation queues or stages when no input asked for it, and that a later check does again after a failure, such as a cache staging in the focus check or a File Enrichment of the Review Search acquisition. Its failure keeps the shown message.
+_Avoid_: housekeeping.
+
 **Enrichment Range**:
 The Files whose File Enrichment Presentation keeps: every File with a row in the DiffPane viewport, plus a fixed number of overscan Files above and below them. An isolated File is the whole Enrichment Range.
 _Avoid_: prefetch window, focused File (for the whole range).
@@ -221,6 +225,10 @@ _Avoid_: command, handler, event.
 **Interaction Context**:
 The active input surface and semantic target from the current Presentation Frame: an Overlay when one captures input, otherwise the focused Pane and its cursor target. The Detecting Frame and the Browser Entry under the cursor are also input surfaces. It determines Action resolution and ActionAvailability without becoming Review state.
 _Avoid_: mode (too broad), focus alone (omits the target), input state.
+
+**Error Origin**:
+The path that shows an action error. A key, a mouse action, or an Overlay action has the origin `user`. A completion has the path of its work, such as `file_enrichment` or `review_search`. Work of one path that runs inside an event of another path has the origin of its own path. A clear from `user` clears any error. A clear from another origin clears only an error of that origin.
+_Avoid_: event class, trigger.
 
 **ActionAvailability**:
 Whether an Action is valid for the currently published Review. Unavailable Actions remain visible but greyed in the help Overlay; invoking one produces an explanatory status message, while Presentation alone decides availability. A mutation Action carries the precise refusal reason for the item under the cursor — an active or recovered SubmissionRun owns it, its publication outcome is unresolved, it is in flight, it is already represented by Bitbucket, or there is no ReviewCard there at all. A cascading Action answers for its whole consequence: one ineligible Reply below the item refuses the complete deletion rather than applying part of it.

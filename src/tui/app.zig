@@ -1321,10 +1321,7 @@ fn drainPresentationCommands(
             continue;
         }
         futures.ensureUnusedCapacity(ctx.gpa, 1) catch |err| {
-            const diagnostic = presentation_runtime.commandHandle(command, ctx.diagnostic, null);
-            const input = try command.launchFailed(err);
-            presentation_runtime.recordFailures(diagnostic, input);
-            try state.dispatch(input);
+            try presentation_runtime.dispatchLaunchFailure(state, presentation_runtime.commandHandle(command, ctx.diagnostic, null), &command, err);
             continue;
         };
         const work_id = next_work_id.*;
@@ -1355,9 +1352,7 @@ fn drainPresentationCommands(
             .build_buffer_disclosure => |job| bbr.diagnostics.concurrent(ctx.io, presentationDisclosureWorker, .{ loop, work_id, diagnostic, job }),
             .scan_review_source => |scan| bbr.diagnostics.concurrent(ctx.io, presentationReviewSourceWorker, .{ loop, work_id, diagnostic, scan }),
         } catch |err| {
-            const input = try command.launchFailed(err);
-            presentation_runtime.recordFailures(diagnostic, input);
-            try state.dispatch(input);
+            try presentation_runtime.dispatchLaunchFailure(state, diagnostic, &command, err);
             continue;
         };
         futures.appendAssumeCapacity(.{ .id = work_id, .future = future });
