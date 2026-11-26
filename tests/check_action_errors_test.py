@@ -45,7 +45,7 @@ HELPERS = """pub const Presentation = struct {
     }
 
     fn acceptPullRequests(self: *Presentation) void {
-        if (self.action_error == null) self.clearError();
+        if (self.action_error != null) self.clearError();
         // self.action_error = null;
         const text = "self.action_error = null";
         _ = text;
@@ -118,6 +118,28 @@ COPIED_ORIGIN = """pub const Presentation = struct {
 
 fn showTestError(state: *Presentation, origin: ErrorOrigin, err: ActionError) void {
     state.withErrorOrigin(origin, Presentation.showError, .{ state, err });
+}
+"""
+# failMaintenance and the failed enrichment build before ticket 01 of
+# query-edit-clear-order kept the shown message by hand.
+OLD_KEEP = """pub const Presentation = struct {
+    fn failMaintenance(self: *Presentation, err: anyerror) void {
+        if (self.action_error == null) self.showError(.out_of_memory);
+    }
+
+    fn acceptViewBuild(self: *Presentation, job: *DisclosureBuild) void {
+        if (!job.kind.isMaintenance() or (!speculative and self.action_error == null))
+            self.showError(.buffer_build_failed);
+    }
+
+    fn showMaintenanceError(self: *Presentation, err: ActionError) void {
+        if (self.action_error == null) return self.showError(err);
+        self.kept_failure = .{ .err = err, .event = self.event_serial };
+    }
+};
+
+test "a fixture" {
+    try testing.expect(presentation.action_error == null);
 }
 """
 
@@ -218,6 +240,12 @@ class ActionErrorsTest(unittest.TestCase):
             "};\n"
         )
         self.assertEqual([message.split(":")[1] for message in found], ["9"])
+
+    def test_a_hand_kept_message_is_rejected(self):
+        found = self.check(OLD_KEEP)
+        self.assertEqual([message.split(":")[1] for message in found], ["3", "7"])
+        self.assertIn("outside showMaintenanceError", found[0])
+        self.assertIn("showMaintenanceError(err)", found[0])
 
     def test_a_file_without_the_presentation_struct_is_rejected(self):
         found = self.check(COPIED_ORIGIN.replace("pub const Presentation = struct {", "pub const Renamed = struct {"))

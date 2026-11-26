@@ -13,6 +13,10 @@ a write of the Presentation field.
 A `withErrorOrigin` call in Presentation names its origin as an enum literal.
 A copied origin, such as the origin of a saved error that the code shows
 again, can drop a field of the copy without a compile error.
+
+Only `showMaintenanceError` asks whether no action error shows. A failure
+that keeps the shown message must go through it, because a later clear of the
+same event would otherwise remove the kept message and hide the failure.
 """
 
 from pathlib import Path
@@ -52,6 +56,12 @@ ORIGIN_MESSAGE = (
     "withErrorOrigin(.review_search, work, args). To keep a shown error after a failure, "
     "call failMaintenance instead of showing a saved copy again."
 )
+KEEP_HELPER = re.compile(r"^\s*(?:pub\s+)?fn\s+showMaintenanceError\(")
+KEEP_TEST = re.compile(r"\.action_error\s*==\s*null")
+KEEP_MESSAGE = (
+    "decides whether a failure keeps the shown message outside showMaintenanceError. "
+    "Call showMaintenanceError(err) instead, so a later clear of the same event shows the failure."
+)
 MISSING_MESSAGE = (
     "has no line `pub const Presentation = struct {`, so the withErrorOrigin check reads nothing. "
     "Update PRESENTATION in tools/check_action_errors.py to the new name of the struct."
@@ -83,25 +93,37 @@ def literal_origin_violations(relative, lines):
     return found
 
 
+def outside_helpers(lines, helpers):
+    """Each line number and line outside the bodies of the helper functions."""
+    helper_depth = None
+    body_open = False
+    depth = 0
+    for number, line in enumerate(lines, 1):
+        if helper_depth is None and helpers.match(line):
+            helper_depth = depth
+            body_open = False
+        elif helper_depth is None:
+            yield number, line
+        depth += line.count("{") - line.count("}")
+        if helper_depth is not None:
+            body_open = body_open or depth > helper_depth
+            if body_open and depth <= helper_depth:
+                helper_depth = None
+
+
 def violations(root):
     found = []
     for relative, lines in zig_files(root, SOURCES, literals=False):
         found.extend(literal_origin_violations(relative, lines))
         for _, helpers, write, message in CHECKS:
-            helper_depth = None
-            body_open = False
-            depth = 0
-            for number, line in enumerate(lines, 1):
-                if helper_depth is None and helpers.match(line):
-                    helper_depth = depth
-                    body_open = False
-                elif helper_depth is None and write.search(line):
+            for number, line in outside_helpers(lines, helpers):
+                if write.search(line):
                     found.append((str(relative), number, f"{relative}:{number}: {message}"))
-                depth += line.count("{") - line.count("}")
-                if helper_depth is not None:
-                    body_open = body_open or depth > helper_depth
-                    if body_open and depth <= helper_depth:
-                        helper_depth = None
+        span = presentation_span(lines)
+        if span is not None:
+            for number, line in outside_helpers(lines, KEEP_HELPER):
+                if span[0] < number <= span[1] + 1 and KEEP_TEST.search(line):
+                    found.append((str(relative), number, f"{relative}:{number}: {KEEP_MESSAGE}"))
     return [message for _, _, message in sorted(found)]
 
 
@@ -114,7 +136,8 @@ def main():
         return 1
     print(
         "Only showErrorFor and clearError write action_error, only dispatch and withErrorOrigin write event_origin, "
-        "and each withErrorOrigin call in Presentation names an enum literal."
+        "each withErrorOrigin call in Presentation names an enum literal, "
+        "and only showMaintenanceError asks whether no action error shows."
     )
     return 0
 
