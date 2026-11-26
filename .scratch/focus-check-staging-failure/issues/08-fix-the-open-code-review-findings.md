@@ -55,6 +55,18 @@ Source: Open Code Review of PR #45.
 4. The checker already rejected `ErrorOrigin.user`, so `test_a_qualified_origin_is_rejected` passes.
    A pattern that accepts a qualified name before the dot fails it.
 
+### 2026-11-26 launch path
+
+The operator asked for a test of the launch failure path of item 2.
+`drainPresentationCommands` needs a terminal, so no test can run it.
+Commit `40d92d6f` moves its two copies of the launch failure steps into `dispatchLaunchFailure` in `src/tui/presentation_runtime.zig`.
+Commit `fb68ee96` adds "diagnostics a failed Buffer build launch has one record from the command drain".
+It shares one body with the worker test.
+Without `recordFailures` in `dispatchLaunchFailure`, the test fails: `'tui.presentation_runtime.test.diagnostics a failed Buffer build launch has one record from the command drain' terminated with signal ABRT`.
+Without the `.buffer_disclosure_built` prong in `recordFailures`, both tests fail with the same signal.
+Each mutation was reverted.
+Commit `fdc4b2bc` names the test in `docs/rules/diagnostics.md` and removes the gap text.
+
 ## Completion
 
 Commits `ad8a3eba..0d7f7332`.
