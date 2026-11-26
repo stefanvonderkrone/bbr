@@ -46,7 +46,7 @@ CHECKS = tuple(
 
 
 PRESENTATION = re.compile(r"^pub const Presentation = struct \{")
-ORIGIN_CALL = re.compile(r"(?<!fn )withErrorOrigin\(\s*(?!\.[A-Za-z_]\w*\s*,)")
+ORIGIN_CALL = re.compile(r"(?<!fn )withErrorOrigin\((?!\s*\.[A-Za-z_]\w*\s*,)")
 ORIGIN_MESSAGE = (
     "passes a withErrorOrigin origin that is not an enum literal. Name the path, such as "
     "withErrorOrigin(.review_search, work, args). To keep a shown error after a failure, "
