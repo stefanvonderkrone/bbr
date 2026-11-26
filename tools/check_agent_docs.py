@@ -39,6 +39,14 @@ PUBLIC_PULL_REQUESTS = {
         "a pull request of the public bbr GitHub repository",
     (".scratch/focus-check-staging-failure", "36"):
         "a pull request of the public bbr GitHub repository",
+    (".scratch/focus-check-staging-failure", "45"):
+        "a pull request of the public bbr GitHub repository",
+    (".scratch/focus-check-staging-failure", "52"):
+        "a pull request of the public bbr GitHub repository",
+    (".scratch/focus-check-staging-failure", "46"):
+        "a pull request of the public bbr GitHub repository",
+    (".scratch/query-edit-clear-order", "45"):
+        "a pull request of the public bbr GitHub repository",
 }
 AGENTS_MD_CAP = 5000
 COMPILE_CLAIM = re.compile(r"compile error|does not compile|do not compile|fails to compile")
