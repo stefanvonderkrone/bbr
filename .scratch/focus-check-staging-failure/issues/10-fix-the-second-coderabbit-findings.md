@@ -52,3 +52,13 @@ The focus check now runs the query retry and then the pump in one event, as `ope
 - Checks: `zig build test` exit 0, `zig fmt --check src build.zig tests` exit 0, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, and `python3 tools/check_doc_symbols.py .` exit 0.
 - Review: a readonly review found two claims that went too far. `11b20a41` fixes both. It found no other issue with the eight-request limit, `failMaintenance`, the cache order, or the other pump callers.
 - Open: the owner of `.scratch/query-edit-clear-order/` must add the focus check to its second gap, because the focus check now runs the retry right before the pump.
+
+### 2026-11-26 third CodeRabbit review
+
+Valid. With the cursor on a Review-level card, `activeFile` is null and the focused range is empty, so `ensureFocusedEnrichment` returned before the pump. A pending cache update and an over-budget cache also returned before it. The fix of item 2 covered only the path that reaches `focusAdmitted`.
+
+- Fix: the range work moves to `ensureFocusedRange`, and `ensureFocusedEnrichment` pumps after it. Only a shutdown and a missing Review stop the pump. Cache staging does not change.
+- Red proof: "M21 kernel the focus check queues a Review Search acquisition that failed with no work in flight" now also starts with eight Review-level Comments in the viewport. It failed with `expected 8, found 0` and passes now.
+- Commits: `c0fc4641` (red test), `0f3a8d51` (fix), and the review fix after them.
+- Review: a readonly review found no harmful state. The completions already pump while a cache update is pending or the cache is over the budget. It found three texts to fix, and the review commit fixes them. The old sentence of `CODING_STANDARDS.md` that the focus check stages after a pending cache update commits stays open, because the code stages at once when the focus changes.
+- Checks: `zig build test` exit 0 and every check of the acceptance criteria pass.
