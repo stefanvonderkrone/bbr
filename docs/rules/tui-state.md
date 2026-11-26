@@ -74,7 +74,11 @@ While Buffer Search is open, the status shows the Buffer Search line with only B
 `showErrorFor` and `clearError` read `Presentation.event_origin`, the origin of the event that runs.
 `dispatch` sets the event origin from `OwnedInput.errorOrigin` and restores it when the event ends.
 A key, a mouse action, or an Overlay action has the origin `.user`, and its `clearError` clears any error.
-A user input clears before its own steps that can show a failure, such as the Review Search acquisition pump and the reopened query retry of `openReviewSearch`, so it keeps the messages of those failures.
+`openReviewSearch` clears before its steps that can show a failure, the reopened query retry and the acquisition pump, so the open keeps the messages of those failures.
+Two known gaps remain, and `.scratch/query-edit-clear-order/` on the branch `query-edit-clear-order` owns them.
+A query edit clears after `releaseReviewSearchHolds` and `discardQueuedReviewSourceScans`, so it removes the message of a failed cache staging of those steps.
+The query retry and the acquisition pump share the origin `.review_search`, so a successful pump after a failed retry removes the message of the retry.
+`openReviewSearch` runs the retry right before the pump, and the focus check runs the retry, then its range work, then the pump.
 A completion of background work has the origin of its own path, and its `clearError` clears only an error of that origin.
 Thus a completion keeps an error that another path showed and that the user has not read yet.
 A helper that keys and completions both reach takes the origin of the event that reaches it.
@@ -90,7 +94,7 @@ These overrides exist:
 
 - `dispatch` runs `holdReviewSearchPreview` after each event as `.review_search`, because the Preview hold acquires Files for Review Search.
 - The focus check runs `retryReviewSearchQuery` as `.review_search`, so a successful retry clears only a Review Search error.
-- `pumpReviewSearchAcquisition` queues each File as `.review_search`, because it acquires Files for Review Search. So a success keeps an error of the event that pumps, such as `file_enrichment_launch_failed` of the File that failed before.
+- `pumpReviewSearchAcquisition` queues each File as `.review_search`, because it acquires Files for Review Search. So a success keeps an error of another path, such as `file_enrichment_launch_failed` of the File that failed before.
 - `openReviewSearch` runs `replaceReviewSearchQuery` for a reopened query as `.review_search`, so its scan clears only a Review Search error.
 - `applySubmissionTreeKey` shows `replacement_pending` as `.reconciliation`, so the end of the replacement clears the notice.
 - `init` runs `discoverRecovery` as `.submission`, because recovery belongs to the Submission path.

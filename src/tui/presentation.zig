@@ -8781,9 +8781,10 @@ pub const Presentation = struct {
     }
 
     /// A reopened query whose scan could not queue stays pending with
-    /// `needs_scan`. The retry runs after the inputs of an event, so a
-    /// failure keeps the shown message, and a success clears only an error
-    /// from the Review Search scan path.
+    /// `needs_scan`. A failure keeps the shown message, and a success clears
+    /// only a Review Search error. A successful acquisition pump after a
+    /// failed retry clears its message, a gap that the rule in
+    /// `docs/rules/tui-state.md` names.
     fn retryReviewSearchQuery(self: *Presentation) void {
         const published = self.published orelse return;
         const state = &published.review_search;
@@ -9012,7 +9013,7 @@ pub const Presentation = struct {
     }
 
     /// Each queue runs as `.review_search`, because it acquires a File for
-    /// Review Search. So a success keeps an error of the event that pumps.
+    /// Review Search. So a success keeps an error of another path.
     fn pumpReviewSearchAcquisition(self: *Presentation, published: *Published) void {
         if (!published.review_search.open) return;
         const acquired = published.review_search.acquired orelse return;
@@ -12750,14 +12751,22 @@ pub const Presentation = struct {
         }
     }
 
+    /// A failed acquisition queue can leave no File Enrichment in flight, so
+    /// this check can be the only later pump.
+    fn ensureFocusedEnrichment(self: *Presentation) void {
+        if (self.shutdown_requested) return;
+        const published = self.published orelse return;
+        self.ensureFocusedRange(published);
+        self.pumpReviewSearchAcquisition(published);
+    }
+
     /// Keep File Enrichment for the Enrichment Range. The active File is
     /// demand work. Once it is terminal, the other Files in the range follow
     /// as speculative work, up to `max_speculative_enrichments` at once: the
     /// visible Files from top to bottom, then the overscan Files above, then
-    /// the overscan Files below.
-    fn ensureFocusedEnrichment(self: *Presentation) void {
-        if (self.shutdown_requested) return;
-        const published = self.published orelse return;
+    /// the overscan Files below. While Review Search is open, it only stages
+    /// the cache and admits the focus.
+    fn ensureFocusedRange(self: *Presentation, published: *Published) void {
         const files = @min(published.session.diff.files.len, published.session.enrichment.len());
         const active = if (published.activeFile()) |index| if (index < files) index else null else null;
         const range = enrichmentRange(published, active, files);
@@ -31387,6 +31396,54 @@ test "M21 kernel opening Review Search shows the failure of its acquisition queu
         }
         try testing.expectEqual(@as(usize, 1), records);
         try testing.expectEqual(@as(usize, @intFromBool(reopened_query)), query_scans);
+    }
+}
+
+test "M21 kernel the focus check queues a Review Search acquisition that failed with no work in flight" {
+    for ([_]bool{ false, true }) |on_review_card| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testManyFileSession(testing.allocator, 1, 10);
+        if (on_review_card) {
+            var comments: [8]bbr.review.Comment = undefined;
+            for (&comments, 0..) |*comment, index| comment.* = .{ .id = 100 + index, .author = "Author", .body = "Review-level Comment", .scope = .review };
+            session.threads = try bbr.review.buildThreads(session.arena.allocator(), try session.arena.allocator().dupe(bbr.review.Comment, &comments));
+        }
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 80, .rows = 10 },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        while (presentation.takeCommand()) |next| {
+            var queued = next;
+            queued.deinit();
+        }
+        presentation.issued_enrichments.clearAndFree(presentation.allocator);
+        try presentation.commands.ensureTotalCapacity(presentation.allocator, 32);
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.{ .action = .open_review_search });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        var record = presentation.takeCommand() orelse return error.TestExpectedRecord;
+        defer record.deinit();
+        try testing.expect(record == .report_diagnostic);
+        try testing.expect(presentation.takeCommand() == null);
+        const published = presentation.published.?;
+        try testing.expectEqual(on_review_card, Presentation.enrichmentRange(published, published.activeFile(), published.session.diff.files.len).focused.isEmpty());
+
+        try presentation.dispatch(.ensure_focused_enrichment);
+
+        var queued: usize = 0;
+        while (presentation.takeCommand()) |next| {
+            var command = next;
+            defer command.deinit();
+            if (command == .enrich_file) queued += 1;
+        }
+        try testing.expectEqual(@as(usize, 8), queued);
     }
 }
 
