@@ -3314,7 +3314,9 @@ pub const DisclosureBuild = struct {
         if (self.kind == .card_destination) {
             self.destination_row = self.projection.?.navigation.owners.get(cardHeaderOwner(self.destination_card.?));
         }
-        if (self.batch orelse self.rebuilt_batch orelse self.accepted_snapshot) |batch| {
+        // An input build projects only the batch of its own query, and a
+        // build without one restores the view of a failed scan.
+        if (if (self.kind == .input) self.batch else self.batch orelse self.rebuilt_batch orelse self.accepted_snapshot) |batch| {
             const result = try self.projection.?.project(std.heap.page_allocator, batch);
             self.ranges = result.ranges;
             self.navigation_rows = result.navigation_rows;
@@ -4129,6 +4131,33 @@ const ErrorOrigin = enum {
     review_search,
 };
 
+/// A step of maintenance work. An event keeps one outcome per tag, so a
+/// later run of a step in the same event replaces the outcome of an
+/// earlier run. A File Enrichment success replaces only a failure of the
+/// same File.
+const MaintenanceStep = union(enum) {
+    /// `stageCacheBuild` and the retry of a stale cache update. A
+    /// Session has one queued cache update, so a later staging recovers
+    /// an earlier one.
+    cache_staging,
+    /// `retryReviewSearchQuery`.
+    query_retry,
+    /// `queueMaintenanceFileEnrichment` of a File. Only a queue of the same
+    /// File recovers it. Null when two Files failed in the event, because
+    /// no one queue recovers both.
+    file_enrichment: ?usize,
+    /// A failed enrichment or cache update build in `acceptBufferDisclosure`.
+    failed_build,
+    /// A non-speculative result that `dropEnrichments` drops.
+    dropped_result,
+};
+
+const MaintenanceFailure = struct {
+    step: MaintenanceStep,
+    err: ActionError,
+    origin: ErrorOrigin,
+};
+
 const ShownError = struct {
     err: ActionError,
     origin: ErrorOrigin,
@@ -4239,6 +4268,20 @@ const BufferSearchInput = struct {
         if (self.saved_search_disclosures) |disclosures| disclosures.release();
         self.corpus.release();
         self.* = undefined;
+    }
+
+    /// While a scan is pending, the input shows the batch of the previous
+    /// query. A scan that ends without its own batch drops that batch, so an
+    /// accept never installs the batch of another query.
+    fn failPendingScan(self: *BufferSearchInput, allocator: Allocator) void {
+        if (self.batch) |*batch| batch.deinit(allocator);
+        if (self.ranges) |ranges| std.heap.page_allocator.free(ranges);
+        if (self.navigation_rows) |rows| std.heap.page_allocator.free(rows);
+        self.batch = null;
+        self.ranges = null;
+        self.navigation_rows = null;
+        self.active = null;
+        self.pending = false;
     }
 };
 
@@ -6776,6 +6819,10 @@ pub const Presentation = struct {
     /// for one piece of work. It is null outside both, and then an action
     /// error is a bug.
     event_origin: ?ErrorOrigin = null,
+    /// The failed maintenance steps of the event that runs. `finishEvent`
+    /// shows the failure of the first step in enum order when the event
+    /// ends without a message.
+    maintenance_failures: std.EnumArray(std.meta.Tag(MaintenanceStep), ?MaintenanceFailure) = .initFill(null),
     diagnostic_state: bbr.diagnostic.State = .off,
     diagnostic_pending: bool = false,
     fatal_error: ?FatalError = null,
@@ -6873,6 +6920,7 @@ pub const Presentation = struct {
         const outer_origin = self.event_origin;
         self.event_origin = input.errorOrigin();
         defer self.event_origin = outer_origin;
+        defer if (outer_origin == null) self.finishEvent();
         // The preview hold acquires Files for the Review Search after every event.
         defer self.withErrorOrigin(.review_search, holdReviewSearchPreview, .{self});
         defer if (self.published) |published| {
@@ -7091,6 +7139,26 @@ pub const Presentation = struct {
         self.status_revision +%= 1;
     }
 
+    /// Clears the shown error by the rule of `clearError` unless it is one
+    /// of `kept`.
+    fn clearErrorExcept(self: *Presentation, kept: []const ActionError) void {
+        const shown = self.action_error orelse return;
+        if (std.mem.indexOfScalar(ActionError, kept, shown.err) == null) self.clearError();
+    }
+
+    /// Ends the outermost event. A maintenance failure shows only when the
+    /// event ends without a message, so no clear of the event removes it,
+    /// and a step that a later run recovered shows nothing.
+    fn finishEvent(self: *Presentation) void {
+        defer self.maintenance_failures = .initFill(null);
+        if (self.action_error != null) return;
+        for (self.maintenance_failures.values) |entry| if (entry) |failure| {
+            self.action_error = .{ .err = failure.err, .origin = failure.origin, .key = null };
+            self.status_revision +%= 1;
+            return;
+        };
+    }
+
     fn errorOrigin(self: *const Presentation) ErrorOrigin {
         return self.event_origin orelse @panic("an action error outside an event: dispatch the event, or run the work in withErrorOrigin");
     }
@@ -7101,6 +7169,7 @@ pub const Presentation = struct {
         const outer = self.event_origin;
         self.event_origin = origin;
         defer self.event_origin = outer;
+        defer if (outer == null) self.finishEvent();
         return @call(.auto, work, args);
     }
 
@@ -8858,12 +8927,10 @@ pub const Presentation = struct {
         self.pauseQueuedSpeculativeEnrichment(published);
         self.clearError();
         if (state.needs_scan) {
-            const text = (state.query orelse unreachable).query.text;
-            // The retry of this query clears only a Review Search error.
-            self.withErrorOrigin(.review_search, replaceReviewSearchQuery, .{ self, text });
             // The query must not show over the results of another query
             // without the pending mark, also when its scan cannot queue.
             state.pending = true;
+            self.withErrorOrigin(.review_search, retryReviewSearchQuery, .{self});
         }
         self.pumpReviewSearchAcquisition(published);
         self.maybeQueueReviewSourceScan(published);
@@ -8874,14 +8941,12 @@ pub const Presentation = struct {
 
     /// A reopened query whose scan could not queue stays pending with
     /// `needs_scan`. A failure keeps the shown message, and a success clears
-    /// only a Review Search error. A successful acquisition pump after a
-    /// failed retry clears its message, a gap that the rule in
-    /// `docs/rules/tui-state.md` names.
+    /// only a Review Search error.
     fn retryReviewSearchQuery(self: *Presentation) void {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (!state.open or !state.pending or !state.needs_scan) return;
-        self.setReviewSearchQuery((state.query orelse unreachable).query.text) catch |err| self.failMaintenance(.review_search, err, @src());
+        self.settleMaintenance(.query_retry, .review_search, self.setReviewSearchQuery((state.query orelse unreachable).query.text), @src());
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
@@ -8950,8 +9015,8 @@ pub const Presentation = struct {
         self.replaceReviewSearchQuery(text[0..end]);
     }
 
-    /// A query edit or a reopened query is the outcome of a user input, so
-    /// its failure shows over another message.
+    /// A query edit is the outcome of a user input, so its failure shows
+    /// over another message.
     fn replaceReviewSearchQuery(self: *Presentation, text: []const u8) void {
         self.setReviewSearchQuery(text) catch |err| self.failDroppedInput(err, @src());
     }
@@ -9210,15 +9275,39 @@ pub const Presentation = struct {
     }
 
     fn stageCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) void {
-        self.queueCacheBuild(published, focused) catch |err| self.failMaintenance(.buffer_build, err, @src());
+        self.settleMaintenance(.cache_staging, .buffer_build, self.queueCacheBuild(published, focused), @src());
+    }
+
+    /// Records the outcome of a run of `step`. A success recovers a failure
+    /// of an earlier run of `step` in the same event.
+    fn settleMaintenance(self: *Presentation, step: MaintenanceStep, operation: bbr.diagnostic.Operation, outcome: anyerror!void, comptime source: std.builtin.SourceLocation) void {
+        outcome catch |err| return self.failMaintenance(step, operation, err, source);
+        const entry = self.maintenance_failures.getPtr(step);
+        if (entry.*) |failure| if (std.meta.eql(failure.step, step)) {
+            entry.* = null;
+        };
     }
 
     /// Work that no input asked for, such as a cache staging or a File
     /// Enrichment of the focus check, runs again at a later check. So its
-    /// failure has one record and keeps the shown message.
-    fn failMaintenance(self: *Presentation, operation: bbr.diagnostic.Operation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
+    /// failure has one record and keeps the shown message. `finishEvent`
+    /// shows it when the event ends without a message.
+    fn failMaintenance(self: *Presentation, step: MaintenanceStep, operation: bbr.diagnostic.Operation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
         self.reportFailure(operation, .prepare, err, source);
-        if (self.action_error == null) self.showError(.out_of_memory);
+        self.showMaintenanceError(step, .out_of_memory);
+    }
+
+    /// A later check does the failed step again, so its failure keeps a
+    /// shown message. `finishEvent` shows `err` when the event ends without
+    /// a message. A failure of a second File makes the File Enrichment step
+    /// name no File.
+    fn showMaintenanceError(self: *Presentation, step: MaintenanceStep, err: ActionError) void {
+        const entry = self.maintenance_failures.getPtr(step);
+        const failed: MaintenanceStep = if (entry.*) |earlier|
+            if (std.meta.eql(earlier.step, step)) step else .{ .file_enrichment = null }
+        else
+            step;
+        entry.* = .{ .step = failed, .err = err, .origin = self.errorOrigin() };
     }
 
     /// No later check retries this input, so its failure replaces the shown message.
@@ -9788,7 +9877,14 @@ pub const Presentation = struct {
             } else _ = published.jumpToSearchOccurrence(batch.occurrences[active]);
         };
         input.deinit(self.allocator);
-        self.clearError();
+        // An accepted search without matches opens nothing, so the user
+        // sees why. A search without a batch keeps only the message that
+        // says why it has none, and it clears another message by the rule
+        // of `clearError`. So a completion clears only a message of its own
+        // origin.
+        if (published.buffer_search.accepted_batch) |batch| {
+            if (batch.occurrences.len == 0) self.showError(.buffer_search_no_matches) else self.clearError();
+        } else self.clearErrorExcept(&.{ .buffer_search_scan_failed, .buffer_search_no_matches });
         published.frame_revision += 1;
     }
 
@@ -10016,9 +10112,7 @@ pub const Presentation = struct {
         if (completed.request_id != input.request_id or !input.pending) return;
         var batch = switch (completed.outcome) {
             .failed => {
-                input.pending = false;
-                self.showError(.buffer_search_scan_failed);
-                published.frame_revision += 1;
+                self.failBufferSearchScan(published);
                 return;
             },
             .scanned => |batch| batch,
@@ -10035,17 +10129,14 @@ pub const Presentation = struct {
         if (self.queueBufferDisclosure(published, batch, active, input.request_id, completed.navigation_rows) catch |err| switch (err) {
             error.OutOfMemory => {
                 batch.deinit(self.allocator);
-                input.pending = false;
-                self.showError(.out_of_memory);
-                published.frame_revision += 1;
+                self.failPendingInput(published);
+                self.failDroppedInput(err, @src());
                 return;
             },
-        }) return;
+        } != null) return;
         const ranges = completed.ranges orelse {
             batch.deinit(self.allocator);
-            input.pending = false;
-            self.showError(.buffer_search_scan_failed);
-            published.frame_revision += 1;
+            self.failBufferSearchScan(published);
             return;
         };
         completed.ranges = null;
@@ -10074,21 +10165,56 @@ pub const Presentation = struct {
         if ((published.buffer_search.input orelse return).accept_when_ready) self.acceptBufferSearch();
     }
 
-    fn queueBufferDisclosure(self: *Presentation, published: *Published, batch: search.Batch, active: ?usize, request_id: u64, navigation_rows: ?[]SearchNavigationRow) !bool {
+    /// Ends a pending scan of the input without a batch. Like a scan without
+    /// matches, it restores the disclosures that the preview of the previous
+    /// query expanded, and its build shows the scan failure again.
+    fn failBufferSearchScan(self: *Presentation, published: *Published) void {
+        const input = &published.buffer_search.input.?;
+        input.failPendingScan(self.allocator);
+        const job = self.queueBufferDisclosure(published, null, null, input.request_id, null) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.failPendingInput(published);
+                self.failDroppedInput(err, @src());
+                return;
+            },
+        } orelse {
+            self.failPendingInput(published);
+            self.showError(.buffer_search_scan_failed);
+            return;
+        };
+        job.result_error = .buffer_search_scan_failed;
+        input.pending = true;
+        self.showError(.buffer_search_scan_failed);
+        published.frame_revision += 1;
+    }
+
+    /// Ends the pending work of the input without its result. An Enter key
+    /// during that work accepts the query here, before the caller shows why
+    /// the work failed, so the accept does not clear that message. A failed
+    /// opening keeps the input open, because an accept queues the opening
+    /// again and would repeat a build that fails.
+    fn failPendingInput(self: *Presentation, published: *Published) void {
+        const input = &published.buffer_search.input.?;
+        input.failPendingScan(self.allocator);
+        published.frame_revision += 1;
+        if (input.accept_when_ready and !input.restoring_review_disclosures) self.acceptBufferSearch();
+    }
+
+    fn queueBufferDisclosure(self: *Presentation, published: *Published, batch: ?search.Batch, active: ?usize, request_id: u64, navigation_rows: ?[]SearchNavigationRow) !?*DisclosureBuild {
         var required: SearchDisclosureSet = .{};
         if (active) |index| {
-            const occurrence = batch.occurrences[index];
+            const occurrence = batch.?.occurrences[index];
             const visible = if (navigation_rows) |rows| rows[index].visible else published.occurrenceVisualRow(occurrence);
             required = searchDisclosureForVisibility(published, occurrence, visible != null);
         }
-        if (required.len == 0 and published.buffer_search.saved_disclosures == null) return false;
+        if (required.len == 0 and published.buffer_search.saved_disclosures == null) return null;
         const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
         if (target.matchesKeys(published.disclosure_keys)) {
             if (required.len == 0) if (published.buffer_search.saved_disclosures) |saved| {
                 saved.release();
                 published.buffer_search.saved_disclosures = null;
             };
-            return false;
+            return null;
         }
         const job = try DisclosureBuild.create(published, self.preferences, target, request_id);
         errdefer job.destroy();
@@ -10097,7 +10223,7 @@ pub const Presentation = struct {
         job.clear_saved_disclosures = required.len == 0;
         job.batch = batch;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
-        return true;
+        return job;
     }
 
     fn acceptBufferDisclosure(self: *Presentation, job: *DisclosureBuild) void {
@@ -10119,13 +10245,12 @@ pub const Presentation = struct {
         const input = &(published.buffer_search.input orelse return);
         if (job.request_id != input.request_id or !input.pending) return;
         if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or !std.meta.eql(job.geometry, published.geometry)) {
-            self.retryStaleBufferDisclosure(published);
+            self.retryStaleInputBuild(published, job);
             return;
         }
         if (job.failed) {
-            input.pending = false;
+            self.failPendingInput(published);
             self.showError(.buffer_build_failed);
-            published.frame_revision += 1;
             return;
         }
 
@@ -10133,7 +10258,7 @@ pub const Presentation = struct {
         const wanted_cursor: ?file_tree.Identity = if (published.tree.entries.len == 0) null else published.tree.entries[published.tree.cursor].identity;
         const same_cursor = if (wanted_cursor) |cursor| if (job.wanted_cursor) |saved| cursor.eql(saved) else false else job.wanted_cursor == null;
         if (job.active_file != active_file or job.tree_scroll != published.tree.scroll or !same_cursor) {
-            self.retryStaleBufferDisclosure(published);
+            self.retryStaleInputBuild(published, job);
             return;
         }
         const same_batch = if (job.accepted_snapshot) |snapshot| if (published.buffer_search.accepted_batch) |current|
@@ -10145,10 +10270,10 @@ pub const Presentation = struct {
         else
             false else published.review_search.batch == null;
         if (!same_batch or !same_review) {
-            self.retryStaleBufferDisclosure(published);
+            self.retryStaleInputBuild(published, job);
             return;
         }
-        const ranges = job.ranges.?;
+        const ranges = job.ranges;
         job.ranges = null;
         const accepted_ranges = job.accepted_ranges;
         job.accepted_ranges = null;
@@ -10158,11 +10283,11 @@ pub const Presentation = struct {
         disclosures.appendSlice(self.allocator, job.disclosures) catch |err| switch (err) {
             error.OutOfMemory => {
                 disclosures.deinit(self.allocator);
-                std.heap.page_allocator.free(ranges);
+                if (ranges) |old| std.heap.page_allocator.free(old);
                 if (accepted_ranges) |old| std.heap.page_allocator.free(old);
                 if (review_ranges) |old| std.heap.page_allocator.free(old);
-                input.pending = false;
-                self.showError(.out_of_memory);
+                self.failPendingInput(published);
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
@@ -10216,8 +10341,17 @@ pub const Presentation = struct {
         }
         published.frame_revision += 1;
         published.visual_rows_revision = published.frame_revision;
-        if (job.destination_active == null) self.showError(.buffer_search_no_matches) else self.clearError();
+        if (job.result_error) |err| {
+            self.showError(err);
+        } else if (job.destination_active == null) self.showError(.buffer_search_no_matches) else self.clearError();
         if (input.accept_when_ready) self.acceptBufferSearch();
+    }
+
+    /// A stale restore of a failed scan queues the restore again, because a
+    /// scan of the failed query would replace the failure with a new result.
+    /// Only `failBufferSearchScan` queues an input build without a batch.
+    fn retryStaleInputBuild(self: *Presentation, published: *Published, job: *const DisclosureBuild) void {
+        if (job.batch == null) self.failBufferSearchScan(published) else self.retryStaleBufferDisclosure(published);
     }
 
     fn acceptViewBuild(self: *Presentation, published: *Published, job: *DisclosureBuild, owned: *bool) void {
@@ -10317,8 +10451,9 @@ pub const Presentation = struct {
             if (job.kind == .card_destination) return self.failCardDestination(published, .buffer_build_failed);
             const dropped_location = releaseEnrichments(published, job.enrichments.items);
             const speculative = job.kind == .enrichment and EnrichedFile.allSpeculative(job.enrichments.items);
-            if (!job.kind.isMaintenance() or dropped_location or (!speculative and self.action_error == null))
+            if (!job.kind.isMaintenance() or dropped_location) {
                 self.showError(.buffer_build_failed);
+            } else if (!speculative) self.showMaintenanceError(.failed_build, .buffer_build_failed);
             return;
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -10599,9 +10734,10 @@ pub const Presentation = struct {
                 self.openReviewSearchOccurrence();
             },
             .enrichment => self.retryEnrichmentBuild(published, job),
-            .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch |err| {
-                published.pending_cache_update = null;
-                self.failMaintenance(.buffer_build, err, @src());
+            .cache_update => {
+                const outcome = self.queueCacheBuild(published, published.pending_cache_focus);
+                if (std.meta.isError(outcome)) published.pending_cache_update = null;
+                self.settleMaintenance(.cache_staging, .buffer_build, outcome, @src());
             },
             .draft_save => {
                 self.queueDraftBuild(published, job.new_draft.?) catch |err| switch (err) {
@@ -10794,7 +10930,7 @@ pub const Presentation = struct {
             self.failDroppedInput(err, source);
         } else {
             self.reportFailure(.completion, .admission, err, source);
-            if (!EnrichedFile.allSpeculative(enrichments) and self.action_error == null) self.showError(.out_of_memory);
+            if (!EnrichedFile.allSpeculative(enrichments)) self.showMaintenanceError(.dropped_result, .out_of_memory);
         }
         for (enrichments) |*enriched| enriched.result.deinit();
     }
@@ -10892,7 +11028,7 @@ pub const Presentation = struct {
             return;
         }
         if (job.failed) {
-            if (job.kind == .clear_input or job.kind == .open_input) published.buffer_search.input.?.pending = false;
+            if (job.kind == .clear_input or job.kind == .open_input) self.failPendingInput(published);
             self.showError(.buffer_build_failed);
             return;
         }
@@ -10917,15 +11053,12 @@ pub const Presentation = struct {
             self.retryAcceptedDisclosure(published, job);
             return;
         }
-        var admitted = false;
-        defer if (!admitted and (job.kind == .clear_input or job.kind == .open_input)) {
-            published.buffer_search.input.?.pending = false;
-        };
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
         disclosures.appendSlice(self.allocator, job.disclosures) catch |err| switch (err) {
             error.OutOfMemory => {
                 disclosures.deinit(self.allocator);
-                self.showError(.out_of_memory);
+                if (job.kind == .clear_input or job.kind == .open_input) self.failPendingInput(published);
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
@@ -10953,7 +11086,6 @@ pub const Presentation = struct {
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
         owned.* = false;
-        admitted = true;
         if (published.buffer_search.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
         if (published.buffer_search.accepted_navigation_rows) |rows| std.heap.page_allocator.free(rows);
         published.buffer_search.accepted_ranges = job.ranges;
@@ -11015,7 +11147,7 @@ pub const Presentation = struct {
         if (job.kind == .open_input) {
             self.queueBufferSearchOpening(published, job.target.base) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    published.buffer_search.input.?.pending = false;
+                    self.failPendingInput(published);
                     self.failDroppedInput(err, @src());
                 },
             };
@@ -11033,7 +11165,7 @@ pub const Presentation = struct {
         }
         const replacement = self.queueAcceptedDisclosure(published, job.target, destination, job.kind, job.result_error) catch |err| switch (err) {
             error.OutOfMemory => {
-                if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
+                if (job.kind == .clear_input) self.failPendingInput(published);
                 self.failDroppedInput(err, @src());
                 return;
             },
@@ -11055,17 +11187,17 @@ pub const Presentation = struct {
         const query = input.query orelse return;
         const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch |err| switch (err) {
             error.OutOfMemory => {
-                input.pending = false;
+                self.failPendingInput(published);
                 self.failDroppedInput(err, @src());
                 return;
             },
             error.TooLong => {
-                input.pending = false;
+                self.failPendingInput(published);
                 self.showError(.buffer_search_query_too_long);
                 return;
             },
             error.InvalidUtf8, error.LineEnding, error.Nul => {
-                input.pending = false;
+                self.failPendingInput(published);
                 self.showError(.buffer_search_invalid_query);
                 return;
             },
@@ -11084,7 +11216,7 @@ pub const Presentation = struct {
         self.commands.append(self.allocator, command) catch |err| switch (err) {
             error.OutOfMemory => {
                 command.deinit();
-                input.pending = false;
+                self.failPendingInput(published);
                 self.failDroppedInput(err, @src());
                 return;
             },
@@ -13016,11 +13148,9 @@ pub const Presentation = struct {
     /// Queues a File Enrichment that no input asked for. The File stays
     /// pending after a failure, so a later check queues it again.
     fn queueMaintenanceFileEnrichment(self: *Presentation, published: *Published, file_index: usize) bool {
-        self.queueFileEnrichment(published, file_index, false) catch |err| {
-            self.failMaintenance(.file_enrichment, err, @src());
-            return false;
-        };
-        return true;
+        const outcome = self.queueFileEnrichment(published, file_index, false);
+        self.settleMaintenance(.{ .file_enrichment = file_index }, .file_enrichment, outcome, @src());
+        return if (outcome) true else |_| false;
     }
 
     /// Reads of a replaced Session also count. They run until they finish.
@@ -13946,13 +14076,15 @@ pub const Presentation = struct {
         candidate.epoch = self.next_session_epoch + 1;
         candidate.allocator = self.allocator;
         job.candidate = null;
+        if (self.list_overlay) |*overlay| if (overlay.closesOnReplacement()) self.closeListOverlay();
+        self.published = candidate;
+        // The replaced Session is no longer published, so a discarded source
+        // scan stages no cache build for it.
         if (previous) |current| {
             self.discardQueuedReviewSourceScans();
             self.discardQueuedReviewSearchScans();
             self.discardQueuedSearchEnrichments(current);
         }
-        if (self.list_overlay) |*overlay| if (overlay.closesOnReplacement()) self.closeListOverlay();
-        self.published = candidate;
         self.preferences = job.preferences;
         self.discardQueuedBufferSearchScans(null);
         if (self.stale_repair) |*gate| if (OwnedReviewIdentity.eql(gate.key, candidate.key)) {
@@ -16414,7 +16546,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
         var start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .composer = .save });
         draft_dispatch[sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (presentation.action_error != null or published.review.drafts.items.len != draft_count + sample or published.composer == null)
+        if (presentation.projection().action_error != null or published.review.drafts.items.len != draft_count + sample or published.composer == null)
             return error.DraftSavePublishedBeforeWorker;
         const job = (presentation.takeCommand() orelse return error.MissingDraftBuild).build_buffer_disclosure;
         start = std.Io.Clock.awake.now(io);
@@ -16424,7 +16556,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
         start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .buffer_disclosure_built = job });
         draft_admission[sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (presentation.action_error != null or published.composer != null or published.review.drafts.items.len != draft_count + sample + 1)
+        if (presentation.projection().action_error != null or published.composer != null or published.review.drafts.items.len != draft_count + sample + 1)
             return error.DraftSaveAdmissionFailed;
         // The control builds the same Draft graph through the former synchronous path.
         start = std.Io.Clock.awake.now(io);
@@ -16493,7 +16625,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             var start = std.Io.Clock.awake.now(io);
             try repeatTestDraftMutation(&presentation, mutation);
             mutation_times[mutation_index][0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-            if (presentation.action_error != null or published.visual_rows.ptr != before.visual_rows.ptr) return error.DraftMutationPublishedBeforeWorker;
+            if (presentation.projection().action_error != null or published.visual_rows.ptr != before.visual_rows.ptr) return error.DraftMutationPublishedBeforeWorker;
             const job = (presentation.takeCommand() orelse return error.MissingDraftMutationBuild).build_buffer_disclosure;
             start = std.Io.Clock.awake.now(io);
             job.build();
@@ -16502,7 +16634,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             start = std.Io.Clock.awake.now(io);
             try presentation.dispatch(.{ .buffer_disclosure_built = job });
             mutation_times[mutation_index][2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-            if (presentation.action_error != null or published.pending_draft_mutation != null or published.visual_rows.ptr == before.visual_rows.ptr)
+            if (presentation.projection().action_error != null or published.pending_draft_mutation != null or published.visual_rows.ptr == before.visual_rows.ptr)
                 return error.DraftMutationAdmissionFailed;
             switch (mutation) {
                 .body => if (!std.mem.endsWith(u8, published.review.getConst(root.local_id).?.body, " changed")) return error.DraftMutationBodyMismatch,
@@ -16635,7 +16767,7 @@ fn finishBenchmarkSearchWork(presentation: *Presentation) !void {
             },
         }
     }
-    if (presentation.action_error != null) return error.BenchmarkSearchFailed;
+    if (presentation.projection().action_error != null) return error.BenchmarkSearchFailed;
 }
 
 fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u8) !void {
@@ -16887,7 +17019,7 @@ fn benchmarkSidebar(presentation: *Presentation, io: std.Io) !void {
         start = std.Io.Clock.awake.now(io);
         presentation.revealActiveFile(published);
         times[3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (presentation.action_error != null or published.tree.entries.ptr != visible_tree or
+        if (presentation.projection().action_error != null or published.tree.entries.ptr != visible_tree or
             published.buffer.rows.ptr != before.buffer.rows.ptr or published.visual_rows.ptr != before.visual_rows.ptr or
             published.visual_rows_revision != before.visual_rows_revision) return error.SidebarChangedDiffPane;
         start = std.Io.Clock.awake.now(io);
@@ -25898,6 +26030,573 @@ test "M21 Query edit restores search-owned disclosures on the worker" {
     try testing.expectEqual(ActionError.buffer_search_no_matches, presentation.projection().action_error.?);
 }
 
+test "M21 kernel an accepted Buffer Search without matches keeps its message" {
+    for ([_]bool{ false, true }) |accept_first| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'q', .text = "qqqq" } });
+        if (accept_first) try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_no_matches), presentation.projection().action_error);
+        if (!accept_first) try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expect(!presentation.projection().buffer_search.?.input);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_no_matches), presentation.projection().action_error);
+    }
+}
+
+test "M21 kernel an accepted Buffer Search shows no-match only for an empty batch" {
+    for ([_]bool{ false, true }) |failed_scan| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+        if (failed_scan) {
+            var command = presentation.takeCommand().?;
+            defer command.deinit();
+            var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+            completed.outcome.scanned.deinit(completed.allocator);
+            completed.outcome = .failed;
+            try presentation.dispatch(.{ .buffer_search_scanned = completed });
+            try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        } else {
+            try completeBufferSearchScan(&presentation);
+            // A rebuild of the Buffer can leave matches without an active one.
+            presentation.published.?.buffer_search.input.?.active = null;
+            showTestError(&presentation, .buffer_search, .buffer_search_hit_bottom);
+        }
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expectEqual(@as(?ActionError, if (failed_scan) .buffer_search_scan_failed else null), presentation.projection().action_error);
+    }
+}
+
+test "M21 kernel an accepted Buffer Search without a batch keeps only a message of the search" {
+    const Case = struct { shown: ?ActionError, kept: ?ActionError };
+    for ([_]Case{
+        .{ .shown = null, .kept = .buffer_search_scan_failed },
+        .{ .shown = .buffer_search_no_matches, .kept = .buffer_search_no_matches },
+        .{ .shown = .file_enrichment_launch_failed, .kept = null },
+    }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        if (case.shown) |err| showTestError(&presentation, .file_enrichment, err);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expectEqual(case.kept, presentation.projection().action_error);
+    }
+}
+
+test "M21 kernel an accepted Buffer Search keeps the scan failure of its query edit" {
+    const Case = struct { scanned: []const u8, appended: []const u8 };
+    for ([_]Case{
+        .{ .scanned = "qqqq", .appended = "q" },
+        .{ .scanned = "eigh", .appended = "x" },
+    }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = case.scanned[0], .text = case.scanned } });
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = case.appended[0], .text = case.appended } });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        _ = try completeTestDisclosureBuilds(&presentation);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        try testing.expect(presentation.projection().buffer_search == null);
+    }
+}
+
+/// Completes every queued disclosure build and returns the number of
+/// diagnostic records that the Presentation queued. A queued scan fails
+/// the test, because a build that queues a scan expects it to run.
+fn completeTestDisclosureBuilds(presentation: *Presentation) !usize {
+    var records: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command != .build_buffer_disclosure) {
+            defer command.deinit();
+            if (command == .scan_buffer_search) return error.UnexpectedBufferSearchScan;
+            if (command == .report_diagnostic) records += 1;
+            continue;
+        }
+        command.build_buffer_disclosure.build();
+        try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+    }
+    return records;
+}
+
+test "M21 kernel a failed Buffer Search scan collapses the preview of the previous query" {
+    const Case = struct { appended: []const u8, missing_ranges: bool };
+    for ([_]Case{
+        .{ .appended = "x", .missing_ranges = false },
+        .{ .appended = "t", .missing_ranges = true },
+    }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        const initial = presentation.projection().review.?.buffer.rows.len;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eigh" } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expect(presentation.projection().review.?.buffer.rows.len > initial);
+
+        try presentation.dispatch(.{ .key = .{ .codepoint = case.appended[0], .text = case.appended } });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        if (case.missing_ranges) {
+            std.heap.page_allocator.free(completed.ranges.?);
+            completed.ranges = null;
+        } else {
+            completed.outcome.scanned.deinit(completed.allocator);
+            completed.outcome = .failed;
+        }
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        _ = try completeTestDisclosureBuilds(&presentation);
+        try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        try testing.expect(presentation.projection().buffer_search == null);
+        try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
+    }
+}
+
+test "M21 kernel a Buffer Search input that fails after a query edit opens no occurrence of the previous query" {
+    const Failure = enum { queue_disclosure, queue_restore, input_build, admit_input_build, queue_stale_scan };
+    for ([_]Failure{ .queue_disclosure, .queue_restore, .input_build, .admit_input_build, .queue_stale_scan }) |failure| for ([_]bool{ false, true }) |enter_first| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        // The edit to "eigh" expands the Resolved Thread of its match, and
+        // the edit from "eigh" collapses it again.
+        const queries: [2][]const u8 = if (failure == .admit_input_build) .{ "c1", "eigh" } else .{ "eigh", "eighx" };
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, queries[0]);
+        try completeBufferSearchScan(&presentation);
+        try testing.expect(presentation.projection().buffer_search.?.total > 0);
+
+        try replaceTestBufferSearchQuery(&presentation, queries[1]);
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        if (enter_first) try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        switch (failure) {
+            .queue_disclosure => presentation.published.?.disclosure_inputs_current = false,
+            .queue_restore => {
+                presentation.published.?.disclosure_inputs_current = false;
+                completed.outcome.scanned.deinit(completed.allocator);
+                completed.outcome = .failed;
+            },
+            .queue_stale_scan => {
+                completed.visual_rows_revision -%= 1;
+                try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
+                presentation.commands.clearAndFree(presentation.allocator);
+                once.armed = true;
+            },
+            .input_build, .admit_input_build => {},
+        }
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        switch (failure) {
+            .queue_disclosure, .queue_restore, .queue_stale_scan => {},
+            .input_build, .admit_input_build => {
+                const worker = presentation.takeCommand().?.build_buffer_disclosure;
+                if (failure == .input_build) worker.failed = true else {
+                    worker.build();
+                    once.armed = true;
+                }
+                try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+            },
+        }
+        try testing.expect(!once.armed);
+        try testing.expectEqual(@as(?ActionError, switch (failure) {
+            .queue_disclosure, .queue_restore, .admit_input_build, .queue_stale_scan => .out_of_memory,
+            .input_build => .buffer_build_failed,
+        }), presentation.projection().action_error);
+        try testing.expectEqual(@as(usize, @intFromBool(failure != .input_build)), try completeTestDisclosureBuilds(&presentation));
+
+        // An Enter key during the failed work closes the input at the failure.
+        if (enter_first) {
+            try testing.expect(presentation.published.?.buffer_search.input == null);
+        } else try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expect(presentation.projection().buffer_search == null);
+    };
+}
+
+test "M21 kernel an Enter key during a failed Buffer Search scan closes the input" {
+    const Case = enum { no_restore, restore, failed_restore };
+    for ([_]Case{ .no_restore, .restore, .failed_restore }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        const initial = presentation.projection().review.?.buffer.rows.len;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        // The first query has no preview to restore. The edit from "eigh"
+        // must collapse the Resolved Thread that the match of "eigh" opened.
+        if (case != .no_restore) {
+            try replaceTestBufferSearchQuery(&presentation, "eigh");
+            try completeBufferSearchScan(&presentation);
+        }
+        try replaceTestBufferSearchQuery(&presentation, if (case == .no_restore) "eight" else "eighx");
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        switch (case) {
+            .no_restore => try testing.expect(presentation.takeCommand() == null),
+            .restore => _ = try completeTestDisclosureBuilds(&presentation),
+            .failed_restore => {
+                const restore = presentation.takeCommand().?.build_buffer_disclosure;
+                restore.failed = true;
+                try presentation.dispatch(.{ .buffer_disclosure_built = restore });
+            },
+        }
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expectEqual(@as(?ActionError, if (case == .failed_restore) .buffer_build_failed else .buffer_search_scan_failed), presentation.projection().action_error);
+        if (case == .restore) try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
+    }
+}
+
+test "M21 kernel a query edit drops the restore of a failed Buffer Search scan" {
+    for ([_]bool{ false, true }) |running| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        const initial = presentation.projection().review.?.buffer.rows.len;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, "eigh");
+        try completeBufferSearchScan(&presentation);
+        try replaceTestBufferSearchQuery(&presentation, "eighx");
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        const restore: ?OwnedCommand = if (running) presentation.takeCommand().? else null;
+
+        try replaceTestBufferSearchQuery(&presentation, "eighxy");
+        try testing.expectEqual(@as(usize, 1), presentation.commands.items.len);
+        try testing.expect(presentation.commands.items[0] == .scan_buffer_search);
+        if (restore) |stale| {
+            stale.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = stale.build_buffer_disclosure });
+            try testing.expectEqual(@as(usize, 1), presentation.commands.items.len);
+        }
+        try testing.expect(presentation.projection().action_error == null);
+        try testing.expect(presentation.published.?.buffer_search.input.?.pending);
+
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_no_matches), presentation.projection().action_error);
+        try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+}
+
+test "M21 kernel a failed restore of a failed Buffer Search scan shows the build failure" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try replaceTestBufferSearchQuery(&presentation, "eigh");
+    try completeBufferSearchScan(&presentation);
+    const preview = presentation.projection().review.?.buffer.rows.len;
+    try replaceTestBufferSearchQuery(&presentation, "eighx");
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+    completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
+    try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    const restore = presentation.takeCommand().?.build_buffer_disclosure;
+    restore.failed = true;
+    try presentation.dispatch(.{ .buffer_disclosure_built = restore });
+    try testing.expectEqual(@as(?ActionError, .buffer_build_failed), presentation.projection().action_error);
+    try testing.expect(!presentation.published.?.buffer_search.input.?.pending);
+    // The rule in docs/rules/tui-state.md: without its restore, the view
+    // keeps the disclosures of the previous preview.
+    try testing.expectEqual(preview, presentation.projection().review.?.buffer.rows.len);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "M21 kernel a restore of a failed Buffer Search scan keeps the failure after a resize" {
+    for ([_]bool{ false, true }) |running| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        const initial = presentation.projection().review.?.buffer.rows.len;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, "eigh");
+        try completeBufferSearchScan(&presentation);
+        try replaceTestBufferSearchQuery(&presentation, "eight");
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        const restore: ?OwnedCommand = if (running) presentation.takeCommand().? else null;
+
+        try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 30 } });
+        if (restore) |stale| {
+            stale.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = stale.build_buffer_disclosure });
+        }
+        // A rescan of "eight" would let the waiting Enter key open a match.
+        _ = try completeTestDisclosureBuilds(&presentation);
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expect(presentation.published.?.buffer_search.accepted_batch == null);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
+    }
+}
+
+test "M21 kernel an Enter key during a failed Buffer Search query clear closes the input" {
+    const Failure = enum { build, queue_retry, admission };
+    for ([_]Failure{ .build, .queue_retry, .admission }) |failure| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        if (failure == .admission) {
+            // The clear copies the disclosures from before the preview, so
+            // the copy allocates only when the user expanded one.
+            const published = presentation.published.?;
+            const fold = for (published.buffer.rows, 0..) |row, index| {
+                if (row == .disclosure and row.disclosure.kind == .fold) break index;
+            } else return error.MissingFold;
+            try moveToRow(&presentation, published.visualIndexForBufferIndex(fold).?);
+            try presentation.dispatch(.{ .action = .toggle_disclosure });
+            try completeDisclosureBuild(&presentation);
+        }
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, "eigh");
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const clear = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.clear_input, clear.kind);
+        switch (failure) {
+            .build => clear.failed = true,
+            .queue_retry => presentation.published.?.disclosure_inputs_current = false,
+            .admission => {
+                clear.build();
+                try testing.expect(clear.disclosures.len > 0);
+                once.armed = true;
+            },
+        }
+        try presentation.dispatch(.{ .buffer_disclosure_built = clear });
+        try testing.expect(!once.armed);
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expectEqual(@as(?ActionError, if (failure == .build) .buffer_build_failed else .out_of_memory), presentation.projection().action_error);
+        // The worker boundary writes the record of a failed build.
+        try testing.expectEqual(@as(usize, @intFromBool(failure != .build)), try completeTestDisclosureBuilds(&presentation));
+    }
+}
+
+test "M21 kernel a failed admission of a disclosure build records the failure once" {
+    for ([_]DisclosureBuild.Kind{ .accepted, .restore, .general, .open_input }) |kind| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 40 },
+        });
+        defer presentation.deinit();
+        if (kind == .restore or kind == .open_input) {
+            // These builds copy the disclosures from before the preview, so
+            // the copy allocates only when the user expanded one.
+            try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+            try presentation.dispatch(.{ .action = .toggle_disclosure });
+            try completeDisclosureBuild(&presentation);
+        }
+        switch (kind) {
+            .accepted => {
+                try presentation.dispatch(.{ .action = .open_buffer_search });
+                try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c" } });
+                try completeBufferSearchScan(&presentation);
+                try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+                try presentation.dispatch(.{ .key = .{ .codepoint = '4', .text = "4" } });
+                try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
+            },
+            .restore => {
+                try presentation.dispatch(.{ .action = .open_buffer_search });
+                try replaceTestBufferSearchQuery(&presentation, "eigh");
+                try completeBufferSearchScan(&presentation);
+                try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+            },
+            .general => {
+                try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+                try presentation.dispatch(.{ .action = .toggle_disclosure });
+            },
+            .open_input => {
+                try revealTemporaryReviewFold(&presentation);
+                try presentation.dispatch(.{ .action = .open_buffer_search });
+                try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+            },
+            else => unreachable,
+        }
+        const job = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(kind, job.kind);
+        job.build();
+        try testing.expect(job.disclosures.len > 0);
+        once.armed = true;
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        try testing.expect(once.failed and !once.armed);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        try testing.expectEqual(@as(usize, 1), try completeTestDisclosureBuilds(&presentation));
+    }
+}
+
+test "M21 kernel a failed Buffer Search opening keeps the input open" {
+    const Failure = enum { build, queue_retry };
+    for ([_]Failure{ .build, .queue_retry }) |failure| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try revealTemporaryReviewFold(&presentation);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const opening = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.open_input, opening.kind);
+        switch (failure) {
+            .build => opening.failed = true,
+            .queue_retry => presentation.published.?.disclosure_inputs_current = false,
+        }
+        try presentation.dispatch(.{ .buffer_disclosure_built = opening });
+        const input = presentation.published.?.buffer_search.input orelse return error.TestUnexpectedResult;
+        try testing.expect(!input.pending);
+        try testing.expectEqual(@as(?ActionError, if (failure == .build) .buffer_build_failed else .out_of_memory), presentation.projection().action_error);
+        // An accept would queue the opening that just failed.
+        try testing.expect(presentation.takeCommand() == null);
+        if (failure == .queue_retry) presentation.published.?.disclosure_inputs_current = true;
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const retry = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.open_input, retry.kind);
+        retry.build();
+        try presentation.dispatch(.{ .buffer_disclosure_built = retry });
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+    }
+}
+
+test "M21 kernel an Enter key during a failed Buffer Search query clear opens the next accepted occurrence" {
+    const Failure = enum { build, queue_retry };
+    for ([_]Failure{ .build, .queue_retry }) |failure| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, "c5");
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        // One occurrence, so the next occurrence wraps to it.
+        try testing.expectEqual(@as(usize, 1), presentation.published.?.buffer_search.accepted_batch.?.occurrences.len);
+        const occurrence_row = presentation.published.?.navigation.cursor;
+        try testing.expect(occurrence_row != 0);
+        const accepted_rows = presentation.projection().review.?.buffer.rows.len;
+        try moveToRow(&presentation, 0);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, "eigh");
+        try completeBufferSearchScan(&presentation);
+        const preview_rows = presentation.projection().review.?.buffer.rows.len;
+        try testing.expect(preview_rows > accepted_rows);
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const clear = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.clear_input, clear.kind);
+        switch (failure) {
+            .build => clear.failed = true,
+            .queue_retry => presentation.published.?.disclosure_inputs_current = false,
+        }
+        try presentation.dispatch(.{ .buffer_disclosure_built = clear });
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expectEqual(@as(?ActionError, if (failure == .build) .buffer_build_failed else .out_of_memory), presentation.projection().action_error);
+        switch (failure) {
+            // The build of the occurrence also restores the disclosures that
+            // the failed clear kept, so its result replaces the failure.
+            .build => {
+                try completeDisclosureBuild(&presentation);
+                try testing.expectEqual(accepted_rows, presentation.projection().review.?.buffer.rows.len);
+                try testing.expectEqual(occurrence_row, presentation.published.?.navigation.cursor);
+                try testing.expectEqual(@as(?ActionError, .buffer_search_hit_bottom), presentation.projection().action_error);
+            },
+            // The rule in docs/rules/tui-state.md: when the build of the
+            // occurrence cannot queue, the view keeps the preview.
+            .queue_retry => {
+                try testing.expect(presentation.takeCommand() == null);
+                try testing.expectEqual(preview_rows, presentation.projection().review.?.buffer.rows.len);
+            },
+        }
+    }
+}
+
 test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -27722,7 +28421,7 @@ fn repeatTestDraftMutation(presentation: *Presentation, mutation: TestDraftMutat
 fn expectTestDraftMutation(presentation: *Presentation, mutation: TestDraftMutation) !void {
     const published = presentation.published.?;
     try testing.expect(published.pending_draft_mutation == null);
-    try testing.expect(presentation.action_error == null);
+    try testing.expect(presentation.projection().action_error == null);
     switch (mutation) {
         .body => {
             try testing.expectEqualStrings("root changed", draftBody(presentation, 1));
@@ -38772,7 +39471,7 @@ test "Review recovery a failed view build survives a successful Review Search qu
     try testing.expectEqual(@as(?ActionError, .buffer_build_failed), view.action_error);
 }
 
-test "M21 kernel Review Search keeps another message of the same event when a reopened query retry succeeds" {
+test "M21 kernel Review Search keeps an older message when a reopened query retry succeeds" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
@@ -38801,7 +39500,7 @@ test "M21 kernel Review Search keeps another message of the same event when a re
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
 }
 
-test "M21 kernel Review Search keeps another message of the same event when a reopened query retry fails" {
+test "M21 kernel Review Search keeps an older message when a reopened query retry fails" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
@@ -38831,6 +39530,294 @@ test "M21 kernel Review Search keeps another message of the same event when a re
     try presentation.dispatch(.ensure_focused_enrichment);
     try completeBufferSearchScan(&presentation);
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
+}
+
+/// Fails the next allocation after `armed` is set, and every later one succeeds.
+const FailOnceAllocator = struct {
+    child: Allocator,
+    armed: bool = false,
+    failed: bool = false,
+
+    fn allocator(self: *FailOnceAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        if (self.armed) {
+            self.armed = false;
+            self.failed = true;
+            return null;
+        }
+        return self.child.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, return_address);
+    }
+};
+
+fn drainTestCommands(presentation: *Presentation) usize {
+    var records: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command == .report_diagnostic) records += 1;
+        command.deinit();
+    }
+    return records;
+}
+
+test "M21 kernel a Review Search query edit shows the failure of its cache staging" {
+    for ([_]bool{ false, true }) |empty_query| for ([_]bool{ false, true }) |older_message| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        // File 11 is outside the focus of the first Files on screen.
+        var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 12, .{ .diagnostic_state = .on, .inactive_file_cache_max_bytes = 1 });
+        defer presentation.deinit();
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try runTestUntilSourceScanWaits(&presentation, 11);
+        // A released lease stages a cache build while a cache update runs.
+        const published = presentation.published.?;
+        try presentation.queueCacheBuild(published, published.session.enrichment.focused);
+        var running = presentation.commands.pop().?;
+        defer running.deinit();
+        try testing.expect(running == .build_buffer_disclosure);
+        if (older_message) showTestError(&presentation, .file_enrichment, .file_enrichment_launch_failed);
+        // A query scan takes the one free slot, so the staging cannot grow
+        // the queue.
+        presentation.commands.clearAndFree(presentation.allocator);
+        if (!empty_query) try presentation.commands.ensureTotalCapacityPrecise(presentation.allocator, 1);
+        failing.fail_index = failing.alloc_index;
+        try presentation.dispatch(.{ .key = if (empty_query) .{ .codepoint = 'k', .mods = .{ .ctrl = true } } else .{ .codepoint = keymap_mod.special.backspace } });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        try testing.expect(presentation.queued_source_scan == null);
+        try testing.expectEqualStrings(if (empty_query) "" else "ne", presentation.projection().review_search.?.query);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        // An empty query also releases the holds, and that staging fails too.
+        try testing.expectEqual(@as(usize, if (empty_query) 2 else 1), drainTestCommands(&presentation));
+        // The failure is a message of its own event, so the next key clears it.
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'w', .text = "w" } });
+        try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+    };
+}
+
+test "M21 kernel a Review Search destination shows the failure of its cache staging" {
+    for ([_]bool{ false, true }) |older_message| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try openTestReviewSourceSearchWith(&store, failing.allocator(), 12, .{ .diagnostic_state = .on, .inactive_file_cache_max_bytes = 1 });
+        defer presentation.deinit();
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try runTestUntilSourceScanWaits(&presentation, 11);
+        try presentation.dispatch(.{ .action = .open_search_occurrence });
+        const destination = presentation.commands.orderedRemove(0).build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.review_destination, destination.kind);
+        try testing.expect(presentation.queued_source_scan != null);
+        destination.build();
+        try testing.expect(!destination.failed);
+        if (older_message) showTestError(&presentation, .buffer, .buffer_search_no_matches);
+        presentation.commands.clearAndFree(presentation.allocator);
+        // The first allocation copies the disclosures of the destination.
+        try testing.expect(destination.disclosures.len > 0);
+        failing.fail_index = failing.alloc_index + 1;
+        try presentation.dispatch(.{ .buffer_disclosure_built = destination });
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(failing.has_induced_failure);
+        try testing.expect(presentation.projection().review_search == null);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        // The discarded source scan and the released holds each fail to stage.
+        try testing.expectEqual(@as(usize, 2), drainTestCommands(&presentation));
+    }
+}
+
+test "M21 kernel a Review Search query edit shows no failure of a cache staging that a later staging recovers" {
+    for ([_]bool{ false, true }) |older_message| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try openTestReviewSourceSearchWith(&store, once.allocator(), 12, .{ .diagnostic_state = .on, .inactive_file_cache_max_bytes = 1 });
+        defer presentation.deinit();
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try runTestUntilSourceScanWaits(&presentation, 11);
+        const published = presentation.published.?;
+        try presentation.queueCacheBuild(published, published.session.enrichment.focused);
+        var running = presentation.commands.pop().?;
+        defer running.deinit();
+        if (older_message) showTestError(&presentation, .file_enrichment, .file_enrichment_launch_failed);
+        presentation.commands.clearAndFree(presentation.allocator);
+        // The release of the holds fails to stage. The discard of the
+        // source scan stages the same cache build after it.
+        once.armed = true;
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } } });
+        try testing.expect(once.failed);
+        try testing.expect(presentation.queued_source_scan == null);
+        try testing.expect(published.pending_cache_update != null);
+        try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+        try testing.expectEqual(@as(usize, 1), drainTestCommands(&presentation));
+    }
+}
+
+fn failTestStepsAndRecoverStaging(presentation: *Presentation, once: *FailOnceAllocator, file_index: usize) void {
+    const published = presentation.published.?;
+    once.armed = true;
+    _ = presentation.queueMaintenanceFileEnrichment(published, file_index);
+    published.disclosure_inputs_current = false;
+    presentation.stageCacheBuild(published, published.session.enrichment.focused);
+    published.disclosure_inputs_current = true;
+    presentation.stageCacheBuild(published, published.session.enrichment.focused);
+}
+
+test "M21 kernel a recovered cache staging keeps the failure of another maintenance step" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var once: FailOnceAllocator = .{ .child = testing.allocator };
+    var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+    });
+    defer presentation.deinit();
+    _ = drainTestCommands(&presentation);
+    presentation.commands.clearAndFree(presentation.allocator);
+    const file_index = 9;
+    try testing.expect(presentation.published.?.session.enrichment.needsEnrichment(file_index));
+    presentation.withErrorOrigin(.file_enrichment, failTestStepsAndRecoverStaging, .{ &presentation, &once, file_index });
+    try testing.expect(once.failed);
+    try testing.expect(presentation.published.?.pending_cache_update != null);
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+    try testing.expectEqual(@as(usize, 2), drainTestCommands(&presentation));
+}
+
+/// Fails the queue of each File in `failed`, then queues `queued`. Returns
+/// the failure records.
+fn failTestEnrichmentsAndQueue(presentation: *Presentation, once: *FailOnceAllocator, failed: []const usize, queued: usize) !usize {
+    var records: usize = 0;
+    for (failed) |file_index| {
+        records += drainTestCommands(presentation);
+        presentation.commands.clearAndFree(presentation.allocator);
+        once.armed = true;
+        try testing.expect(!presentation.queueMaintenanceFileEnrichment(presentation.published.?, file_index));
+    }
+    try testing.expect(presentation.queueMaintenanceFileEnrichment(presentation.published.?, queued));
+    return records;
+}
+
+test "M21 kernel a File Enrichment queue recovers only the failure of its own File" {
+    const Case = struct { failed: []const usize, queued: usize, shown: ?ActionError };
+    for ([_]Case{
+        .{ .failed = &.{9}, .queued = 9, .shown = null },
+        .{ .failed = &.{9}, .queued = 8, .shown = .out_of_memory },
+        .{ .failed = &.{ 8, 9 }, .queued = 9, .shown = .out_of_memory },
+        .{ .failed = &.{ 8, 9 }, .queued = 8, .shown = .out_of_memory },
+    }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+        });
+        defer presentation.deinit();
+        _ = drainTestCommands(&presentation);
+        const records = try presentation.withErrorOrigin(.review_search, failTestEnrichmentsAndQueue, .{ &presentation, &once, case.failed, case.queued });
+        try testing.expect(once.failed);
+        try testing.expectEqual(case.shown, presentation.projection().action_error);
+        try testing.expectEqual(case.failed.len, records + drainTestCommands(&presentation));
+    }
+}
+
+test "M21 kernel a Session replacement shows no cache staging failure of the replaced Session" {
+    for ([_]bool{ false, true }) |older_message| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 12, .{ .diagnostic_state = .on, .inactive_file_cache_max_bytes = 1 });
+        defer presentation.deinit();
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try runTestUntilSourceScanWaits(&presentation, 11);
+        const previous = presentation.published.?;
+        try presentation.queueCacheBuild(previous, previous.session.enrichment.focused);
+        var running = presentation.commands.pop().?;
+        defer running.deinit();
+        // The Review Search Overlay takes the refresh key, so a Refresh
+        // from outside it replaces the Session.
+        presentation.withErrorOrigin(.user, Presentation.queueRefresh, .{ &presentation, previous.key });
+        const load = presentation.takeCommand().?.load_session;
+        try presentation.dispatch(.{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testManyFileSession(testing.allocator, 1, 12) },
+        } });
+        const job = presentation.takeCommand().?.prepare_session;
+        job.build();
+        try testing.expect(job.ready);
+        try testing.expect(presentation.queued_source_scan != null);
+        try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
+        if (older_message) showTestError(&presentation, .reconciliation, .replacement_pending);
+        // A cache build of the replaced Session can no longer start.
+        previous.disclosure_inputs_current = false;
+        const epoch = previous.epoch;
+        try presentation.dispatch(.{ .session_prepared = job });
+        try testing.expect(presentation.published.?.epoch != epoch);
+        try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+        try testing.expectEqual(@as(usize, 0), drainTestCommands(&presentation));
+    }
+}
+
+test "M21 kernel a successful acquisition pump keeps the failure of the Review Search query retry before it" {
+    for ([_]bool{ false, true }) |focus_check| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+        // Escape while the query scan is pending leaves the reopened query
+        // without a scan.
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        try testing.expect(presentation.published.?.review_search.needs_scan);
+        _ = drainTestCommands(&presentation);
+        // The first allocation is the queue slot of the query retry, and the
+        // pump that follows queues the Files.
+        presentation.commands.clearAndFree(presentation.allocator);
+        presentation.issued_enrichments.clearAndFree(presentation.allocator);
+        once.armed = true;
+        if (focus_check) {
+            // The open fails its retry, so the query stays without a scan
+            // while Review Search is open.
+            try presentation.dispatch(.{ .action = .open_review_search });
+            try testing.expect(once.failed);
+            presentation.discardQueuedSearchEnrichments(presentation.published.?);
+            _ = drainTestCommands(&presentation);
+            presentation.commands.clearAndFree(presentation.allocator);
+            presentation.issued_enrichments.clearAndFree(presentation.allocator);
+            once.armed = true;
+        }
+        try presentation.dispatch(if (focus_check) .ensure_focused_enrichment else .{ .action = .open_review_search });
+        try testing.expect(once.failed);
+        try testing.expect(presentation.published.?.review_search.needs_scan);
+        var queued: usize = 0;
+        for (presentation.commands.items) |command| queued += @intFromBool(command == .enrich_file);
+        try testing.expect(queued > 0);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        try testing.expectEqual(@as(usize, 1), drainTestCommands(&presentation));
+    }
 }
 
 test "M21 kernel Review Search keeps the PullRequest of a shown error when a reopened query retry fails" {
@@ -39914,7 +40901,7 @@ fn initWholeFileGapPresentation(store: *bbr.review.InMemoryStore, key: OwnedRevi
 
 fn expectCursorOnWholeFileGapLine(presentation: *const Presentation, text: []const u8, number: u32, viewport_offset: ?usize) !void {
     const published = presentation.published.?;
-    try testing.expect(presentation.action_error == null);
+    try testing.expect(presentation.projection().action_error == null);
     try testing.expectEqual(try wholeFileGapRow(published, 2, text, number), published.navigation.cursor);
     try testing.expectEqual(@as(?usize, 2), published.activeFile());
     if (viewport_offset) |offset| {
