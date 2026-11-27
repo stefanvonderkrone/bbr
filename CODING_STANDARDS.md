@@ -196,6 +196,7 @@ The failure of a user input is the outcome of that input. So the retry records t
 These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and the `.draft_save` and `.draft_mutation` prongs of `retryContentBuild`.
 `selectVersion` also calls it when its view build or its File Enrichment cannot queue, because no later check does that input again.
 So does `replaceReviewSearchQuery` when a query edit cannot allocate or queue its scan.
+A Buffer Search query edit calls it when its input build cannot queue or cannot be admitted: in `acceptBufferSearchScanned`, `failBufferSearchScan`, and `acceptBufferDisclosure`.
 A reopened query keeps `needs_scan` after a failure, and the focus check retries it, so `openReviewSearch` runs `retryReviewSearchQuery`, which is maintenance work.
 An enrichment failure can cancel the pending reading location from a refresh or Reconciliation.
 That cancellation drops part of the refresh or Reconciliation.

@@ -10039,7 +10039,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 batch.deinit(self.allocator);
                 input.failPendingScan(self.allocator);
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
                 published.frame_revision += 1;
                 return;
             },
@@ -10085,7 +10085,7 @@ pub const Presentation = struct {
         published.frame_revision += 1;
         const job = self.queueBufferDisclosure(published, null, null, input.request_id, null) catch |err| switch (err) {
             error.OutOfMemory => {
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
                 return;
             },
         } orelse return;
@@ -10181,7 +10181,7 @@ pub const Presentation = struct {
                 if (accepted_ranges) |old| std.heap.page_allocator.free(old);
                 if (review_ranges) |old| std.heap.page_allocator.free(old);
                 input.failPendingScan(self.allocator);
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
