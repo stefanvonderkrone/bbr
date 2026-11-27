@@ -47,6 +47,8 @@ PUBLIC_PULL_REQUESTS = {
         "a pull request of the public bbr GitHub repository",
     (".scratch/query-edit-clear-order", "45"):
         "a pull request of the public bbr GitHub repository",
+    (".scratch/query-edit-clear-order", "44"):
+        "a pull request of the public bbr GitHub repository",
 }
 AGENTS_MD_CAP = 5000
 COMPILE_CLAIM = re.compile(r"compile error|does not compile|do not compile|fails to compile")
