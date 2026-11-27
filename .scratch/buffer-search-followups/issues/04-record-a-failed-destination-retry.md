@@ -102,7 +102,7 @@ The `.buffer_build_failed` and `.no_review_item` calls of `failCardDestination` 
 One way is to record only at the four completion prongs.
 Another way is to give the helpers the cause on the `error.OutOfMemory` prongs only.
 For example, `failCardDestination` can take an optional cause, and only the `.out_of_memory` callers pass one.
-That way also adds a record to the direct prongs, `toggleDisclosure` included, and to the admission copy failure of a `.card_destination` build.
+That way also adds a record to the direct prongs, `toggleDisclosure` included. It also adds a record to the admission copy failure of a `.card_destination` build.
 So it needs the triage decisions on the direct prongs and on the admissions first.
 A helper that records for each `ActionError` is wrong.
 It writes a second record for a failed build and a record for `.no_review_item`.
@@ -118,7 +118,7 @@ So the check needs a per-file baseline, as `tools/diagnostic_catch_baseline.txt`
 It fails when a change adds a prong.
 Its error names `failDroppedInput` and `failMaintenance` as the fix.
 It does not see paths 1 and 2, because `retryContentBuild` reaches the prong through `openReviewSearchOccurrence`.
-A narrower rule can require that each prong in a function that queues work again calls `failDroppedInput`, `failMaintenance`, or `settleMaintenance`.
+A narrower rule can cover each prong in a function that queues work again. Each such prong calls `failDroppedInput`, `failMaintenance`, or `settleMaintenance`.
 That rule has the same blind spot for paths 1 and 2.
 Triage decides whether either check earns its place.
 
