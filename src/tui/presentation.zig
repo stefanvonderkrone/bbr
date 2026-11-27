@@ -26035,14 +26035,16 @@ test "M21 kernel an accepted Buffer Search keeps the scan failure of its query e
 }
 
 /// Completes every queued disclosure build and returns the number of
-/// diagnostic records that the Presentation queued.
+/// diagnostic records that the Presentation queued. A queued scan fails
+/// the test, because a build that queues a scan expects it to run.
 fn completeTestDisclosureBuilds(presentation: *Presentation) !usize {
     var records: usize = 0;
     while (presentation.takeCommand()) |next| {
         var command = next;
         if (command != .build_buffer_disclosure) {
+            defer command.deinit();
+            if (command == .scan_buffer_search) return error.UnexpectedBufferSearchScan;
             if (command == .report_diagnostic) records += 1;
-            command.deinit();
             continue;
         }
         command.build_buffer_disclosure.build();
@@ -26197,6 +26199,74 @@ test "M21 kernel an Enter key during a failed Buffer Search scan closes the inpu
         try testing.expectEqual(@as(?ActionError, if (case == .failed_restore) .buffer_build_failed else .buffer_search_scan_failed), presentation.projection().action_error);
         if (case == .restore) try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
     }
+}
+
+test "M21 kernel a query edit drops the restore of a failed Buffer Search scan" {
+    for ([_]bool{ false, true }) |running| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        const initial = presentation.projection().review.?.buffer.rows.len;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, "eigh");
+        try completeBufferSearchScan(&presentation);
+        try replaceTestBufferSearchQuery(&presentation, "eighx");
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        const restore: ?OwnedCommand = if (running) presentation.takeCommand().? else null;
+
+        try replaceTestBufferSearchQuery(&presentation, "eighxy");
+        try testing.expectEqual(@as(usize, 1), presentation.commands.items.len);
+        try testing.expect(presentation.commands.items[0] == .scan_buffer_search);
+        if (restore) |stale| {
+            stale.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = stale.build_buffer_disclosure });
+            try testing.expectEqual(@as(usize, 1), presentation.commands.items.len);
+        }
+        try testing.expect(presentation.projection().action_error == null);
+        try testing.expect(presentation.published.?.buffer_search.input.?.pending);
+
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_no_matches), presentation.projection().action_error);
+        try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+}
+
+test "M21 kernel a failed restore of a failed Buffer Search scan shows the build failure" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try replaceTestBufferSearchQuery(&presentation, "eigh");
+    try completeBufferSearchScan(&presentation);
+    const preview = presentation.projection().review.?.buffer.rows.len;
+    try replaceTestBufferSearchQuery(&presentation, "eighx");
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+    completed.outcome.scanned.deinit(completed.allocator);
+    completed.outcome = .failed;
+    try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    const restore = presentation.takeCommand().?.build_buffer_disclosure;
+    restore.failed = true;
+    try presentation.dispatch(.{ .buffer_disclosure_built = restore });
+    try testing.expectEqual(@as(?ActionError, .buffer_build_failed), presentation.projection().action_error);
+    try testing.expect(!presentation.published.?.buffer_search.input.?.pending);
+    // The rule in docs/rules/tui-state.md: without its restore, the view
+    // keeps the disclosures of the previous preview.
+    try testing.expectEqual(preview, presentation.projection().review.?.buffer.rows.len);
+    try testing.expect(presentation.takeCommand() == null);
 }
 
 test "M21 kernel an Enter key during a failed Buffer Search query clear closes the input" {
