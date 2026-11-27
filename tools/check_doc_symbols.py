@@ -48,7 +48,7 @@ def enforcement_violations(path, paragraph, test_names):
     offsets = []
     for number, line in paragraph:
         offsets.append(len(text))
-        text += line.strip() + "\n"
+        text += line.strip() + " "
     runs = list(re.finditer(r"`+", text))
     index = 0
     while index < len(runs):
@@ -66,9 +66,15 @@ def enforcement_violations(path, paragraph, test_names):
     for match in re.finditer(r"[\u201c\u201d\u201e]", text):
         number = paragraph[bisect_right(offsets, match.start()) - 1][0]
         yield (
-            f"{path}:{number}: a curly double quote in an Enforcement paragraph. "
+            f"{path}:{number}: the Enforcement paragraph has a curly double quote. "
             "To name a test, use straight double quotes. Write other text as a code span."
         )
+    if text.count('"') % 2:
+        yield (
+            f"{path}:{paragraph[0][0]}: the Enforcement paragraph has an unpaired double quote. "
+            "Close the test name, or write other text as a code span."
+        )
+        return
     for match in re.finditer(r'"([^"]*)"', text):
         if match[1] not in test_names:
             number = paragraph[bisect_right(offsets, match.start()) - 1][0]
