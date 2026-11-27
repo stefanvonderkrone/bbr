@@ -42,10 +42,10 @@ Enforcement: the `@compileError` calls of the `flag_sets` block in `src/api/cli.
 
 A `bbr api` verb with `--concurrency` states in its help the default that its parser uses. The help gets the text from `workspaces.concurrencyHelp` or `workspaces.pagingHelp`. These functions take the default as an argument, so no help text holds a concurrency digit.
 
-Enforcement: the test "every verb with --concurrency names its default in the help" in `src/api/cli.zig`, and the tests whose names contain "concurrency default" in `src/api/workspaces.zig`, `src/api/repositories.zig`, `src/api/branches.zig`, and `src/api/pullrequests.zig`. `zig build test` runs them.
+Enforcement: the test "every verb with --concurrency names its default in the help" in `src/api/cli.zig`, and the tests whose names contain `concurrency default` in `src/api/workspaces.zig`, `src/api/repositories.zig`, `src/api/branches.zig`, and `src/api/pullrequests.zig`. `zig build test` runs them.
 
 ## Default Reviewers on a PullRequest write
 
 `--default-reviewers` on `create-pull-request` and `update-pull-request` reads the PullRequest Author and the Default Reviewers before the POST or PUT. Thus a failed read sends no write. The sent reviewers never include the Author. A `--reviewer` value that names the Author prints a warning on stderr and leaves stdout to the result.
 
-Enforcement: the tests whose names start with "--default-reviewers", and the test "a failed Author or Default Reviewer read sends no PullRequest write", in `src/api/cli.zig`. `zig build test` runs them.
+Enforcement: the tests whose names start with `--default-reviewers`, and the test "a failed Author or Default Reviewer read sends no PullRequest write", in `src/api/cli.zig`. `zig build test` runs them.
