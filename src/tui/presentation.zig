@@ -37591,6 +37591,43 @@ test "M21 kernel a Review Search destination shows the failure of its cache stag
     }
 }
 
+test "M21 kernel a Session replacement shows no cache staging failure of the replaced Session" {
+    for ([_]bool{ false, true }) |older_message| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try openTestReviewSourceSearchWith(&store, testing.allocator, 12, .{ .diagnostic_state = .on, .inactive_file_cache_max_bytes = 1 });
+        defer presentation.deinit();
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try runTestUntilSourceScanWaits(&presentation, 11);
+        const previous = presentation.published.?;
+        try presentation.queueCacheBuild(previous, previous.session.enrichment.focused);
+        var running = presentation.commands.pop().?;
+        defer running.deinit();
+        // The Review Search Overlay takes the refresh key, so a Refresh
+        // from outside it replaces the Session.
+        presentation.withErrorOrigin(.user, Presentation.queueRefresh, .{ &presentation, previous.key });
+        const load = presentation.takeCommand().?.load_session;
+        try presentation.dispatch(.{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testManyFileSession(testing.allocator, 1, 12) },
+        } });
+        const job = presentation.takeCommand().?.prepare_session;
+        job.build();
+        try testing.expect(job.ready);
+        try testing.expect(presentation.queued_source_scan != null);
+        try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
+        if (older_message) showTestError(&presentation, .reconciliation, .replacement_pending);
+        // A cache build of the replaced Session can no longer start.
+        previous.disclosure_inputs_current = false;
+        const epoch = previous.epoch;
+        try presentation.dispatch(.{ .session_prepared = job });
+        try testing.expect(presentation.published.?.epoch != epoch);
+        try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+        try testing.expectEqual(@as(usize, 0), drainTestCommands(&presentation));
+    }
+}
+
 test "M21 kernel a successful acquisition pump keeps the failure of the Review Search query retry before it" {
     for ([_]bool{ false, true }) |focus_check| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
