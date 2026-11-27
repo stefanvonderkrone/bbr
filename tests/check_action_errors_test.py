@@ -318,6 +318,46 @@ class ActionErrorsTest(unittest.TestCase):
         self.assertIn("writes action_error outside", found[0])
         self.assertIn("writes event_origin outside", found[1])
 
+    def test_a_one_line_helper_ends_on_its_line(self):
+        found = self.check(
+            "pub const Presentation = struct {\n"
+            "    fn finishEvent(self: *Presentation) void { self.action_error = null; }\n"
+            "    fn other(self: *Presentation) void {\n"
+            "        if (self.action_error != null) return;\n"
+            "    }\n"
+            "};\n"
+        )
+        self.assertEqual([message.split(":")[1] for message in found], ["4"])
+
+    def test_a_read_beside_a_write_on_one_line_is_rejected(self):
+        found = self.check(
+            "pub const Presentation = struct {\n"
+            "    fn other(self: *Presentation) void {\n"
+            "        self.action_error = self.action_error;\n"
+            "    }\n"
+            "};\n"
+        )
+        self.assertEqual(len(found), 2, found)
+        self.assertIn("reads action_error outside", found[0])
+        self.assertIn("writes action_error outside", found[1])
+
+    def test_a_helper_name_in_a_nested_struct_is_not_a_helper(self):
+        found = self.check(
+            "pub const Presentation = struct {\n"
+            "    const Nested = struct {\n"
+            "        fn projection(self: *Presentation) void {\n"
+            "            _ = self.action_error;\n"
+            "        }\n"
+            "    };\n"
+            "};\n"
+            "const Published = struct {\n"
+            "    fn clearError(self: *Published) void {\n"
+            "        self.action_error = null;\n"
+            "    }\n"
+            "};\n"
+        )
+        self.assertEqual([message.split(":")[1] for message in found], ["4", "10"])
+
     def test_maintenance_failures_outside_their_helpers_are_rejected(self):
         found = self.check(MAINTENANCE)
         self.assertEqual([message.split(":")[1] for message in found], ["17", "18"])
