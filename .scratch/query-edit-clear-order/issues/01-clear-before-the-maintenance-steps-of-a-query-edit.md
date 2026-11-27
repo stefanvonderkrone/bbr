@@ -182,3 +182,9 @@ Open Code Review found one item in `c2ae8321`.
 1. Valid. The test "M21 kernel a failed Buffer Search opening keeps the input open" pressed the second Enter key only after a failed opening build. After a failed queue of the retry, the test stopped, but the Enforcement text in `docs/rules/tui-state.md` says that the test fails when a second Enter key does not retry the opening. The test now presses the second Enter key in both cases. After the failed queue, it lets memory recover first. It expects an `open_input` build, runs it, and checks that the input closes. A temporary mutation that cleared `restoring_review_disclosures` after the failed queue of the retry made the test fail at the retry command, and `zig build test` exited with 1. No production code changed.
 
 Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, and `python3 tools/check_doc_symbols.py .` pass.
+
+## OCR round 9
+
+Open Code Review found one item in `91f625b1`.
+
+1. Valid. Two sentences in `docs/rules/tui-state.md` about the Buffer Search accept had more than 20 words and several clauses. A one-time script listed each added sentence of more than 20 words in the changed sections of `docs/rules/tui-state.md`, `CODING_STANDARDS.md`, and `docs/rules/diagnostics.md`. The script counted a quoted test name or a code span as one word. The fix splits each listed sentence into sentences of 20 words or fewer, with the same meaning. The script then listed no sentence, no semicolon, and no em dash. No code changed.
