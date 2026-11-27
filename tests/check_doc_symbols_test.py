@@ -172,11 +172,38 @@ class DocSymbolsTest(unittest.TestCase):
                 result = self.check_enforcement(f"Enforcement: the test {quote}.\n", 'test "kept test" {}\n')
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("docs/rules/fixture.md:1:", result.stderr)
+                self.assertIn("the Enforcement paragraph has a curly double quote", result.stderr)
                 self.assertIn("use straight double quotes", result.stderr)
 
     def test_apostrophes_and_single_quotes_pass(self):
         result = self.check_enforcement("Enforcement: the check's run and the 'x' word and the Theme\u2019s role.\n")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unpaired_double_quote_fails(self):
+        result = self.check_enforcement('Enforcement: the test "kept test.\n', 'test "kept test" {}\n')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("docs/rules/fixture.md:1: the Enforcement paragraph has an unpaired double quote", result.stderr)
+
+    def test_name_wrapped_over_two_lines_passes(self):
+        result = self.check_enforcement('Enforcement: the test "kept\ntest" runs.\n', 'test "kept test" {}\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_names_compare_as_raw_zig_text(self):
+        source = 'test "\\\\ marker" {}\ntest "a \\"b\\"" {}\n'
+        result = self.check_enforcement('Enforcement: the test "\\\\ marker".\n', source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.check_enforcement('Enforcement: the test "\\ marker".\n', source)
+        self.assert_test_name_rejected(result, "\\ marker")
+
+    def test_fence_ends_an_enforcement_paragraph(self):
+        result = self.check_enforcement('Enforcement: a check.\n```\ncode\n```\nThe "next" text.\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_enforcement_quotes_outside_rule_docs_pass(self):
+        for path in ("AGENTS.md", "CODING_STANDARDS.md"):
+            with self.subTest(path=path):
+                result = self.check('Enforcement: the test "missing test".\n', "", path=path)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_document_fails(self):
         result = self.check("", "", path="docs/rules/fixture.md", missing=("CODING_STANDARDS.md",))
