@@ -364,6 +364,25 @@ class ActionErrorsTest(unittest.TestCase):
         self.assertIn("uses maintenance_failures outside settleMaintenance, showMaintenanceError, and finishEvent.", found[0])
         self.assertIn("failMaintenance(step, operation, err, source)", found[0])
 
+    def test_a_free_function_outside_a_test_block_is_checked(self):
+        found = self.check(
+            "pub const Presentation = struct {\n"
+            "    action_error: ?ShownError = null,\n"
+            "};\n"
+            "fn restoreReviewLocation(presentation: *Presentation) void {\n"
+            "    if (presentation.action_error != null) return;\n"
+            "    presentation.maintenance_failures = .initFill(null);\n"
+            "}\n"
+            "test \"a test reads the shown error\" {\n"
+            "    var presentation: Presentation = .{};\n"
+            "    _ = presentation.action_error;\n"
+            "    _ = presentation.maintenance_failures;\n"
+            "}\n"
+        )
+        self.assertEqual([message.split(":")[1] for message in found], ["5", "6"])
+        self.assertIn("reads action_error outside", found[0])
+        self.assertIn("uses maintenance_failures outside", found[1])
+
     def test_a_file_without_the_presentation_struct_is_rejected(self):
         found = self.check(COPIED_ORIGIN.replace("pub const Presentation = struct {", "pub const Renamed = struct {"))
         self.assertEqual(len(found), 1, found)
