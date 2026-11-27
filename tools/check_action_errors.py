@@ -29,7 +29,7 @@ SOURCES = (Path("src/tui/presentation.zig"),)
 FIELDS = (
     (
         "action_error",
-        ("showErrorFor", "clearError"),
+        ("showErrorFor", "clearError", "finishEvent"),
         "Call showError(err), showErrorFor(err, key), or clearError() instead. All take the origin of the event that runs.",
     ),
     (
@@ -38,12 +38,19 @@ FIELDS = (
         "Run the work through withErrorOrigin(origin, work, args) instead. It restores the origin of the event.",
     ),
 )
+def listed(names):
+    """The names as an English list, such as `a, b, and c`."""
+    if len(names) < 3:
+        return " and ".join(names)
+    return f"{', '.join(names[:-1])}, and {names[-1]}"
+
+
 CHECKS = tuple(
     (
         field,
         re.compile(rf"^\s*(?:pub\s+)?fn\s+(?:{'|'.join(helpers)})\("),
         re.compile(rf"[\w)\]*]\.{field}\s*=(?!=)"),
-        f"writes {field} outside {' and '.join(helpers)}. {fix}",
+        f"writes {field} outside {listed(helpers)}. {fix}",
     )
     for field, helpers, fix in FIELDS
 )
@@ -135,7 +142,7 @@ def main():
     if found:
         return 1
     print(
-        "Only showErrorFor and clearError write action_error, only dispatch and withErrorOrigin write event_origin, "
+        "Only showErrorFor, clearError, and finishEvent write action_error, only dispatch and withErrorOrigin write event_origin, "
         "each withErrorOrigin call in Presentation names an enum literal, "
         "and only showMaintenanceError asks whether no action error shows."
     )

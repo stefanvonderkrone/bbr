@@ -158,7 +158,7 @@ class ActionErrorsTest(unittest.TestCase):
     def test_the_old_clipboard_reset_is_rejected(self):
         found = self.check(OLD_CLIPBOARD)
         self.assertEqual(len(found), 1)
-        self.assertIn("src/tui/presentation.zig:8: writes action_error outside showErrorFor and clearError.", found[0])
+        self.assertIn("src/tui/presentation.zig:8: writes action_error outside showErrorFor, clearError, and finishEvent.", found[0])
         self.assertIn("clearError()", found[0])
 
     def test_writes_of_a_test_and_after_the_helpers_are_rejected(self):
@@ -176,7 +176,7 @@ class ActionErrorsTest(unittest.TestCase):
     def test_show_error_may_not_write_the_field_itself(self):
         found = self.check(OLD_SHOW_ERROR)
         self.assertEqual(len(found), 1, found)
-        self.assertIn("src/tui/presentation.zig:5: writes action_error outside showErrorFor and clearError.", found[0])
+        self.assertIn("src/tui/presentation.zig:5: writes action_error outside showErrorFor, clearError, and finishEvent.", found[0])
 
     def test_the_helpers_reads_comments_literals_and_projection_fields_are_allowed(self):
         self.assertEqual(self.check(HELPERS), [])

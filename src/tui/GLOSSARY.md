@@ -206,7 +206,7 @@ The active input surface and semantic target from the current Presentation Frame
 _Avoid_: mode (too broad), focus alone (omits the target), input state.
 
 **Error Origin**:
-The path that shows an action error. A key, a mouse action, or an Overlay action has the origin `user`. A completion has the path of its work, such as `file_enrichment` or `review_search`. Work of one path that runs inside an event of another path has the origin of its own path. A clear from `user` clears any error that an earlier event showed. A clear from another origin clears only such an error of that origin.
+The path that shows an action error. A key, a mouse action, or an Overlay action has the origin `user`. A completion has the path of its work, such as `file_enrichment` or `review_search`. Work of one path that runs inside an event of another path has the origin of its own path. A clear from `user` clears any error. A clear from another origin clears only an error of that origin.
 _Avoid_: event class, trigger.
 
 **ActionAvailability**:

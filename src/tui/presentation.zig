@@ -4104,9 +4104,9 @@ pub const DeleteConfirmationProjection = struct {
 };
 
 /// The path that shows an action error. A completion of background work
-/// clears only an earlier error of its own path, so it keeps an error that the user
+/// clears only an error of its own path, so it keeps an error that the user
 /// has not read yet. A key, a mouse action, or an Overlay action is `.user`
-/// and clears any error of an earlier event.
+/// and clears any error.
 const ErrorOrigin = enum {
     user,
     picker,
@@ -4123,19 +4123,34 @@ const ErrorOrigin = enum {
     review_search,
 };
 
-const KeptFailure = struct {
+/// A step of maintenance work. An event keeps one outcome per step, so a
+/// later run of a step in the same event replaces the outcome of an
+/// earlier run.
+const MaintenanceStep = enum {
+    /// `stageCacheBuild` and the retry of a stale cache update. A
+    /// Session has one queued cache update, so a later staging recovers
+    /// an earlier one.
+    cache_staging,
+    /// `retryReviewSearchQuery`.
+    query_retry,
+    /// `queueMaintenanceFileEnrichment`. A queue of another File does not
+    /// recover it.
+    file_enrichment,
+    /// A failed enrichment or cache update build in `acceptBufferDisclosure`.
+    failed_build,
+    /// A non-speculative result that `dropEnrichments` drops.
+    dropped_result,
+};
+
+const MaintenanceFailure = struct {
     err: ActionError,
     origin: ErrorOrigin,
-    /// The `Presentation.event_serial` of the event of the failed step.
-    event: u64,
 };
 
 const ShownError = struct {
     err: ActionError,
     origin: ErrorOrigin,
     key: ?OwnedRemoteReviewIdentity,
-    /// The `Presentation.event_serial` of the event that showed it.
-    event: u64,
 };
 
 pub const ActionError = enum {
@@ -6764,11 +6779,9 @@ pub const Presentation = struct {
     /// for one piece of work. It is null outside both, and then an action
     /// error is a bug.
     event_origin: ?ErrorOrigin = null,
-    /// Counts the events, so a clear can tell the message of the event that
-    /// runs from an older one.
-    event_serial: u64 = 0,
-    /// The failure of a maintenance step that kept an older message.
-    kept_failure: ?KeptFailure = null,
+    /// The failed maintenance steps of the event that runs. `finishEvent`
+    /// shows the first of them when the event ends without a message.
+    maintenance_failures: std.EnumArray(MaintenanceStep, ?MaintenanceFailure) = .initFill(null),
     diagnostic_state: bbr.diagnostic.State = .off,
     diagnostic_pending: bool = false,
     fatal_error: ?FatalError = null,
@@ -6855,9 +6868,9 @@ pub const Presentation = struct {
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
         const outer_origin = self.event_origin;
-        if (outer_origin == null) self.event_serial +%= 1;
         self.event_origin = input.errorOrigin();
         defer self.event_origin = outer_origin;
+        defer if (outer_origin == null) self.finishEvent();
         // The preview hold acquires Files for the Review Search after every event.
         defer self.withErrorOrigin(.review_search, holdReviewSearchPreview, .{self});
         defer if (self.published) |published| {
@@ -7061,26 +7074,31 @@ pub const Presentation = struct {
     /// name it as `repo#id` while another review is visible. Only a Remote
     /// Review has that name.
     fn showErrorFor(self: *Presentation, err: ActionError, key: ?OwnedRemoteReviewIdentity) void {
-        self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key, .event = self.event_serial };
+        self.action_error = .{ .err = err, .origin = self.errorOrigin(), .key = key };
         self.status_revision +%= 1;
     }
 
-    /// A user action clears any error of an earlier event. Other work clears
-    /// only such an error of its own origin. A message of the event that runs
-    /// is the outcome of one of its steps, so no clear of that event removes
-    /// it. The order of a clear and the steps of an event does not matter.
+    /// A user action clears any error. Other work clears only an error of its
+    /// own origin.
     fn clearError(self: *Presentation) void {
         const shown = self.action_error orelse return;
         const origin = self.errorOrigin();
-        if (shown.event == self.event_serial) return;
         if (origin != .user and shown.origin != origin) return;
         self.action_error = null;
-        // A failed maintenance step of this event kept this message, so the
-        // failure takes its place.
-        if (self.kept_failure) |kept| if (kept.event == self.event_serial) {
-            self.action_error = .{ .err = kept.err, .origin = kept.origin, .key = null, .event = self.event_serial };
-        };
         self.status_revision +%= 1;
+    }
+
+    /// Ends the outermost event. A maintenance failure shows only when the
+    /// event ends without a message, so no clear of the event removes it,
+    /// and a step that a later run recovered shows nothing.
+    fn finishEvent(self: *Presentation) void {
+        defer self.maintenance_failures = .initFill(null);
+        if (self.action_error != null) return;
+        for (self.maintenance_failures.values) |entry| if (entry) |failure| {
+            self.action_error = .{ .err = failure.err, .origin = failure.origin, .key = null };
+            self.status_revision +%= 1;
+            return;
+        };
     }
 
     fn errorOrigin(self: *const Presentation) ErrorOrigin {
@@ -7091,9 +7109,9 @@ pub const Presentation = struct {
     /// path, and then restores the origin of the event.
     fn withErrorOrigin(self: *Presentation, origin: ErrorOrigin, comptime work: anytype, args: anytype) @typeInfo(@TypeOf(work)).@"fn".return_type.? {
         const outer = self.event_origin;
-        if (outer == null) self.event_serial +%= 1;
         self.event_origin = origin;
         defer self.event_origin = outer;
+        defer if (outer == null) self.finishEvent();
         return @call(.auto, work, args);
     }
 
@@ -8790,12 +8808,10 @@ pub const Presentation = struct {
         self.pauseQueuedSpeculativeEnrichment(published);
         self.clearError();
         if (state.needs_scan) {
-            const text = (state.query orelse unreachable).query.text;
-            // The retry of this query clears only a Review Search error.
-            self.withErrorOrigin(.review_search, replaceReviewSearchQuery, .{ self, text });
             // The query must not show over the results of another query
             // without the pending mark, also when its scan cannot queue.
             state.pending = true;
+            self.withErrorOrigin(.review_search, retryReviewSearchQuery, .{self});
         }
         self.pumpReviewSearchAcquisition(published);
         self.maybeQueueReviewSourceScan(published);
@@ -8811,7 +8827,7 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (!state.open or !state.pending or !state.needs_scan) return;
-        self.setReviewSearchQuery((state.query orelse unreachable).query.text) catch |err| self.failMaintenance(.review_search, err, @src());
+        self.settleMaintenance(.query_retry, .review_search, self.setReviewSearchQuery((state.query orelse unreachable).query.text), @src());
     }
 
     fn countFileCandidates(self: *ReviewSearchState, index: usize, view: file_enrichment.FileView) void {
@@ -8880,8 +8896,8 @@ pub const Presentation = struct {
         self.replaceReviewSearchQuery(text[0..end]);
     }
 
-    /// A query edit or a reopened query is the outcome of a user input, so
-    /// its failure shows over another message.
+    /// A query edit is the outcome of a user input, so its failure shows
+    /// over another message.
     fn replaceReviewSearchQuery(self: *Presentation, text: []const u8) void {
         self.setReviewSearchQuery(text) catch |err| self.failDroppedInput(err, @src());
     }
@@ -9140,22 +9156,29 @@ pub const Presentation = struct {
     }
 
     fn stageCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) void {
-        self.queueCacheBuild(published, focused) catch |err| self.failMaintenance(.buffer_build, err, @src());
+        self.settleMaintenance(.cache_staging, .buffer_build, self.queueCacheBuild(published, focused), @src());
+    }
+
+    /// Records the outcome of a run of `step`. A success recovers a failure
+    /// of an earlier run of `step` in the same event.
+    fn settleMaintenance(self: *Presentation, step: MaintenanceStep, operation: bbr.diagnostic.Operation, outcome: anyerror!void, comptime source: std.builtin.SourceLocation) void {
+        outcome catch |err| return self.failMaintenance(step, operation, err, source);
+        self.maintenance_failures.set(step, null);
     }
 
     /// Work that no input asked for, such as a cache staging or a File
     /// Enrichment of the focus check, runs again at a later check. So its
     /// failure has one record and keeps the shown message.
-    fn failMaintenance(self: *Presentation, operation: bbr.diagnostic.Operation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
+    fn failMaintenance(self: *Presentation, step: MaintenanceStep, operation: bbr.diagnostic.Operation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
         self.reportFailure(operation, .prepare, err, source);
-        self.showMaintenanceError(.out_of_memory);
+        self.showMaintenanceError(step, .out_of_memory);
     }
 
     /// A later check does the failed step again, so its failure keeps a
-    /// shown message. A clear of the same event then shows `err` instead.
-    fn showMaintenanceError(self: *Presentation, err: ActionError) void {
-        if (self.action_error == null) return self.showError(err);
-        self.kept_failure = .{ .err = err, .origin = self.errorOrigin(), .event = self.event_serial };
+    /// shown message. `finishEvent` shows `err` when the event ends without
+    /// a message.
+    fn showMaintenanceError(self: *Presentation, step: MaintenanceStep, err: ActionError) void {
+        self.maintenance_failures.set(step, .{ .err = err, .origin = self.errorOrigin() });
     }
 
     /// No later check retries this input, so its failure replaces the shown message.
@@ -9726,7 +9749,9 @@ pub const Presentation = struct {
             } else _ = published.jumpToSearchOccurrence(batch.occurrences[active]);
         };
         input.deinit(self.allocator);
-        self.clearError();
+        // An accepted search without matches opens nothing, so the user
+        // sees why.
+        if (published.buffer_search.active == null) self.showError(.buffer_search_no_matches) else self.clearError();
         published.frame_revision += 1;
     }
 
@@ -10256,7 +10281,7 @@ pub const Presentation = struct {
             const speculative = job.kind == .enrichment and EnrichedFile.allSpeculative(job.enrichments.items);
             if (!job.kind.isMaintenance() or dropped_location) {
                 self.showError(.buffer_build_failed);
-            } else if (!speculative) self.showMaintenanceError(.buffer_build_failed);
+            } else if (!speculative) self.showMaintenanceError(.failed_build, .buffer_build_failed);
             return;
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -10536,9 +10561,10 @@ pub const Presentation = struct {
                 self.openReviewSearchOccurrence();
             },
             .enrichment => self.retryEnrichmentBuild(published, job),
-            .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch |err| {
-                published.pending_cache_update = null;
-                self.failMaintenance(.buffer_build, err, @src());
+            .cache_update => {
+                const outcome = self.queueCacheBuild(published, published.pending_cache_focus);
+                if (std.meta.isError(outcome)) published.pending_cache_update = null;
+                self.settleMaintenance(.cache_staging, .buffer_build, outcome, @src());
             },
             .draft_save => {
                 self.queueDraftBuild(published, job.new_draft.?) catch |err| switch (err) {
@@ -10731,7 +10757,7 @@ pub const Presentation = struct {
             self.failDroppedInput(err, source);
         } else {
             self.reportFailure(.completion, .admission, err, source);
-            if (!EnrichedFile.allSpeculative(enrichments)) self.showMaintenanceError(.out_of_memory);
+            if (!EnrichedFile.allSpeculative(enrichments)) self.showMaintenanceError(.dropped_result, .out_of_memory);
         }
         for (enrichments) |*enriched| enriched.result.deinit();
     }
@@ -12953,7 +12979,7 @@ pub const Presentation = struct {
     /// pending after a failure, so a later check queues it again.
     fn queueMaintenanceFileEnrichment(self: *Presentation, published: *Published, file_index: usize) bool {
         self.queueFileEnrichment(published, file_index, false) catch |err| {
-            self.failMaintenance(.file_enrichment, err, @src());
+            self.failMaintenance(.file_enrichment, .file_enrichment, err, @src());
             return false;
         };
         return true;
