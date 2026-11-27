@@ -26017,22 +26017,27 @@ test "M21 kernel an accepted Buffer Search keeps the scan failure of its query e
         completed.outcome = .failed;
         try presentation.dispatch(.{ .buffer_search_scanned = completed });
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
-        try completeTestDisclosureBuilds(&presentation);
+        _ = try completeTestDisclosureBuilds(&presentation);
         try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
         try testing.expect(presentation.projection().buffer_search == null);
     }
 }
 
-fn completeTestDisclosureBuilds(presentation: *Presentation) !void {
+/// Completes every queued disclosure build and returns the number of
+/// diagnostic records that the Presentation queued.
+fn completeTestDisclosureBuilds(presentation: *Presentation) !usize {
+    var records: usize = 0;
     while (presentation.takeCommand()) |next| {
         var command = next;
         if (command != .build_buffer_disclosure) {
+            if (command == .report_diagnostic) records += 1;
             command.deinit();
             continue;
         }
         command.build_buffer_disclosure.build();
         try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
     }
+    return records;
 }
 
 test "M21 kernel a failed Buffer Search scan collapses the preview of the previous query" {
@@ -26066,7 +26071,7 @@ test "M21 kernel a failed Buffer Search scan collapses the preview of the previo
         }
         try presentation.dispatch(.{ .buffer_search_scanned = completed });
         try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
-        try completeTestDisclosureBuilds(&presentation);
+        _ = try completeTestDisclosureBuilds(&presentation);
         try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
         try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
 
@@ -26078,12 +26083,13 @@ test "M21 kernel a failed Buffer Search scan collapses the preview of the previo
 }
 
 test "M21 kernel a Buffer Search input that fails after a query edit opens no occurrence of the previous query" {
-    const Failure = enum { queue_disclosure, input_build, admit_input_build, queue_stale_scan };
-    for ([_]Failure{ .queue_disclosure, .input_build, .admit_input_build, .queue_stale_scan }) |failure| {
+    const Failure = enum { queue_disclosure, queue_restore, input_build, admit_input_build, queue_stale_scan };
+    for ([_]Failure{ .queue_disclosure, .queue_restore, .input_build, .admit_input_build, .queue_stale_scan }) |failure| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         var once: FailOnceAllocator = .{ .child = testing.allocator };
         var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
             .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
         });
         defer presentation.deinit();
@@ -26101,8 +26107,14 @@ test "M21 kernel a Buffer Search input that fails after a query edit opens no oc
         var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
         switch (failure) {
             .queue_disclosure => presentation.published.?.disclosure_inputs_current = false,
+            .queue_restore => {
+                presentation.published.?.disclosure_inputs_current = false;
+                completed.outcome.scanned.deinit(completed.allocator);
+                completed.outcome = .failed;
+            },
             .queue_stale_scan => {
                 completed.visual_rows_revision -%= 1;
+                try testing.expectEqual(@as(usize, 0), presentation.commands.items.len);
                 presentation.commands.clearAndFree(presentation.allocator);
                 once.armed = true;
             },
@@ -26110,7 +26122,7 @@ test "M21 kernel a Buffer Search input that fails after a query edit opens no oc
         }
         try presentation.dispatch(.{ .buffer_search_scanned = completed });
         switch (failure) {
-            .queue_disclosure, .queue_stale_scan => {},
+            .queue_disclosure, .queue_restore, .queue_stale_scan => {},
             .input_build, .admit_input_build => {
                 const worker = presentation.takeCommand().?.build_buffer_disclosure;
                 if (failure == .input_build) worker.failed = true else {
@@ -26122,10 +26134,10 @@ test "M21 kernel a Buffer Search input that fails after a query edit opens no oc
         }
         try testing.expect(!once.armed);
         try testing.expectEqual(@as(?ActionError, switch (failure) {
-            .queue_disclosure, .admit_input_build, .queue_stale_scan => .out_of_memory,
+            .queue_disclosure, .queue_restore, .admit_input_build, .queue_stale_scan => .out_of_memory,
             .input_build => .buffer_build_failed,
         }), presentation.projection().action_error);
-        try completeTestDisclosureBuilds(&presentation);
+        try testing.expectEqual(@as(usize, @intFromBool(failure != .input_build)), try completeTestDisclosureBuilds(&presentation));
 
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
         try testing.expect(presentation.projection().buffer_search == null);
