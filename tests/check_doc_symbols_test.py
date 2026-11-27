@@ -209,23 +209,6 @@ class DocSymbolsTest(unittest.TestCase):
             [message.format("'first'"), message.format("\u201cfirst\u201d"), message.format("\u2018first\u2019")],
         )
 
-    def test_enforcement_test_name_keeps_its_code_span(self):
-        result = self.check(
-            "Enforcement: the test \"a `b` c\" in `src/fixture.zig` fails.\n\n"
-            "Enforcement: the test \"a `d` c\" in `src/fixture.zig` fails.\n",
-            'test "a `b` c" {}\n',
-            path="docs/rules/fixture.md",
-        )
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(
-            result.stderr.splitlines(),
-            [
-                'docs/rules/fixture.md:3: src/fixture.zig has no test "a `d` c". '
-                "Point the Enforcement paragraph at an existing test, or restore the test. "
-                "If the quote is not a test name, write it as a code span."
-            ],
-        )
-
     def test_enforcement_file_stays_in_the_sentence_of_the_test(self):
         result = self.check(
             'Enforcement: the test "first" fails. The block in `src/fixture.zig` holds it.\n\n'

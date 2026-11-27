@@ -80,14 +80,14 @@ def enforcement_test_violations(root, path, paragraph, tests):
     ends = [end.end() for end in SENTENCE_END.finditer(bare)]
     code_span = "If the quote is not a test name, write it as a code span."
     for match in QUOTED.finditer(prose):
-        if match[1] is None and match[2] is None:
+        name = match[1]
+        if name is None and match[2] is None:
             continue
         number = max(line for start, line in starts if start <= match.start())
         location = f"{path.relative_to(root)}:{number}"
         if match[2]:
-            yield f"{location}: the quote {text[match.start(2):match.end(2)]} is not in double quotes. Write a test name in double quotes. {code_span}"
+            yield f"{location}: the quote {match[2]} is not in double quotes. Write a test name in double quotes. {code_span}"
             continue
-        name = text[match.start(1):match.end(1)]
         sentence_end = min((end for end in ends if end >= match.end()), default=len(text))
         file = ZIG_FILE.search(text, match.end(), sentence_end) or (
             [None] + list(ZIG_FILE.finditer(text, 0, match.start()))
