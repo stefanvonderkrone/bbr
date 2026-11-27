@@ -4123,9 +4123,10 @@ const ErrorOrigin = enum {
     review_search,
 };
 
-/// A step of maintenance work. An event keeps one outcome per step, so a
+/// A step of maintenance work. An event keeps one outcome per tag, so a
 /// later run of a step in the same event replaces the outcome of an
-/// earlier run.
+/// earlier run. A File Enrichment success replaces only a failure of the
+/// same File.
 const MaintenanceStep = union(enum) {
     /// `stageCacheBuild` and the retry of a stale cache update. A
     /// Session has one queued cache update, so a later staging recovers

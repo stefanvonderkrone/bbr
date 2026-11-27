@@ -11,14 +11,14 @@ sets it for one piece of work, so a raw write of `event_origin` would give an
 error the wrong origin.
 
 Code outside the test blocks reads `action_error` only in its writers,
-`clearErrorExcept`, and `projection`, and reads the shown error elsewhere
-through `projection().action_error`. A read in other code decides whether a
+`clearErrorExcept`, and `projection`. A read in other code decides whether a
 message shows, and that decision belongs to `finishEvent`. The same code uses
 `maintenance_failures` only in `settleMaintenance`, `showMaintenanceError`, and
 `finishEvent`, so each failed step goes through `failMaintenance` or
 `showMaintenanceError` and only a later run of the same step recovers it. Both
-rules also read the free functions that take a `*Presentation`, and only a
-method of Presentation counts as a helper.
+rules read every function outside the top-level test blocks, and only a
+method of Presentation counts as a helper. Outside the Presentation body, a
+read through `projection().action_error` passes.
 
 A `withErrorOrigin` call in Presentation names its origin as an enum literal.
 A copied origin, such as the origin of a saved error that the code shows
