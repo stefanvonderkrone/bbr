@@ -25922,6 +25922,34 @@ test "M21 kernel an accepted Buffer Search shows no-match only for an empty batc
     }
 }
 
+test "M21 kernel an accepted Buffer Search without a batch keeps only a message of the search" {
+    const Case = struct { shown: ?ActionError, kept: ?ActionError };
+    for ([_]Case{
+        .{ .shown = null, .kept = .buffer_search_scan_failed },
+        .{ .shown = .buffer_search_no_matches, .kept = .buffer_search_no_matches },
+        .{ .shown = .file_enrichment_launch_failed, .kept = null },
+    }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        if (case.shown) |err| showTestError(&presentation, .file_enrichment, err);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expectEqual(case.kept, presentation.projection().action_error);
+    }
+}
+
 test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
