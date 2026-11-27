@@ -141,6 +141,13 @@ class DocSymbolsTest(unittest.TestCase):
         result = self.check_enforcement('Enforcement: the test "kept test".\n', '// test "kept test" {}\n')
         self.assert_test_name_rejected(result, "kept test")
 
+    def test_multiline_string_line_supplies_no_name(self):
+        result = self.check_enforcement(
+            'Enforcement: the test "kept test".\n',
+            'const s =\n    \\\\test "kept test" {}\n;\n',
+        )
+        self.assert_test_name_rejected(result, "kept test")
+
     def test_quote_on_a_later_line_of_the_paragraph_names_its_line(self):
         result = self.check_enforcement('Enforcement: the tests\n"missing test" run.\n')
         self.assert_test_name_rejected(result, "missing test", line=2)
@@ -157,6 +164,10 @@ class DocSymbolsTest(unittest.TestCase):
             with self.subTest(span=span):
                 result = self.check_enforcement(f"Enforcement: the step {span} runs it.\n")
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_quote_after_a_closed_code_span_fails(self):
+        result = self.check_enforcement('Enforcement: the step `x` and the test "missing test".\n')
+        self.assert_test_name_rejected(result, "missing test")
 
     def test_unclosed_backtick_run_does_not_hide_a_quote(self):
         result = self.check_enforcement('Enforcement: a `` run and the test "missing test" and ` one.\n')

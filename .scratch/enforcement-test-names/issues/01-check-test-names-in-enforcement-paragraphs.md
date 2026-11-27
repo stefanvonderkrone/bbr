@@ -64,3 +64,4 @@ Review:
 - The fixes cover an unpaired quote, a name that wraps over two lines, tests for the raw compare, the fence end, and Enforcement text outside `docs/rules/`, and the prose of the rule section and the curly quote error.
 - The rule section keeps the sentence about the file of the test, as the section "Compile claims in Enforcement paragraphs" does.
 - The review flagged STE problems in the messages of commits that already exist. These commits stay as they are.
+- OCR round 1 gaps: added tests for a stale quote after a closed code span and for a Zig multiline string line that names a test. Each new test fails under its mutation (mask to the paragraph end; unanchored TEST with search). Mutations reverted.
