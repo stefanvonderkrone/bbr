@@ -13882,13 +13882,15 @@ pub const Presentation = struct {
         candidate.epoch = self.next_session_epoch + 1;
         candidate.allocator = self.allocator;
         job.candidate = null;
+        if (self.list_overlay) |*overlay| if (overlay.closesOnReplacement()) self.closeListOverlay();
+        self.published = candidate;
+        // The replaced Session is no longer published, so a discarded source
+        // scan stages no cache build for it.
         if (previous) |current| {
             self.discardQueuedReviewSourceScans();
             self.discardQueuedReviewSearchScans();
             self.discardQueuedSearchEnrichments(current);
         }
-        if (self.list_overlay) |*overlay| if (overlay.closesOnReplacement()) self.closeListOverlay();
-        self.published = candidate;
         self.preferences = job.preferences;
         self.discardQueuedBufferSearchScans(null);
         if (self.stale_repair) |*gate| if (OwnedReviewIdentity.eql(gate.key, candidate.key)) {
