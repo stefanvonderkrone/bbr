@@ -105,3 +105,16 @@ Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `p
 Open Code Review found one item in `e0f03ced`.
 
 1. Valid. `docs/rules/tui-state.md` said that an accepted Buffer Search without a batch clears any other message. But `clearErrorExcept` clears by the rule of `clearError`. Only an accept by the Enter key has the origin `.user` and clears any message. An accept that a Buffer Search completion runs through `accept_when_ready` clears only a message of the origin of that completion. The rule doc and the comment in `acceptBufferSearch` now say so. The code does not change.
+
+## CodeRabbit round 1
+
+CodeRabbit found one item in `c3168e16`.
+
+1. Valid. A query edit keeps the batch of the previous query in `BufferSearchInput.batch` while the scan of the edited query is pending. Each failure that ended that scan only set `input.pending = false`, so the input kept the batch of the previous query as if it belonged to the edited query. An accept then installed it as `accepted_batch`. After a scan of `qqqq` with no match and a failed scan of `qqqqq`, the Enter key replaced `buffer_search_scan_failed` with `buffer_search_no_matches`. After a scan of `eigh` with matches and a failed scan of `eighx`, the accept cleared the message and opened the matches of `eigh`. The code before this branch has the same fault: its accept installs the batch of the previous query and clears every message, so the user sees no message at all. The test "M21 kernel an accepted Buffer Search keeps the scan failure of its query edit" (`d81ccf68`) failed with `expected .buffer_search_scan_failed, found .buffer_search_no_matches`, and its case with matches failed with `expected .buffer_search_scan_failed, found null`. The fix (`d17e4ec4`) adds `BufferSearchInput.failPendingScan`. It ends the scan and drops the batch, its ranges, its navigation rows, and the active occurrence. Each failure of a pending input scan calls it: a failed scan, a failed allocation after the scan, a failed or unadmitted disclosure build of the input, and a failed retry of a stale scan. So the batch of an accept always belongs to the accepted query, and `acceptBufferSearch` needs no new guard.
+
+Review: a readonly review of `c3168e16..HEAD` found no blocking finding. It found every path that ends a pending input scan without its own batch covered, no batch of the current query dropped except by a real failure, and no double free. Two low findings stay open by choice:
+
+- Some failure sites drop the highlights without a change of `frame_revision`. Each of them calls `showError`, which changes `status_revision`, and the App paints again on any change of `Projection.revision`. So the user sees no stale highlight.
+- The test covers only the failed scan outcome. The other failure sites call the same `failPendingScan`, and each needs a disclosure build or an allocation failure at one point that no test helper reaches cheaply.
+
+Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_action_errors_test.py` pass.
