@@ -6780,7 +6780,8 @@ pub const Presentation = struct {
     /// error is a bug.
     event_origin: ?ErrorOrigin = null,
     /// The failed maintenance steps of the event that runs. `finishEvent`
-    /// shows the first of them when the event ends without a message.
+    /// shows the failure of the first step in enum order when the event
+    /// ends without a message.
     maintenance_failures: std.EnumArray(MaintenanceStep, ?MaintenanceFailure) = .initFill(null),
     diagnostic_state: bbr.diagnostic.State = .off,
     diagnostic_pending: bool = false,
@@ -37497,7 +37498,7 @@ test "Review recovery a failed view build survives a successful Review Search qu
     try testing.expectEqual(@as(?ActionError, .buffer_build_failed), view.action_error);
 }
 
-test "M21 kernel Review Search keeps another message of the same event when a reopened query retry succeeds" {
+test "M21 kernel Review Search keeps an older message when a reopened query retry succeeds" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
@@ -37526,7 +37527,7 @@ test "M21 kernel Review Search keeps another message of the same event when a re
     try testing.expect(presentation.published.?.review_search.currentQueryResultsPublished());
 }
 
-test "M21 kernel Review Search keeps another message of the same event when a reopened query retry fails" {
+test "M21 kernel Review Search keeps an older message when a reopened query retry fails" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
@@ -37634,7 +37635,7 @@ test "M21 kernel a Review Search query edit shows the failure of its cache stagi
         try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
         // An empty query also releases the holds, and that staging fails too.
         try testing.expectEqual(@as(usize, if (empty_query) 2 else 1), drainTestCommands(&presentation));
-        // The kept failure belongs to its own event, so the next key clears.
+        // The failure is a message of its own event, so the next key clears it.
         try presentation.dispatch(.{ .key = .{ .codepoint = 'w', .text = "w" } });
         try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
     };
