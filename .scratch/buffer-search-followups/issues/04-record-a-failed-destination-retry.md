@@ -5,7 +5,7 @@ Blocked by: none
 
 Source: the merge of `main` at `b6b31d6a` into the branch `m29-comment-overview`, commit `06e62ca9`.
 That `main` commit merged the work of [the query edit clear order ticket](../../query-edit-clear-order/issues/01-clear-before-the-maintenance-steps-of-a-query-edit.md).
-The merge agent found this fault and did not fix it.
+The fault was found during the merge of `main` into `m29-comment-overview`. The merge did not fix it.
 
 ## Problem
 
@@ -50,12 +50,36 @@ The destination paths show the message through helpers that write no record:
 - `openReviewSearchOccurrence` calls `reviewSearchAllocationFailed` when `queueReviewSearchDestination` fails.
   `reviewSearchAllocationFailed` only calls `showError(.out_of_memory)`.
 - `failCardDestination` clears `pending_card_destination`, calls `showError`, and shows the Submission Overlay again.
-  Its caller passes `.out_of_memory`, but `failCardDestination` gets no cause.
+  It gets an `ActionError`, but no cause.
 
-The two helpers also serve the direct user paths.
-These are the Enter key on a Review Search hit and the Enter key in the Submission Overlay.
-[A boundary records every error except error.Reported](../../../docs/rules/diagnostics.md#a-boundary-records-every-error-except-errorreported) also asks for a record on those paths.
-This ticket does not decide the record count of the direct paths.
+The two helpers have more callers than the destination retries.
+
+`reviewSearchAllocationFailed` has these callers:
+
+- `openReviewSearchOccurrence`, at its two queues of `queueReviewSearchDestination`.
+  `activateMouseTarget` and `applyAction` call `openReviewSearchOccurrence` for a direct user open, such as the Enter key on a Review Search hit.
+  `acceptViewBuild` and `retryContentBuild` call it at a completion. These are paths 1 and 2.
+- `toggleDisclosure`, at its three copies of the saved Review Search disclosures.
+  These are `error.OutOfMemory` prongs of a direct key press, and not a destination.
+
+`failCardDestination` has these callers:
+
+- `jumpToSubmissionCard` with `.out_of_memory`, when the direct queue of `queueCardDestination` fails.
+  This is the Enter key in the Submission Overlay.
+- `retryContentBuild` with `.out_of_memory`. This is path 3.
+- `acceptViewBuild` with `.out_of_memory`, when the second queue with `destination_attempt` 1 fails. This is path 4.
+- `acceptViewBuild` with `.out_of_memory`, when the copy of `job.disclosures` fails. This is an admission failure.
+- `acceptViewBuild` with `.buffer_build_failed`, when the `.card_destination` build failed.
+- `acceptViewBuild` with `.no_review_item`, when the second build also finds no row for the card.
+
+Only the `error.OutOfMemory` prongs drop a cause.
+The `.buffer_build_failed` call must write no record.
+[A failed Buffer build has its record from the worker boundary](../../../docs/rules/diagnostics.md#a-failed-buffer-build-has-its-record-from-the-worker-boundary) says so, because `recordFailures` already wrote the one record.
+The `.no_review_item` call must write no record, because no error caused it.
+
+[A boundary records every error except error.Reported](../../../docs/rules/diagnostics.md#a-boundary-records-every-error-except-errorreported) also asks for a record on the direct `error.OutOfMemory` prongs.
+These are the direct opens, the Enter key in the Submission Overlay, and the three prongs of `toggleDisclosure`.
+This ticket does not decide the record count of the direct prongs. Triage decides it.
 
 `tools/check_diagnostics.py` accepts each of these sites.
 A switch prong that names `error.OutOfMemory` is the sanctioned drop of [A catch captures and records its cause](../../../docs/rules/diagnostics.md#a-catch-captures-and-records-its-cause).
@@ -72,9 +96,16 @@ Triage decides whether this ticket covers them.
 Each failed queue of a destination at a completion calls `failDroppedInput`.
 It keeps the current state changes.
 These are `destination_pending`, `pending_card_destination`, and the Submission Overlay.
-One way is to give `reviewSearchAllocationFailed` and `failCardDestination` the cause and a record.
-That way also adds a record to the direct user paths.
-Another way is to record only at the completion sites.
+A record goes only on an `error.OutOfMemory` prong.
+The `.buffer_build_failed` and `.no_review_item` calls of `failCardDestination` stay without a record.
+
+One way is to record only at the four completion prongs.
+Another way is to give the helpers the cause on the `error.OutOfMemory` prongs only.
+For example, `failCardDestination` can take an optional cause, and only the `.out_of_memory` callers pass one.
+That way also adds a record to the direct prongs, `toggleDisclosure` included, and to the admission copy failure of a `.card_destination` build.
+So it needs the triage decisions on the direct prongs and on the admissions first.
+A helper that records for each `ActionError` is wrong.
+It writes a second record for a failed build and a record for `.no_review_item`.
 Both ways meet the acceptance criteria.
 
 The fix adds the destination prongs to the list of the standard.
@@ -112,10 +143,20 @@ Triage decides whether either check earns its place.
   After the completion, the status shows `out_of_memory`.
   The commands hold exactly one `report_diagnostic` with the cause `error.OutOfMemory`.
   `pending_card_destination` is null, and the Submission Overlay shows again.
+- [ ] A test, "M21 kernel a failed card destination build keeps one record", passes before and after the fix.
+  It runs with `.diagnostic_state = .on`.
+  One case fails a `.card_destination` build with a cause in its `evidence`.
+  After the completion, the status shows `buffer_build_failed`.
+  The commands hold no `report_diagnostic`.
+  So the one record stays the record of `recordFailures` at the worker boundary.
+  Another case lets the second build with `destination_attempt` 1 find no row for the card.
+  After the completion, the status shows `no_review_item`, and the commands hold no `report_diagnostic`.
+  When no test can reach that case, the ticket says why.
 - [ ] The tests do not pin the `operation` and the `phase` of the record.
   `failDroppedInput` writes `.completion` and `.admission`, but another correct fix can write other values.
 - [ ] [A dropped user input shows its failure](../../../CODING_STANDARDS.md#a-dropped-user-input-shows-its-failure) names the destination retries.
-  It names the two new tests.
+  It names the two red tests.
+- [ ] Triage records its decision on the direct `error.OutOfMemory` prongs in this ticket, the three prongs of `toggleDisclosure` included.
 - [ ] Triage records its decision on the two admissions of `acceptViewBuild` in this ticket.
 - [ ] Triage records its decision on the check option in this ticket.
 - [ ] `zig build test` exits with 0.
