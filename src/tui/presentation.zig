@@ -25836,6 +25836,25 @@ test "M21 Query edit restores search-owned disclosures on the worker" {
     try testing.expectEqual(ActionError.buffer_search_no_matches, presentation.projection().action_error.?);
 }
 
+test "M21 kernel an accepted Buffer Search without matches keeps its message" {
+    for ([_]bool{ false, true }) |accept_first| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'q', .text = "qqqq" } });
+        if (accept_first) try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_no_matches), presentation.projection().action_error);
+        if (!accept_first) try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expect(!presentation.projection().buffer_search.?.input);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_no_matches), presentation.projection().action_error);
+    }
+}
+
 test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
