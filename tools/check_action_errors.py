@@ -37,7 +37,10 @@ from source_lines import zig_files
 
 SOURCES = (Path("src/tui/presentation.zig"),)
 # A member access: an expression, then `.`, then the field name.
-ACCESS = r"(?<!projection\()[\w)\]*?]\s*\.\s*(?P<name>{field})\b"
+ACCESS = r"[\w)\]*?]\s*\.\s*(?P<name>{field})\b"
+# Outside the Presentation body, a test helper or a benchmark reads the shown
+# error through `projection()`. Inside the body, that read is a hand-kept message.
+PROJECTION_READ = r"(?<!projection\()"
 
 
 def listed(names):
@@ -197,10 +200,13 @@ def violations(root):
                 written.add(place)
                 found.append((str(relative), place[0], f"{relative}:{place[0]}: {message}"))
         production = set(outside_tests(lines))
+        body = set(range(span[0] + 1, span[1] + 2))
         for field, helpers, pattern, message in ACCESSES:
-            for place in matches(lines, helpers, pattern, production, span):
-                if place not in written:
-                    found.append((str(relative), place[0], f"{relative}:{place[0]}: {message}"))
+            exempt = re.compile(PROJECTION_READ + pattern.pattern)
+            places = set(matches(lines, helpers, pattern, production & body, span))
+            places |= set(matches(lines, helpers, exempt, production - body, span))
+            for place in sorted(places - written):
+                found.append((str(relative), place[0], f"{relative}:{place[0]}: {message}"))
     return [message for _, _, message in sorted(found)]
 
 
