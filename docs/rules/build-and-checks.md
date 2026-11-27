@@ -71,6 +71,15 @@ A type that only lacks a way to write, such as a `const` pointer, a missing fiel
 
 Enforcement: `tools/check_agent_docs.py` counts the sentences without a mechanism in each area doc and fails when a count differs from `tools/compile_claim_baseline.txt`. CI runs the check. The tests in `tests/check_agent_docs_test.py`, run by `zig build test`, reject the old return type claim of `ScanReviewSource.create` and the old `const` claim of the Session fields. The check reads the name of a mechanism, not what the mechanism fails on.
 
+## Test names in Enforcement paragraphs
+
+Each text in straight double quotes in an Enforcement paragraph of `docs/rules/*.md` is the name of a test.
+The name is equal to the name of a `test "..."` declaration in a `.zig` file under `src/` or `tests/`.
+Write other quoted text, such as a CI step name, as a code span.
+Thus a renamed or deleted test fails the doc that names it.
+
+Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker reads each Enforcement paragraph up to the next blank line and skips fenced code blocks and code spans. It fails on a quoted name that no test declares, and on a curly double quote. It does not read single quotes. It compares the doc text with the raw text of the Zig literal and does not decode a Zig escape. Thus a doc writes a name with a backslash as the Zig source writes it, and it cannot cite a name with an escaped double quote. It does not check that the file that the paragraph names declares the test.
+
 ## CLI check environment
 
 A CLI check under `zig build test-cli` gets no Credentials, Profile, or XDG home from the caller's environment. `build.zig` passes on only `PATH`, and the tools add a few locale and color variables. A check that needs Credentials, a Profile, or an XDG home sets them itself. Thus the check passes locally only when it also passes in CI. A script gets its environment from `cli_env` in `tests/cli_env.py`.
