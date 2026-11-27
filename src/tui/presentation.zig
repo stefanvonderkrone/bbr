@@ -26312,14 +26312,27 @@ test "M21 kernel a restore of a failed Buffer Search scan keeps the failure afte
 }
 
 test "M21 kernel an Enter key during a failed Buffer Search query clear closes the input" {
-    const Failure = enum { build, queue_retry };
-    for ([_]Failure{ .build, .queue_retry }) |failure| {
+    const Failure = enum { build, queue_retry, admission };
+    for ([_]Failure{ .build, .queue_retry, .admission }) |failure| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
-        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
             .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
         });
         defer presentation.deinit();
+        if (failure == .admission) {
+            // The clear copies the disclosures from before the preview, so
+            // the copy allocates only when the user expanded one.
+            const published = presentation.published.?;
+            const fold = for (published.buffer.rows, 0..) |row, index| {
+                if (row == .disclosure and row.disclosure.kind == .fold) break index;
+            } else return error.MissingFold;
+            try moveToRow(&presentation, published.visualIndexForBufferIndex(fold).?);
+            try presentation.dispatch(.{ .action = .toggle_disclosure });
+            try completeDisclosureBuild(&presentation);
+        }
         try presentation.dispatch(.{ .action = .open_buffer_search });
         try replaceTestBufferSearchQuery(&presentation, "eigh");
         try completeBufferSearchScan(&presentation);
@@ -26330,10 +26343,18 @@ test "M21 kernel an Enter key during a failed Buffer Search query clear closes t
         switch (failure) {
             .build => clear.failed = true,
             .queue_retry => presentation.published.?.disclosure_inputs_current = false,
+            .admission => {
+                clear.build();
+                try testing.expect(clear.disclosures.len > 0);
+                once.armed = true;
+            },
         }
         try presentation.dispatch(.{ .buffer_disclosure_built = clear });
+        try testing.expect(!once.armed);
         try testing.expect(presentation.published.?.buffer_search.input == null);
         try testing.expectEqual(@as(?ActionError, if (failure == .build) .buffer_build_failed else .out_of_memory), presentation.projection().action_error);
+        // The worker boundary writes the record of a failed build.
+        try testing.expectEqual(@as(usize, @intFromBool(failure != .build)), try completeTestDisclosureBuilds(&presentation));
     }
 }
 
