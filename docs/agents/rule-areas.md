@@ -33,6 +33,5 @@ A claim of a compile error names the mechanism that fails: a `comptime` assertio
 
 Keep the facts that an agent cannot find from the check output or from the code.
 Leave out the test names of a test file that holds only the tests of this rule, because a failing test prints its name.
-Name a test in double quotes with its exact name and its file, as in [Test names in Enforcement paragraphs](../rules/build-and-checks.md#test-names-in-enforcement-paragraphs). Write any other quoted text in an Enforcement paragraph as a code span.
 Leave out the old commits that fail a check.
 Put the cases that no check sees in `CODING_STANDARDS.md`, with the reason that no check covers them.

@@ -16,11 +16,6 @@ FILE_EXTENSIONS = {
     "html", "yml", "yaml", "c", "h", "cc", "scm",
 }
 EXTERNAL_MODULES = {"std", "vaxis", "zf", "c"}
-QUOTED = re.compile(r'(?<!step )"([^"\n]+)"')
-ZIG_FILE = re.compile(r"\bin `([^`\n]+\.zig)`")
-CODE_SPAN = re.compile(r"`[^`\n]*`")
-TEST_DECLARATION = re.compile(r'^\s*test\s+"((?:[^"\\]|\\.)*)"')
-ZIG_ESCAPE = re.compile(r"\\(.)")
 
 
 def source_names(root):
@@ -46,50 +41,6 @@ def markdown_lines(path):
         yield from enumerate(document, 1)
 
 
-def zig_string(text):
-    r"""The Zig string literal body `text` with each `\\` and `\"` escape decoded."""
-    return ZIG_ESCAPE.sub(lambda escape: escape[1], text)
-
-
-def test_names(root, file):
-    return {
-        zig_string(match[1])
-        for _, lines in zig_files(root, (file,), literals=True)
-        for line in lines
-        if (match := TEST_DECLARATION.match(line))
-    }
-
-
-def enforcement_test_violations(root, path, paragraph, tests):
-    """Each quoted test name of an Enforcement paragraph without that test in its named file.
-
-    `tests` caches the test names of each Zig file.
-    """
-    starts, text = [], ""
-    for number, line in paragraph:
-        starts.append((len(text), number))
-        text += line.strip() + " "
-    prose = CODE_SPAN.sub(lambda span: " " * len(span[0]), text)
-    for match in QUOTED.finditer(prose):
-        name = match[1]
-        number = max(line for start, line in starts if start <= match.start())
-        location = f"{path.relative_to(root)}:{number}"
-        file = ZIG_FILE.search(text, match.end()) or ([None] + list(ZIG_FILE.finditer(text, 0, match.start())))[-1]
-        if file is None:
-            yield f'{location}: the test "{name}" names no file. Add "in `<file>.zig`" to its Enforcement paragraph.'
-            continue
-        if not (root / file[1]).is_file():
-            yield f'{location}: the test "{name}" names the missing file {file[1]}. Name the file that holds the test.'
-            continue
-        if file[1] not in tests:
-            tests[file[1]] = test_names(root, file[1])
-        if name not in tests[file[1]]:
-            yield (
-                f'{location}: {file[1]} has no test "{name}". '
-                "Point the Enforcement paragraph at an existing test, or restore the test."
-            )
-
-
 def violations(root):
     identifiers, containers = source_names(root)
     documents = [root / "AGENTS.md", root / "CODING_STANDARDS.md"]
@@ -97,18 +48,13 @@ def violations(root):
     if not rules:
         yield "docs/rules/*.md: no rule documents found. Restore docs/rules/, or update the document list in tools/check_doc_symbols.py."
     documents.extend(rules)
-    tests = {}
     for path in documents:
         if not path.is_file():
             yield f"{path.relative_to(root)}: the document is missing. Restore it, or update the document list in tools/check_doc_symbols.py."
             continue
         fence = None
-        paragraph = None
         for number, line in markdown_lines(path):
             marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", line)
-            if paragraph and not line.strip():
-                yield from enforcement_test_violations(root, path, paragraph, tests)
-                paragraph = None
             if marker:
                 run, rest = marker.groups()
                 if fence is None:
@@ -118,10 +64,6 @@ def violations(root):
                 continue
             if fence is not None:
                 continue
-            if paragraph is not None:
-                paragraph.append((number, line))
-            elif path in rules and line.startswith("Enforcement:"):
-                paragraph = [(number, line)]
             for match in SYMBOL.finditer(line):
                 name = match[1]
                 parts = name.split(".")
@@ -139,8 +81,6 @@ def violations(root):
                         f"{path.relative_to(root)}:{number}: `{name}` names no current symbol. "
                         "rename it to the current symbol, or remove it."
                     )
-        if paragraph:
-            yield from enforcement_test_violations(root, path, paragraph, tests)
 
 
 def main():
