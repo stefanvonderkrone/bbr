@@ -37728,6 +37728,44 @@ test "M21 kernel a recovered cache staging keeps the failure of another maintena
     try testing.expectEqual(@as(usize, 2), drainTestCommands(&presentation));
 }
 
+/// Fails the queue of each File in `failed`, then queues `queued`. Returns
+/// the failure records.
+fn failTestEnrichmentsAndQueue(presentation: *Presentation, once: *FailOnceAllocator, failed: []const usize, queued: usize) !usize {
+    var records: usize = 0;
+    for (failed) |file_index| {
+        records += drainTestCommands(presentation);
+        presentation.commands.clearAndFree(presentation.allocator);
+        once.armed = true;
+        try testing.expect(!presentation.queueMaintenanceFileEnrichment(presentation.published.?, file_index));
+    }
+    try testing.expect(presentation.queueMaintenanceFileEnrichment(presentation.published.?, queued));
+    return records;
+}
+
+test "M21 kernel a File Enrichment queue recovers only the failure of its own File" {
+    const Case = struct { failed: []const usize, queued: usize, shown: ?ActionError };
+    for ([_]Case{
+        .{ .failed = &.{9}, .queued = 9, .shown = null },
+        .{ .failed = &.{9}, .queued = 8, .shown = .out_of_memory },
+        .{ .failed = &.{ 8, 9 }, .queued = 9, .shown = .out_of_memory },
+        .{ .failed = &.{ 8, 9 }, .queued = 8, .shown = .out_of_memory },
+    }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+        });
+        defer presentation.deinit();
+        _ = drainTestCommands(&presentation);
+        const records = try presentation.withErrorOrigin(.review_search, failTestEnrichmentsAndQueue, .{ &presentation, &once, case.failed, case.queued });
+        try testing.expect(once.failed);
+        try testing.expectEqual(case.shown, presentation.projection().action_error);
+        try testing.expectEqual(case.failed.len, records + drainTestCommands(&presentation));
+    }
+}
+
 test "M21 kernel a Session replacement shows no cache staging failure of the replaced Session" {
     for ([_]bool{ false, true }) |older_message| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
