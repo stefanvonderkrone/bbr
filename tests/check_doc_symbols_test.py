@@ -108,6 +108,72 @@ class DocSymbolsTest(unittest.TestCase):
         result = self.check("Use `Missing.member`.\n", "", path="CODING_STANDARDS.md")
         self.assert_rejected(result, "Missing.member", "CODING_STANDARDS.md:1")
 
+    def test_renamed_enforcement_test_fails(self):
+        result = self.check(
+            "## Retry\n\n"
+            'Enforcement: "M21 kernel Review Search retries a reopened query scan" in `src/fixture.zig` fails.\n',
+            'test "Review recovery a Review Search query retry clears its failed scan error" {}\n'
+            '// test "M21 kernel Review Search retries a reopened query scan" {}\n'
+            'const old = "M21 kernel Review Search retries a reopened query scan";\n',
+            path="docs/rules/tui-state.md",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(
+            'docs/rules/tui-state.md:3: src/fixture.zig has no test "M21 kernel Review Search retries a reopened query scan". '
+            "Point the Enforcement paragraph at an existing test, or restore the test.",
+            result.stderr,
+        )
+
+    def test_current_enforcement_tests_pass(self):
+        result = self.check(
+            '## One\n\nThe rule "quoted" is prose.\n\n'
+            'Enforcement: the tests "first" and "second" in `src/fixture.zig`.\n\n'
+            'Enforcement: the block in `src/fixture.zig`. The test\n"second" fails.\n\n'
+            'Enforcement: the CI step "Lint the tree" runs the tests whose names contain `fir`.\n\n'
+            'Enforcement: the libc `extern "c" fn mkfifo` fails in `src/fixture.zig`.\n\n'
+            '```\nEnforcement: "missing" in `src/fixture.zig`.\n```\n',
+            'test "first" {}\n    test "second" {}\n',
+            path="docs/rules/fixture.md",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_enforcement_test_takes_the_next_file_and_its_unescaped_name(self):
+        result = self.check(
+            'Enforcement: the tests in `src/other.zig`, and "\\ No newline marker" and "the wrapped\n'
+            'name" in `src/fixture.zig`.\n',
+            'test "\\\\ No newline marker" {}\ntest "the wrapped name" {}\n',
+            path="docs/rules/fixture.md",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_enforcement_file_needs_the_word_in(self):
+        result = self.check(
+            'Enforcement: the test "first" and the join `src/fixture.zig`.\n',
+            'test "first" {}\n',
+            path="docs/rules/fixture.md",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('docs/rules/fixture.md:1: the test "first" names no file.', result.stderr)
+
+    def test_wrapped_stale_test_name_fails_at_its_first_line(self):
+        result = self.check(
+            'Enforcement: the test "the old\nname" in `src/fixture.zig`.\n',
+            'test "the new name" {}\n',
+            path="docs/rules/fixture.md",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('docs/rules/fixture.md:1: src/fixture.zig has no test "the old name".', result.stderr)
+
+    def test_enforcement_test_without_its_file_fails(self):
+        result = self.check(
+            'Enforcement: the test "first".\n\nEnforcement: the test\n"first" in `src/missing.zig`.\n',
+            'test "first" {}\n',
+            path="docs/rules/fixture.md",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('docs/rules/fixture.md:1: the test "first" names no file.', result.stderr)
+        self.assertIn('docs/rules/fixture.md:4: the test "first" names the missing file src/missing.zig.', result.stderr)
+
 
     def test_missing_document_fails(self):
         result = self.check("", "", path="docs/rules/fixture.md", missing=("CODING_STANDARDS.md",))
