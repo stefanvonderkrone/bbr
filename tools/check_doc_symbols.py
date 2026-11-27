@@ -49,20 +49,15 @@ def enforcement_violations(path, paragraph, test_names):
     for number, line in paragraph:
         offsets.append(len(text))
         text += line.strip() + " "
-    runs = list(re.finditer(r"`+", text))
-    index = 0
-    while index < len(runs):
-        opening = runs[index]
-        closing = next(
-            (i for i in range(index + 1, len(runs)) if runs[i][0] == opening[0]),
-            None,
-        )
-        if closing is None:
-            index += 1
+    position = 0
+    while opening := re.compile(r"\\.|`+").search(text, position):
+        position = opening.end()
+        if opening[0][0] != "`":
             continue
-        end = runs[closing].end()
-        text = text[:opening.start()] + " " * (end - opening.start()) + text[end:]
-        index = closing + 1
+        closing = re.compile(f"(?<!`){opening[0]}(?!`)").search(text, position)
+        if closing:
+            text = text[:opening.start()] + " " * (closing.end() - opening.start()) + text[closing.end():]
+            position = closing.end()
     for match in re.finditer(r"[\u201c\u201d\u201e]", text):
         number = paragraph[bisect_right(offsets, match.start()) - 1][0]
         yield (
