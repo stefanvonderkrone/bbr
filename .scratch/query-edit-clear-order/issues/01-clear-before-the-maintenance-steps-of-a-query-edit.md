@@ -136,6 +136,7 @@ Review: a readonly review of `82169b10..HEAD` found no high finding. It found th
 The test also checks that the command queue is empty before it frees the capacity. Two low findings stay open by choice:
 
 - After an `out_of_memory` of these sites, the Enter key clears the message through `clearErrorExcept`, so the accept does not say why nothing opened. The input could keep the message of its failure, and the accept could show it. That changes the accept rule of OCR round 2, so it needs a decision.
+  Decision: this PR does not fix it. The case is rare, and the failure keeps its record. A follow-up ticket owns it, because the fix changes the accept rule of OCR round 2.
 - The CodeRabbit round 1 section says that only the failed scan outcome has a test. This section supersedes it.
 
 Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_action_errors_test.py` pass.
