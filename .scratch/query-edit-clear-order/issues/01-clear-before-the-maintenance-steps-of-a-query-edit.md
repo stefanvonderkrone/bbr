@@ -158,3 +158,5 @@ Review: a readonly review of `8e6cf144..HEAD` found no blocking finding. No call
 - A failed opening keeps the Enter key, as item 1 says.
 
 Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_action_errors_test.py` pass.
+
+Decision on the open question of OCR round 6: when Enter comes before a failed restore, the view keeps the old preview. This PR does not fix that. A follow-up ticket owns it, together with the deferred out-of-memory message of an accepted Buffer Search.
