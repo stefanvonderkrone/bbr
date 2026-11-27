@@ -118,7 +118,7 @@ So the check needs a per-file baseline, as `tools/diagnostic_catch_baseline.txt`
 It fails when a change adds a prong.
 Its error names `failDroppedInput` and `failMaintenance` as the fix.
 It does not see paths 1 and 2, because `retryContentBuild` reaches the prong through `openReviewSearchOccurrence`.
-A narrower rule can cover each prong in a function that queues work again. Each such prong calls `failDroppedInput`, `failMaintenance`, or `settleMaintenance`.
+A narrower rule can cover each prong in a function that queues work again. It requires that each such prong calls `failDroppedInput`, `failMaintenance`, or `settleMaintenance`.
 That rule has the same blind spot for paths 1 and 2.
 Triage decides whether either check earns its place.
 
