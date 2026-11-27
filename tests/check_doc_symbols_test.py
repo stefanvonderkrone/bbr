@@ -173,6 +173,19 @@ class DocSymbolsTest(unittest.TestCase):
         result = self.check_enforcement('Enforcement: a `` run and the test "missing test" and ` one.\n')
         self.assert_test_name_rejected(result, "missing test")
 
+    def test_escaped_backtick_does_not_hide_a_quote(self):
+        for document in ('Enforcement: \\` "missing test" \\`.\n', 'Enforcement: \\`` "missing test" ``.\n'):
+            with self.subTest(document=document):
+                self.assert_test_name_rejected(self.check_enforcement(document), "missing test")
+
+    def test_backslash_does_not_escape_a_closing_backtick_run(self):
+        result = self.check_enforcement('Enforcement: `a\\` "missing test" `b`.\n')
+        self.assert_test_name_rejected(result, "missing test")
+
+    def test_escaped_backslash_before_a_code_span_passes(self):
+        result = self.check_enforcement('Enforcement: a \\\\`"x"` span.\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_ci_step_name_in_double_quotes_fails(self):
         result = self.check_enforcement('Enforcement: the CI step "Lint" runs it.\n')
         self.assert_test_name_rejected(result, "Lint")
