@@ -10257,6 +10257,7 @@ pub const Presentation = struct {
 
     /// A stale restore of a failed scan queues the restore again, because a
     /// scan of the failed query would replace the failure with a new result.
+    /// Only `failBufferSearchScan` queues an input build without a batch.
     fn retryStaleInputBuild(self: *Presentation, published: *Published, job: *const DisclosureBuild) void {
         if (job.batch == null) self.failBufferSearchScan(published) else self.retryStaleBufferDisclosure(published);
     }
