@@ -224,3 +224,25 @@ Open Code Review found two items in the Enforcement test name check. The check r
 ## OCR round 13
 
 Open Code Review found one item. The Enforcement paragraph of the test name rule in `docs/rules/build-and-checks.md` said that the check fails on a quote in single quotes. The check does not read single quotes since round 12. The paragraph now says that the check fails on a quote in curly quotes. No other doc, tool, test, or PR text says that single quotes fail. Checks: `zig build test` exits with 0. `python3 tools/check_agent_docs.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_doc_symbols_test.py` pass.
+
+## CodeRabbit round 2
+
+CodeRabbit found seven items in `68fdba72`. The Enforcement test name check of `tools/check_doc_symbols.py` moved out of this ticket to its own PR. The revert commits `93a9bb5f` to `e38ef47e` remove the check, its tests, its rule in `docs/rules/build-and-checks.md`, and its link in `docs/agents/rule-areas.md`. The two code spans in `docs/rules/cli.md` and the renamed test name in `docs/rules/tui-state.md` (`b75c930f`) stay. They are true without the check. The sections of rounds 10 to 13 stay as records of the check.
+
+1. `src/tui/presentation.zig:10094`. Valid. A height change before the restore of a failed scan landed made `acceptBufferDisclosure` reject the geometry of the restore. It then called `retryStaleBufferDisclosure`, which scanned the failed query again. A waiting Enter key could then open a match, and the scan failure disappeared. The test "M21 kernel a restore of a failed Buffer Search scan keeps the failure after a resize" (`b7d13877`) failed with `error.UnexpectedBufferSearchScan`. The fix (`d33e76bc`) sends each stale input build through `retryStaleInputBuild`. A build without a batch is the restore of a failed scan, so it runs `failBufferSearchScan` again. That queues the restore against the current geometry with the same request and the same failure. A query edit still drops the restore, and the test "M21 kernel a query edit drops the restore of a failed Buffer Search scan" still checks that.
+2. `src/tui/presentation.zig:10931`. Valid, but not from this branch. `queueAcceptedDisclosure` removes a queued `.cache_update` build and keeps `pending_cache_update`. `main` has the same removal without a reset, so the fault does not come from this branch. It goes to the follow-up list.
+3. `src/tui/presentation.zig:10960`. Valid. When the disclosure copy of an accepted disclosure build ran out of memory, `acceptAcceptedDisclosure` showed `out_of_memory` with no record. The test "M21 kernel an Enter key during a failed Buffer Search query clear closes the input" has a new admission case (`aa9682e0`). The user expands a fold first, so the copy allocates. The case failed with `expected 1, found 0` at the record count. The fix (`292ec149`) calls `failDroppedInput`, which writes the one record. The build case of the same test reads no record from Presentation, because the worker boundary writes the record of a failed build. The fix also covers the accepted and restore builds, which `main` left without a record.
+4. `src/tui/presentation.zig:13052`. Valid, but not from this branch. A File Enrichment that the path length refuses shows `action_refused` at once, and `queueMaintenanceFileEnrichment` settles it as a success. `main` shows the same refusal at once in `queueFileEnrichment`. It goes to the follow-up list.
+5. `tools/check_doc_symbols.py:27`. Not fixed here. The check moved to its own PR.
+6. `tools/check_doc_symbols.py:57`. Not fixed here. The check moved to its own PR.
+7. `tools/check_doc_symbols.py:94`. Not fixed here. The check moved to its own PR.
+
+Follow-up list:
+
+- Clear `pending_cache_update` when `queueAcceptedDisclosure` removes a queued `.cache_update` build. Until a focus change, the focus check stages no cache update and runs no focused enrichment.
+- Do not settle a refused File Enrichment with a too-long path as a success. Defer its `action_refused` for maintenance work.
+- The Enforcement test name check, with the three CodeRabbit items above: complete multi-backtick code spans, Zig escape decoding, and file references inside quoted test names.
+
+Review: a readonly review of `68fdba72..HEAD` found no blocking finding. It confirmed that the reverts leave the check files as they were before `cfbe1047`, that only `failBufferSearchScan` queues an input build without a batch, and that the admission fix writes one record. Two low items are fixed: `retryStaleInputBuild` states its batch marker, and two long sentences are split.
+
+Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, `python3 tests/check_action_errors_test.py`, and `python3 tests/check_doc_symbols_test.py` pass.
