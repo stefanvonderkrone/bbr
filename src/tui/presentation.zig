@@ -25881,6 +25881,35 @@ test "M21 kernel an accepted Buffer Search without matches keeps its message" {
     }
 }
 
+test "M21 kernel an accepted Buffer Search shows no-match only for an empty batch" {
+    for ([_]bool{ false, true }) |failed_scan| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+        if (failed_scan) {
+            var command = presentation.takeCommand().?;
+            defer command.deinit();
+            var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+            completed.outcome.scanned.deinit(completed.allocator);
+            completed.outcome = .failed;
+            try presentation.dispatch(.{ .buffer_search_scanned = completed });
+            try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        } else {
+            try completeBufferSearchScan(&presentation);
+            // A rebuild of the Buffer can leave matches without an active one.
+            presentation.published.?.buffer_search.input.?.active = null;
+            showTestError(&presentation, .buffer_search, .buffer_search_hit_bottom);
+        }
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expectEqual(@as(?ActionError, if (failed_scan) .buffer_search_scan_failed else null), presentation.projection().action_error);
+    }
+}
+
 test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
