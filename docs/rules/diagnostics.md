@@ -104,7 +104,7 @@ A boundary records every error except `error.Reported` once. Then it restores st
 
 `Handle.record` drops a Failure whose cause is `error.Reported`, so a boundary that records it writes no second record. A boundary that maps errors to user messages names `error.Reported` in its own prong.
 
-In Presentation, `failMaintenance` and `failDroppedInput` write the one record of a failed queue and show its message. [Maintenance work keeps the shown message](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message) and [A dropped user input shows its failure](../../CODING_STANDARDS.md#a-dropped-user-input-shows-its-failure) say which message each shows.
+In Presentation, `failMaintenance` and `failDroppedInput` write the one record of a failed queue. [Maintenance work keeps the shown message](../../CODING_STANDARDS.md#maintenance-work-keeps-the-shown-message) and [A dropped user input shows its failure](../../CODING_STANDARDS.md#a-dropped-user-input-shows-its-failure) say which message each shows.
 
 Enforcement: `Handle.record` in `src/diagnostics.zig` drops `error.Reported` in every build. `Sink.record` is private, so no record reaches the Sink another way. `SqliteStore.native` returns an error union, so a plain SQLite error after a recorded result does not compile. The `diagnostics` tests in `src/diagnostics.zig`, `src/tui/presentation.zig`, `src/tui/presentation_runtime.zig`, `src/tui/app.zig`, `src/api/cli.zig`, `src/main.zig`, and `src/bitbucket/client.zig` read exactly one record per failure at each boundary kind. So do `tests/record_once_cli_test.py`, `tests/config_load_cli_test.py`, and `tests/store_message_cli_test.py`. `zig build test` runs them.
 
