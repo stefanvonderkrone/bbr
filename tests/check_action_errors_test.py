@@ -268,9 +268,10 @@ class ActionErrorsTest(unittest.TestCase):
 
     def test_a_copied_origin_in_presentation_is_rejected(self):
         found = self.check(COPIED_ORIGIN)
-        self.assertEqual([message.split(":")[1] for message in found], ["5", "6"])
-        self.assertIn("is not an enum literal", found[0])
-        self.assertIn("failMaintenance", found[0])
+        self.assertEqual([message.split(":")[1] for message in found], ["3", "5", "6"])
+        self.assertIn("reads action_error outside", found[0])
+        self.assertIn("is not an enum literal", found[1])
+        self.assertIn("failMaintenance", found[1])
 
     def test_a_qualified_origin_is_rejected(self):
         found = self.check(
@@ -302,7 +303,7 @@ class ActionErrorsTest(unittest.TestCase):
 
     def test_a_hand_kept_message_is_rejected(self):
         found = self.check(OLD_KEEP)
-        self.assertEqual([message.split(":")[1] for message in found], ["3", "7", "11"])
+        self.assertEqual([message.split(":")[1] for message in found], ["3", "7", "12"])
         self.assertIn("reads action_error outside showErrorFor, clearError, finishEvent, and projection.", found[0])
         self.assertIn("showMaintenanceError(step, err)", found[0])
 

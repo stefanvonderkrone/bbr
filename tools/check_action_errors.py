@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""Fail when code in Presentation writes `action_error` or `event_origin` outside their helpers.
+"""Fail when code uses the action error fields of Presentation outside their helpers.
 
 A shown action error records the path that set it. A completion of background
 work clears only an error of its own path, and a user action clears any error.
-`showErrorFor` and `clearError` apply that rule, so a raw write of `action_error`
-would skip it. Both read the origin from `event_origin`. `dispatch` sets it
-from its input, and `withErrorOrigin` sets it for one piece of work, so a raw
-write of `event_origin` would give an error the wrong origin.
-A struct literal field such as `.action_error = ...` in the Projection is not
-a write of the Presentation field.
+`showErrorFor` and `clearError` apply that rule, and `finishEvent` shows the
+failure of a maintenance step when its event ends without a message. A raw
+write of `action_error` would skip those rules. All of them read the origin
+from `event_origin`. `dispatch` sets it from its input, and `withErrorOrigin`
+sets it for one piece of work, so a raw write of `event_origin` would give an
+error the wrong origin.
+
+Code in Presentation reads `action_error` only in its writers and in
+`projection`. A read elsewhere decides whether a message shows, and that
+decision belongs to `finishEvent`. Code in Presentation uses
+`maintenance_failures` only in `settleMaintenance`, `showMaintenanceError`, and
+`finishEvent`, so each failed step goes through `failMaintenance` or
+`showMaintenanceError` and only a later run of the same step recovers it.
 
 A `withErrorOrigin` call in Presentation names its origin as an enum literal.
 A copied origin, such as the origin of a saved error that the code shows
 again, can drop a field of the copy without a compile error.
 
-Only `showMaintenanceError` asks whether no action error shows. A failure
-that keeps the shown message must go through it, because a later clear of the
-same event would otherwise remove the kept message and hide the failure.
+Each rule reads the code text joined across lines, so a line break inside an
+access does not hide it. A struct literal field such as `.action_error = ...`
+is not an access of the Presentation field.
 """
 
 from pathlib import Path
@@ -26,18 +33,10 @@ import sys
 from source_lines import zig_files
 
 SOURCES = (Path("src/tui/presentation.zig"),)
-FIELDS = (
-    (
-        "action_error",
-        ("showErrorFor", "clearError", "finishEvent"),
-        "Call showError(err), showErrorFor(err, key), or clearError() instead. All take the origin of the event that runs.",
-    ),
-    (
-        "event_origin",
-        ("dispatch", "withErrorOrigin"),
-        "Run the work through withErrorOrigin(origin, work, args) instead. It restores the origin of the event.",
-    ),
-)
+# A member access: an expression, then `.`, then the field name.
+ACCESS = r"[\w)\]*?]\s*\.\s*(?P<name>{field})\b"
+
+
 def listed(names):
     """The names as an English list, such as `a, b, and c`."""
     if len(names) < 3:
@@ -45,14 +44,55 @@ def listed(names):
     return f"{', '.join(names[:-1])}, and {names[-1]}"
 
 
-CHECKS = tuple(
+def helper_start(helpers):
+    return re.compile(rf"^\s*(?:pub\s+)?fn\s+(?:{'|'.join(helpers)})\(")
+
+
+# Writes anywhere in the file, the tests included.
+WRITES = tuple(
     (
         field,
-        re.compile(rf"^\s*(?:pub\s+)?fn\s+(?:{'|'.join(helpers)})\("),
-        re.compile(rf"[\w)\]*]\.{field}\s*=(?!=)"),
+        helper_start(helpers),
+        re.compile(ACCESS.format(field=field) + r"\s*=(?!=)"),
         f"writes {field} outside {listed(helpers)}. {fix}",
     )
-    for field, helpers, fix in FIELDS
+    for field, helpers, fix in (
+        (
+            "action_error",
+            ("showErrorFor", "clearError", "finishEvent"),
+            "Call showError(err), showErrorFor(err, key), or clearError() instead. All take the origin of the event that runs.",
+        ),
+        (
+            "event_origin",
+            ("dispatch", "withErrorOrigin"),
+            "Run the work through withErrorOrigin(origin, work, args) instead. It restores the origin of the event.",
+        ),
+    )
+)
+# Every access inside the Presentation struct body.
+ACCESSES = tuple(
+    (
+        field,
+        helper_start(helpers),
+        re.compile(ACCESS.format(field=field)),
+        f"{verb} {field} outside {listed(helpers)}. {fix}",
+    )
+    for field, verb, helpers, fix in (
+        (
+            "action_error",
+            "reads",
+            ("showErrorFor", "clearError", "finishEvent", "projection"),
+            "To report a failed maintenance step, call failMaintenance(step, operation, err, source) or "
+            "showMaintenanceError(step, err). finishEvent shows it when the event ends without a message.",
+        ),
+        (
+            "maintenance_failures",
+            "uses",
+            ("settleMaintenance", "showMaintenanceError", "finishEvent"),
+            "Call failMaintenance(step, operation, err, source) for a failure, or "
+            "settleMaintenance(step, operation, outcome, source) when a later run of the step can recover it.",
+        ),
+    )
 )
 
 
@@ -62,12 +102,6 @@ ORIGIN_MESSAGE = (
     "passes a withErrorOrigin origin that is not an enum literal. Name the path, such as "
     "withErrorOrigin(.review_search, work, args). To keep a shown error after a failure, "
     "call failMaintenance instead of showing a saved copy again."
-)
-KEEP_HELPER = re.compile(r"^\s*(?:pub\s+)?fn\s+showMaintenanceError\(")
-KEEP_TEST = re.compile(r"\.action_error\s*==\s*null")
-KEEP_MESSAGE = (
-    "decides whether a failure keeps the shown message outside showMaintenanceError. "
-    "Call showMaintenanceError(err) instead, so a later clear of the same event shows the failure."
 )
 MISSING_MESSAGE = (
     "has no line `pub const Presentation = struct {`, so the withErrorOrigin check reads nothing. "
@@ -87,10 +121,7 @@ def presentation_span(lines):
     return None
 
 
-def literal_origin_violations(relative, lines):
-    span = presentation_span(lines)
-    if span is None:
-        return [(str(relative), 1, f"{relative}:1: {MISSING_MESSAGE}")]
+def literal_origin_violations(relative, lines, span):
     start, end = span
     text = "\n".join(lines[start : end + 1])
     found = []
@@ -101,7 +132,7 @@ def literal_origin_violations(relative, lines):
 
 
 def outside_helpers(lines, helpers):
-    """Each line number and line outside the bodies of the helper functions."""
+    """Each line number outside the bodies of the helper functions."""
     helper_depth = None
     body_open = False
     depth = 0
@@ -110,7 +141,7 @@ def outside_helpers(lines, helpers):
             helper_depth = depth
             body_open = False
         elif helper_depth is None:
-            yield number, line
+            yield number
         depth += line.count("{") - line.count("}")
         if helper_depth is not None:
             body_open = body_open or depth > helper_depth
@@ -118,19 +149,33 @@ def outside_helpers(lines, helpers):
                 helper_depth = None
 
 
+def matches(lines, helpers, pattern, numbers):
+    """The line number of each match in the text of `numbers` outside the helpers, joined across lines."""
+    kept = set(outside_helpers(lines, helpers)) & numbers
+    text = "\n".join(line if number in kept else "" for number, line in enumerate(lines, 1))
+    for match in pattern.finditer(text):
+        yield 1 + text.count("\n", 0, match.start("name"))
+
+
 def violations(root):
     found = []
     for relative, lines in zig_files(root, SOURCES, literals=False):
-        found.extend(literal_origin_violations(relative, lines))
-        for _, helpers, write, message in CHECKS:
-            for number, line in outside_helpers(lines, helpers):
-                if write.search(line):
-                    found.append((str(relative), number, f"{relative}:{number}: {message}"))
         span = presentation_span(lines)
-        if span is not None:
-            for number, line in outside_helpers(lines, KEEP_HELPER):
-                if span[0] < number <= span[1] + 1 and KEEP_TEST.search(line):
-                    found.append((str(relative), number, f"{relative}:{number}: {KEEP_MESSAGE}"))
+        if span is None:
+            found.append((str(relative), 1, f"{relative}:1: {MISSING_MESSAGE}"))
+            continue
+        found.extend(literal_origin_violations(relative, lines, span))
+        everywhere = set(range(1, len(lines) + 1))
+        written = set()
+        for field, helpers, pattern, message in WRITES:
+            for number in matches(lines, helpers, pattern, everywhere):
+                written.add((field, number))
+                found.append((str(relative), number, f"{relative}:{number}: {message}"))
+        body = set(range(span[0] + 2, span[1] + 2))
+        for field, helpers, pattern, message in ACCESSES:
+            for number in matches(lines, helpers, pattern, body):
+                if (field, number) not in written:
+                    found.append((str(relative), number, f"{relative}:{number}: {message}"))
     return [message for _, _, message in sorted(found)]
 
 
@@ -142,9 +187,10 @@ def main():
     if found:
         return 1
     print(
-        "Only showErrorFor, clearError, and finishEvent write action_error, only dispatch and withErrorOrigin write event_origin, "
-        "each withErrorOrigin call in Presentation names an enum literal, "
-        "and only showMaintenanceError asks whether no action error shows."
+        "Only showErrorFor, clearError, and finishEvent write action_error, and only they and projection read it. "
+        "Only dispatch and withErrorOrigin write event_origin. "
+        "Only settleMaintenance, showMaintenanceError, and finishEvent use maintenance_failures. "
+        "Each withErrorOrigin call in Presentation names an enum literal."
     )
     return 0
 
