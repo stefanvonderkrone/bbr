@@ -26269,6 +26269,42 @@ test "M21 kernel a failed restore of a failed Buffer Search scan shows the build
     try testing.expect(presentation.takeCommand() == null);
 }
 
+test "M21 kernel a restore of a failed Buffer Search scan keeps the failure after a resize" {
+    for ([_]bool{ false, true }) |running| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        const initial = presentation.projection().review.?.buffer.rows.len;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, "eigh");
+        try completeBufferSearchScan(&presentation);
+        try replaceTestBufferSearchQuery(&presentation, "eight");
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        const restore: ?OwnedCommand = if (running) presentation.takeCommand().? else null;
+
+        try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 30 } });
+        if (restore) |stale| {
+            stale.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = stale.build_buffer_disclosure });
+        }
+        // A rescan of "eight" would let the waiting Enter key open a match.
+        _ = try completeTestDisclosureBuilds(&presentation);
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expect(presentation.published.?.buffer_search.accepted_batch == null);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
+    }
+}
+
 test "M21 kernel an Enter key during a failed Buffer Search query clear closes the input" {
     const Failure = enum { build, queue_retry };
     for ([_]Failure{ .build, .queue_retry }) |failure| {
