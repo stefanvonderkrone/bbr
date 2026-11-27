@@ -26077,6 +26077,61 @@ test "M21 kernel a failed Buffer Search scan collapses the preview of the previo
     }
 }
 
+test "M21 kernel a Buffer Search input that fails after a query edit opens no occurrence of the previous query" {
+    const Failure = enum { queue_disclosure, input_build, admit_input_build, queue_stale_scan };
+    for ([_]Failure{ .queue_disclosure, .input_build, .admit_input_build, .queue_stale_scan }) |failure| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        // The edit to "eigh" expands the Resolved Thread of its match, and
+        // the edit from "eigh" collapses it again.
+        const queries: [2][]const u8 = if (failure == .admit_input_build) .{ "c1", "eigh" } else .{ "eigh", "eighx" };
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, queries[0]);
+        try completeBufferSearchScan(&presentation);
+        try testing.expect(presentation.projection().buffer_search.?.total > 0);
+
+        try replaceTestBufferSearchQuery(&presentation, queries[1]);
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        switch (failure) {
+            .queue_disclosure => presentation.published.?.disclosure_inputs_current = false,
+            .queue_stale_scan => {
+                completed.visual_rows_revision -%= 1;
+                presentation.commands.clearAndFree(presentation.allocator);
+                once.armed = true;
+            },
+            .input_build, .admit_input_build => {},
+        }
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        switch (failure) {
+            .queue_disclosure, .queue_stale_scan => {},
+            .input_build, .admit_input_build => {
+                const worker = presentation.takeCommand().?.build_buffer_disclosure;
+                if (failure == .input_build) worker.failed = true else {
+                    worker.build();
+                    once.armed = true;
+                }
+                try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+            },
+        }
+        try testing.expect(!once.armed);
+        try testing.expectEqual(@as(?ActionError, switch (failure) {
+            .queue_disclosure, .admit_input_build, .queue_stale_scan => .out_of_memory,
+            .input_build => .buffer_build_failed,
+        }), presentation.projection().action_error);
+        try completeTestDisclosureBuilds(&presentation);
+
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expect(presentation.projection().buffer_search == null);
+    }
+}
+
 test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
