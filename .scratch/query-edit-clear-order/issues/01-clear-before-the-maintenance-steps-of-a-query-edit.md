@@ -251,3 +251,7 @@ Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `p
 
 1. Test gap at `acceptAcceptedDisclosure`. Valid. The test "M21 kernel a failed admission of a disclosure build records the failure once" (`562e14fb`) covers the accepted, restore, general, and opening builds. Each case failed alone with `expected 1, found 0` when the call went back to a bare `showError(.out_of_memory)`.
 2. Doc gap in `CODING_STANDARDS.md`. Valid. A new sentence names the admission in `acceptAcceptedDisclosure` for each of its builds.
+
+## OCR round 16
+
+1. Doc gap in `docs/rules/tui-state.md`. Valid. The Enforcement paragraph of "Background work keeps an unrelated action error" did not name the test "M21 kernel a failed admission of a disclosure build records the failure once". Two new sentences name the test and what it fails on.
