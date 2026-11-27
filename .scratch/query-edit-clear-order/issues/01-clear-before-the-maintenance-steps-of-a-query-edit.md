@@ -246,3 +246,8 @@ Follow-up list:
 Review: a readonly review of `68fdba72..HEAD` found no blocking finding. It confirmed that the reverts leave the check files as they were before `cfbe1047`, that only `failBufferSearchScan` queues an input build without a batch, and that the admission fix writes one record. Two low items are fixed: `retryStaleInputBuild` states its batch marker, and two long sentences are split.
 
 Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, `python3 tests/check_action_errors_test.py`, and `python3 tests/check_doc_symbols_test.py` pass.
+
+## OCR round 15
+
+1. Test gap at `acceptAcceptedDisclosure`. Valid. The test "M21 kernel a failed admission of a disclosure build records the failure once" (`562e14fb`) covers the accepted, restore, general, and opening builds. Each case failed alone with `expected 1, found 0` when the call went back to a bare `showError(.out_of_memory)`.
+2. Doc gap in `CODING_STANDARDS.md`. Valid. A new sentence names the admission in `acceptAcceptedDisclosure` for each of its builds.

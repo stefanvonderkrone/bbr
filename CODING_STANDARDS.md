@@ -197,6 +197,7 @@ These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleB
 `selectVersion` also calls it when its view build or its File Enrichment cannot queue, because no later check does that input again.
 So does `replaceReviewSearchQuery` when a query edit cannot allocate or queue its scan.
 A Buffer Search query edit calls it when its input build cannot queue or fails its admission. The calls are in `acceptBufferSearchScanned`, `failBufferSearchScan`, and `acceptBufferDisclosure`.
+`acceptAcceptedDisclosure` also calls it when the admission of any of its builds cannot copy the disclosures.
 A reopened query keeps `needs_scan` after a failure, and the focus check retries it. So `openReviewSearch` runs `retryReviewSearchQuery`, which is maintenance work.
 An enrichment failure can cancel the pending reading location from a refresh or Reconciliation.
 That cancellation drops part of the refresh or Reconciliation.
