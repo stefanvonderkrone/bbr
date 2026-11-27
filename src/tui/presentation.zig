@@ -10038,9 +10038,8 @@ pub const Presentation = struct {
         if (self.queueBufferDisclosure(published, batch, active, input.request_id, completed.navigation_rows) catch |err| switch (err) {
             error.OutOfMemory => {
                 batch.deinit(self.allocator);
-                input.failPendingScan(self.allocator);
+                self.failPendingInput(published);
                 self.failDroppedInput(err, @src());
-                published.frame_revision += 1;
                 return;
             },
         } != null) return;
@@ -10081,16 +10080,33 @@ pub const Presentation = struct {
     fn failBufferSearchScan(self: *Presentation, published: *Published) void {
         const input = &published.buffer_search.input.?;
         input.failPendingScan(self.allocator);
-        self.showError(.buffer_search_scan_failed);
-        published.frame_revision += 1;
         const job = self.queueBufferDisclosure(published, null, null, input.request_id, null) catch |err| switch (err) {
             error.OutOfMemory => {
+                self.failPendingInput(published);
                 self.failDroppedInput(err, @src());
                 return;
             },
-        } orelse return;
+        } orelse {
+            self.failPendingInput(published);
+            self.showError(.buffer_search_scan_failed);
+            return;
+        };
         job.result_error = .buffer_search_scan_failed;
         input.pending = true;
+        self.showError(.buffer_search_scan_failed);
+        published.frame_revision += 1;
+    }
+
+    /// Ends the pending work of the input without its result. An Enter key
+    /// during that work accepts the query here, before the caller shows why
+    /// the work failed, so the accept does not clear that message. A failed
+    /// opening keeps the Enter key, because an accept queues the opening
+    /// again and would repeat a build that fails.
+    fn failPendingInput(self: *Presentation, published: *Published) void {
+        const input = &published.buffer_search.input.?;
+        input.failPendingScan(self.allocator);
+        published.frame_revision += 1;
+        if (input.accept_when_ready and !input.restoring_review_disclosures) self.acceptBufferSearch();
     }
 
     fn queueBufferDisclosure(self: *Presentation, published: *Published, batch: ?search.Batch, active: ?usize, request_id: u64, navigation_rows: ?[]SearchNavigationRow) !?*DisclosureBuild {
@@ -10142,9 +10158,8 @@ pub const Presentation = struct {
             return;
         }
         if (job.failed) {
-            input.failPendingScan(self.allocator);
+            self.failPendingInput(published);
             self.showError(.buffer_build_failed);
-            published.frame_revision += 1;
             return;
         }
 
@@ -10180,7 +10195,7 @@ pub const Presentation = struct {
                 if (ranges) |old| std.heap.page_allocator.free(old);
                 if (accepted_ranges) |old| std.heap.page_allocator.free(old);
                 if (review_ranges) |old| std.heap.page_allocator.free(old);
-                input.failPendingScan(self.allocator);
+                self.failPendingInput(published);
                 self.failDroppedInput(err, @src());
                 return;
             },
@@ -10913,7 +10928,7 @@ pub const Presentation = struct {
             return;
         }
         if (job.failed) {
-            if (job.kind == .clear_input or job.kind == .open_input) published.buffer_search.input.?.pending = false;
+            if (job.kind == .clear_input or job.kind == .open_input) self.failPendingInput(published);
             self.showError(.buffer_build_failed);
             return;
         }
@@ -10938,14 +10953,11 @@ pub const Presentation = struct {
             self.retryAcceptedDisclosure(published, job);
             return;
         }
-        var admitted = false;
-        defer if (!admitted and (job.kind == .clear_input or job.kind == .open_input)) {
-            published.buffer_search.input.?.pending = false;
-        };
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
         disclosures.appendSlice(self.allocator, job.disclosures) catch |err| switch (err) {
             error.OutOfMemory => {
                 disclosures.deinit(self.allocator);
+                if (job.kind == .clear_input or job.kind == .open_input) self.failPendingInput(published);
                 self.showError(.out_of_memory);
                 return;
             },
@@ -10973,7 +10985,6 @@ pub const Presentation = struct {
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
         owned.* = false;
-        admitted = true;
         if (published.buffer_search.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
         if (published.buffer_search.accepted_navigation_rows) |rows| std.heap.page_allocator.free(rows);
         published.buffer_search.accepted_ranges = job.ranges;
@@ -11035,7 +11046,7 @@ pub const Presentation = struct {
         if (job.kind == .open_input) {
             self.queueBufferSearchOpening(published, job.target.base) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    published.buffer_search.input.?.pending = false;
+                    self.failPendingInput(published);
                     self.failDroppedInput(err, @src());
                 },
             };
@@ -11053,7 +11064,7 @@ pub const Presentation = struct {
         }
         const replacement = self.queueAcceptedDisclosure(published, job.target, destination, job.kind, job.result_error) catch |err| switch (err) {
             error.OutOfMemory => {
-                if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
+                if (job.kind == .clear_input) self.failPendingInput(published);
                 self.failDroppedInput(err, @src());
                 return;
             },
@@ -11075,17 +11086,17 @@ pub const Presentation = struct {
         const query = input.query orelse return;
         const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch |err| switch (err) {
             error.OutOfMemory => {
-                input.failPendingScan(self.allocator);
+                self.failPendingInput(published);
                 self.failDroppedInput(err, @src());
                 return;
             },
             error.TooLong => {
-                input.failPendingScan(self.allocator);
+                self.failPendingInput(published);
                 self.showError(.buffer_search_query_too_long);
                 return;
             },
             error.InvalidUtf8, error.LineEnding, error.Nul => {
-                input.failPendingScan(self.allocator);
+                self.failPendingInput(published);
                 self.showError(.buffer_search_invalid_query);
                 return;
             },
@@ -11104,7 +11115,7 @@ pub const Presentation = struct {
         self.commands.append(self.allocator, command) catch |err| switch (err) {
             error.OutOfMemory => {
                 command.deinit();
-                input.failPendingScan(self.allocator);
+                self.failPendingInput(published);
                 self.failDroppedInput(err, @src());
                 return;
             },
