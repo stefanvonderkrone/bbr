@@ -26188,6 +26188,26 @@ test "M21 kernel an Enter key during a failed Buffer Search scan closes the inpu
     }
 }
 
+test "M21 kernel an Enter key during a failed Buffer Search query clear closes the input" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try replaceTestBufferSearchQuery(&presentation, "eigh");
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const clear = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expectEqual(DisclosureBuild.Kind.clear_input, clear.kind);
+    clear.failed = true;
+    try presentation.dispatch(.{ .buffer_disclosure_built = clear });
+    try testing.expect(presentation.published.?.buffer_search.input == null);
+    try testing.expectEqual(@as(?ActionError, .buffer_build_failed), presentation.projection().action_error);
+}
+
 test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
