@@ -10,12 +10,15 @@ from `event_origin`. `dispatch` sets it from its input, and `withErrorOrigin`
 sets it for one piece of work, so a raw write of `event_origin` would give an
 error the wrong origin.
 
-Code in Presentation reads `action_error` only in its writers,
-`clearErrorExcept`, and `projection`. A read elsewhere decides whether a message shows, and that
-decision belongs to `finishEvent`. Code in Presentation uses
+Code outside the test blocks reads `action_error` only in its writers,
+`clearErrorExcept`, and `projection`, and reads the shown error elsewhere
+through `projection().action_error`. A read in other code decides whether a
+message shows, and that decision belongs to `finishEvent`. The same code uses
 `maintenance_failures` only in `settleMaintenance`, `showMaintenanceError`, and
 `finishEvent`, so each failed step goes through `failMaintenance` or
-`showMaintenanceError` and only a later run of the same step recovers it.
+`showMaintenanceError` and only a later run of the same step recovers it. Both
+rules also read the free functions that take a `*Presentation`, and only a
+method of Presentation counts as a helper.
 
 A `withErrorOrigin` call in Presentation names its origin as an enum literal.
 A copied origin, such as the origin of a saved error that the code shows
@@ -34,7 +37,7 @@ from source_lines import zig_files
 
 SOURCES = (Path("src/tui/presentation.zig"),)
 # A member access: an expression, then `.`, then the field name.
-ACCESS = r"[\w)\]*?]\s*\.\s*(?P<name>{field})\b"
+ACCESS = r"(?<!projection\()[\w)\]*?]\s*\.\s*(?P<name>{field})\b"
 
 
 def listed(names):
@@ -69,7 +72,7 @@ WRITES = tuple(
         ),
     )
 )
-# Every access inside the Presentation struct body.
+# Every access outside the test blocks.
 ACCESSES = tuple(
     (
         field,
@@ -97,6 +100,7 @@ ACCESSES = tuple(
 
 
 PRESENTATION = re.compile(r"^pub const Presentation = struct \{")
+TEST_BLOCK = re.compile(r"^test\b")
 ORIGIN_CALL = re.compile(r"(?<!fn )withErrorOrigin\((?!\s*\.[A-Za-z_]\w*\s*,)")
 ORIGIN_MESSAGE = (
     "passes a withErrorOrigin origin that is not an enum literal. Name the path, such as "
@@ -119,6 +123,20 @@ def presentation_span(lines):
                 if depth == 0:
                     return start, end
     return None
+
+
+def outside_tests(lines):
+    """Each line number outside the top-level test blocks."""
+    depth = 0
+    in_test = False
+    for number, line in enumerate(lines, 1):
+        if depth == 0 and TEST_BLOCK.match(line):
+            in_test = True
+        if not in_test:
+            yield number
+        depth += line.count("{") - line.count("}")
+        if depth == 0:
+            in_test = False
 
 
 def literal_origin_violations(relative, lines, span):
@@ -178,9 +196,9 @@ def violations(root):
             for place in matches(lines, helpers, pattern, everywhere, span):
                 written.add(place)
                 found.append((str(relative), place[0], f"{relative}:{place[0]}: {message}"))
-        body = set(range(span[0] + 2, span[1] + 2))
+        production = set(outside_tests(lines))
         for field, helpers, pattern, message in ACCESSES:
-            for place in matches(lines, helpers, pattern, body, span):
+            for place in matches(lines, helpers, pattern, production, span):
                 if place not in written:
                     found.append((str(relative), place[0], f"{relative}:{place[0]}: {message}"))
     return [message for _, _, message in sorted(found)]

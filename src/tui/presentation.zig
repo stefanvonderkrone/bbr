@@ -16397,7 +16397,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
         var start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .composer = .save });
         draft_dispatch[sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (presentation.action_error != null or published.review.drafts.items.len != draft_count + sample or published.composer == null)
+        if (presentation.projection().action_error != null or published.review.drafts.items.len != draft_count + sample or published.composer == null)
             return error.DraftSavePublishedBeforeWorker;
         const job = (presentation.takeCommand() orelse return error.MissingDraftBuild).build_buffer_disclosure;
         start = std.Io.Clock.awake.now(io);
@@ -16407,7 +16407,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
         start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .buffer_disclosure_built = job });
         draft_admission[sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (presentation.action_error != null or published.composer != null or published.review.drafts.items.len != draft_count + sample + 1)
+        if (presentation.projection().action_error != null or published.composer != null or published.review.drafts.items.len != draft_count + sample + 1)
             return error.DraftSaveAdmissionFailed;
         // The control builds the same Draft graph through the former synchronous path.
         start = std.Io.Clock.awake.now(io);
@@ -16476,7 +16476,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             var start = std.Io.Clock.awake.now(io);
             try repeatTestDraftMutation(&presentation, mutation);
             mutation_times[mutation_index][0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-            if (presentation.action_error != null or published.visual_rows.ptr != before.visual_rows.ptr) return error.DraftMutationPublishedBeforeWorker;
+            if (presentation.projection().action_error != null or published.visual_rows.ptr != before.visual_rows.ptr) return error.DraftMutationPublishedBeforeWorker;
             const job = (presentation.takeCommand() orelse return error.MissingDraftMutationBuild).build_buffer_disclosure;
             start = std.Io.Clock.awake.now(io);
             job.build();
@@ -16485,7 +16485,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             start = std.Io.Clock.awake.now(io);
             try presentation.dispatch(.{ .buffer_disclosure_built = job });
             mutation_times[mutation_index][2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-            if (presentation.action_error != null or published.pending_draft_mutation != null or published.visual_rows.ptr == before.visual_rows.ptr)
+            if (presentation.projection().action_error != null or published.pending_draft_mutation != null or published.visual_rows.ptr == before.visual_rows.ptr)
                 return error.DraftMutationAdmissionFailed;
             switch (mutation) {
                 .body => if (!std.mem.endsWith(u8, published.review.getConst(root.local_id).?.body, " changed")) return error.DraftMutationBodyMismatch,
@@ -16618,7 +16618,7 @@ fn finishBenchmarkSearchWork(presentation: *Presentation) !void {
             },
         }
     }
-    if (presentation.action_error != null) return error.BenchmarkSearchFailed;
+    if (presentation.projection().action_error != null) return error.BenchmarkSearchFailed;
 }
 
 fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u8) !void {
@@ -16870,7 +16870,7 @@ fn benchmarkSidebar(presentation: *Presentation, io: std.Io) !void {
         start = std.Io.Clock.awake.now(io);
         presentation.revealActiveFile(published);
         times[3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (presentation.action_error != null or published.tree.entries.ptr != visible_tree or
+        if (presentation.projection().action_error != null or published.tree.entries.ptr != visible_tree or
             published.buffer.rows.ptr != before.buffer.rows.ptr or published.visual_rows.ptr != before.visual_rows.ptr or
             published.visual_rows_revision != before.visual_rows_revision) return error.SidebarChangedDiffPane;
         start = std.Io.Clock.awake.now(io);
@@ -27781,7 +27781,7 @@ fn repeatTestDraftMutation(presentation: *Presentation, mutation: TestDraftMutat
 fn expectTestDraftMutation(presentation: *Presentation, mutation: TestDraftMutation) !void {
     const published = presentation.published.?;
     try testing.expect(published.pending_draft_mutation == null);
-    try testing.expect(presentation.action_error == null);
+    try testing.expect(presentation.projection().action_error == null);
     switch (mutation) {
         .body => {
             try testing.expectEqualStrings("root changed", draftBody(presentation, 1));
@@ -38968,7 +38968,7 @@ fn initWholeFileGapPresentation(store: *bbr.review.InMemoryStore, key: OwnedRevi
 
 fn expectCursorOnWholeFileGapLine(presentation: *const Presentation, text: []const u8, number: u32, viewport_offset: ?usize) !void {
     const published = presentation.published.?;
-    try testing.expect(presentation.action_error == null);
+    try testing.expect(presentation.projection().action_error == null);
     try testing.expectEqual(try wholeFileGapRow(published, 2, text, number), published.navigation.cursor);
     try testing.expectEqual(@as(?usize, 2), published.activeFile());
     if (viewport_offset) |offset| {

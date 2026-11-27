@@ -372,6 +372,7 @@ class ActionErrorsTest(unittest.TestCase):
             "fn restoreReviewLocation(presentation: *Presentation) void {\n"
             "    if (presentation.action_error != null) return;\n"
             "    presentation.maintenance_failures = .initFill(null);\n"
+            "    _ = presentation.projection().action_error;\n"
             "}\n"
             "test \"a test reads the shown error\" {\n"
             "    var presentation: Presentation = .{};\n"
