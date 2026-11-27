@@ -174,3 +174,11 @@ This round closes the second open finding of the OCR round 6 review: the queued 
 Review: a readonly review of `1a8fbac2..HEAD` confirmed that item 1 is not reachable. It also found the `review_snapshot` return unreachable, because the Buffer Search input takes every key, so Review Search cannot open and change its batch. It found no blocking finding. Its low findings are fixed: a rule sentence that was too long and named the wrong cause, a missing rule for a clear whose occurrence build cannot queue, a test that did not check that the accepted search has one occurrence and that the cursor moves, a null unwrap in a test, and an Enforcement sentence without the second Enter key. The wording of two commit messages stays as committed. The docs commit says that the accept queues the occurrence build, but it only can queue it, when the disclosures differ.
 
 Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_action_errors_test.py` pass.
+
+## OCR round 8
+
+Open Code Review found one item in `c2ae8321`.
+
+1. Valid. The test "M21 kernel a failed Buffer Search opening keeps the input open" pressed the second Enter key only after a failed opening build. After a failed queue of the retry, the test stopped, but the Enforcement text in `docs/rules/tui-state.md` says that the test fails when a second Enter key does not retry the opening. The test now presses the second Enter key in both cases. After the failed queue, it lets memory recover first. It expects an `open_input` build, runs it, and checks that the input closes. A temporary mutation that cleared `restoring_review_disclosures` after the failed queue of the retry made the test fail at the retry command, and `zig build test` exited with 1. No production code changed.
+
+Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, and `python3 tools/check_doc_symbols.py .` pass.
