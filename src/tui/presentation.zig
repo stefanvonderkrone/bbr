@@ -26295,6 +26295,92 @@ test "M21 kernel an Enter key during a failed Buffer Search query clear closes t
     }
 }
 
+test "M21 kernel a failed Buffer Search opening keeps the input open" {
+    const Failure = enum { build, queue_retry };
+    for ([_]Failure{ .build, .queue_retry }) |failure| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try revealTemporaryReviewFold(&presentation);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const opening = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.open_input, opening.kind);
+        switch (failure) {
+            .build => opening.failed = true,
+            .queue_retry => presentation.published.?.disclosure_inputs_current = false,
+        }
+        try presentation.dispatch(.{ .buffer_disclosure_built = opening });
+        const input = presentation.published.?.buffer_search.input.?;
+        try testing.expect(!input.pending);
+        try testing.expectEqual(@as(?ActionError, if (failure == .build) .buffer_build_failed else .out_of_memory), presentation.projection().action_error);
+        // An accept would queue the opening that just failed.
+        try testing.expect(presentation.takeCommand() == null);
+        if (failure == .build) {
+            try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+            const retry = presentation.takeCommand().?.build_buffer_disclosure;
+            try testing.expectEqual(DisclosureBuild.Kind.open_input, retry.kind);
+            retry.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = retry });
+            try testing.expect(presentation.published.?.buffer_search.input == null);
+        }
+    }
+}
+
+test "M21 kernel an Enter key during a failed Buffer Search query clear opens the next accepted occurrence" {
+    const Failure = enum { build, queue_retry };
+    for ([_]Failure{ .build, .queue_retry }) |failure| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, "c5");
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const occurrence_row = presentation.published.?.navigation.cursor;
+        const accepted_rows = presentation.projection().review.?.buffer.rows.len;
+        try moveToRow(&presentation, 0);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try replaceTestBufferSearchQuery(&presentation, "eigh");
+        try completeBufferSearchScan(&presentation);
+        const preview_rows = presentation.projection().review.?.buffer.rows.len;
+        try testing.expect(preview_rows > accepted_rows);
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const clear = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.clear_input, clear.kind);
+        switch (failure) {
+            .build => clear.failed = true,
+            .queue_retry => presentation.published.?.disclosure_inputs_current = false,
+        }
+        try presentation.dispatch(.{ .buffer_disclosure_built = clear });
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expectEqual(@as(?ActionError, if (failure == .build) .buffer_build_failed else .out_of_memory), presentation.projection().action_error);
+        switch (failure) {
+            // The build of the occurrence also restores the disclosures that
+            // the failed clear kept, so its result replaces the failure.
+            .build => {
+                try completeDisclosureBuild(&presentation);
+                try testing.expectEqual(accepted_rows, presentation.projection().review.?.buffer.rows.len);
+                try testing.expectEqual(occurrence_row, presentation.published.?.navigation.cursor);
+                try testing.expectEqual(@as(?ActionError, .buffer_search_hit_bottom), presentation.projection().action_error);
+            },
+            // The rule in docs/rules/tui-state.md: without its build, the view
+            // keeps the disclosures of the preview.
+            .queue_retry => {
+                try testing.expect(presentation.takeCommand() == null);
+                try testing.expectEqual(preview_rows, presentation.projection().review.?.buffer.rows.len);
+            },
+        }
+    }
+}
+
 test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
