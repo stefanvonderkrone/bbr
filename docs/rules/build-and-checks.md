@@ -45,7 +45,7 @@ The suffix of a file name in `tests/` decides where the file runs. No list needs
 
 Any other file in `tests/` is a support file and goes in `test_support_files` in `build.zig`.
 
-Enforcement: `addTestScripts` in `build.zig` lists `tests/` when the build configures. `zig build test` fails on a file that fits no suffix and is not a support file. The CI step "Tests that need CI tools" runs `tests/*_ci_test.py` with a glob.
+Enforcement: `addTestScripts` in `build.zig` lists `tests/` when the build configures. `zig build test` fails on a file that fits no suffix and is not a support file. The CI step `Tests that need CI tools` runs `tests/*_ci_test.py` with a glob.
 
 ## Checker source lines
 
