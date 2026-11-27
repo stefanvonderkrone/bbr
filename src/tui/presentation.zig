@@ -9750,8 +9750,11 @@ pub const Presentation = struct {
         };
         input.deinit(self.allocator);
         // An accepted search without matches opens nothing, so the user
-        // sees why.
-        if (published.buffer_search.active == null) self.showError(.buffer_search_no_matches) else self.clearError();
+        // sees why. A search without a batch keeps the message of its
+        // failed scan.
+        if (published.buffer_search.accepted_batch) |batch| {
+            if (batch.occurrences.len == 0) self.showError(.buffer_search_no_matches) else self.clearError();
+        }
         published.frame_revision += 1;
     }
 
