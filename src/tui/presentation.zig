@@ -26084,7 +26084,7 @@ test "M21 kernel a failed Buffer Search scan collapses the preview of the previo
 
 test "M21 kernel a Buffer Search input that fails after a query edit opens no occurrence of the previous query" {
     const Failure = enum { queue_disclosure, queue_restore, input_build, admit_input_build, queue_stale_scan };
-    for ([_]Failure{ .queue_disclosure, .queue_restore, .input_build, .admit_input_build, .queue_stale_scan }) |failure| {
+    for ([_]Failure{ .queue_disclosure, .queue_restore, .input_build, .admit_input_build, .queue_stale_scan }) |failure| for ([_]bool{ false, true }) |enter_first| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
         defer store.deinit();
         var once: FailOnceAllocator = .{ .child = testing.allocator };
@@ -26104,6 +26104,7 @@ test "M21 kernel a Buffer Search input that fails after a query edit opens no oc
         try replaceTestBufferSearchQuery(&presentation, queries[1]);
         var command = presentation.takeCommand().?;
         defer command.deinit();
+        if (enter_first) try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
         var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
         switch (failure) {
             .queue_disclosure => presentation.published.?.disclosure_inputs_current = false,
@@ -26139,8 +26140,51 @@ test "M21 kernel a Buffer Search input that fails after a query edit opens no oc
         }), presentation.projection().action_error);
         try testing.expectEqual(@as(usize, @intFromBool(failure != .input_build)), try completeTestDisclosureBuilds(&presentation));
 
-        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        // An Enter key during the failed work closes the input at the failure.
+        if (enter_first) {
+            try testing.expect(presentation.published.?.buffer_search.input == null);
+        } else try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
         try testing.expect(presentation.projection().buffer_search == null);
+    };
+}
+
+test "M21 kernel an Enter key during a failed Buffer Search scan closes the input" {
+    const Case = enum { no_restore, restore, failed_restore };
+    for ([_]Case{ .no_restore, .restore, .failed_restore }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        const initial = presentation.projection().review.?.buffer.rows.len;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        // The first query has no preview to restore. The edit from "eigh"
+        // must collapse the Resolved Thread that the match of "eigh" opened.
+        if (case != .no_restore) {
+            try replaceTestBufferSearchQuery(&presentation, "eigh");
+            try completeBufferSearchScan(&presentation);
+        }
+        try replaceTestBufferSearchQuery(&presentation, if (case == .no_restore) "eight" else "eighx");
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        switch (case) {
+            .no_restore => try testing.expect(presentation.takeCommand() == null),
+            .restore => _ = try completeTestDisclosureBuilds(&presentation),
+            .failed_restore => {
+                const restore = presentation.takeCommand().?.build_buffer_disclosure;
+                restore.failed = true;
+                try presentation.dispatch(.{ .buffer_disclosure_built = restore });
+            },
+        }
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expectEqual(@as(?ActionError, if (case == .failed_restore) .buffer_build_failed else .buffer_search_scan_failed), presentation.projection().action_error);
+        if (case == .restore) try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
     }
 }
 
