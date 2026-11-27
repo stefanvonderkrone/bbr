@@ -10100,7 +10100,7 @@ pub const Presentation = struct {
     /// Ends the pending work of the input without its result. An Enter key
     /// during that work accepts the query here, before the caller shows why
     /// the work failed, so the accept does not clear that message. A failed
-    /// opening keeps the Enter key, because an accept queues the opening
+    /// opening keeps the input open, because an accept queues the opening
     /// again and would repeat a build that fails.
     fn failPendingInput(self: *Presentation, published: *Published) void {
         const input = &published.buffer_search.input.?;
