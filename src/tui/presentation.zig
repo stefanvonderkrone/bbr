@@ -9772,7 +9772,9 @@ pub const Presentation = struct {
         input.deinit(self.allocator);
         // An accepted search without matches opens nothing, so the user
         // sees why. A search without a batch keeps only the message that
-        // says why it has none.
+        // says why it has none, and it clears another message by the rule
+        // of `clearError`. So a completion clears only a message of its own
+        // origin.
         if (published.buffer_search.accepted_batch) |batch| {
             if (batch.occurrences.len == 0) self.showError(.buffer_search_no_matches) else self.clearError();
         } else self.clearErrorExcept(&.{ .buffer_search_scan_failed, .buffer_search_no_matches });

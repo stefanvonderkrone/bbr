@@ -71,7 +71,7 @@ An `out_of_memory` error has no key, because it belongs to the process and not t
 When that PullRequest is not the visible review, or no review is visible, the status names it as `repo#id: ` before the error text.
 The re-anchor banner shows no action error of another PullRequest, because its text names no PullRequest.
 While Buffer Search is open, the status shows the Buffer Search line with only Buffer Search errors, so it does not show an action error of another PullRequest.
-An accepted Buffer Search shows `buffer_search_no_matches` when its batch has no occurrence, so the user sees why nothing opened. Without a batch, it keeps only `buffer_search_scan_failed` or `buffer_search_no_matches`, the messages that say why nothing opened, and it clears any other message.
+An accepted Buffer Search shows `buffer_search_no_matches` when its batch has no occurrence, so the user sees why nothing opened. Without a batch, it keeps only `buffer_search_scan_failed` or `buffer_search_no_matches`, the messages that say why nothing opened, and it clears any other message by the rule of `clearError`. So an accept by the Enter key clears any other message, and an accept that a completion runs clears only a message of the origin of that completion.
 `showErrorFor` and `clearError` read `Presentation.event_origin`, the origin of the event that runs.
 `dispatch` sets the event origin from `OwnedInput.errorOrigin` and restores it when the event ends.
 A key, a mouse action, or an Overlay action has the origin `.user`, and its `clearError` clears any error.

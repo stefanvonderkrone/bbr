@@ -99,3 +99,9 @@ Review: a readonly review of `c35cf920..HEAD` found that the `projection().actio
 - After two Files fail in one event, the step names no File. So when both Files recover later in the event, the user still sees `out_of_memory`. A bitset of Files would fix it, but no event recovers two failed Files.
 
 Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_action_errors_test.py` pass.
+
+## OCR round 3
+
+Open Code Review found one item in `e0f03ced`.
+
+1. Valid. `docs/rules/tui-state.md` said that an accepted Buffer Search without a batch clears any other message. But `clearErrorExcept` clears by the rule of `clearError`. Only an accept by the Enter key has the origin `.user` and clears any message. An accept that a Buffer Search completion runs through `accept_when_ready` clears only a message of the origin of that completion. The rule doc and the comment in `acceptBufferSearch` now say so. The code does not change.
