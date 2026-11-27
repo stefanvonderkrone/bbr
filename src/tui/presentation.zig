@@ -26319,14 +26319,13 @@ test "M21 kernel a failed Buffer Search opening keeps the input open" {
         try testing.expectEqual(@as(?ActionError, if (failure == .build) .buffer_build_failed else .out_of_memory), presentation.projection().action_error);
         // An accept would queue the opening that just failed.
         try testing.expect(presentation.takeCommand() == null);
-        if (failure == .build) {
-            try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
-            const retry = presentation.takeCommand().?.build_buffer_disclosure;
-            try testing.expectEqual(DisclosureBuild.Kind.open_input, retry.kind);
-            retry.build();
-            try presentation.dispatch(.{ .buffer_disclosure_built = retry });
-            try testing.expect(presentation.published.?.buffer_search.input == null);
-        }
+        if (failure == .queue_retry) presentation.published.?.disclosure_inputs_current = true;
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const retry = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(DisclosureBuild.Kind.open_input, retry.kind);
+        retry.build();
+        try presentation.dispatch(.{ .buffer_disclosure_built = retry });
+        try testing.expect(presentation.published.?.buffer_search.input == null);
     }
 }
 
