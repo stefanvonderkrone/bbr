@@ -44,8 +44,13 @@ HELPERS = """pub const Presentation = struct {
         if (origin == .user or shown.origin == origin) self.action_error = null;
     }
 
+    fn finishEvent(self: *Presentation) void {
+        if (self.action_error != null) return;
+        self.action_error = .{ .err = .out_of_memory, .origin = .user, .key = null };
+    }
+
     fn acceptPullRequests(self: *Presentation) void {
-        if (self.action_error != null) self.clearError();
+        self.clearError();
         // self.action_error = null;
         const text = "self.action_error = null";
         _ = text;
@@ -120,6 +125,60 @@ fn showTestError(state: *Presentation, origin: ErrorOrigin, err: ActionError) vo
     state.withErrorOrigin(origin, Presentation.showError, .{ state, err });
 }
 """
+# Each form reads the shown error outside its owners.
+READS = """pub const Presentation = struct {
+    action_error: ?ShownError = null,
+
+    fn keepers(self: *Presentation) void {
+        if (self.action_error != null) return;
+        if (null == self.action_error) return;
+        const shown = self.action_error orelse return;
+        if (self.action_error) |_| return;
+        if (self
+            .action_error == null) return;
+        const alias = self.action_error;
+        const slot = &self.action_error;
+        _ = .{ shown, alias, slot };
+        return .{ .action_error = null };
+    }
+};
+
+test "a fixture" {
+    try testing.expect(presentation.action_error == null);
+}
+"""
+# A write that a line break splits.
+SPLIT_WRITES = """pub const Presentation = struct {
+    fn reset(self: *Presentation) void {
+        self.action_error
+            = null;
+        self
+            .event_origin = .user;
+    }
+};
+"""
+# The maintenance failures of an event outside the helpers that own them.
+MAINTENANCE = """pub const Presentation = struct {
+    maintenance_failures: Failures = .initFill(null),
+
+    fn settleMaintenance(self: *Presentation, step: MaintenanceStep) void {
+        self.maintenance_failures.set(step, null);
+    }
+
+    fn showMaintenanceError(self: *Presentation, step: MaintenanceStep, err: ActionError) void {
+        self.maintenance_failures.set(step, .{ .err = err, .origin = self.errorOrigin() });
+    }
+
+    fn finishEvent(self: *Presentation) void {
+        defer self.maintenance_failures = .initFill(null);
+    }
+
+    fn acceptViewBuild(self: *Presentation) void {
+        self.maintenance_failures.set(.failed_build, null);
+        if (self.maintenance_failures.get(.cache_staging) == null) return;
+    }
+};
+"""
 # failMaintenance and the failed enrichment build before ticket 01 of
 # query-edit-clear-order kept the shown message by hand.
 OLD_KEEP = """pub const Presentation = struct {
@@ -171,7 +230,7 @@ class ActionErrorsTest(unittest.TestCase):
             + "    presentation.*.action_error = null;\n"
             + "}\n"
         )
-        self.assertEqual([message.split(":")[1] for message in found], ["30", "33"])
+        self.assertEqual([message.split(":")[1] for message in found], ["35", "38"])
 
     def test_show_error_may_not_write_the_field_itself(self):
         found = self.check(OLD_SHOW_ERROR)
@@ -243,9 +302,26 @@ class ActionErrorsTest(unittest.TestCase):
 
     def test_a_hand_kept_message_is_rejected(self):
         found = self.check(OLD_KEEP)
-        self.assertEqual([message.split(":")[1] for message in found], ["3", "7"])
-        self.assertIn("outside showMaintenanceError", found[0])
-        self.assertIn("showMaintenanceError(err)", found[0])
+        self.assertEqual([message.split(":")[1] for message in found], ["3", "7", "11"])
+        self.assertIn("reads action_error outside showErrorFor, clearError, finishEvent, and projection.", found[0])
+        self.assertIn("showMaintenanceError(step, err)", found[0])
+
+    def test_every_read_form_of_the_shown_error_is_rejected(self):
+        found = self.check(READS)
+        self.assertEqual([message.split(":")[1] for message in found], ["5", "6", "7", "8", "10", "11", "12"])
+        self.assertIn("reads action_error outside", found[0])
+
+    def test_a_write_split_across_lines_is_rejected(self):
+        found = self.check(SPLIT_WRITES)
+        self.assertEqual([message.split(":")[1] for message in found], ["3", "6"])
+        self.assertIn("writes action_error outside", found[0])
+        self.assertIn("writes event_origin outside", found[1])
+
+    def test_maintenance_failures_outside_their_helpers_are_rejected(self):
+        found = self.check(MAINTENANCE)
+        self.assertEqual([message.split(":")[1] for message in found], ["17", "18"])
+        self.assertIn("uses maintenance_failures outside settleMaintenance, showMaintenanceError, and finishEvent.", found[0])
+        self.assertIn("failMaintenance(step, operation, err, source)", found[0])
 
     def test_a_file_without_the_presentation_struct_is_rejected(self):
         found = self.check(COPIED_ORIGIN.replace("pub const Presentation = struct {", "pub const Renamed = struct {"))
