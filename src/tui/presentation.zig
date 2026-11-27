@@ -25962,6 +25962,34 @@ test "M21 kernel an accepted Buffer Search without a batch keeps only a message 
     }
 }
 
+test "M21 kernel an accepted Buffer Search keeps the scan failure of its query edit" {
+    const Case = struct { scanned: []const u8, appended: []const u8 };
+    for ([_]Case{
+        .{ .scanned = "qqqq", .appended = "q" },
+        .{ .scanned = "eigh", .appended = "x" },
+    }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = case.scanned[0], .text = case.scanned } });
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = case.appended[0], .text = case.appended } });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        completed.outcome.scanned.deinit(completed.allocator);
+        completed.outcome = .failed;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        try testing.expect(presentation.projection().buffer_search == null);
+    }
+}
+
 test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
