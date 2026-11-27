@@ -200,3 +200,19 @@ This was the second doc that named a missing thing, after the missing path of PR
 A readonly review found seven low items. Six are fixed. The check now decodes the `\\` and `\"` escapes of a Zig test name, and it binds a file only after the word `in`. New cases cover the file order, a quote across two lines, and the word `in`. The rule tells the agent to write other quoted text as a code span. Long sentences in the rule, the ticket, and the commit messages are split. The review also found that the check commit fails `zig build test` alone. That order stays, because each red check lands before its fix in this branch. Branch `m30-viewer-scrollbars` has a near copy of the check in `tools/check_agent_docs.py`. Its merge with `main` must keep only one copy.
 
 Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_doc_symbols_test.py` pass.
+
+## OCR round 11
+
+Open Code Review found five items in the Enforcement test name check of `tools/check_doc_symbols.py`. All five are valid. Each fix has a unit test in `tests/check_doc_symbols_test.py` that failed before the fix.
+
+1. Valid. The check skipped only the opening quote of a CI step name. The closing quote then paired with the next quote. Thus `step "Lint" runs "foo"` read ` runs ` as a test name and did not check `foo`. The check now reads a step quote as one token. After "steps", it also reads a list of step names joined by commas, "and", or "or".
+2. Valid. A test name in single quotes or in curly quotes passed without a check. Now such a quote fails, and the error tells the agent to use double quotes. An apostrophe passes. "Step" and "Steps" now count as "step" and "steps".
+3. Valid. Each error now ends with "If the quote is not a test name, write it as a code span."
+4. Valid. A test name took the next file of the paragraph, also from a later sentence. Now it takes the next file only in its own sentence. Else it takes the last file before it in the paragraph. The rule docs use the earlier file in sentences such as "Other tests in that file", so no rule doc changes. The rule section states where a sentence ends.
+5. Valid. `docs/agents/rule-areas.md` now only links to the rule section in `docs/rules/build-and-checks.md`.
+
+A readonly review found two medium items and six low items. A list of quotes after a singular "step" hid the test name after "and". An apostrophe after a code span opened a single quote. Both are fixed with a failing test first. The rule now states the step list, the case of "Step", the apostrophe, and the sentence end. The review also asked for a stricter missing file test and for tests of "!", "?", and a test name with the word "step". Those are added. The review also proposed a sentence end that skips "e.g.". That proposal is not taken, because the rule tells the agent not to write such abbreviations.
+
+Branch `m30-viewer-scrollbars` has a near copy of the check in `tools/check_agent_docs.py`. Its merge with `main` must keep only one copy, with the step token, the quote form error, the sentence limit, and the error text of this round.
+
+Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_doc_symbols_test.py` pass.
