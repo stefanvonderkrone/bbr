@@ -3310,7 +3310,9 @@ pub const DisclosureBuild = struct {
         if (self.kind == .card_destination) {
             self.destination_row = self.projection.?.navigation.owners.get(cardHeaderOwner(self.destination_card.?));
         }
-        if (self.batch orelse self.rebuilt_batch orelse self.accepted_snapshot) |batch| {
+        // An input build projects only the batch of its own query, and a
+        // build without one restores the view of a failed scan.
+        if (if (self.kind == .input) self.batch else self.batch orelse self.rebuilt_batch orelse self.accepted_snapshot) |batch| {
             const result = try self.projection.?.project(std.heap.page_allocator, batch);
             self.ranges = result.ranges;
             self.navigation_rows = result.navigation_rows;
@@ -10019,9 +10021,7 @@ pub const Presentation = struct {
         if (completed.request_id != input.request_id or !input.pending) return;
         var batch = switch (completed.outcome) {
             .failed => {
-                input.failPendingScan(self.allocator);
-                self.showError(.buffer_search_scan_failed);
-                published.frame_revision += 1;
+                self.failBufferSearchScan(published);
                 return;
             },
             .scanned => |batch| batch,
@@ -10043,12 +10043,10 @@ pub const Presentation = struct {
                 published.frame_revision += 1;
                 return;
             },
-        }) return;
+        } != null) return;
         const ranges = completed.ranges orelse {
             batch.deinit(self.allocator);
-            input.failPendingScan(self.allocator);
-            self.showError(.buffer_search_scan_failed);
-            published.frame_revision += 1;
+            self.failBufferSearchScan(published);
             return;
         };
         completed.ranges = null;
@@ -10077,21 +10075,39 @@ pub const Presentation = struct {
         if ((published.buffer_search.input orelse return).accept_when_ready) self.acceptBufferSearch();
     }
 
-    fn queueBufferDisclosure(self: *Presentation, published: *Published, batch: search.Batch, active: ?usize, request_id: u64, navigation_rows: ?[]SearchNavigationRow) !bool {
+    /// Ends a pending scan of the input without a batch. Like a scan without
+    /// matches, it restores the disclosures that the preview of the previous
+    /// query expanded, and its build shows the scan failure again.
+    fn failBufferSearchScan(self: *Presentation, published: *Published) void {
+        const input = &published.buffer_search.input.?;
+        input.failPendingScan(self.allocator);
+        self.showError(.buffer_search_scan_failed);
+        published.frame_revision += 1;
+        const job = self.queueBufferDisclosure(published, null, null, input.request_id, null) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.showError(.out_of_memory);
+                return;
+            },
+        } orelse return;
+        job.result_error = .buffer_search_scan_failed;
+        input.pending = true;
+    }
+
+    fn queueBufferDisclosure(self: *Presentation, published: *Published, batch: ?search.Batch, active: ?usize, request_id: u64, navigation_rows: ?[]SearchNavigationRow) !?*DisclosureBuild {
         var required: SearchDisclosureSet = .{};
         if (active) |index| {
-            const occurrence = batch.occurrences[index];
+            const occurrence = batch.?.occurrences[index];
             const visible = if (navigation_rows) |rows| rows[index].visible else published.occurrenceVisualRow(occurrence);
             required = searchDisclosureForVisibility(published, occurrence, visible != null);
         }
-        if (required.len == 0 and published.buffer_search.saved_disclosures == null) return false;
+        if (required.len == 0 and published.buffer_search.saved_disclosures == null) return null;
         const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
         if (target.matchesKeys(published.disclosure_keys)) {
             if (required.len == 0) if (published.buffer_search.saved_disclosures) |saved| {
                 saved.release();
                 published.buffer_search.saved_disclosures = null;
             };
-            return false;
+            return null;
         }
         const job = try DisclosureBuild.create(published, self.preferences, target, request_id);
         errdefer job.destroy();
@@ -10100,7 +10116,7 @@ pub const Presentation = struct {
         job.clear_saved_disclosures = required.len == 0;
         job.batch = batch;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
-        return true;
+        return job;
     }
 
     fn acceptBufferDisclosure(self: *Presentation, job: *DisclosureBuild) void {
@@ -10151,7 +10167,7 @@ pub const Presentation = struct {
             self.retryStaleBufferDisclosure(published);
             return;
         }
-        const ranges = job.ranges.?;
+        const ranges = job.ranges;
         job.ranges = null;
         const accepted_ranges = job.accepted_ranges;
         job.accepted_ranges = null;
@@ -10161,7 +10177,7 @@ pub const Presentation = struct {
         disclosures.appendSlice(self.allocator, job.disclosures) catch |err| switch (err) {
             error.OutOfMemory => {
                 disclosures.deinit(self.allocator);
-                std.heap.page_allocator.free(ranges);
+                if (ranges) |old| std.heap.page_allocator.free(old);
                 if (accepted_ranges) |old| std.heap.page_allocator.free(old);
                 if (review_ranges) |old| std.heap.page_allocator.free(old);
                 input.failPendingScan(self.allocator);
@@ -10218,7 +10234,9 @@ pub const Presentation = struct {
         }
         published.frame_revision += 1;
         published.visual_rows_revision = published.frame_revision;
-        if (job.destination_active == null) self.showError(.buffer_search_no_matches) else self.clearError();
+        if (job.result_error) |err| {
+            self.showError(err);
+        } else if (job.destination_active == null) self.showError(.buffer_search_no_matches) else self.clearError();
         if (input.accept_when_ready) self.acceptBufferSearch();
     }
 
@@ -25999,6 +26017,7 @@ test "M21 kernel an accepted Buffer Search keeps the scan failure of its query e
         completed.outcome = .failed;
         try presentation.dispatch(.{ .buffer_search_scanned = completed });
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try completeTestDisclosureBuilds(&presentation);
         try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
         try testing.expect(presentation.projection().buffer_search == null);
     }
