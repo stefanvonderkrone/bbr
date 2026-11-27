@@ -115,7 +115,8 @@ Option for a check, from the `correct` skill: `tools/check_diagnostics.py` can c
 A prong writes a record when it calls `reportFailure` or a helper from `recording_helpers`.
 A rough script with the parse of that check counts 91 such prongs in `src/tui/presentation.zig` on `main`.
 So the check needs a per-file baseline, as `tools/diagnostic_catch_baseline.txt` has.
-It fails when a change adds a prong.
+It fails when the count of a file goes up.
+A change that removes one such prong and adds another keeps the count, so the check misses it.
 Its error names `failDroppedInput` and `failMaintenance` as the fix.
 It does not see paths 1 and 2, because `retryContentBuild` reaches the prong through `openReviewSearchOccurrence`.
 A narrower rule can cover each prong in a function that queues work again. It requires that each such prong calls `failDroppedInput`, `failMaintenance`, or `settleMaintenance`.
