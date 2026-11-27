@@ -37593,6 +37593,63 @@ test "M21 kernel a Review Search destination shows the failure of its cache stag
     }
 }
 
+test "M21 kernel a Review Search query edit shows no failure of a cache staging that a later staging recovers" {
+    for ([_]bool{ false, true }) |older_message| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try openTestReviewSourceSearchWith(&store, once.allocator(), 12, .{ .diagnostic_state = .on, .inactive_file_cache_max_bytes = 1 });
+        defer presentation.deinit();
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try runTestUntilSourceScanWaits(&presentation, 11);
+        const published = presentation.published.?;
+        try presentation.queueCacheBuild(published, published.session.enrichment.focused);
+        var running = presentation.commands.pop().?;
+        defer running.deinit();
+        if (older_message) showTestError(&presentation, .file_enrichment, .file_enrichment_launch_failed);
+        presentation.commands.clearAndFree(presentation.allocator);
+        // The release of the holds fails to stage. The discard of the
+        // source scan stages the same cache build after it.
+        once.armed = true;
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } } });
+        try testing.expect(once.failed);
+        try testing.expect(presentation.queued_source_scan == null);
+        try testing.expect(published.pending_cache_update != null);
+        try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
+        try testing.expectEqual(@as(usize, 1), drainTestCommands(&presentation));
+    }
+}
+
+fn failTestStepsAndRecoverStaging(presentation: *Presentation, once: *FailOnceAllocator, file_index: usize) void {
+    const published = presentation.published.?;
+    once.armed = true;
+    _ = presentation.queueMaintenanceFileEnrichment(published, file_index);
+    published.disclosure_inputs_current = false;
+    presentation.stageCacheBuild(published, published.session.enrichment.focused);
+    published.disclosure_inputs_current = true;
+    presentation.stageCacheBuild(published, published.session.enrichment.focused);
+}
+
+test "M21 kernel a recovered cache staging keeps the failure of another maintenance step" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var once: FailOnceAllocator = .{ .child = testing.allocator };
+    var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store() }, .{
+        .diagnostic_state = .on,
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 10) },
+    });
+    defer presentation.deinit();
+    _ = drainTestCommands(&presentation);
+    presentation.commands.clearAndFree(presentation.allocator);
+    const file_index = 9;
+    try testing.expect(presentation.published.?.session.enrichment.needsEnrichment(file_index));
+    presentation.withErrorOrigin(.file_enrichment, failTestStepsAndRecoverStaging, .{ &presentation, &once, file_index });
+    try testing.expect(once.failed);
+    try testing.expect(presentation.published.?.pending_cache_update != null);
+    try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+    try testing.expectEqual(@as(usize, 2), drainTestCommands(&presentation));
+}
+
 test "M21 kernel a Session replacement shows no cache staging failure of the replaced Session" {
     for ([_]bool{ false, true }) |older_message| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
