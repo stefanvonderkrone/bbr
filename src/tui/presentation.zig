@@ -10154,7 +10154,7 @@ pub const Presentation = struct {
         const input = &(published.buffer_search.input orelse return);
         if (job.request_id != input.request_id or !input.pending) return;
         if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or !std.meta.eql(job.geometry, published.geometry)) {
-            self.retryStaleBufferDisclosure(published);
+            self.retryStaleInputBuild(published, job);
             return;
         }
         if (job.failed) {
@@ -10167,7 +10167,7 @@ pub const Presentation = struct {
         const wanted_cursor: ?file_tree.Identity = if (published.tree.entries.len == 0) null else published.tree.entries[published.tree.cursor].identity;
         const same_cursor = if (wanted_cursor) |cursor| if (job.wanted_cursor) |saved| cursor.eql(saved) else false else job.wanted_cursor == null;
         if (job.active_file != active_file or job.tree_scroll != published.tree.scroll or !same_cursor) {
-            self.retryStaleBufferDisclosure(published);
+            self.retryStaleInputBuild(published, job);
             return;
         }
         const same_batch = if (job.accepted_snapshot) |snapshot| if (published.buffer_search.accepted_batch) |current|
@@ -10179,7 +10179,7 @@ pub const Presentation = struct {
         else
             false else published.review_search.batch == null;
         if (!same_batch or !same_review) {
-            self.retryStaleBufferDisclosure(published);
+            self.retryStaleInputBuild(published, job);
             return;
         }
         const ranges = job.ranges;
@@ -10253,6 +10253,12 @@ pub const Presentation = struct {
             self.showError(err);
         } else if (job.destination_active == null) self.showError(.buffer_search_no_matches) else self.clearError();
         if (input.accept_when_ready) self.acceptBufferSearch();
+    }
+
+    /// A stale restore of a failed scan queues the restore again, because a
+    /// scan of the failed query would replace the failure with a new result.
+    fn retryStaleInputBuild(self: *Presentation, published: *Published, job: *const DisclosureBuild) void {
+        if (job.batch == null) self.failBufferSearchScan(published) else self.retryStaleBufferDisclosure(published);
     }
 
     fn acceptViewBuild(self: *Presentation, published: *Published, job: *DisclosureBuild, owned: *bool) void {
