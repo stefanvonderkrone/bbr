@@ -31,6 +31,9 @@ For fault 1:
 
 An Enter key after the failed restore takes the same path through `acceptBufferSearch`. This case is inferred from the code, and no test checks it.
 `cancelBufferSearch` has no such fault. It compares the expanded disclosures with `saved_expanded_disclosures` and queues a `.restore` build.
+But a cancel and a failed scan restore to different baselines.
+`saved_expanded_disclosures` holds the disclosures at the open of the input. So it keeps a Resolved Thread that an earlier accepted search expanded.
+The restore of `failBufferSearchScan` comes from `queueBufferDisclosure` without an occurrence. Its target is `buffer_search.saved_disclosures`, the disclosures before the first preview or accepted search that is still in effect. So it also collapses the thread of an earlier accepted search, as a scan without matches does.
 
 The test "M21 kernel a failed restore of a failed Buffer Search scan shows the build failure" pins the preview while the input stays open. That limit is documented in `docs/rules/tui-state.md`. The test "M21 kernel an Enter key during a failed Buffer Search scan closes the input" checks the `.failed_restore` case, but it does not check the rows of the view.
 
@@ -53,8 +56,16 @@ Give `BufferSearchInput` a record of its failure. `failPendingInput` sets it, an
 
 Then `acceptBufferSearch` uses the record:
 
-- When a restore is due, the accept queues a `.restore` build to `saved_expanded_disclosures`, as `cancelBufferSearch` does.
+- When a restore is due, the accept queues a `.restore` build to the baseline of the failed scan, `buffer_search.saved_disclosures`. That is the target that the restore of `failBufferSearchScan` uses. The target is not `saved_expanded_disclosures`, because that baseline keeps the thread of an earlier accepted search open.
 - The accept keeps the message of the record, and it clears other messages by the rule of `clearError`.
+- The `.restore` build carries the message of the record in `result_error`, as the restore of `failBufferSearchScan` carries `buffer_search_scan_failed`.
+  A `.restore` build has the origin `.buffer_search`, and so has the message of a failed input build or a failed restore.
+  Without `result_error`, the landing of the `.restore` build calls `clearError` and removes the kept message.
+  With `result_error`, the landing shows the message again.
+
+Triage must decide which message the record keeps after a failed restore.
+`buffer_build_failed` says why the earlier restore failed. But after the new `.restore` build lands, that build failure no longer applies.
+`buffer_search_scan_failed` says why the accept opened nothing.
 
 A `.restore` build that fails or cannot queue after the accept must not loop. It shows its message, and the view keeps the preview.
 
@@ -62,8 +73,8 @@ Open question: who releases `saved_disclosures` after the accept of fault 1? The
 
 ## Acceptance criteria
 
-- [ ] A red test through `Presentation.dispatch`, "M21 kernel an accepted Buffer Search after a failed restore collapses the preview of the previous query", fails on `main`. It covers an Enter key during the failed work and an Enter key after it. After the accept, the view must have the rows of the view before the search, and `saved_disclosures` must be null.
-- [ ] A red test, "M21 kernel an accepted Buffer Search keeps the failure message of its input", fails on `main`. It fails the input work with `out_of_memory`, and it then presses the Enter key. The message must stay `out_of_memory`, and a message of another path must still clear.
+- [ ] A red test through `Presentation.dispatch`, "M21 kernel an accepted Buffer Search after a failed restore collapses the preview of the previous query", fails on `main`. It covers an Enter key during the failed work and an Enter key after it. One case starts with no accepted search. Another case first accepts a search that expands a Resolved Thread, and then edits the query of a new input to a scan that fails. After the accept and the landing of its `.restore` build, the view must have the rows of the disclosures that `buffer_search.saved_disclosures` held at the failure. In the second case, the thread of the earlier accepted search must be closed too, as after the restore of `failBufferSearchScan`. `saved_disclosures` must be null. After the `.restore` build lands, the status must show the message that triage chose for the record.
+- [ ] A red test, "M21 kernel an accepted Buffer Search keeps the failure message of its input", fails on `main`. It fails the input work with `out_of_memory`, and it then presses the Enter key. The message must stay `out_of_memory` after the accept, and also after the `.restore` build of the accept lands when the failure left a preview. A message of another path must still clear.
 - [ ] `docs/rules/tui-state.md` states the new accept rule once, and its Enforcement paragraph names both tests.
 - [ ] The open question has an answer in this ticket.
 - [ ] `zig build test` exits with 0.

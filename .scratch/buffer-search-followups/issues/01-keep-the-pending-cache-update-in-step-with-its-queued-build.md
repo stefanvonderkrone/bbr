@@ -54,13 +54,22 @@ Give each kind of a queued build one owner for its removal and its pending marke
 One option is a helper that removes a queued build and also resets the marker of its kind.
 An exhaustive switch on `DisclosureBuild.Kind` in that helper makes a new kind fail to compile until it names its marker.
 A smaller option is to keep `.cache_update` in the filter of `queueAcceptedDisclosure`, as `discardQueuedBufferSearchScans` does.
+With that option, the queued build stays, and `pending_cache_update` stays correct.
+So with the same focus, the next `ensureFocusedRange` returns without new work, and that is correct, because the kept build does the work.
 The `correct` skill prefers the first option, because it makes the divergence of the two lists impossible.
+
+The two options give different outcomes after the action. Both outcomes are correct:
+
+- The smaller option: the queued `.cache_update` build stays in the command queue, and `pending_cache_update` keeps its request ID.
+- The helper option: the action removes the build and sets `pending_cache_update` to null. Then the next `ensure_focused_enrichment` stages a cache build or queues a File Enrichment of the active File.
+
+In both outcomes, File Enrichment of the active File must start after the queued builds land. A stale build that queues again counts as queued until its retry lands.
 
 Open question: does the removal of a `.review_destination` or `.card_destination` build stall its path too?
 
 ## Acceptance criteria
 
-- [ ] A red test through `Presentation.dispatch`, "M21 kernel a disclosure build keeps the queued cache update of the focus check", fails on `main`. It queues a cache update while another build runs. Then it runs an action that calls `queueAcceptedDisclosure`, such as a fold toggle. With the same focus, the next `ensure_focused_enrichment` must queue a cache update or a File Enrichment of the active File.
+- [ ] A red test through `Presentation.dispatch`, "M21 kernel a disclosure build keeps the queued cache update of the focus check", fails on `main`. It queues a cache update while another build runs. Then it runs an action that calls `queueAcceptedDisclosure`, such as a fold toggle. The test accepts either outcome of the proposal. If the `.cache_update` build stays queued, the test lets it complete, and `pending_cache_update` must then be null. If the action removed the build, `pending_cache_update` must be null, and with the same focus, the next `ensure_focused_enrichment` must stage a cache build or queue a File Enrichment of the active File. In both outcomes, the test lands the queued builds and their retries, and a later `ensure_focused_enrichment` must queue a File Enrichment of the active File.
 - [ ] The test passes after the fix.
 - [ ] The open question has an answer in this ticket, with a test for each kind that stalls.
 - [ ] `zig build test` exits with 0.
