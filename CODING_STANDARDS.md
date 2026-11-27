@@ -155,7 +155,7 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 
 [Maintenance work](src/tui/GLOSSARY.md) is work that no input asked for and that a later check does again.
 A failure of maintenance work records its cause once and shows its failure message only when no message shows.
-`showMaintenanceError` makes that decision, and a later clear of the same event shows the kept failure.
+`showMaintenanceError` makes that decision.
 An allocation failure uses `out_of_memory`.
 A failed enrichment or cache update build uses `buffer_build_failed`.
 [A failed Buffer build has its record from the worker boundary](docs/rules/diagnostics.md#a-failed-buffer-build-has-its-record-from-the-worker-boundary).

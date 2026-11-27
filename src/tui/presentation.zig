@@ -4104,7 +4104,7 @@ pub const DeleteConfirmationProjection = struct {
 };
 
 /// The path that shows an action error. A completion of background work
-/// clears only an error of its own path, so it keeps an error that the user
+/// clears only an earlier error of its own path, so it keeps an error that the user
 /// has not read yet. A key, a mouse action, or an Overlay action is `.user`
 /// and clears any error of an earlier event.
 const ErrorOrigin = enum {
@@ -4125,6 +4125,7 @@ const ErrorOrigin = enum {
 
 const KeptFailure = struct {
     err: ActionError,
+    origin: ErrorOrigin,
     /// The `Presentation.event_serial` of the event of the failed step.
     event: u64,
 };
@@ -7073,10 +7074,12 @@ pub const Presentation = struct {
         const origin = self.errorOrigin();
         if (shown.event == self.event_serial) return;
         if (origin != .user and shown.origin != origin) return;
+        self.action_error = null;
         // A failed maintenance step of this event kept this message, so the
         // failure takes its place.
-        if (self.kept_failure) |kept| if (kept.event == self.event_serial) return self.showError(kept.err);
-        self.action_error = null;
+        if (self.kept_failure) |kept| if (kept.event == self.event_serial) {
+            self.action_error = .{ .err = kept.err, .origin = kept.origin, .key = null, .event = self.event_serial };
+        };
         self.status_revision +%= 1;
     }
 
@@ -9152,7 +9155,7 @@ pub const Presentation = struct {
     /// shown message. A clear of the same event then shows `err` instead.
     fn showMaintenanceError(self: *Presentation, err: ActionError) void {
         if (self.action_error == null) return self.showError(err);
-        self.kept_failure = .{ .err = err, .event = self.event_serial };
+        self.kept_failure = .{ .err = err, .origin = self.errorOrigin(), .event = self.event_serial };
     }
 
     /// No later check retries this input, so its failure replaces the shown message.
@@ -37552,6 +37555,9 @@ test "M21 kernel a Review Search query edit shows the failure of its cache stagi
         try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
         // An empty query also releases the holds, and that staging fails too.
         try testing.expectEqual(@as(usize, if (empty_query) 2 else 1), drainTestCommands(&presentation));
+        // The kept failure belongs to its own event, so the next key clears.
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'w', .text = "w" } });
+        try testing.expectEqual(@as(?ActionError, null), presentation.projection().action_error);
     };
 }
 
