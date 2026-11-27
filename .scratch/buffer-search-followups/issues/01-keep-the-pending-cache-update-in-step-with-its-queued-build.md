@@ -63,17 +63,24 @@ With the same focus, the next `ensureFocusedRange` then returns without new work
 That is correct, because the kept build does the work.
 The `correct` skill prefers the first option, because it makes the divergence of the two lists impossible.
 
-A correct fix leaves one of two states after the action:
+A correct fix leaves one of three states after the action:
 
 - `pending_cache_update` holds a request ID.
   A `.cache_update` build with that `cache_request_id` is in the command queue.
   The smaller option keeps the old build and its request ID.
   A helper that removes the build and at once queues a new build through `queueCacheBuild` gives a new request ID.
+- `pending_cache_update` holds a request ID.
+  A `.cache_update` build with that `cache_request_id` runs on the worker.
+  `takeCommand` removes a build from the command queue when it issues the build.
+  `pending_cache_update` stays set until the build lands in `acceptViewBuild`.
+  `queueAcceptedDisclosure` reads only the command queue, so neither option changes this state.
+  The test "M21 kernel Review Search starts a source scan without superseding a cache build in flight" treats this state as a cache build on the worker.
 - `pending_cache_update` is null.
   The helper option without a new build gives this state.
   Then the next `ensure_focused_enrichment` stages a cache build or queues a File Enrichment of the active File.
 
-In each state, File Enrichment of the active File must start after the queued builds land. A stale build that queues again counts as queued until its retry lands.
+In each state, File Enrichment of the active File must start after the queued and running builds land.
+A stale build that queues again counts as queued until its retry lands.
 
 Open question: does the removal of a `.review_destination` or `.card_destination` build stall its path too?
 
@@ -83,8 +90,8 @@ Open question: does the removal of a `.review_destination` or `.card_destination
   The test queues a cache update while another build runs.
   Then it runs an action that calls `queueAcceptedDisclosure`, such as a fold toggle.
   The test accepts each state of the proposal.
-  After the action, `pending_cache_update` must be null, or a request ID that a queued `.cache_update` build carries.
-  Then the test lands the queued builds and their retries.
+  After the action, `pending_cache_update` must be null, or a request ID that a queued or running `.cache_update` build carries.
+  Then the test lands the queued and running builds and their retries.
   After that, `pending_cache_update` must be null.
   With the same focus, the test then sends `ensure_focused_enrichment` at most two times.
   After each input, it lands the builds that the input queues.

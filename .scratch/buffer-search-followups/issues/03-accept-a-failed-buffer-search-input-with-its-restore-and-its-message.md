@@ -12,6 +12,10 @@ This ticket holds two faults of an accept after a failed Buffer Search input. Bo
 1. The user edits a query. A scan of the edited query fails. The restore build of that failed scan then fails too. When the user presses the Enter key during or after that work, the input closes. But the view keeps the preview of the previous query. A Resolved Thread that the previous preview expanded stays open. `BufferSearchState.saved_disclosures` stays set until the next search.
 2. The work of the input fails with `out_of_memory` at a Buffer Search failure site. When the user presses the Enter key after the failure, the input closes. The message disappears. So the accept opens nothing. The user does not see why.
 
+The fix also closes a gap that the restore of the accept and the restore of `failBufferSearchScan` share.
+The landing of each restore can replace a later error of another path.
+The section "Proposal" describes it.
+
 ## What is known about the cause
 
 The evidence comes from a read of `src/tui/presentation.zig` on `main` and from the tests that the source ticket names. No test reproduces either fault yet.
@@ -69,6 +73,26 @@ Then `acceptBufferSearch` uses the record:
   A message of a failed input build or a failed restore has the same origin.
   Without `result_error`, the landing of the `.restore` build calls `clearError` and removes the kept message.
   With `result_error`, the landing shows the message again.
+- The landing of the `.restore` build keeps a later error of another origin.
+  Take this order of events.
+  The accept queues the `.restore` build.
+  Then a completion of another path shows its error.
+  Then the `.restore` build lands.
+  The status must then show the later error.
+  One way is to show `result_error` only when no error shows or the shown error has the origin `.buffer_search`.
+  This follows the rule "Background work keeps an unrelated action error" in `docs/rules/tui-state.md`.
+
+`main` has the same gap in the restore of `failBufferSearchScan`, so the fix covers both restores.
+That restore is an input build, and `acceptBufferDisclosure` lands it.
+`acceptBufferDisclosure` calls `showError` with `result_error` and does not read the shown error.
+`acceptAcceptedDisclosure` does the same for the `.restore` build of the accept.
+So `main` has no keep that the fix can reuse.
+On `main`, the landing replaces a later error of another origin with `buffer_search_scan_failed`.
+With an Enter key during the restore, the landing then runs the accept with the origin `.buffer_search`.
+That accept keeps an error of another origin, but the landing already replaced it.
+So the user never sees the later error.
+This case comes from a read of the code. No test checks it.
+The fix applies the same keep to both landings.
 
 Triage must decide which message the record keeps after a failed restore.
 `buffer_build_failed` says why the earlier restore failed. But after the new `.restore` build lands, that build failure no longer applies.
@@ -98,6 +122,14 @@ Open question: who releases `saved_disclosures` after the accept of fault 1? The
   The message must stay `out_of_memory` after the accept.
   When the failure left a preview, the message must also stay after the `.restore` build of the accept lands.
   A message of another path must still clear.
+  Another case shows an error of another origin after the accept queues the `.restore` build and before that build lands.
+  The later error must stay after the build lands.
+- [ ] A red test, "M21 kernel a restore of a failed Buffer Search scan keeps a later unrelated error", fails on `main`.
+  It fails a scan, so `failBufferSearchScan` queues its restore.
+  Before the restore lands, a completion of another path shows its error.
+  One case presses the Enter key before that error shows, so the landing runs the accept.
+  Another case presses no Enter key.
+  The later error must stay after the restore lands.
 - [ ] The test "M21 kernel a Buffer Search input that fails after a query edit opens no occurrence of the previous query" passes with the new accept.
   `completeTestDisclosureBuilds` runs each queued build and returns the count of diagnostic records.
   Where the new accept queues a `.restore` build or fails to queue one, the test must match that accept.
@@ -112,6 +144,8 @@ Open question: who releases `saved_disclosures` after the accept of fault 1? The
   The third is the rule for a restore of `failBufferSearchScan` that cannot queue or fails.
   That rule says that the view keeps the previous preview and `saved_disclosures`.
   After the fix, that rule holds only until the accept.
-  The Enforcement paragraph of that section names both new tests.
+  That rule also says that the restore shows `buffer_search_scan_failed` again.
+  After the fix, the restore keeps a later error of another origin.
+  The Enforcement paragraph of that section names the three new tests.
 - [ ] The open question has an answer in this ticket.
 - [ ] `zig build test` exits with 0.
