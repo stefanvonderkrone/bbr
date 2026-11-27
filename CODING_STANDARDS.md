@@ -167,15 +167,14 @@ No check: the test "M21 kernel Review Search starts a source scan when no alloca
 ### Maintenance work keeps the shown message
 
 [Maintenance work](src/tui/GLOSSARY.md) is work that no input asked for and that a later check does again.
-A failure of maintenance work records its cause once and shows its failure message only when no message shows.
+A failure of maintenance work records its cause once. It shows its failure message only when its event ends without a message.
 An allocation failure uses `out_of_memory`.
 A failed enrichment or cache update build uses `buffer_build_failed`.
 [A failed Buffer build has its record from the worker boundary](docs/rules/diagnostics.md#a-failed-buffer-build-has-its-record-from-the-worker-boundary).
 A success clears only an error of its own origin, by [Background work keeps an unrelated action error](docs/rules/tui-state.md#background-work-keeps-an-unrelated-action-error).
 A successful cache staging writes no message.
-A user action that hands its work to maintenance work calls `clearError` before it does so, as `openReviewSearchOccurrence` does before the acquisition pump for an evicted File.
 
-These sites are maintenance work:
+These sites are maintenance work, and each has its `MaintenanceStep`:
 
 - A cache staging after a lease release or in the focus check. Both go through `stageCacheBuild`.
 - The retry of a stale cache update in `retryContentBuild`.
@@ -183,11 +182,13 @@ These sites are maintenance work:
 - The Review Search retry, `retryReviewSearchQuery`, of a query whose scan could not queue.
 - A failed enrichment build in `acceptBufferDisclosure` that cancels no pending reading location, `pending_review_location`, and a failed cache update build. `DisclosureBuild.Kind.isMaintenance` names these two build kinds, and its exhaustive switch makes a new build kind choose.
 - A non-speculative result that `dropEnrichments` drops when it cancels no pending reading location.
+- The Comment Overview rebuild, `refreshOverview`, that `dispatch` runs after each event. A failed rebuild keeps the index stale or the File Tree Filter changed, so the rebuild of the next event runs again. The test "M29 overview a failed Comment Overview refresh keeps the message of another path" in `src/tui/presentation.zig` fails when the failure replaces the message of another path.
 
 `dropEnrichments` records with operation `.completion` and phase `.admission`.
 A speculative-only drop records the failure without a message.
 
-`failMaintenance` writes the record and the message of a failed queue or staging, so a new such site calls it in its `catch`.
+`failMaintenance` writes the record of a failed queue or staging and records the failure of its step. So a new such site calls it in its `catch`.
+A step that a later run of the same event can recover passes its error union to `settleMaintenance` instead. `stageCacheBuild` and `queueMaintenanceFileEnrichment` do this.
 A function that also serves user input, such as `setReviewSearchQuery`, records its failure and returns `error.Reported` without a message.
 Then each caller picks the message.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.
@@ -199,7 +200,7 @@ A File that the acquisition cannot queue stays pending and unacquired, so a late
 So a failure loses no work and keeps the session.
 The message of the event outcome stays, such as `buffer_search_scan_failed` or `file_enrichment_launch_failed`.
 
-No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and calls `showError` without the check of a shown message passes every check, and so does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
+No check: the tests cover only the current sites, and they dispatch `ensure_focused_enrichment` themselves. A new site that queues maintenance work and calls `showError` instead of `showMaintenanceError` passes every check. So does an event loop that stops the dispatch after an event. Related checked rule: [Review Search source scan failures](docs/rules/tui-state.md#review-search-source-scan-failures).
 
 ### A dropped user input shows its failure
 
@@ -208,7 +209,10 @@ The failure of a user input is the outcome of that input. So the retry records t
 `failDroppedInput` does both.
 These retries call it: `retryViewBuild`, `retryAcceptedDisclosure`, `retryStaleBufferDisclosure`, `republishPostedParent`, and the `.draft_save` and `.draft_mutation` prongs of `retryContentBuild`.
 `selectVersion` also calls it when its view build or its File Enrichment cannot queue, because no later check does that input again.
-So does `replaceReviewSearchQuery` when a query edit or a reopened query cannot allocate or queue its scan.
+So does `replaceReviewSearchQuery` when a query edit cannot allocate or queue its scan.
+A Buffer Search query edit calls it when its input build cannot queue or fails its admission. The calls are in `acceptBufferSearchScanned`, `failBufferSearchScan`, and `acceptBufferDisclosure`.
+`acceptAcceptedDisclosure` also calls it when the admission of any of its builds cannot copy the disclosures.
+A reopened query keeps `needs_scan` after a failure, and the focus check retries it. So `openReviewSearch` runs `retryReviewSearchQuery`, which is maintenance work.
 An enrichment failure can cancel the pending reading location from a refresh or Reconciliation.
 That cancellation drops part of the refresh or Reconciliation.
 No later check restores the canceled location.
