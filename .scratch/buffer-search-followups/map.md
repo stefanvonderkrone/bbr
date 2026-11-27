@@ -14,7 +14,7 @@ They come from the same review, so they live in this effort too.
 
 | Ticket | Fault | File |
 | --- | --- | --- |
-| 01 | A search build removes a queued cache update and keeps its pending marker. | [01-keep-the-pending-cache-update-in-step-with-its-queued-build.md](issues/01-keep-the-pending-cache-update-in-step-with-its-queued-build.md) |
+| 01 | An accepted disclosure build, such as a fold toggle, removes a queued cache update and keeps its pending marker. | [01-keep-the-pending-cache-update-in-step-with-its-queued-build.md](issues/01-keep-the-pending-cache-update-in-step-with-its-queued-build.md) |
 | 02 | A refused maintenance File Enrichment shows `action_refused` at once and counts as a success. | [02-defer-the-refusal-of-a-maintenance-file-enrichment.md](issues/02-defer-the-refusal-of-a-maintenance-file-enrichment.md) |
 | 03 | An accept after a failed Buffer Search input keeps the old preview and clears the failure message. | [03-accept-a-failed-buffer-search-input-with-its-restore-and-its-message.md](issues/03-accept-a-failed-buffer-search-input-with-its-restore-and-its-message.md) |
 
