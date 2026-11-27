@@ -125,7 +125,9 @@ Open question: who releases `saved_disclosures` after the accept of fault 1? The
   Another case shows an error of another origin after the accept queues the `.restore` build and before that build lands.
   The later error must stay after the build lands.
 - [ ] A red test, "M21 kernel a restore of a failed Buffer Search scan keeps a later unrelated error", fails on `main`.
-  It fails a scan, so `failBufferSearchScan` queues its restore.
+  The scan fails after an edit from a query whose preview expanded a Resolved Thread.
+  This is the setup of the test "M21 kernel a failed restore of a failed Buffer Search scan shows the build failure".
+  So `failBufferSearchScan` queues its restore.
   Before the restore lands, a completion of another path shows its error.
   One case presses the Enter key before that error shows, so the landing runs the accept.
   Another case presses no Enter key.
