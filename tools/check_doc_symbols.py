@@ -16,7 +16,13 @@ FILE_EXTENSIONS = {
     "html", "yml", "yaml", "c", "h", "cc", "scm",
 }
 EXTERNAL_MODULES = {"std", "vaxis", "zf", "c"}
-QUOTED = re.compile(r'(?<!step )"([^"\n]+)"')
+STEP_QUOTE = r'"[^"\n]*"'
+QUOTED = re.compile(
+    rf"\b[Ss]teps? {STEP_QUOTE}(?:(?:,|,? and|,? or) {STEP_QUOTE})*"
+    r'|"([^"\n]+)"'
+    r"|((?<!\w)'[^'\n]+'(?!\w)|\u2018[^\u2019\n]+\u2019|\u201c[^\u201d\n]+\u201d)"
+)
+SENTENCE_END = re.compile(r"[.!?]\s")
 ZIG_FILE = re.compile(r"\bin `([^`\n]+\.zig)`")
 CODE_SPAN = re.compile(r"`[^`\n]*`")
 TEST_DECLARATION = re.compile(r'^\s*test\s+"((?:[^"\\]|\\.)*)"')
@@ -70,23 +76,34 @@ def enforcement_test_violations(root, path, paragraph, tests):
         starts.append((len(text), number))
         text += line.strip() + " "
     prose = CODE_SPAN.sub(lambda span: " " * len(span[0]), text)
+    bare = QUOTED.sub(lambda quote: " " * len(quote[0]), prose)
+    ends = [end.end() for end in SENTENCE_END.finditer(bare)]
+    code_span = "If the quote is not a test name, write it as a code span."
     for match in QUOTED.finditer(prose):
-        name = match[1]
         number = max(line for start, line in starts if start <= match.start())
         location = f"{path.relative_to(root)}:{number}"
-        file = ZIG_FILE.search(text, match.end()) or ([None] + list(ZIG_FILE.finditer(text, 0, match.start())))[-1]
+        if match[2]:
+            yield f"{location}: the quote {match[2]} is not in double quotes. Write a test name in double quotes. {code_span}"
+            continue
+        name = match[1]
+        if name is None:
+            continue
+        sentence_end = min((end for end in ends if end >= match.end()), default=len(text))
+        file = ZIG_FILE.search(text, match.end(), sentence_end) or (
+            [None] + list(ZIG_FILE.finditer(text, 0, match.start()))
+        )[-1]
         if file is None:
-            yield f'{location}: the test "{name}" names no file. Add "in `<file>.zig`" to its Enforcement paragraph.'
+            yield f'{location}: the test "{name}" names no file. Add "in `<file>.zig`" to its sentence or to a sentence before it. {code_span}'
             continue
         if not (root / file[1]).is_file():
-            yield f'{location}: the test "{name}" names the missing file {file[1]}. Name the file that holds the test.'
+            yield f'{location}: the test "{name}" names the missing file {file[1]}. Name the file that holds the test. {code_span}'
             continue
         if file[1] not in tests:
             tests[file[1]] = test_names(root, file[1])
         if name not in tests[file[1]]:
             yield (
                 f'{location}: {file[1]} has no test "{name}". '
-                "Point the Enforcement paragraph at an existing test, or restore the test."
+                f"Point the Enforcement paragraph at an existing test, or restore the test. {code_span}"
             )
 
 

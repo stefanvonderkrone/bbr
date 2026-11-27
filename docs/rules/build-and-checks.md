@@ -65,13 +65,14 @@ Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` 
 ## Test names in Enforcement paragraphs
 
 An Enforcement paragraph in `docs/rules/*.md` names each test in double quotes with the exact name of the test.
-The paragraph names the file of the test as "in `<file>.zig`", after the test name or before it.
+The paragraph names the file of the test as "in `<file>.zig`" in the sentence of the test or in an earlier sentence.
 Thus a renamed or removed test fails the check, and the claim of the paragraph keeps a test behind it.
 Write a part of a test name as a code span, such as the tests whose names start with `--default-reviewers`.
-A quote after "step", such as a CI step name, is not a test name.
+A quote after "step" or "steps", such as a CI step name, is not a test name.
 Write any other quoted text in an Enforcement paragraph as a code span.
+Do not use single quotes or curly quotes in an Enforcement paragraph.
 
-Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker fails on a quoted test name without a file. It also fails on a missing file and on a file without a `test "<name>"` declaration. The checker takes the first `.zig` file name after the test name, or else the last one before the test name. Only a file name after the word `in` counts. A test declaration in a comment or a string literal does not count. It skips code spans and fenced code blocks. It does not see a test name outside an Enforcement paragraph, such as a test name in `CODING_STANDARDS.md`. It reads only the name, not what the test fails on, so break the rule once all the same.
+Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker fails on a quoted test name without a file. It also fails on a missing file and on a file without a `test "<name>"` declaration. The checker takes the first `.zig` file name after the test name in the same sentence. Else it takes the last one before the test name in the paragraph. It also fails on a quote in single quotes or in curly quotes. Only a file name after the word `in` counts. A test declaration in a comment or a string literal does not count. It skips code spans and fenced code blocks. It does not see a test name outside an Enforcement paragraph, such as a test name in `CODING_STANDARDS.md`. It reads only the name, not what the test fails on, so break the rule once all the same.
 
 ## Compile claims in Enforcement paragraphs
 
