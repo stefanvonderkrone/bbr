@@ -4126,16 +4126,17 @@ const ErrorOrigin = enum {
 /// A step of maintenance work. An event keeps one outcome per step, so a
 /// later run of a step in the same event replaces the outcome of an
 /// earlier run.
-const MaintenanceStep = enum {
+const MaintenanceStep = union(enum) {
     /// `stageCacheBuild` and the retry of a stale cache update. A
     /// Session has one queued cache update, so a later staging recovers
     /// an earlier one.
     cache_staging,
     /// `retryReviewSearchQuery`.
     query_retry,
-    /// `queueMaintenanceFileEnrichment`. A queue of another File does not
-    /// recover it.
-    file_enrichment,
+    /// `queueMaintenanceFileEnrichment` of a File. Only a queue of the same
+    /// File recovers it. Null when two Files failed in the event, because
+    /// no one queue recovers both.
+    file_enrichment: ?usize,
     /// A failed enrichment or cache update build in `acceptBufferDisclosure`.
     failed_build,
     /// A non-speculative result that `dropEnrichments` drops.
@@ -4143,6 +4144,7 @@ const MaintenanceStep = enum {
 };
 
 const MaintenanceFailure = struct {
+    step: MaintenanceStep,
     err: ActionError,
     origin: ErrorOrigin,
 };
@@ -6782,7 +6784,7 @@ pub const Presentation = struct {
     /// The failed maintenance steps of the event that runs. `finishEvent`
     /// shows the failure of the first step in enum order when the event
     /// ends without a message.
-    maintenance_failures: std.EnumArray(MaintenanceStep, ?MaintenanceFailure) = .initFill(null),
+    maintenance_failures: std.EnumArray(std.meta.Tag(MaintenanceStep), ?MaintenanceFailure) = .initFill(null),
     diagnostic_state: bbr.diagnostic.State = .off,
     diagnostic_pending: bool = false,
     fatal_error: ?FatalError = null,
@@ -9164,7 +9166,10 @@ pub const Presentation = struct {
     /// of an earlier run of `step` in the same event.
     fn settleMaintenance(self: *Presentation, step: MaintenanceStep, operation: bbr.diagnostic.Operation, outcome: anyerror!void, comptime source: std.builtin.SourceLocation) void {
         outcome catch |err| return self.failMaintenance(step, operation, err, source);
-        self.maintenance_failures.set(step, null);
+        const entry = self.maintenance_failures.getPtr(step);
+        if (entry.*) |failure| if (std.meta.eql(failure.step, step)) {
+            entry.* = null;
+        };
     }
 
     /// Work that no input asked for, such as a cache staging or a File
@@ -9179,7 +9184,12 @@ pub const Presentation = struct {
     /// shown message. `finishEvent` shows `err` when the event ends without
     /// a message.
     fn showMaintenanceError(self: *Presentation, step: MaintenanceStep, err: ActionError) void {
-        self.maintenance_failures.set(step, .{ .err = err, .origin = self.errorOrigin() });
+        const entry = self.maintenance_failures.getPtr(step);
+        const failed: MaintenanceStep = if (entry.*) |earlier|
+            if (std.meta.eql(earlier.step, step)) step else .{ .file_enrichment = null }
+        else
+            step;
+        entry.* = .{ .step = failed, .err = err, .origin = self.errorOrigin() };
     }
 
     /// No later check retries this input, so its failure replaces the shown message.
@@ -12982,11 +12992,9 @@ pub const Presentation = struct {
     /// Queues a File Enrichment that no input asked for. The File stays
     /// pending after a failure, so a later check queues it again.
     fn queueMaintenanceFileEnrichment(self: *Presentation, published: *Published, file_index: usize) bool {
-        self.queueFileEnrichment(published, file_index, false) catch |err| {
-            self.failMaintenance(.file_enrichment, .file_enrichment, err, @src());
-            return false;
-        };
-        return true;
+        const outcome = self.queueFileEnrichment(published, file_index, false);
+        self.settleMaintenance(.{ .file_enrichment = file_index }, .file_enrichment, outcome, @src());
+        return if (outcome) true else |_| false;
     }
 
     /// Reads of a replaced Session also count. They run until they finish.
