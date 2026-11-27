@@ -192,10 +192,9 @@ class DocSymbolsTest(unittest.TestCase):
         )
         self.assertEqual(result.stderr.splitlines(), [message.format(3, "old"), message.format(7, "gone")])
 
-    def test_single_and_curly_quotes_fail(self):
+    def test_curly_quotes_fail(self):
         result = self.check(
-            "Enforcement: the agents' test 'first' and \u201cfirst\u201d and \u2018first\u2019 in `src/fixture.zig` don't pass. "
-            "The `bbr`'s output and the agents' docs pass.\n",
+            "Enforcement: \u201cfirst\u201d and \u2018first\u2019 in `src/fixture.zig` fail.\n",
             'test "first" {}\n',
             path="docs/rules/fixture.md",
         )
@@ -206,8 +205,17 @@ class DocSymbolsTest(unittest.TestCase):
         )
         self.assertEqual(
             result.stderr.splitlines(),
-            [message.format("'first'"), message.format("\u201cfirst\u201d"), message.format("\u2018first\u2019")],
+            [message.format("\u201cfirst\u201d"), message.format("\u2018first\u2019")],
         )
+
+    def test_single_quotes_and_apostrophes_pass(self):
+        result = self.check(
+            "Enforcement: the test \"first\"'s result and the agents' docs in `src/fixture.zig` pass. "
+            "The `bbr`'s output and 'other' text pass.\n",
+            'test "first" {}\n',
+            path="docs/rules/fixture.md",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_enforcement_test_name_keeps_its_code_span(self):
         result = self.check(

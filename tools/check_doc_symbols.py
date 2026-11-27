@@ -20,7 +20,7 @@ STEP_QUOTE = r'"[^"\n]*"'
 QUOTED = re.compile(
     rf"\b[Ss]tep {STEP_QUOTE}|\b[Ss]teps {STEP_QUOTE}(?:(?:,|,? and|,? or) {STEP_QUOTE})*"
     r'|"([^"\n]+)"'
-    r"|((?<!\w)'[^'\n]+'(?!\w)|\u2018[^\u2019\n]+\u2019|\u201c[^\u201d\n]+\u201d)"
+    r"|(\u2018[^\u2019\n]+\u2019|\u201c[^\u201d\n]+\u201d)"
 )
 SENTENCE_END = re.compile(r"[.!?]\s")
 ZIG_FILE = re.compile(r"\bin `([^`\n]+\.zig)`")
@@ -75,7 +75,7 @@ def enforcement_test_violations(root, path, paragraph, tests):
     for number, line in paragraph:
         starts.append((len(text), number))
         text += line.strip() + " "
-    prose = CODE_SPAN.sub(lambda span: "x" * len(span[0]), text)
+    prose = CODE_SPAN.sub(lambda span: " " * len(span[0]), text)
     bare = QUOTED.sub(lambda quote: " " * len(quote[0]), prose)
     ends = [end.end() for end in SENTENCE_END.finditer(bare)]
     code_span = "If the quote is not a test name, write it as a code span."

@@ -72,7 +72,7 @@ A quote after "step", such as a CI step name, is not a test name.
 After "steps", each quote of a list joined by commas, "and", or "or" is not a test name.
 The check also reads "Step" and "Steps" in this way.
 Write any other quoted text in an Enforcement paragraph as a code span.
-Do not put text in single quotes or in curly quotes in an Enforcement paragraph. An apostrophe is correct.
+Only double quotes name a test. The check does not read single quotes, so it does not find a test name in single quotes. Do not put text in curly quotes in an Enforcement paragraph.
 A sentence ends at a period, an exclamation mark, or a question mark before a space, so do not write abbreviations such as "e.g.".
 
 Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker fails on a quoted test name without a file. It also fails on a missing file and on a file without a `test "<name>"` declaration. The checker takes the first `.zig` file name after the test name in the same sentence. Else it takes the last one before the test name in the paragraph. It also fails on a quote in single quotes or in curly quotes. Only a file name after the word `in` counts. A test declaration in a comment or a string literal does not count. It skips code spans and fenced code blocks. It does not see a test name outside an Enforcement paragraph, such as a test name in `CODING_STANDARDS.md`. It reads only the name, not what the test fails on, so break the rule once all the same.
