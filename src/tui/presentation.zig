@@ -10964,7 +10964,7 @@ pub const Presentation = struct {
             error.OutOfMemory => {
                 disclosures.deinit(self.allocator);
                 if (job.kind == .clear_input or job.kind == .open_input) self.failPendingInput(published);
-                self.showError(.out_of_memory);
+                self.failDroppedInput(err, @src());
                 return;
             },
         };
