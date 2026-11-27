@@ -85,6 +85,8 @@ Open question: who releases `saved_disclosures` after the accept of fault 1? The
   One case starts with no accepted search.
   Another case first accepts a search that expands a Resolved Thread.
   Then it edits the query of a new input to a scan that fails.
+  In each case, the restore build of that failed scan fails or cannot queue.
+  This precondition holds for the Enter key during the failed work and for the Enter key after it.
   The test then lands the `.restore` build of the accept.
   The view must then have the rows of the disclosures that `buffer_search.saved_disclosures` held at the failure.
   In the second case, the thread of the earlier accepted search must also close, as after the restore of `failBufferSearchScan`.
@@ -97,8 +99,12 @@ Open question: who releases `saved_disclosures` after the accept of fault 1? The
   When the failure left a preview, the message must also stay after the `.restore` build of the accept lands.
   A message of another path must still clear.
 - [ ] The test "M21 kernel a Buffer Search input that fails after a query edit opens no occurrence of the previous query" passes with the new accept.
-  On `main`, its `.input_build` case with `enter_first` expects no build from `completeTestDisclosureBuilds`.
-  After the fix, the accept in that case queues a `.restore` build, so the case must expect that build.
+  `completeTestDisclosureBuilds` runs each queued build and returns the count of diagnostic records.
+  Where the new accept queues a `.restore` build or fails to queue one, the test must match that accept.
+  The `queue_disclosure` and `queue_restore` cases with `enter_first` set `disclosure_inputs_current` to false.
+  So the queue of the `.restore` build of the accept can fail there and add a record.
+  Each case must expect the record count of the new accept from `completeTestDisclosureBuilds`.
+  The test keeps its checks that the input closes and that the status shows the message of the new accept.
 - [ ] `docs/rules/tui-state.md` states the new accept rule once, in the section "Background work keeps an unrelated action error".
   The fix updates three old rules of that section.
   The first is the rule that an accept without a batch keeps only `buffer_search_scan_failed` or `buffer_search_no_matches`.
