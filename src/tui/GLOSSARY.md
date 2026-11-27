@@ -19,7 +19,7 @@ The lazily acquired old/new full-file content and Highlighting attached to a Fil
 _Avoid_: blob load, highlight job, hydration.
 
 **Maintenance work**:
-Work that Presentation queues or stages when no input asked for it, and that a later check does again after a failure, such as a cache staging in the focus check or a File Enrichment of the Review Search acquisition. Its failure keeps the shown message.
+Work that Presentation queues or stages when no input asked for it, and that a later check does again after a failure, such as a cache staging in the focus check or a File Enrichment of the Review Search acquisition. Its failure keeps the shown message, and it shows only when its event ends without a message.
 _Avoid_: housekeeping.
 
 **Enrichment Range**:

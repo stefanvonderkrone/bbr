@@ -173,8 +173,8 @@ These sites are maintenance work, and each has its `MaintenanceStep`:
 `dropEnrichments` records with operation `.completion` and phase `.admission`.
 A speculative-only drop records the failure without a message.
 
-`failMaintenance` writes the record and the message of a failed queue or staging, so a new such site calls it in its `catch`.
-A step that a later run of the same event can recover passes its error union to `settleMaintenance` instead, as `stageCacheBuild` does.
+`failMaintenance` writes the record of a failed queue or staging and records the failure of its step, so a new such site calls it in its `catch`.
+A step that a later run of the same event can recover passes its error union to `settleMaintenance` instead, as `stageCacheBuild` and `queueMaintenanceFileEnrichment` do.
 A function that also serves user input, such as `setReviewSearchQuery`, records its failure and returns `error.Reported` without a message.
 Then each caller picks the message.
 The event loop in `src/tui/app.zig` dispatches `ensure_focused_enrichment` after each event while a Review shows.

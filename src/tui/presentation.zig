@@ -9181,7 +9181,8 @@ pub const Presentation = struct {
 
     /// Work that no input asked for, such as a cache staging or a File
     /// Enrichment of the focus check, runs again at a later check. So its
-    /// failure has one record and keeps the shown message.
+    /// failure has one record and keeps the shown message. `finishEvent`
+    /// shows it when the event ends without a message.
     fn failMaintenance(self: *Presentation, step: MaintenanceStep, operation: bbr.diagnostic.Operation, err: anyerror, comptime source: std.builtin.SourceLocation) void {
         self.reportFailure(operation, .prepare, err, source);
         self.showMaintenanceError(step, .out_of_memory);
@@ -9189,7 +9190,8 @@ pub const Presentation = struct {
 
     /// A later check does the failed step again, so its failure keeps a
     /// shown message. `finishEvent` shows `err` when the event ends without
-    /// a message.
+    /// a message. A failure of a second File makes the File Enrichment step
+    /// name no File.
     fn showMaintenanceError(self: *Presentation, step: MaintenanceStep, err: ActionError) void {
         const entry = self.maintenance_failures.getPtr(step);
         const failed: MaintenanceStep = if (entry.*) |earlier|
