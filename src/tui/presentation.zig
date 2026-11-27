@@ -4261,6 +4261,20 @@ const BufferSearchInput = struct {
         self.corpus.release();
         self.* = undefined;
     }
+
+    /// While a scan is pending, the input shows the batch of the previous
+    /// query. A scan that ends without its own batch drops that batch, so an
+    /// accept never installs the batch of another query.
+    fn failPendingScan(self: *BufferSearchInput, allocator: Allocator) void {
+        if (self.batch) |*batch| batch.deinit(allocator);
+        if (self.ranges) |ranges| std.heap.page_allocator.free(ranges);
+        if (self.navigation_rows) |rows| std.heap.page_allocator.free(rows);
+        self.batch = null;
+        self.ranges = null;
+        self.navigation_rows = null;
+        self.active = null;
+        self.pending = false;
+    }
 };
 
 const BufferSearchState = struct {
@@ -10005,7 +10019,7 @@ pub const Presentation = struct {
         if (completed.request_id != input.request_id or !input.pending) return;
         var batch = switch (completed.outcome) {
             .failed => {
-                input.pending = false;
+                input.failPendingScan(self.allocator);
                 self.showError(.buffer_search_scan_failed);
                 published.frame_revision += 1;
                 return;
@@ -10024,7 +10038,7 @@ pub const Presentation = struct {
         if (self.queueBufferDisclosure(published, batch, active, input.request_id, completed.navigation_rows) catch |err| switch (err) {
             error.OutOfMemory => {
                 batch.deinit(self.allocator);
-                input.pending = false;
+                input.failPendingScan(self.allocator);
                 self.showError(.out_of_memory);
                 published.frame_revision += 1;
                 return;
@@ -10032,7 +10046,7 @@ pub const Presentation = struct {
         }) return;
         const ranges = completed.ranges orelse {
             batch.deinit(self.allocator);
-            input.pending = false;
+            input.failPendingScan(self.allocator);
             self.showError(.buffer_search_scan_failed);
             published.frame_revision += 1;
             return;
@@ -10112,7 +10126,7 @@ pub const Presentation = struct {
             return;
         }
         if (job.failed) {
-            input.pending = false;
+            input.failPendingScan(self.allocator);
             self.showError(.buffer_build_failed);
             published.frame_revision += 1;
             return;
@@ -10150,7 +10164,7 @@ pub const Presentation = struct {
                 std.heap.page_allocator.free(ranges);
                 if (accepted_ranges) |old| std.heap.page_allocator.free(old);
                 if (review_ranges) |old| std.heap.page_allocator.free(old);
-                input.pending = false;
+                input.failPendingScan(self.allocator);
                 self.showError(.out_of_memory);
                 return;
             },
@@ -11043,17 +11057,17 @@ pub const Presentation = struct {
         const query = input.query orelse return;
         const worker_query = search.Query.init(std.heap.page_allocator, query.text) catch |err| switch (err) {
             error.OutOfMemory => {
-                input.pending = false;
+                input.failPendingScan(self.allocator);
                 self.failDroppedInput(err, @src());
                 return;
             },
             error.TooLong => {
-                input.pending = false;
+                input.failPendingScan(self.allocator);
                 self.showError(.buffer_search_query_too_long);
                 return;
             },
             error.InvalidUtf8, error.LineEnding, error.Nul => {
-                input.pending = false;
+                input.failPendingScan(self.allocator);
                 self.showError(.buffer_search_invalid_query);
                 return;
             },
@@ -11072,7 +11086,7 @@ pub const Presentation = struct {
         self.commands.append(self.allocator, command) catch |err| switch (err) {
             error.OutOfMemory => {
                 command.deinit();
-                input.pending = false;
+                input.failPendingScan(self.allocator);
                 self.failDroppedInput(err, @src());
                 return;
             },
