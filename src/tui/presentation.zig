@@ -26359,6 +26359,62 @@ test "M21 kernel an Enter key during a failed Buffer Search query clear closes t
     }
 }
 
+test "M21 kernel a failed admission of a disclosure build records the failure once" {
+    for ([_]DisclosureBuild.Kind{ .accepted, .restore, .general, .open_input }) |kind| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var once: FailOnceAllocator = .{ .child = testing.allocator };
+        var presentation = try Presentation.init(once.allocator(), .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+            .diagnostic_state = .on,
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 40 },
+        });
+        defer presentation.deinit();
+        if (kind == .restore or kind == .open_input) {
+            // These builds copy the disclosures from before the preview, so
+            // the copy allocates only when the user expanded one.
+            try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+            try presentation.dispatch(.{ .action = .toggle_disclosure });
+            try completeDisclosureBuild(&presentation);
+        }
+        switch (kind) {
+            .accepted => {
+                try presentation.dispatch(.{ .action = .open_buffer_search });
+                try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c" } });
+                try completeBufferSearchScan(&presentation);
+                try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+                try presentation.dispatch(.{ .key = .{ .codepoint = '4', .text = "4" } });
+                try presentation.dispatch(.{ .key = .{ .codepoint = 'n' } });
+            },
+            .restore => {
+                try presentation.dispatch(.{ .action = .open_buffer_search });
+                try replaceTestBufferSearchQuery(&presentation, "eigh");
+                try completeBufferSearchScan(&presentation);
+                try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+            },
+            .general => {
+                try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+                try presentation.dispatch(.{ .action = .toggle_disclosure });
+            },
+            .open_input => {
+                try revealTemporaryReviewFold(&presentation);
+                try presentation.dispatch(.{ .action = .open_buffer_search });
+                try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+            },
+            else => unreachable,
+        }
+        const job = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(kind, job.kind);
+        job.build();
+        try testing.expect(job.disclosures.len > 0);
+        once.armed = true;
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        try testing.expect(once.failed and !once.armed);
+        try testing.expectEqual(@as(?ActionError, .out_of_memory), presentation.projection().action_error);
+        try testing.expectEqual(@as(usize, 1), try completeTestDisclosureBuilds(&presentation));
+    }
+}
+
 test "M21 kernel a failed Buffer Search opening keeps the input open" {
     const Failure = enum { build, queue_retry };
     for ([_]Failure{ .build, .queue_retry }) |failure| {
