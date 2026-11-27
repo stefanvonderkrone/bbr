@@ -10,8 +10,8 @@ from `event_origin`. `dispatch` sets it from its input, and `withErrorOrigin`
 sets it for one piece of work, so a raw write of `event_origin` would give an
 error the wrong origin.
 
-Code in Presentation reads `action_error` only in its writers and in
-`projection`. A read elsewhere decides whether a message shows, and that
+Code in Presentation reads `action_error` only in its writers,
+`clearErrorExcept`, and `projection`. A read elsewhere decides whether a message shows, and that
 decision belongs to `finishEvent`. Code in Presentation uses
 `maintenance_failures` only in `settleMaintenance`, `showMaintenanceError`, and
 `finishEvent`, so each failed step goes through `failMaintenance` or
@@ -81,7 +81,7 @@ ACCESSES = tuple(
         (
             "action_error",
             "reads",
-            ("showErrorFor", "clearError", "finishEvent", "projection"),
+            ("showErrorFor", "clearError", "clearErrorExcept", "finishEvent", "projection"),
             "To report a failed maintenance step, call failMaintenance(step, operation, err, source) or "
             "showMaintenanceError(step, err). finishEvent shows it when the event ends without a message.",
         ),
@@ -194,7 +194,7 @@ def main():
     if found:
         return 1
     print(
-        "Only showErrorFor, clearError, and finishEvent write action_error, and only they and projection read it. "
+        "Only showErrorFor, clearError, and finishEvent write action_error, and only they, clearErrorExcept, and projection read it. "
         "Only dispatch and withErrorOrigin write event_origin. "
         "Only settleMaintenance, showMaintenanceError, and finishEvent use maintenance_failures. "
         "Each withErrorOrigin call in Presentation names an enum literal."

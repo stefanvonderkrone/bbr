@@ -304,7 +304,7 @@ class ActionErrorsTest(unittest.TestCase):
     def test_a_hand_kept_message_is_rejected(self):
         found = self.check(OLD_KEEP)
         self.assertEqual([message.split(":")[1] for message in found], ["3", "7", "12"])
-        self.assertIn("reads action_error outside showErrorFor, clearError, finishEvent, and projection.", found[0])
+        self.assertIn("reads action_error outside showErrorFor, clearError, clearErrorExcept, finishEvent, and projection.", found[0])
         self.assertIn("showMaintenanceError(step, err)", found[0])
 
     def test_every_read_form_of_the_shown_error_is_rejected(self):

@@ -7091,6 +7091,13 @@ pub const Presentation = struct {
         self.status_revision +%= 1;
     }
 
+    /// Clears the shown error by the rule of `clearError` unless it is one
+    /// of `kept`.
+    fn clearErrorExcept(self: *Presentation, kept: []const ActionError) void {
+        const shown = self.action_error orelse return;
+        if (std.mem.indexOfScalar(ActionError, kept, shown.err) == null) self.clearError();
+    }
+
     /// Ends the outermost event. A maintenance failure shows only when the
     /// event ends without a message, so no clear of the event removes it,
     /// and a step that a later run recovered shows nothing.
@@ -9761,11 +9768,11 @@ pub const Presentation = struct {
         };
         input.deinit(self.allocator);
         // An accepted search without matches opens nothing, so the user
-        // sees why. A search without a batch keeps the message of its
-        // failed scan.
+        // sees why. A search without a batch keeps only the message that
+        // says why it has none.
         if (published.buffer_search.accepted_batch) |batch| {
             if (batch.occurrences.len == 0) self.showError(.buffer_search_no_matches) else self.clearError();
-        }
+        } else self.clearErrorExcept(&.{ .buffer_search_scan_failed, .buffer_search_no_matches });
         published.frame_revision += 1;
     }
 
