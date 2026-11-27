@@ -131,30 +131,37 @@ def literal_origin_violations(relative, lines, span):
     return found
 
 
-def outside_helpers(lines, helpers):
-    """Each line number outside the bodies of the helper functions."""
+def outside_helpers(lines, helpers, span):
+    """Each line number outside the bodies of the helper functions.
+
+    A helper is a method of Presentation, so a function of the same name in
+    another struct is not one.
+    """
     helper_depth = None
     body_open = False
     depth = 0
     for number, line in enumerate(lines, 1):
-        if helper_depth is None and helpers.match(line):
+        method = span[0] < number <= span[1] + 1 and depth == 1
+        if helper_depth is None and method and helpers.match(line):
             helper_depth = depth
             body_open = False
         elif helper_depth is None:
             yield number
         depth += line.count("{") - line.count("}")
         if helper_depth is not None:
-            body_open = body_open or depth > helper_depth
+            # A body on the line of the signature opens and closes there.
+            body_open = body_open or depth > helper_depth or "{" in line
             if body_open and depth <= helper_depth:
                 helper_depth = None
 
 
-def matches(lines, helpers, pattern, numbers):
-    """The line number of each match in the text of `numbers` outside the helpers, joined across lines."""
-    kept = set(outside_helpers(lines, helpers)) & numbers
+def matches(lines, helpers, pattern, numbers, span):
+    """The line and the column of each match in the text of `numbers` outside the helpers, joined across lines."""
+    kept = set(outside_helpers(lines, helpers, span)) & numbers
     text = "\n".join(line if number in kept else "" for number, line in enumerate(lines, 1))
     for match in pattern.finditer(text):
-        yield 1 + text.count("\n", 0, match.start("name"))
+        start = match.start("name")
+        yield 1 + text.count("\n", 0, start), start - text.rfind("\n", 0, start)
 
 
 def violations(root):
@@ -168,14 +175,14 @@ def violations(root):
         everywhere = set(range(1, len(lines) + 1))
         written = set()
         for field, helpers, pattern, message in WRITES:
-            for number in matches(lines, helpers, pattern, everywhere):
-                written.add((field, number))
-                found.append((str(relative), number, f"{relative}:{number}: {message}"))
+            for place in matches(lines, helpers, pattern, everywhere, span):
+                written.add(place)
+                found.append((str(relative), place[0], f"{relative}:{place[0]}: {message}"))
         body = set(range(span[0] + 2, span[1] + 2))
         for field, helpers, pattern, message in ACCESSES:
-            for number in matches(lines, helpers, pattern, body):
-                if (field, number) not in written:
-                    found.append((str(relative), number, f"{relative}:{number}: {message}"))
+            for place in matches(lines, helpers, pattern, body, span):
+                if place not in written:
+                    found.append((str(relative), place[0], f"{relative}:{place[0]}: {message}"))
     return [message for _, _, message in sorted(found)]
 
 
