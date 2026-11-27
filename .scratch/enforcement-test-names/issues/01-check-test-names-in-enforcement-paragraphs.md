@@ -65,3 +65,4 @@ Review:
 - The rule section keeps the sentence about the file of the test, as the section "Compile claims in Enforcement paragraphs" does.
 - The review flagged STE problems in the messages of commits that already exist. These commits stay as they are.
 - OCR round 1 gaps: added tests for a stale quote after a closed code span and for a Zig multiline string line that names a test. Each new test fails under its mutation (mask to the paragraph end; unanchored TEST with search). Mutations reverted.
+- CodeRabbit round 1: `0ca1b7b7` adds the red test for an escaped backtick that opened a code span and hid a missing name. Two subtests failed before the fix. `c35a7d36` makes an escaped backtick not open a span and keeps a backslash in a span literal. The finding about a name with an escaped double quote is dismissed, because the rule section states that limit.
