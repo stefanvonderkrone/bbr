@@ -26314,7 +26314,7 @@ test "M21 kernel a failed Buffer Search opening keeps the input open" {
             .queue_retry => presentation.published.?.disclosure_inputs_current = false,
         }
         try presentation.dispatch(.{ .buffer_disclosure_built = opening });
-        const input = presentation.published.?.buffer_search.input.?;
+        const input = presentation.published.?.buffer_search.input orelse return error.TestUnexpectedResult;
         try testing.expect(!input.pending);
         try testing.expectEqual(@as(?ActionError, if (failure == .build) .buffer_build_failed else .out_of_memory), presentation.projection().action_error);
         // An accept would queue the opening that just failed.
@@ -26343,7 +26343,10 @@ test "M21 kernel an Enter key during a failed Buffer Search query clear opens th
         try replaceTestBufferSearchQuery(&presentation, "c5");
         try completeBufferSearchScan(&presentation);
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        // One occurrence, so the next occurrence wraps to it.
+        try testing.expectEqual(@as(usize, 1), presentation.published.?.buffer_search.accepted_batch.?.occurrences.len);
         const occurrence_row = presentation.published.?.navigation.cursor;
+        try testing.expect(occurrence_row != 0);
         const accepted_rows = presentation.projection().review.?.buffer.rows.len;
         try moveToRow(&presentation, 0);
         try presentation.dispatch(.{ .action = .open_buffer_search });
@@ -26371,8 +26374,8 @@ test "M21 kernel an Enter key during a failed Buffer Search query clear opens th
                 try testing.expectEqual(occurrence_row, presentation.published.?.navigation.cursor);
                 try testing.expectEqual(@as(?ActionError, .buffer_search_hit_bottom), presentation.projection().action_error);
             },
-            // The rule in docs/rules/tui-state.md: without its build, the view
-            // keeps the disclosures of the preview.
+            // The rule in docs/rules/tui-state.md: when the build of the
+            // occurrence cannot queue, the view keeps the preview.
             .queue_retry => {
                 try testing.expect(presentation.takeCommand() == null);
                 try testing.expectEqual(preview_rows, presentation.projection().review.?.buffer.rows.len);
