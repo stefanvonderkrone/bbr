@@ -32,7 +32,8 @@ Item 5 is a design choice of the pump. Triage decides whether it is part of this
 A user input such as `selectVersion` also calls `queueFileEnrichment` with `speculative` false.
 For a user input, the message at once is right, because the user asked for the work.
 
-The source ticket kept this out of scope. The code before that branch did the same, and the message is not `out_of_memory`.
+The source ticket kept this out of scope. The code before that branch did the same.
+Also the message is not `out_of_memory`.
 
 ## Proposal
 

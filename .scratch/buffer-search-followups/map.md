@@ -6,7 +6,8 @@ This effort holds known faults on `main` at `b6b31d6a`.
 The work of [the query edit clear order ticket](../query-edit-clear-order/issues/01-clear-before-the-maintenance-steps-of-a-query-edit.md) found them and did not fix them.
 Its sections "OCR round 5", "OCR round 6", and "CodeRabbit round 2" name them.
 Each ticket here starts as `needs-triage`.
-Triage writes the red test, and then it moves the ticket to `ready-for-agent`.
+Triage writes the red test.
+Then it moves the ticket to `ready-for-agent`.
 
 Tickets 01 and 02 are not Buffer Search faults.
 They come from the same review, so they live in this effort too.
