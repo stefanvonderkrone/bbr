@@ -18,7 +18,7 @@ FILE_EXTENSIONS = {
 EXTERNAL_MODULES = {"std", "vaxis", "zf", "c"}
 STEP_QUOTE = r'"[^"\n]*"'
 QUOTED = re.compile(
-    rf"\b[Ss]tep {STEP_QUOTE}|\b[Ss]teps {STEP_QUOTE}(?:(?:,|,? and|,? or) {STEP_QUOTE})*"
+    rf"\b[Ss]teps? {STEP_QUOTE}(?:(?:,|,? and|,? or) {STEP_QUOTE})*"
     r'|"([^"\n]+)"'
     r"|((?<!\w)'[^'\n]+'(?!\w)|\u2018[^\u2019\n]+\u2019|\u201c[^\u201d\n]+\u201d)"
 )
@@ -75,18 +75,18 @@ def enforcement_test_violations(root, path, paragraph, tests):
     for number, line in paragraph:
         starts.append((len(text), number))
         text += line.strip() + " "
-    prose = CODE_SPAN.sub(lambda span: "x" * len(span[0]), text)
+    prose = CODE_SPAN.sub(lambda span: " " * len(span[0]), text)
     bare = QUOTED.sub(lambda quote: " " * len(quote[0]), prose)
     ends = [end.end() for end in SENTENCE_END.finditer(bare)]
     code_span = "If the quote is not a test name, write it as a code span."
     for match in QUOTED.finditer(prose):
-        name = match[1]
-        if name is None and match[2] is None:
-            continue
         number = max(line for start, line in starts if start <= match.start())
         location = f"{path.relative_to(root)}:{number}"
         if match[2]:
             yield f"{location}: the quote {match[2]} is not in double quotes. Write a test name in double quotes. {code_span}"
+            continue
+        name = match[1]
+        if name is None:
             continue
         sentence_end = min((end for end in ends if end >= match.end()), default=len(text))
         file = ZIG_FILE.search(text, match.end(), sentence_end) or (
