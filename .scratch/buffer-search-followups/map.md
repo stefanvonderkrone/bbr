@@ -9,7 +9,7 @@ Each ticket here starts as `needs-triage`.
 Triage writes the red test.
 Then it moves the ticket to `ready-for-agent`.
 
-Tickets 01 and 02 are not Buffer Search faults.
+Ticket 01 is not only a Buffer Search fault. Ticket 02 is not a Buffer Search fault.
 They come from the same review, so they live in this effort too.
 
 | Ticket | Fault | File |
