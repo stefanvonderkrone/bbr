@@ -216,3 +216,7 @@ A readonly review found two medium items and six low items. A list of quotes aft
 Branch `m30-viewer-scrollbars` has a near copy of the check in `tools/check_agent_docs.py`. Its merge with `main` must keep only one copy, with the step token, the quote form error, the sentence limit, and the error text of this round.
 
 Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_action_errors.py`, `python3 tools/check_diagnostics.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_doc_symbols_test.py` pass.
+
+## OCR round 12
+
+Open Code Review found two items in the Enforcement test name check. The check read a test name from the text with blanked code spans, so a correct quote such as "a `b` c" failed. The check now reads the name from the original text. The check also failed a correct doc because an apostrophe opened a single quote. The check now does not read single quotes, and the rule states that only double quotes name a test. Each fix has a unit test that failed before the fix. Checks: `zig build test` exits with 0. `zig fmt --check src build.zig tests`, `python3 tools/check_agent_docs.py`, `python3 tools/check_doc_symbols.py .`, and `python3 tests/check_doc_symbols_test.py` pass.
