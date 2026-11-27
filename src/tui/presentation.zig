@@ -26004,6 +26004,60 @@ test "M21 kernel an accepted Buffer Search keeps the scan failure of its query e
     }
 }
 
+fn completeTestDisclosureBuilds(presentation: *Presentation) !void {
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command != .build_buffer_disclosure) {
+            command.deinit();
+            continue;
+        }
+        command.build_buffer_disclosure.build();
+        try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+    }
+}
+
+test "M21 kernel a failed Buffer Search scan collapses the preview of the previous query" {
+    const Case = struct { appended: []const u8, missing_ranges: bool };
+    for ([_]Case{
+        .{ .appended = "x", .missing_ranges = false },
+        .{ .appended = "t", .missing_ranges = true },
+    }) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        const initial = presentation.projection().review.?.buffer.rows.len;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eigh" } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expect(presentation.projection().review.?.buffer.rows.len > initial);
+
+        try presentation.dispatch(.{ .key = .{ .codepoint = case.appended[0], .text = case.appended } });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+        if (case.missing_ranges) {
+            std.heap.page_allocator.free(completed.ranges.?);
+            completed.ranges = null;
+        } else {
+            completed.outcome.scanned.deinit(completed.allocator);
+            completed.outcome = .failed;
+        }
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        try completeTestDisclosureBuilds(&presentation);
+        try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expectEqual(@as(?ActionError, .buffer_search_scan_failed), presentation.projection().action_error);
+        try testing.expect(presentation.projection().buffer_search == null);
+        try testing.expectEqual(initial, presentation.projection().review.?.buffer.rows.len);
+    }
+}
+
 test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
