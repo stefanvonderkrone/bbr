@@ -384,6 +384,17 @@ class ActionErrorsTest(unittest.TestCase):
         self.assertIn("reads action_error outside", found[0])
         self.assertIn("uses maintenance_failures outside", found[1])
 
+    def test_a_projection_read_in_presentation_is_rejected(self):
+        found = self.check(
+            "pub const Presentation = struct {\n"
+            "    fn keep(self: *Presentation) void {\n"
+            "        if (self.projection().action_error == null) self.showError(.out_of_memory);\n"
+            "    }\n"
+            "};\n"
+        )
+        self.assertEqual([message.split(":")[1] for message in found], ["3"])
+        self.assertIn("reads action_error outside", found[0])
+
     def test_a_file_without_the_presentation_struct_is_rejected(self):
         found = self.check(COPIED_ORIGIN.replace("pub const Presentation = struct {", "pub const Renamed = struct {"))
         self.assertEqual(len(found), 1, found)
