@@ -76,7 +76,8 @@ Enforcement: `tools/check_agent_docs.py` counts the sentences without a mechanis
 Each text in straight double quotes in an Enforcement paragraph of `docs/rules/*.md` is the name of a test.
 The name is equal to the name of a `test "..."` declaration in a `.zig` file under `src/` or `tests/`.
 Write other quoted text, such as a CI step name, as a code span.
-Thus a renamed or deleted test makes the check fail on the doc that names it.
+Thus the check fails on a doc that names a renamed or deleted test.
+It passes when another `.zig` file still declares a test with that name.
 
 Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker reads each paragraph that starts with `Enforcement:` up to the next blank line or fence. It skips fenced code blocks and code spans. It fails on a quoted name that no test declares, on an unpaired double quote, and on a curly double quote. It does not read single quotes. It compares the doc text with the raw text of the Zig literal and does not decode a Zig escape. A doc writes a backslash in a name as the Zig source writes it. A doc cannot cite a name with an escaped double quote. A doc also cannot cite a test whose name is not on the line of its `test` keyword. The checker does not check that the file that the paragraph names declares the test.
 
