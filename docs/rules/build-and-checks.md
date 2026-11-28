@@ -45,7 +45,7 @@ The suffix of a file name in `tests/` decides where the file runs. No list needs
 
 Any other file in `tests/` is a support file and goes in `test_support_files` in `build.zig`.
 
-Enforcement: `addTestScripts` in `build.zig` lists `tests/` when the build configures. `zig build test` fails on a file that fits no suffix and is not a support file. The CI step "Tests that need CI tools" runs `tests/*_ci_test.py` with a glob.
+Enforcement: `addTestScripts` in `build.zig` lists `tests/` when the build configures. `zig build test` fails on a file that fits no suffix and is not a support file. The CI step `Tests that need CI tools` runs `tests/*_ci_test.py` with a glob.
 
 ## Checker source lines
 
@@ -70,6 +70,16 @@ The check reads each whole Enforcement paragraph, up to the next blank line, and
 A type that only lacks a way to write, such as a `const` pointer, a missing field, or a return type without an error union, is not such a mechanism, because a cast, a new field, or a `catch` compiles.
 
 Enforcement: `tools/check_agent_docs.py` counts the sentences without a mechanism in each area doc and fails when a count differs from `tools/compile_claim_baseline.txt`. CI runs the check. The tests in `tests/check_agent_docs_test.py`, run by `zig build test`, reject the old return type claim of `ScanReviewSource.create` and the old `const` claim of the Session fields. The check reads the name of a mechanism, not what the mechanism fails on.
+
+## Test names in Enforcement paragraphs
+
+Each text in straight double quotes in an Enforcement paragraph of `docs/rules/*.md` is the name of a test.
+The name is equal to the name of a `test "..."` declaration in a `.zig` file under `src/` or `tests/`.
+Write other quoted text, such as a CI step name, as a code span.
+Thus the check fails on a doc that names a renamed or deleted test.
+It passes when another `.zig` file still declares a test with that name.
+
+Enforcement: `tools/check_doc_symbols.py` and `tests/check_doc_symbols_test.py` run under `zig build test`. CI also runs the checker directly. The checker reads each paragraph that starts with `Enforcement:` up to the next blank line or fence. It skips fenced code blocks and code spans. It fails on a quoted name that no test declares, on an unpaired double quote, and on a curly double quote. It does not read single quotes. It compares the doc text with the raw text of the Zig literal and does not decode a Zig escape. A doc writes a backslash in a name as the Zig source writes it. A doc cannot cite a name with an escaped double quote. A doc also cannot cite a test whose name is not on the line of its `test` keyword. The checker does not check that the file that the paragraph names declares the test.
 
 ## CLI check environment
 
