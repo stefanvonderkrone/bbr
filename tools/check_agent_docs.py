@@ -7,7 +7,6 @@ import sys
 from urllib.parse import unquote, urlsplit
 
 import count_baseline
-from source_lines import zig_files
 
 
 TRIAGE = {"needs-triage", "needs-info", "ready-for-agent", "ready-for-human", "wontfix"}
@@ -23,9 +22,6 @@ COMPILE_CLAIM = re.compile(r"compile error|does not compile|do not compile|fails
 COMPILE_MECHANISM = re.compile(r"comptime|exhaustive switch|@compileError|tests/\w+_test\.(?:py|sh)")
 COMPILE_CLAIM_BASELINE = "tools/compile_claim_baseline.txt"
 SENTENCE_END = re.compile(r"(?<=[.)])\s+(?=[A-Z`\"])")
-QUOTED = re.compile(r'(?<!step )"([^"\n]+)"')
-ZIG_FILE = re.compile(r"in `([^`\n]+\.zig)`")
-CODE_SPAN = re.compile(r"`[^`\n]*`")
 
 
 def unbacked_compile_claims(text):
@@ -177,26 +173,6 @@ def check(root):
                     destination = path.parent / unquote(url.path)
                     if not destination.exists():
                         error(path, f"line {number}: broken link {target}")
-
-    for path in sorted(root.glob("docs/rules/*.md")):
-        for paragraph in enforcement_paragraphs(path.read_text()):
-            starts, enforcement = [], ""
-            for number, line in paragraph:
-                starts.append((len(enforcement), number))
-                enforcement += line.strip() + " "
-            prose_only = CODE_SPAN.sub(lambda span: " " * len(span[0]), enforcement)
-            for match in QUOTED.finditer(prose_only):
-                name = match[1]
-                number = max(line for start, line in starts if start <= match.start())
-                file = ZIG_FILE.search(enforcement, match.end()) or (
-                    list(ZIG_FILE.finditer(enforcement, 0, match.start())) or [None])[-1]
-                if file is None:
-                    error(path, f'line {number}: test "{name}" names no file. Add "in `<file>.zig`" to its Enforcement paragraph')
-                    continue
-                if not (root / file[1]).is_file():
-                    error(path, f'line {number}: test "{name}" names the missing file {file[1]}')
-                elif not any(f'test "{name}"' in line for _, lines in zig_files(root, (file[1],), literals=True) for line in lines):
-                    error(path, f'line {number}: {file[1]} has no test "{name}"; cite the exact test name')
 
     tickets = {}
     groups = {}

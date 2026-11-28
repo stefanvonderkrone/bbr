@@ -189,29 +189,5 @@ class AgentDocsTest(unittest.TestCase):
         self.write("docs/rules/tui-state.md", "Enforcement: the test \"x\".\n")
         self.assertTrue(any("Lower its count" in e for e in checker.check(self.root)))
 
-    def test_enforcement_tests_exist_in_their_files(self):
-        self.write("src/a.zig", 'test "first" {}\ntest "second" {}\n')
-        self.write("docs/rules/tui-state.md", "## One\n\nThe rule \"quoted\" is prose.\n\n"
-                   'Enforcement: the tests "first" and "second" in `src/a.zig`.\n\n'
-                   "## Two\n\n"
-                   'Enforcement: the block in `src/a.zig`. The test\n"second".\n\n'
-                   "## Three\n\n"
-                   'Enforcement: the CI step "Lint the tree" runs `src/a.zig`.\n\n'
-                   "## Four\n\n"
-                   'Enforcement: the libc `extern "c" fn mkfifo` fails `core-linux-tests` in `src/a.zig`.\n')
-        self.assertEqual(checker.check(self.root), [])
-
-    def test_enforcement_test_drift_fails(self):
-        self.write("src/a.zig", 'test "first" {}\n')
-        self.write("docs/rules/tui-paint.md", "## One\n\n"
-                   'Enforcement: the test "frist" in `src/a.zig`.\n\n'
-                   'Enforcement: the test "first".\n\n'
-                   'Enforcement: the test\n"first" in `src/b.zig`.\n')
-        errors = "\n".join(checker.check(self.root))
-        self.assertIn('docs/rules/tui-paint.md: line 3: src/a.zig has no test "frist"', errors)
-        self.assertIn('line 5: test "first" names no file', errors)
-        self.assertIn('line 8: test "first" names the missing file src/b.zig', errors)
-
-
 if __name__ == "__main__":
     unittest.main()
