@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - name: Check agent documents and tracker
         run: python3 tools/check_agent_docs.py
-      - name: Check rule document code names
+      - name: Check rule document code names and test names
         run: python3 tools/check_doc_symbols.py
 
   test:
