@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from bisect import bisect_right
 from pathlib import Path
 import re
 import sys
@@ -7,6 +8,7 @@ from source_lines import zig_files
 
 IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
 SYMBOL = re.compile(r"`([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)(?:\(\))?`")
+TEST = re.compile(r'^\s*test\s+"((?:[^"\\]|\\.)*)"')
 CONTAINER = re.compile(
     r"\b(?:const|var)\s+([A-Za-z_]\w*)\s*(?::\s*type\s*)?=\s*"
     r"(?:(?:extern|packed)\s+)?(?:struct|union|enum)\b[^{]*\{"
@@ -41,8 +43,54 @@ def markdown_lines(path):
         yield from enumerate(document, 1)
 
 
+def enforcement_violations(path, paragraph, test_names):
+    text = ""
+    offsets = []
+    for number, line in paragraph:
+        offsets.append(len(text))
+        text += line.strip() + " "
+    position = 0
+    while opening := re.compile(r"\\.|`+").search(text, position):
+        position = opening.end()
+        if opening[0][0] != "`":
+            continue
+        closing = re.compile(f"(?<!`){opening[0]}(?!`)").search(text, position)
+        if closing:
+            text = text[:opening.start()] + " " * (closing.end() - opening.start()) + text[closing.end():]
+            position = closing.end()
+    for match in re.finditer(r"[\u201c\u201d\u201e]", text):
+        number = paragraph[bisect_right(offsets, match.start()) - 1][0]
+        yield (
+            f"{path}:{number}: the Enforcement paragraph has a curly double quote. "
+            "To name a test, use straight double quotes. Write other text as a code span."
+        )
+    if text.count('"') % 2:
+        yield (
+            f"{path}:{paragraph[0][0]}: the Enforcement paragraph has an unpaired double quote. "
+            "Close the test name, or write other text as a code span."
+        )
+        return
+    for match in re.finditer(r'"([^"]*)"', text):
+        if match[1] not in test_names:
+            number = paragraph[bisect_right(offsets, match.start()) - 1][0]
+            yield (
+                f'{path}:{number}: "{match[1]}" is not the name of a test declaration in src/ or tests/. '
+                "Cite the current test name, or restore the test. "
+                "If the quote is not a test name, write it as a code span."
+            )
+
+
 def violations(root):
     identifiers, containers = source_names(root)
+    test_names = {
+        match[1]
+        for _, lines in zig_files(
+            root, tuple(name for name in ("src", "tests") if (root / name).is_dir()),
+            literals=True,
+        )
+        for line in lines
+        if (match := TEST.match(line))
+    }
     documents = [root / "AGENTS.md", root / "CODING_STANDARDS.md"]
     rules = sorted((root / "docs/rules").glob("*.md"))
     if not rules:
@@ -53,8 +101,12 @@ def violations(root):
             yield f"{path.relative_to(root)}: the document is missing. Restore it, or update the document list in tools/check_doc_symbols.py."
             continue
         fence = None
+        paragraph = []
         for number, line in markdown_lines(path):
             marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", line)
+            if paragraph and (marker or not line.strip()):
+                yield from enforcement_violations(path.relative_to(root), paragraph, test_names)
+                paragraph = []
             if marker:
                 run, rest = marker.groups()
                 if fence is None:
@@ -64,6 +116,8 @@ def violations(root):
                 continue
             if fence is not None:
                 continue
+            if path in rules and (paragraph or line.startswith("Enforcement:")):
+                paragraph.append((number, line))
             for match in SYMBOL.finditer(line):
                 name = match[1]
                 parts = name.split(".")
@@ -81,6 +135,7 @@ def violations(root):
                         f"{path.relative_to(root)}:{number}: `{name}` names no current symbol. "
                         "rename it to the current symbol, or remove it."
                     )
+        yield from enforcement_violations(path.relative_to(root), paragraph, test_names)
 
 
 def main():
@@ -90,7 +145,7 @@ def main():
         print(message, file=sys.stderr)
     if found:
         return 1
-    print("Rule document code names match the Zig source.")
+    print("Rule document code names and test names match the Zig source.")
     return 0
 
 
