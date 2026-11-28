@@ -1,6 +1,6 @@
 # Make each check message name its rule and its fix
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: none
 
 ## Problem
@@ -20,3 +20,11 @@ Some checks already do this well. `tools/check_error_comparisons.py` names the r
 - [ ] Each failure message of `tools/check_*.py` names the rule, the fix, and the rule doc.
 - [ ] The audit lists each compile-time rule check with its message, or with the reason why a compile error cannot carry one.
 - [ ] `zig build test` passes.
+
+## Comments
+
+### 2026-11-23 triage
+
+- On 2026-11-23, 12 of the 14 `tools/check_*.py` name no rule doc in their messages. Only `check_agent_docs.py` and `check_doc_symbols.py` do.
+- The tests in `tests/check_*_test.py` can assert the exact message text. A changed message then breaks such a test. Update the test with the message in the same commit.
+- The rule doc is the section in `docs/rules/` with its anchor, for example `docs/rules/diagnostics.md#a-task-gets-its-slot-by-pointer`.
